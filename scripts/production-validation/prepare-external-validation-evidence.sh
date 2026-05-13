@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
-EVIDENCE_DIR="${1:-./docs/production/evidence/${TIMESTAMP}}"
-TEMPLATE_DIR="./docs/production/evidence/templates"
+EVIDENCE_DIR="${1:-./artifacts/production-validation-evidence/${TIMESTAMP}/external-evidence}"
+TEMPLATE_DIR="./docs/production/evidence-templates"
 mkdir -p "$EVIDENCE_DIR"
 
 copy_template() {
