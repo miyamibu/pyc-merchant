@@ -99,9 +99,6 @@ jobs:
       - name: Audit
         run: npm run audit
 
-      - name: Audit chain
-        run: npm run test:audit-chain
-
       - name: Deploy check
         run: npm run deploy:check
 
@@ -118,6 +115,9 @@ jobs:
             sleep 1
           done
           npm run test:smoke
+
+      - name: Audit chain
+        run: npm run test:audit-chain
 
       - name: Smoke failure logs
         if: failure()
