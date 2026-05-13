@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/production/evidence-manifest.schema.json",
+  "title": "Sanitized Production Evidence Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "release_id",
+    "commit_sha",
+    "artifact_storage_ref",
+    "artifact_hashes",
+    "external_statuses",
+    "reviewer_refs",
+    "approver_refs",
+    "signed_minutes_ref",
+    "sbom_ref",
+    "image_scan_ref",
+    "generated_at"
+  ],
+  "properties": {
+    "release_id": { "type": "string", "minLength": 1 },
+    "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "artifact_storage_ref": { "type": "string", "minLength": 1 },
+    "artifact_hashes": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    },
+    "external_statuses": {
+      "type": "object",
+      "required": ["EXT-001", "EXT-002", "EXT-003", "EXT-004"],
+      "additionalProperties": false,
+      "properties": {
+        "EXT-001": { "type": "string", "enum": ["missing", "pending", "fail", "pass"] },
+        "EXT-002": { "type": "string", "enum": ["missing", "pending", "fail", "pass"] },
+        "EXT-003": { "type": "string", "enum": ["missing", "pending", "fail", "pass"] },
+        "EXT-004": { "type": "string", "enum": ["missing", "pending", "fail", "pass"] }
+      }
+    },
+    "reviewer_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "approver_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "signed_minutes_ref": { "type": "string", "minLength": 1 },
+    "sbom_ref": { "type": "string", "minLength": 1 },
+    "image_scan_ref": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" }
+  }
+}

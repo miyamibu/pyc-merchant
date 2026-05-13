@@ -1,10 +1,12 @@
-FROM node:20-bookworm-slim AS deps
+ARG NODE_IMAGE=node:20-bookworm-slim
+FROM ${NODE_IMAGE} AS deps
 
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-FROM node:20-bookworm-slim AS runtime
+ARG NODE_IMAGE=node:20-bookworm-slim
+FROM ${NODE_IMAGE} AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app

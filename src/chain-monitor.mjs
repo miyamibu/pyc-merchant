@@ -16,6 +16,7 @@ const CWD = process.cwd();
 const DEFAULTS = {
   APP_ENV: "development",
   APP_HOST: "http://localhost:4173",
+  INTERNAL_API_BASE_URL: "",
   DB_PATH: "./data/app.db",
   CHAIN_ID: "137",
   TOKEN_CONTRACT: "",
@@ -78,6 +79,7 @@ const ENV = loadEnv();
 const APP_ENV = String(ENV.APP_ENV || DEFAULTS.APP_ENV).trim().toLowerCase();
 const IS_PRODUCTION = APP_ENV === "production";
 const APP_HOST = ENV.APP_HOST || DEFAULTS.APP_HOST;
+const INTERNAL_API_BASE_URL = String(ENV.INTERNAL_API_BASE_URL || (IS_PRODUCTION ? "" : APP_HOST)).trim();
 const DB_PATH = path.resolve(CWD, ENV.DB_PATH || DEFAULTS.DB_PATH);
 const CHAIN_ID = String(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID);
 const TOKEN_CONTRACT = String(ENV.TOKEN_CONTRACT || DEFAULTS.TOKEN_CONTRACT).toLowerCase();
@@ -162,8 +164,8 @@ if (IS_PRODUCTION && REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
   console.error("FATAL: REQUIRED_CONFIRMATIONS is below MIN_REQUIRED_CONFIRMATIONS.");
   process.exit(1);
 }
-if (IS_PRODUCTION && TOKEN_DECIMALS !== JPYC_DECIMALS) {
-  console.error("FATAL: TOKEN_DECIMALS and JPYC_BASE_UNIT_SCALE are inconsistent in production.");
+if (IS_PRODUCTION && !INTERNAL_API_BASE_URL) {
+  console.error("FATAL: INTERNAL_API_BASE_URL must be configured for production chain monitor ingest.");
   process.exit(1);
 }
 if (IS_PRODUCTION) {
@@ -385,7 +387,7 @@ async function postIngest(payload, idempotencyKey) {
   const serviceJti = crypto.randomUUID();
   const payloadHash = sha256(JSON.stringify(payload));
   const signature = hmac(SERVICE_INGEST_SECRET, `${SERVICE_INGEST_ID}.${timestamp}.${serviceJti}.${payloadHash}`);
-  const response = await fetch(`${APP_HOST}/api/v1/internal/payments/events:ingest`, {
+  const response = await fetch(`${INTERNAL_API_BASE_URL}/api/v1/internal/payments/events:ingest`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -657,8 +659,25 @@ async function runCycle() {
       );
       continue;
     }
-    const selected = selectInvoiceForLog(invoices, toAddress, amountBase);
-    if (!selected.invoice) {
+	    const selected = selectInvoiceForLog(invoices, toAddress, amountBase);
+	    const block = await withProvider("getBlock", (provider) => provider.getBlock(Number(log.blockNumber)));
+	    const blockTimestamp = block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : null;
+	    if (!blockTimestamp) {
+	      upsertDeadLetter({
+	        chainId: CHAIN_ID,
+	        txHash: String(log.transactionHash),
+	        logIndex: Number(log.index ?? log.logIndex ?? 0),
+	        invoiceId: selected.invoice?.id || null,
+	        payload: {
+	          tx_hash: String(log.transactionHash),
+	          log_index: Number(log.index ?? log.logIndex ?? 0),
+	          block_number: Number(log.blockNumber ?? 0),
+	        },
+	        reason: "missing_block_timestamp",
+	      });
+	      continue;
+	    }
+	    if (!selected.invoice) {
       try {
         db.prepare(
           `INSERT INTO chain_unmatched_events
@@ -715,9 +734,13 @@ async function runCycle() {
       confirmations,
       tx_hash: log.transactionHash,
       log_index: Number(log.index ?? log.logIndex ?? 0),
-      block_number: Number(log.blockNumber || 0),
-      amount_jpyc_base: amountBase
-    };
+	      block_number: Number(log.blockNumber || 0),
+	      amount_jpyc_base: amountBase,
+	      observed_at: nowIso(),
+	      detected_at: nowIso(),
+	      block_timestamp: blockTimestamp,
+	      source: "chain_monitor"
+	    };
     const idemSeed = `${CHAIN_ID}:${payload.tx_hash}:${payload.log_index}:${payload.invoice_id}`;
     const idemKey = `chain-${sha256(idemSeed).slice(0, 48)}`;
     try {

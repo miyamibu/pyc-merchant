@@ -46,6 +46,7 @@ const state = {
   addressExpanded: false,
   manualActionHint: "",
   consented: false,
+  consentRecordId: "",
 };
 
 const el = {
@@ -255,23 +256,39 @@ function signedConsentPath() {
 }
 
 function initPolicyLinks() {
-  if (el.consentTermsLink) el.consentTermsLink.href = POLICY_URLS.terms || "#";
-  if (el.consentPrivacyLink) el.consentPrivacyLink.href = POLICY_URLS.privacy || "#";
-  if (el.consentRefundLink) el.consentRefundLink.href = POLICY_URLS.refund || "#";
+  const policy = state.invoice?.policy || {};
+  const urls = {
+    terms: policy.terms_url || POLICY_URLS.terms,
+    privacy: policy.privacy_url || POLICY_URLS.privacy,
+    refund: policy.refund_policy_url || POLICY_URLS.refund,
+  };
+  if (el.consentTermsLink) el.consentTermsLink.href = urls.terms || "#";
+  if (el.consentPrivacyLink) el.consentPrivacyLink.href = urls.privacy || "#";
+  if (el.consentRefundLink) el.consentRefundLink.href = urls.refund || "#";
 }
 
 async function recordConsent() {
   const path = signedConsentPath();
-  if (!path) return;
-  try {
-    await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(POLICY_VERSIONS),
-    });
-  } catch (_) {
-    // best-effort audit; consent is gated locally, server failure does not block user
+  if (!path) throw new Error("同意記録URLが無効です。");
+  const policy = state.invoice?.policy || {};
+  const body = {
+    terms_url: policy.terms_url || POLICY_URLS.terms,
+    privacy_url: policy.privacy_url || POLICY_URLS.privacy,
+    refund_policy_url: policy.refund_policy_url || POLICY_URLS.refund,
+    terms_version: policy.terms_version || POLICY_VERSIONS.terms_version,
+    privacy_version: policy.privacy_version || POLICY_VERSIONS.privacy_version,
+    refund_policy_version: policy.refund_policy_version || POLICY_VERSIONS.refund_policy_version,
+  };
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.consent_record_id) {
+    throw new Error(data?.error?.message || "サーバー同意記録に失敗しました。");
   }
+  state.consentRecordId = data.consent_record_id;
 }
 
 function renderConsentGate(invoice) {
@@ -580,6 +597,7 @@ function renderPaymentVerification(invoice) {
 
 function renderReceiptCard(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status);
+  initPolicyLinks();
   const isPaid = status === "paid" || status === "settled";
   el.receiptCard.classList.toggle("hidden", !isPaid);
   if (!isPaid) return;
@@ -639,10 +657,10 @@ function renderInvoice(invoice) {
 
   const customerMode = invoice?.customer_payment_mode || {};
   const paymentActionAvailable = WAITING_STATUSES.has(status) && (!customerMode.mode || customerMode.mode === "wallet_qr");
-  const walletAllowed = paymentActionAvailable && state.consented;
-  el.walletPayBtn.disabled = !paymentActionAvailable;
-  el.showMethodsBtn.disabled = !paymentActionAvailable;
-  el.copyInfoBtn.disabled = !paymentActionAvailable;
+  const walletAllowed = paymentActionAvailable && state.consented && Boolean(state.consentRecordId);
+  el.walletPayBtn.disabled = !walletAllowed;
+  el.showMethodsBtn.disabled = !walletAllowed;
+  el.copyInfoBtn.disabled = !walletAllowed;
   el.copyAddressBtn.disabled = !walletAllowed;
   el.copyAmountBtn.disabled = !walletAllowed;
   el.copyInvoiceBtn.disabled = !walletAllowed;
@@ -845,14 +863,21 @@ async function loadInvoice(options = {}) {
   }
 }
 
-function handleConsentChange() {
-  state.consented = Boolean(el.consentCheckbox?.checked);
-  if (state.consented) {
-    void recordConsent();
+async function handleConsentChange() {
+  const checked = Boolean(el.consentCheckbox?.checked);
+  state.consented = false;
+  state.consentRecordId = "";
+  if (checked) {
+    try {
+      if (el.consentLiveStatus) el.consentLiveStatus.textContent = "同意をサーバーに記録しています。";
+      await recordConsent();
+      state.consented = true;
+    } catch (error) {
+      if (el.consentCheckbox) el.consentCheckbox.checked = false;
+      showError(String(error.message || error));
+    }
   }
-  if (state.invoice) {
-    renderInvoice(state.invoice);
-  }
+  if (state.invoice) renderInvoice(state.invoice);
   if (el.consentLiveStatus) {
     el.consentLiveStatus.textContent = state.consented
       ? "同意済みです。お支払い操作が可能です。"
@@ -861,7 +886,7 @@ function handleConsentChange() {
 }
 
 function bindEvents() {
-  if (el.consentCheckbox) el.consentCheckbox.addEventListener("change", handleConsentChange);
+  if (el.consentCheckbox) el.consentCheckbox.addEventListener("change", () => void handleConsentChange());
   el.walletPayBtn.addEventListener("click", () => void handleWalletPay());
   el.showMethodsBtn.addEventListener("click", () => {
     if (!state.consented) {

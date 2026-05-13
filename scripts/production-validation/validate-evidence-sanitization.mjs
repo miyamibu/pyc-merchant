@@ -47,6 +47,37 @@ function summarizeViolations(violations) {
   };
 }
 
+function validateManifest(manifestPath) {
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const required = [
+    "release_id",
+    "commit_sha",
+    "artifact_storage_ref",
+    "artifact_hashes",
+    "external_statuses",
+    "reviewer_refs",
+    "approver_refs",
+    "signed_minutes_ref",
+    "sbom_ref",
+    "image_scan_ref",
+    "generated_at",
+  ];
+  const violations = [];
+  for (const key of required) {
+    if (manifest[key] == null || manifest[key] === "") violations.push({ file: path.relative(process.cwd(), manifestPath), reason: `missing_${key}` });
+  }
+  for (const key of ["EXT-001", "EXT-002", "EXT-003", "EXT-004"]) {
+    if (!["missing", "pending", "fail", "pass"].includes(String(manifest.external_statuses?.[key] || ""))) {
+      violations.push({ file: path.relative(process.cwd(), manifestPath), reason: `invalid_${key}_status` });
+    }
+  }
+  const serialized = JSON.stringify(manifest);
+  if (/authorization|bearer|cookie|private[_-]?key|seed phrase|mnemonic|sse_token/i.test(serialized)) {
+    violations.push({ file: path.relative(process.cwd(), manifestPath), reason: "manifest_contains_sensitive_material" });
+  }
+  return violations;
+}
+
 function buildSecretNeedles() {
   const needles = [];
   for (const [key, value] of Object.entries(process.env)) {
@@ -69,6 +100,13 @@ function containsSuspiciousGenericPattern(content) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
+  const manifestPath = args.get("manifest") ? path.resolve(process.cwd(), args.get("manifest")) : null;
+  if (manifestPath) {
+    const summary = summarizeViolations(validateManifest(manifestPath));
+    console.log(JSON.stringify(summary, null, 2));
+    if (!summary.ok) process.exit(1);
+    return;
+  }
   const evidenceDir = path.resolve(process.cwd(), String(args.get("evidence-dir") || args.get("dir") || ""));
   if (!evidenceDir || !fs.existsSync(evidenceDir)) {
     console.error(`evidence directory not found: ${evidenceDir}`);

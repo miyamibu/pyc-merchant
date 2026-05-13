@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { makePaymentLogic } from "../src/payment-logic.mjs";
 import {
   apiRequest,
   authHeaders,
@@ -15,6 +16,38 @@ import {
 } from "./helpers/server-process.mjs";
 
 const CWD = process.cwd();
+
+test("payment decision uses block_timestamp instead of detected/observed time", () => {
+  const logic = makePaymentLogic({ jpycBaseUnitScale: "1000000", requiredConfirmations: 2 });
+  const invoice = {
+    status: "issued",
+    amount_jpyc_base: "1000000",
+    expires_at: "2026-05-13T10:00:00.000Z",
+    chain_id: "137",
+    token_contract: "0x1111111111111111111111111111111111111111",
+    recipient_address: "0x2222222222222222222222222222222222222222",
+  };
+  const baseEvent = {
+    amount_jpyc_base: "1000000",
+    confirmations: 2,
+    chain_id: "137",
+    token_contract: "0x1111111111111111111111111111111111111111",
+    to_address: "0x2222222222222222222222222222222222222222",
+  };
+  assert.equal(logic.decidePaymentStatus(invoice, {
+    ...baseEvent,
+    block_timestamp: "2026-05-13T09:59:59.000Z",
+    detected_at: "2026-05-13T10:10:00.000Z",
+  }, { requireBlockTimestamp: true }).nextStatus, "paid");
+  const late = logic.decidePaymentStatus(invoice, {
+    ...baseEvent,
+    block_timestamp: "2026-05-13T10:00:01.000Z",
+    detected_at: "2026-05-13T09:59:00.000Z",
+  }, { requireBlockTimestamp: true });
+  assert.equal(late.nextStatus, "review_required");
+  assert.equal(late.reasonType, "LATE_PAYMENT");
+  assert.equal(logic.decidePaymentStatus(invoice, baseEvent, { requireBlockTimestamp: true }).reasonLabel, "missing_block_timestamp");
+});
 
 test("SR-18 expired invoice does not become paid and records LATE_PAYMENT review reason", async (t) => {
   const env = baseServerEnv();

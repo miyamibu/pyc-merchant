@@ -21,8 +21,9 @@ test("runtime alignment pins Node 20 across local metadata, CI, and Docker", () 
   assert.match(ci, /node-version:\s*20/);
 
   const dockerfile = read("Dockerfile");
-  assert.match(dockerfile, /FROM node:20-bookworm-slim AS deps/);
-  assert.match(dockerfile, /FROM node:20-bookworm-slim AS runtime/);
+  assert.match(dockerfile, /ARG NODE_IMAGE=node:20-bookworm-slim/);
+  assert.match(dockerfile, /FROM \$\{NODE_IMAGE\} AS deps/);
+  assert.match(dockerfile, /FROM \$\{NODE_IMAGE\} AS runtime/);
 });
 
 test("top-level docs explain Node 20 baseline and serial test fallback", () => {

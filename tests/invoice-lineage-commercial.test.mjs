@@ -36,11 +36,11 @@ test("invoice reissue creates lineage and keeps late-window monitoring on old in
     }),
     body: JSON.stringify({
       source_label: "lineage-test",
-      addresses: [
-        "0x5000000000000000000000000000000000000101",
-        "0x5000000000000000000000000000000000000102",
-        "0x5000000000000000000000000000000000000103",
-      ],
+	      addresses: [
+	        { address: "0x5000000000000000000000000000000000000101", control_proof_type: "external_approval", approval_ref: "ADDR-LINEAGE-1", audit_evidence_ref: "AUDIT-LINEAGE-1" },
+	        { address: "0x5000000000000000000000000000000000000102", control_proof_type: "external_approval", approval_ref: "ADDR-LINEAGE-2", audit_evidence_ref: "AUDIT-LINEAGE-2" },
+	        { address: "0x5000000000000000000000000000000000000103", control_proof_type: "external_approval", approval_ref: "ADDR-LINEAGE-3", audit_evidence_ref: "AUDIT-LINEAGE-3" },
+	      ],
     }),
   });
   assert.equal(importPool.status, 201);

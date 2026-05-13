@@ -47,3 +47,16 @@ test("convertBaseUnitsBetweenDecimals: preserves exactness", () => {
     exact: false,
   });
 });
+
+test("JPYC token decimals and accounting scale are separate but reversible", () => {
+  assert.equal(parseDecimalToBaseUnits("1", 18), "1000000000000000000");
+  assert.equal(parseDecimalToBaseUnits("1000", 18), "1000000000000000000000");
+  assert.deepEqual(convertBaseUnitsBetweenDecimals("1000000000000000000000", 18, 6), {
+    value: "1000000000",
+    exact: true,
+  });
+  assert.deepEqual(convertBaseUnitsBetweenDecimals("1000000000000000001", 18, 6), {
+    value: "1000000",
+    exact: false,
+  });
+});

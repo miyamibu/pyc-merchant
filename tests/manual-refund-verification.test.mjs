@@ -17,7 +17,12 @@ const CWD = process.cwd();
 
 async function importReceiveAddresses(baseUrl, token, count = 12, offset = 1) {
   const addresses = Array.from({ length: count }, (_value, index) =>
-    `0x${String(offset + index).padStart(40, "0")}`
+    ({
+      address: `0x${String(offset + index).padStart(40, "0")}`,
+      control_proof_type: "external_approval",
+      approval_ref: `ADDR-MANUAL-${offset + index}`,
+      audit_evidence_ref: `AUDIT-MANUAL-${offset + index}`,
+    })
   );
   const res = await apiRequest(baseUrl, "/api/v1/admin/receive-addresses:import", {
     method: "POST",

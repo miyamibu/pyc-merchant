@@ -3,9 +3,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${PRODUCTION_NODE_IMAGE:?set to node runtime image pinned by digest}
     image: jpyc-terminal-production:local
     env_file:
       - .env.production
+    environment:
+      INTERNAL_API_BASE_URL: http://app:4173
     command: ["node", "src/server.mjs"]
     restart: unless-stopped
     working_dir: /app
@@ -22,6 +26,8 @@ services:
     image: jpyc-terminal-production:local
     env_file:
       - .env.production
+    environment:
+      INTERNAL_API_BASE_URL: http://app:4173
     command: ["node", "src/chain-monitor.mjs"]
     restart: unless-stopped
     working_dir: /app
@@ -32,7 +38,7 @@ services:
         condition: service_started
 
   nginx:
-    image: nginx:1.27-alpine
+    image: ${PRODUCTION_NGINX_IMAGE:?set to nginx image pinned by digest}
     restart: unless-stopped
     depends_on:
       app:

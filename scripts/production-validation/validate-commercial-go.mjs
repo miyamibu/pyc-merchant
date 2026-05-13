@@ -92,13 +92,36 @@ function isPublicHttpsUrl(value) {
   }
 }
 
-function evaluatePolicyUrls({ sourcePath }) {
+function evaluatePolicyUrls({ sourcePath, env = process.env }) {
+  const values = {
+    terms: String(env.TERMS_URL || "").trim(),
+    privacy: String(env.PRIVACY_URL || "").trim(),
+    refund: String(env.REFUND_POLICY_URL || "").trim(),
+  };
+  const versions = {
+    terms_version: String(env.TERMS_VERSION || "").trim(),
+    privacy_version: String(env.PRIVACY_VERSION || "").trim(),
+    refund_policy_version: String(env.REFUND_POLICY_VERSION || "").trim(),
+  };
+  const invalidUrls = Object.keys(values).filter((key) => !isPublicHttpsUrl(values[key]));
+  const invalidVersions = Object.keys(versions).filter((key) => isPlaceholderLike(versions[key]) || /draft/i.test(versions[key]));
+  if (Object.values(values).some(Boolean) || Object.values(versions).some(Boolean)) {
+    return {
+      ok: invalidUrls.length === 0 && invalidVersions.length === 0,
+      source_path: "env",
+      values,
+      versions,
+      missing_keys: invalidUrls,
+      errors: [...invalidUrls.map((key) => `invalid_or_missing_${key}_policy_url`), ...invalidVersions.map((key) => `invalid_or_draft_${key}`)],
+    };
+  }
+
   const resolvedPath = path.resolve(process.cwd(), sourcePath || "public/mobile.js");
   if (!fs.existsSync(resolvedPath)) {
     return {
       ok: false,
       source_path: resolvedPath,
-      values: { terms: "", privacy: "", refund: "" },
+      values,
       missing_keys: ["terms", "privacy", "refund"],
       errors: ["missing_policy_urls_source_file"],
     };
@@ -110,13 +133,12 @@ function evaluatePolicyUrls({ sourcePath }) {
     return {
       ok: false,
       source_path: resolvedPath,
-      values: { terms: "", privacy: "", refund: "" },
+      values,
       missing_keys: ["terms", "privacy", "refund"],
       errors: ["missing_policy_urls_block"],
     };
   }
 
-  const values = { terms: "", privacy: "", refund: "" };
   const pairRegex = /\b(terms|privacy|refund)\s*:\s*["']([^"']*)["']/g;
   for (const match of blockMatch[1].matchAll(pairRegex)) {
     values[match[1]] = String(match[2] || "").trim();
@@ -249,8 +271,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     && !!approvedTokenContract
     && tokenContract === approvedTokenContract
     && Number.isFinite(tokenDecimals)
-    && scaleDecimals != null
-    && tokenDecimals === scaleDecimals;
+	    && scaleDecimals != null;
 
   const requiredConfirmations = Number(env.REQUIRED_CONFIRMATIONS || 2);
   const minRequiredConfirmations = Number(env.MIN_REQUIRED_CONFIRMATIONS || 2);
@@ -272,7 +293,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const settlementPolicyGate = settlementPolicy === "block" || settlementBlockLegacy;
 
   const refundPolicyGate = boolFlag(env.REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR, true);
-  const policyUrls = evaluatePolicyUrls({ sourcePath: policyUrlSource || env.POLICY_URL_SOURCE || "public/mobile.js" });
+	  const policyUrls = evaluatePolicyUrls({ sourcePath: policyUrlSource || env.POLICY_URL_SOURCE || "public/mobile.js", env });
   const dangerousFlags = evaluateDangerousFlags(env);
   const auditChain = runAuditChainVerification(env);
   const evidence = validateCommercialEvidence({ evidenceRoot });
@@ -305,7 +326,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.aml_gate) blockers.P0.push("missing AML approval gate/reference");
   if (!gates.privacy_gate) blockers.P0.push("missing privacy approval gate/reference");
   if (!gates.appi_gate) blockers.P0.push("missing APPI approval gate/reference");
-  if (!gates.jpyc_contract_gate) blockers.P0.push("JPYC contract gate failed (chain/contract/ref/decimals mismatch)");
+	  if (!gates.jpyc_contract_gate) blockers.P0.push("JPYC contract gate failed (chain/contract/ref/decimal config)");
   if (!gates.confirmation_policy_gate) blockers.P0.push("confirmation policy gate failed");
   if (!gates.backscan_policy_gate) blockers.P0.push("backscan policy gate failed");
   if (!gates.dangerous_flags_gate) blockers.P0.push(...dangerousFlags.blockers);
@@ -457,23 +478,26 @@ function main() {
   fs.writeFileSync(scorecardPath, renderCommercialScorecard(report), "utf8");
   fs.writeFileSync(summaryPath, renderSummaryMarkdown(report, { json: jsonPath, scorecard: scorecardPath }), "utf8");
 
-  console.log(
-    JSON.stringify(
-      {
-        ok: true,
+	  const summary =
+	    JSON.stringify(
+	      {
+	        ok: true,
         generated_at: new Date().toISOString(),
         verdict: report.verdict,
         score: report.score,
         output_dir: outDir,
         json: jsonPath,
         scorecard: scorecardPath,
-        summary: summaryPath,
-      },
-      null,
-      2
-    )
-  );
-}
+	        summary: summaryPath,
+	      },
+	      null,
+	      2
+	    );
+	  console.log(summary);
+	  if (args.get("enforce") === "true" && !["COMMERCIAL_GO", "COMMERCIAL_GO_10"].includes(report.verdict)) {
+	    process.exit(1);
+	  }
+	}
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(THIS_FILE)) {

@@ -37,10 +37,10 @@ test("SR-16 diagnostic mode is env-gated and exposes read-only invoice diagnosti
     }),
     body: JSON.stringify({
       source_label: "diag-seed",
-      addresses: [
-        "0x3000000000000000000000000000000000000001",
-        "0x3000000000000000000000000000000000000002",
-      ],
+	      addresses: [
+	        { address: "0x3000000000000000000000000000000000000001", control_proof_type: "external_approval", approval_ref: "ADDR-DIAG-1", audit_evidence_ref: "AUDIT-DIAG-1" },
+	        { address: "0x3000000000000000000000000000000000000002", control_proof_type: "external_approval", approval_ref: "ADDR-DIAG-2", audit_evidence_ref: "AUDIT-DIAG-2" },
+	      ],
     }),
   });
   assert.equal(importRes.status, 201);

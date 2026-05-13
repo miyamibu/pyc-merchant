@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { Wallet } from "ethers";
 import {
   apiRequest,
   authHeaders,
@@ -47,13 +48,85 @@ test("address pool allocation, reissue, audit, and SSE short-lived tokens", asyn
       body: JSON.stringify({
         source_label: "ops-seed",
         addresses: [
-          "0x1000000000000000000000000000000000000001",
-          "0x1000000000000000000000000000000000000002",
+          { address: "0x1000000000000000000000000000000000000001", control_proof_type: "external_approval", approval_ref: "ADDR-TEST-1", audit_evidence_ref: "AUDIT-TEST-1" },
+          { address: "0x1000000000000000000000000000000000000002", control_proof_type: "external_approval", approval_ref: "ADDR-TEST-2", audit_evidence_ref: "AUDIT-TEST-2" },
         ],
       }),
     });
     assert.equal(importRes.status, 201);
     assert.equal(importRes.data.imported_count, 2);
+    assert.ok(importRes.data.receive_addresses.every((row) => row.status === "available"));
+
+    const noProofImport = await apiRequest(started.baseUrl, "/api/v1/admin/receive-addresses:import", {
+      method: "POST",
+      headers: authHeaders(admin.token, {
+        "content-type": "application/json",
+        "idempotency-key": `pool-import-pending-${Date.now()}`,
+      }),
+      body: JSON.stringify({
+        source_label: "ops-seed",
+        addresses: ["0x1000000000000000000000000000000000000099"],
+      }),
+    });
+    assert.equal(noProofImport.status, 201);
+    assert.equal(noProofImport.data.receive_addresses[0].status, "pending_verification");
+
+    const invalidProofImport = await apiRequest(started.baseUrl, "/api/v1/admin/receive-addresses:import", {
+      method: "POST",
+      headers: authHeaders(admin.token, {
+        "content-type": "application/json",
+        "idempotency-key": `pool-import-invalid-proof-${Date.now()}`,
+      }),
+      body: JSON.stringify({
+        source_label: "ops-seed",
+        addresses: [{
+          address: "0x1000000000000000000000000000000000000098",
+          control_proof_type: "external_approval",
+          approval_ref: "ADDR-INVALID",
+        }],
+      }),
+    });
+    assert.equal(invalidProofImport.status, 400);
+    assert.equal(invalidProofImport.data.error.code, "INVALID_CONTROL_PROOF");
+
+    const wallet = Wallet.createRandom();
+    const proofAddress = wallet.address.toLowerCase();
+    const signature = await wallet.signMessage([
+      "JPYC Merchant Ops receive address control",
+      `address:${proofAddress}`,
+      `network:${env.CHAIN_ID}`,
+      `token_contract:${env.TOKEN_CONTRACT.toLowerCase()}`,
+    ].join("\n"));
+    const signatureProofImport = await apiRequest(started.baseUrl, "/api/v1/admin/receive-addresses:import", {
+      method: "POST",
+      headers: authHeaders(admin.token, {
+        "content-type": "application/json",
+        "idempotency-key": `pool-import-sig-proof-${Date.now()}`,
+      }),
+      body: JSON.stringify({
+        source_label: "ops-seed",
+        addresses: [{
+          address: proofAddress,
+          control_proof_type: "eip191_signature",
+          signature,
+        }],
+      }),
+    });
+	    assert.equal(signatureProofImport.status, 201);
+	    assert.equal(signatureProofImport.data.receive_addresses[0].status, "available");
+	    const disabledSignatureProof = await apiRequest(
+	      started.baseUrl,
+	      `/api/v1/admin/receive-addresses/${encodeURIComponent(signatureProofImport.data.receive_addresses[0].id)}/disable`,
+	      {
+	        method: "POST",
+	        headers: authHeaders(admin.token, {
+	          "content-type": "application/json",
+	          "idempotency-key": `pool-disable-sig-proof-${Date.now()}`,
+	        }),
+	        body: JSON.stringify({ reason: "signature_proof_test_complete" }),
+	      }
+	    );
+	    assert.equal(disabledSignatureProof.status, 200);
 
     const createTerminal = async (terminalCode) =>
       apiRequest(started.baseUrl, "/api/v1/terminals", {
@@ -107,7 +180,7 @@ test("address pool allocation, reissue, audit, and SSE short-lived tokens", asyn
       }),
       body: JSON.stringify({
         source_label: "ops-seed",
-        addresses: ["0x1000000000000000000000000000000000000003"],
+        addresses: [{ address: "0x1000000000000000000000000000000000000003", control_proof_type: "external_approval", approval_ref: "ADDR-TEST-3", audit_evidence_ref: "AUDIT-TEST-3" }],
       }),
     });
     assert.equal(importThird.status, 201);
@@ -144,7 +217,7 @@ test("address pool allocation, reissue, audit, and SSE short-lived tokens", asyn
       }),
       body: JSON.stringify({
         source_label: "ops-seed",
-        addresses: ["0x1000000000000000000000000000000000000004"],
+        addresses: [{ address: "0x1000000000000000000000000000000000000004", control_proof_type: "external_approval", approval_ref: "ADDR-TEST-4", audit_evidence_ref: "AUDIT-TEST-4" }],
       }),
     });
     assert.equal(importFourth.status, 201);
@@ -153,7 +226,7 @@ test("address pool allocation, reissue, audit, and SSE short-lived tokens", asyn
       headers: authHeaders(admin.token),
     });
     assert.equal(listed.status, 200);
-    const availableRow = listed.data.receive_addresses.find((row) => row.address === "0x1000000000000000000000000000000000000004");
+	    const availableRow = listed.data.receive_addresses.find((row) => row.address === "0x1000000000000000000000000000000000000004");
     assert.ok(availableRow);
 
     const disabled = await apiRequest(

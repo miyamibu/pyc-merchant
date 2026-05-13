@@ -111,7 +111,8 @@ async function main() {
     const productionChecks = appEnv === "production";
     const publicBaseUrl = String(env.PUBLIC_BASE_URL || env.APP_HOST || env.PAY_BASE_URL || "").trim();
     const appHost = String(env.APP_HOST || env.PUBLIC_BASE_URL || env.PAY_BASE_URL || (productionChecks ? "" : "http://127.0.0.1:4173")).trim();
-    const payBaseUrl = String(env.PAY_BASE_URL || env.APP_HOST || env.PUBLIC_BASE_URL || appHost).trim();
+	    const payBaseUrl = String(env.PAY_BASE_URL || env.APP_HOST || env.PUBLIC_BASE_URL || appHost).trim();
+	    const internalApiBaseUrl = String(env.INTERNAL_API_BASE_URL || (productionChecks ? "" : appHost)).trim();
     const corsOrigins = String(env.CORS_ALLOW_ORIGINS || "")
       .split(",")
       .map((value) => value.trim().replace(/\/$/, ""))
@@ -170,7 +171,7 @@ async function main() {
       record("pay_base_url_https_fqdn", true, { skipped: true, reason: "allow-empty" });
     }
 
-    if (productionChecks && appHost && publicBaseUrl && payBaseUrl) {
+	    if (productionChecks && appHost && publicBaseUrl && payBaseUrl) {
       const normalizedOrigins = [appHost, publicBaseUrl, payBaseUrl].map((value) => new URL(value).toString().replace(/\/$/, ""));
       ensure(new Set(normalizedOrigins).size === 1, "APP_HOST, PUBLIC_BASE_URL, and PAY_BASE_URL must match exactly", {
         app_host: appHost,
@@ -180,7 +181,31 @@ async function main() {
       record("public_origins_match", true, { value: normalizedOrigins[0] });
     } else {
       record("public_origins_match", true, { skipped: true, reason: "allow-empty" });
-    }
+	    }
+	    if (productionChecks && (!allowEmpty || internalApiBaseUrl)) {
+	      const parsed = new URL(internalApiBaseUrl);
+	      ensure(["http:", "https:"].includes(parsed.protocol), "INTERNAL_API_BASE_URL must be http(s)", { value: internalApiBaseUrl });
+	      ensure(parsed.hostname !== new URL(appHost).hostname || parsed.protocol !== "https:", "INTERNAL_API_BASE_URL must be distinct from public APP_HOST", {
+	        internal_api_base_url: internalApiBaseUrl,
+	        app_host: appHost,
+	      });
+	      record("internal_api_base_url_configured", true, { value: internalApiBaseUrl });
+	    } else {
+	      record("internal_api_base_url_configured", true, { skipped: true, reason: "allow-empty" });
+	    }
+	    const publicLinkGraceSec = Number(env.PUBLIC_LINK_GRACE_SEC || "900");
+	    ensure(Number.isInteger(publicLinkGraceSec) && publicLinkGraceSec >= 0 && publicLinkGraceSec <= 1800, "PUBLIC_LINK_GRACE_SEC must be <= 1800 for payment links", {
+	      public_link_grace_sec: publicLinkGraceSec,
+	    });
+	    record("public_payment_link_grace_short", true, { public_link_grace_sec: publicLinkGraceSec });
+	    for (const key of ["TERMS_URL", "PRIVACY_URL", "REFUND_POLICY_URL"]) {
+	      const parsed = new URL(String(env[key] || ""));
+	      ensure(parsed.protocol === "https:" && !/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), `${key} must be public https`, { value: env[key] || "" });
+	    }
+	    for (const key of ["TERMS_VERSION", "PRIVACY_VERSION", "REFUND_POLICY_VERSION"]) {
+	      ensure(String(env[key] || "").trim() && !/draft|placeholder|todo|tbd/i.test(String(env[key] || "")), `${key} must be non-draft`, { value: env[key] || "" });
+	    }
+	    record("policy_config_public_and_versioned", true);
 
     if (productionChecks && (!allowEmpty || corsOrigins.length > 0)) {
       ensure(corsOrigins.length > 0, "CORS_ALLOW_ORIGINS must not be empty", {});

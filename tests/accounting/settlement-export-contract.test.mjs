@@ -48,6 +48,41 @@ test("settlement export schema pins canonical enums and export privacy exclusion
     "disputed",
   ]);
   assert.deepEqual(schema.properties.export_excluded_private_data.enum, [1]);
+  for (const field of [
+    "export_reference",
+    "settlement_id",
+    "settlement_export_run_id",
+    "settlement_export_row_id",
+    "business_date",
+    "invoice_id",
+    "invoice_no",
+    "checkout_session_id",
+    "store_id",
+    "terminal_id",
+    "operator_id",
+    "payment_attempt_ids",
+    "primary_tx_hash",
+    "primary_tx_log_index",
+    "review_case_id",
+    "review_reason_type",
+    "refund_request_id",
+    "refund_tx_hash",
+    "audit_log_refs",
+    "external_sync_refs",
+    "source_ledger_snapshot_hash",
+  ]) {
+    assert.ok(schema.required.includes(field), `${field} must be required for traceability`);
+    assert.ok(schema.properties[field], `${field} must have schema`);
+  }
+});
+
+test("settlement export traceability invariants are documented", () => {
+  const contractDoc = fs.readFileSync(path.join(ROOT, "docs/contracts/settlement-export-v1.md"), "utf8");
+  assert.match(contractDoc, /Every exported row must include the traceability properties/);
+  assert.match(contractDoc, /A paid row must carry payment evidence/);
+  assert.match(contractDoc, /A review row must carry `review_case_id` and `review_reason_type`/);
+  assert.match(contractDoc, /A refund row must carry `refund_request_id` and `refund_tx_hash`/);
+  assert.match(contractDoc, /Vendor adapters are downstream transforms and must preserve all required trace fields/);
 });
 
 test("buildDailyAccountingSummary aggregates cancelled rows alongside other accounting statuses", () => {

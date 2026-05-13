@@ -5,8 +5,10 @@ export const PROVIDER_PRIVATE_FIELDS = [
   "certificate",
   "raw_certificate",
   "name",
+  "full_name",
   "address",
   "birthdate",
+  "birth_date",
   "date_of_birth",
   "payer_id",
   "payer_ref",
@@ -14,6 +16,9 @@ export const PROVIDER_PRIVATE_FIELDS = [
   "personal_id",
   "identity",
   "credential_subject",
+  "credentialsubject",
+  "vendor_identity",
+  "identity_subject",
 ];
 
 export const PROVIDER_EVENT_ALLOWED_FIELDS = [
@@ -105,7 +110,14 @@ export function findPrivateProviderField(value, prefix = "") {
   if (!value || typeof value !== "object") return null;
   for (const [key, nested] of Object.entries(value)) {
     const path = prefix ? `${prefix}.${key}` : key;
-    if (PROVIDER_PRIVATE_FIELDS.includes(String(key))) {
+    const canonicalKey = String(key)
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+      .replace(/[^a-zA-Z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .toLowerCase();
+    const compactKey = canonicalKey.replace(/_/g, "");
+    if (PROVIDER_PRIVATE_FIELDS.includes(canonicalKey) || PROVIDER_PRIVATE_FIELDS.includes(compactKey)) {
       return path;
     }
     if (Array.isArray(nested)) {

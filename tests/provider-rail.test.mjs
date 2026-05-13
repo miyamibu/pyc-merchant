@@ -15,12 +15,25 @@ import {
   stopServerProcess,
 } from "./helpers/server-process.mjs";
 import { buildServiceAuthHeaders } from "./helpers/service-auth.mjs";
+import { findPrivateProviderField } from "../src/provider-rail.mjs";
 
 const CWD = process.cwd();
 
+test("provider private-field detection normalizes nested camel/Pascal/private synonyms", () => {
+  assert.equal(findPrivateProviderField({ payer: { birthDate: "2000-01-01" } }), "payer.birthDate");
+  assert.equal(findPrivateProviderField({ CredentialSubject: { id: "private" } }), "CredentialSubject");
+  assert.equal(findPrivateProviderField({ payer: { fullName: "Private Name" } }), "payer.fullName");
+  assert.equal(findPrivateProviderField({ vendorIdentity: { payerId: "p-1" } }), "vendorIdentity");
+});
+
 async function importReceiveAddresses(baseUrl, token, count = 20, offset = 100) {
   const addresses = Array.from({ length: count }, (_value, index) =>
-    `0x${String(offset + index).padStart(40, "0")}`
+    ({
+      address: `0x${String(offset + index).padStart(40, "0")}`,
+      control_proof_type: "external_approval",
+      approval_ref: `ADDR-PROVIDER-${offset + index}`,
+      audit_evidence_ref: `AUDIT-PROVIDER-${offset + index}`,
+    })
   );
   const res = await apiRequest(baseUrl, "/api/v1/admin/receive-addresses:import", {
     method: "POST",

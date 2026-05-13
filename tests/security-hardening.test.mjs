@@ -41,11 +41,11 @@ test("receive address reissue keeps old QR on late-arrival review path and scope
     }),
     body: JSON.stringify({
       source_label: "ops-seed",
-      addresses: [
-        "0x5000000000000000000000000000000000000001",
-        "0x5000000000000000000000000000000000000002",
-        "0x5000000000000000000000000000000000000003",
-      ],
+	      addresses: [
+	        { address: "0x5000000000000000000000000000000000000001", control_proof_type: "external_approval", approval_ref: "ADDR-HARDEN-1", audit_evidence_ref: "AUDIT-HARDEN-1" },
+	        { address: "0x5000000000000000000000000000000000000002", control_proof_type: "external_approval", approval_ref: "ADDR-HARDEN-2", audit_evidence_ref: "AUDIT-HARDEN-2" },
+	        { address: "0x5000000000000000000000000000000000000003", control_proof_type: "external_approval", approval_ref: "ADDR-HARDEN-3", audit_evidence_ref: "AUDIT-HARDEN-3" },
+	      ],
     }),
   });
   assert.equal(importRes.status, 201);
@@ -315,11 +315,14 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
   const parsed = parsePaymentUrl(inv.data.payment_url);
   assert.ok(parsed.sig, "payment_url must include sig");
 
-  const consentBody = JSON.stringify({
-    terms_version: "draft-v1",
-    privacy_version: "draft-v1",
-    refund_policy_version: "draft-v1",
-  });
+	  const consentBody = JSON.stringify({
+	    terms_url: "https://terminal.example.com/legal/terms",
+	    privacy_url: "https://terminal.example.com/legal/privacy",
+	    refund_policy_url: "https://terminal.example.com/legal/refund",
+	    terms_version: "terms-2026-05",
+	    privacy_version: "privacy-2026-05",
+	    refund_policy_version: "refund-2026-05",
+	  });
 
   const consentUrl = `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`;
 
@@ -328,8 +331,9 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
     headers: { "content-type": "application/json" },
     body: consentBody,
   });
-  assert.equal(ok.status, 200);
-  assert.equal(ok.data.ok, true);
+	  assert.equal(ok.status, 200);
+	  assert.equal(ok.data.ok, true);
+	  assert.ok(ok.data.consent_record_id, "consent_record_id must be present");
   assert.ok(ok.data.recorded_at, "recorded_at must be present");
 
   const badSig = await apiRequest(

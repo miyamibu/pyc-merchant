@@ -37,6 +37,7 @@ test("validate-production-config passes for production-safe env with skip-rpc", 
       APP_HOST: "https://terminal.example.com",
       PUBLIC_BASE_URL: "https://terminal.example.com",
       PAY_BASE_URL: "https://terminal.example.com",
+      INTERNAL_API_BASE_URL: "http://app:4173",
       CORS_ALLOW_ORIGINS: "https://terminal.example.com",
       CHAIN_ID: "137",
       TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
@@ -44,6 +45,13 @@ test("validate-production-config passes for production-safe env with skip-rpc", 
       TOKEN_DECIMALS: "18",
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
       WALLET_DEEPLINK_TEMPLATE: "wallet://open?uri={{payment_uri_encoded}}",
+      PUBLIC_LINK_GRACE_SEC: "900",
+      TERMS_URL: "https://terminal.example.com/legal/terms",
+      PRIVACY_URL: "https://terminal.example.com/legal/privacy",
+      REFUND_POLICY_URL: "https://terminal.example.com/legal/refund",
+      TERMS_VERSION: "terms-2026-05",
+      PRIVACY_VERSION: "privacy-2026-05",
+      REFUND_POLICY_VERSION: "refund-2026-05",
     }
   );
   assert.equal(result.code, 0, result.stdout || result.stderr);
@@ -61,11 +69,19 @@ test("validate-production-config fails on chain drift", async () => {
       APP_HOST: "https://terminal.example.com",
       PUBLIC_BASE_URL: "https://terminal.example.com",
       PAY_BASE_URL: "https://terminal.example.com",
+      INTERNAL_API_BASE_URL: "http://app:4173",
       CHAIN_ID: "1",
       TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
       APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
       TOKEN_DECIMALS: "18",
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
+      PUBLIC_LINK_GRACE_SEC: "900",
+      TERMS_URL: "https://terminal.example.com/legal/terms",
+      PRIVACY_URL: "https://terminal.example.com/legal/privacy",
+      REFUND_POLICY_URL: "https://terminal.example.com/legal/refund",
+      TERMS_VERSION: "terms-2026-05",
+      PRIVACY_VERSION: "privacy-2026-05",
+      REFUND_POLICY_VERSION: "refund-2026-05",
     }
   );
   assert.notEqual(result.code, 0);
@@ -84,6 +100,31 @@ test("validate-evidence-sanitization rejects leaked bearer token", async () => {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, false);
   assert.equal(payload.violation_count, 1);
+});
+
+test("validate-evidence-sanitization accepts sanitized manifest and rejects sensitive manifest", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "jpyc-manifest-test-"));
+  const manifestPath = path.join(dir, "release.json");
+  const manifest = {
+    release_id: "rel-2026-05",
+    commit_sha: "abcdef1234567890",
+    artifact_storage_ref: "s3://redacted-bucket/releases/rel-2026-05",
+    artifact_hashes: { "EXT-001": "a".repeat(64) },
+    external_statuses: { "EXT-001": "pending", "EXT-002": "pending", "EXT-003": "pending", "EXT-004": "pending" },
+    reviewer_refs: ["review-1"],
+    approver_refs: ["approval-1"],
+    signed_minutes_ref: "minutes-1",
+    sbom_ref: "sbom-1",
+    image_scan_ref: "image-scan-1",
+    generated_at: new Date().toISOString(),
+  };
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  const ok = await runNode("scripts/production-validation/validate-evidence-sanitization.mjs", ["--manifest", manifestPath]);
+  assert.equal(ok.code, 0, ok.stdout || ok.stderr);
+
+  fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, artifact_storage_ref: "authorization: Bearer leak" }, null, 2), "utf8");
+  const bad = await runNode("scripts/production-validation/validate-evidence-sanitization.mjs", ["--manifest", manifestPath]);
+  assert.notEqual(bad.code, 0);
 });
 
 test("run-commercial-validate-safe writes reports under a safe output base", async () => {

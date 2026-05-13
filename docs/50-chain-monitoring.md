@@ -46,7 +46,7 @@
 - `APP_ENV=production` で `MONITOR_BACKSCAN_BLOCKS < MIN_MONITOR_BACKSCAN_BLOCKS` は起動失敗。
 - `APPROVED_JPYC_TOKEN_CONTRACT` と `JPYC_CONTRACT_APPROVAL_REF` が未設定なら起動失敗。
 - `CONFIRMATIONS_POLICY_APPROVAL_REF` と `BACKSCAN_POLICY_APPROVAL_REF` が未設定なら起動失敗。
-- `TOKEN_DECIMALS` と `JPYC_BASE_UNIT_SCALE` が不整合なら起動失敗。
+- `TOKEN_DECIMALS` は ERC-20 の実 decimals、`JPYC_BASE_UNIT_SCALE` は内部会計 scale として扱う。両者は一致不要だが、token atomic unit から app base unit への変換が割り切れない transfer は dead-letter/manual review に送る。
 
 ## Same policy across components
 - chain monitor の paid 候補判定

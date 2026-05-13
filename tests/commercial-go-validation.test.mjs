@@ -62,3 +62,22 @@ test("commercial validation generates JSON, scorecard, and summary without fake 
   assert.equal(report.commercial_10_ready, false);
   assert.ok(Array.isArray(report.blockers.P0));
 });
+
+test("commercial gate exits nonzero for NO_GO verdict", async () => {
+  const evidenceRoot = mkdtempSync(path.join(tmpdir(), "jpyc-commercial-gate-"));
+  const outputDir = mkdtempSync(path.join(tmpdir(), "jpyc-commercial-gate-out-"));
+  const result = await runNode("scripts/production-validation/validate-commercial-go.mjs", [
+    "--evidence-root",
+    evidenceRoot,
+    "--output-dir",
+    outputDir,
+    "--enforce",
+  ], {
+    APP_ENV: "development",
+    COMMERCIAL_GO_MODE: "false",
+    DB_PATH: "./missing-commercial-gate.db",
+  });
+  assert.notEqual(result.code, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.verdict, "NO_GO");
+});

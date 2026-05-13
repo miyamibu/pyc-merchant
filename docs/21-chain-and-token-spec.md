@@ -10,7 +10,9 @@
 - `TOKEN_CONTRACT === APPROVED_JPYC_TOKEN_CONTRACT`
 - `JPYC_CONTRACT_APPROVAL_REF` が空でない
 - `REQUIRED_CONFIRMATIONS >= MIN_REQUIRED_CONFIRMATIONS >= 1`
-- `TOKEN_DECIMALS === scaleToDecimals(JPYC_BASE_UNIT_SCALE)`
+- `TOKEN_DECIMALS` is the ERC-20 token decimal count.
+- `JPYC_BASE_UNIT_SCALE` is the internal accounting scale.
+- They do not have to match, but conversions between token atomic units and app base units must be exact; non-exact transfers go to manual review/dead-letter handling.
 
 ## Required env checklist
 - `CHAIN_ID`

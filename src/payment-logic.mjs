@@ -50,19 +50,23 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     );
     const previousPaidBase = previousPaidBaseResult.error ? "0" : previousPaidBaseResult.value;
     const confirmations = Number(event.confirmations || 0);
-    const observedAtMs =
+    const hasBlockTimestamp = event?.block_timestamp != null && String(event.block_timestamp).trim() !== "";
+    if (options.requireBlockTimestamp && !hasBlockTimestamp) {
+      return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "missing_block_timestamp" };
+    }
+    const canonicalEventAtMs =
       options.nowMs != null
         ? Number(options.nowMs)
-        : (event?.observed_at ? new Date(event.observed_at).getTime() : Date.now());
+        : (hasBlockTimestamp ? new Date(event.block_timestamp).getTime() : (event?.observed_at ? new Date(event.observed_at).getTime() : Date.now()));
     const expiryMs = new Date(invoice.expires_at).getTime();
 
     if (!Number.isFinite(expiryMs)) {
       return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_invoice_expiry" };
     }
-    if (!Number.isFinite(observedAtMs)) {
-      return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_observed_at" };
+    if (!Number.isFinite(canonicalEventAtMs)) {
+      return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_block_timestamp" };
     }
-    if (observedAtMs > expiryMs) {
+    if (canonicalEventAtMs > expiryMs) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.LATE_PAYMENT,

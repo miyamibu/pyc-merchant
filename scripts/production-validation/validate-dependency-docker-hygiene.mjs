@@ -101,16 +101,20 @@ function main() {
     }
     record("dockerignore_secret_patterns", true);
 
-    const dockerfile = readText("Dockerfile");
-    ensure(/npm ci --omit=dev/.test(dockerfile), "Dockerfile must use npm ci --omit=dev");
-    ensure(/USER appuser/.test(dockerfile), "Dockerfile must drop root privileges");
-    ensure(!/COPY \. \./.test(dockerfile), "Dockerfile must not copy the full workspace blindly");
-    record("dockerfile_runtime_hardening", true);
+	    const dockerfile = readText("Dockerfile");
+	    ensure(/npm ci --omit=dev/.test(dockerfile), "Dockerfile must use npm ci --omit=dev");
+	    ensure(/USER appuser/.test(dockerfile), "Dockerfile must drop root privileges");
+	    ensure(!/COPY \. \./.test(dockerfile), "Dockerfile must not copy the full workspace blindly");
+	    ensure(/ARG NODE_IMAGE/.test(dockerfile) && /FROM \$\{NODE_IMAGE\}/.test(dockerfile), "Dockerfile must use a digest-gated NODE_IMAGE build arg");
+	    record("dockerfile_runtime_hardening", true);
 
     const compose = readText("docker-compose.prod.yml");
-    ensure(/\.env\.production/.test(compose), "docker-compose.prod.yml must reference .env.production");
-    ensure(/jpyc-terminal-production:local/.test(compose), "docker-compose.prod.yml must use the built local app image");
-    record("compose_uses_production_env", true);
+	    ensure(/\.env\.production/.test(compose), "docker-compose.prod.yml must reference .env.production");
+	    ensure(/jpyc-terminal-production:local/.test(compose), "docker-compose.prod.yml must use the built local app image");
+	    ensure(/PRODUCTION_NODE_IMAGE:\?/.test(compose), "production compose must require digest-pinned PRODUCTION_NODE_IMAGE");
+	    ensure(/PRODUCTION_NGINX_IMAGE:\?/.test(compose), "production compose must require digest-pinned PRODUCTION_NGINX_IMAGE");
+	    ensure(/INTERNAL_API_BASE_URL:\s*http:\/\/app:4173/.test(compose), "production compose worker must use internal app URL");
+	    record("compose_uses_production_env", true);
 
     const lockfile = JSON.parse(readText("package-lock.json"));
     const licenses = collectLicensesFromLockfile(lockfile);
