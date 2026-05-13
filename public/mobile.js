@@ -267,17 +267,32 @@ function initPolicyLinks() {
   if (el.consentRefundLink) el.consentRefundLink.href = urls.refund || "#";
 }
 
-async function recordConsent() {
-  const path = signedConsentPath();
-  if (!path) throw new Error("同意記録URLが無効です。");
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function displayedPolicyHash() {
   const policy = state.invoice?.policy || {};
-  const body = {
+  const snapshot = {
     terms_url: policy.terms_url || POLICY_URLS.terms,
     privacy_url: policy.privacy_url || POLICY_URLS.privacy,
     refund_policy_url: policy.refund_policy_url || POLICY_URLS.refund,
     terms_version: policy.terms_version || POLICY_VERSIONS.terms_version,
     privacy_version: policy.privacy_version || POLICY_VERSIONS.privacy_version,
     refund_policy_version: policy.refund_policy_version || POLICY_VERSIONS.refund_policy_version,
+  };
+  return sha256Hex(JSON.stringify(snapshot));
+}
+
+async function recordConsent() {
+  const path = signedConsentPath();
+  if (!path) throw new Error("同意記録URLが無効です。");
+  const body = {
+    checked: true,
+    displayed_policy_hash: await displayedPolicyHash(),
+    client_rendered_at: new Date().toISOString(),
   };
   const response = await fetch(path, {
     method: "POST",

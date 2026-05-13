@@ -24,7 +24,7 @@
     "production:validate": "bash scripts/production-validation/run-all.sh",
     "commercial:report": "node scripts/production-validation/run-commercial-validate-safe.mjs",
     "commercial:gate": "node scripts/production-validation/run-commercial-validate-safe.mjs --enforce",
-    "limited:gate": "node scripts/production-validation/validate-commercial-go.mjs",
+    "limited:gate": "node scripts/production-validation/run-commercial-validate-safe.mjs --limited-enforce",
     "commercial:validate": "node scripts/production-validation/validate-commercial-go.mjs",
     "commercial:validate:safe": "node scripts/production-validation/run-commercial-validate-safe.mjs",
     "production:validate:env": "bash scripts/production-validation/validate-production-env.sh",

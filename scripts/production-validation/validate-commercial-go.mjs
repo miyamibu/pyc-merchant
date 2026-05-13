@@ -297,6 +297,18 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const dangerousFlags = evaluateDangerousFlags(env);
   const auditChain = runAuditChainVerification(env);
   const evidence = validateCommercialEvidence({ evidenceRoot });
+  const signedConditionalWaiverRef = String(env.SIGNED_CONDITIONAL_GO_WAIVER_REF || "").trim();
+  const signedConditionalWaiverGate = !isPlaceholderLike(signedConditionalWaiverRef);
+  const serverSource = fs.existsSync(path.resolve(process.cwd(), "src/server.mjs"))
+    ? fs.readFileSync(path.resolve(process.cwd(), "src/server.mjs"), "utf8")
+    : "";
+  const addressProofGate = [
+    "proof_batch_id",
+    "proof_nonce_hash",
+    "proof_valid_from",
+    "proof_valid_until",
+    "proof_scope_hash",
+  ].every((token) => serverSource.includes(token));
 
   const gates = {
     production_env_gate: appEnv === "production",
@@ -313,10 +325,12 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     refund_policy_gate: refundPolicyGate,
     settlement_policy_gate: settlementPolicyGate,
     policy_urls_gate: policyUrls.ok,
+    address_proof_gate: addressProofGate,
     wallet_evidence_gate: Boolean(evidence.ext?.EXT_002?.ok),
     real_payment_evidence_gate: Boolean(evidence.ext?.EXT_001?.ok),
     tls_evidence_gate: Boolean(evidence.ext?.EXT_003?.ok),
     store_ops_drill_gate: Boolean(evidence.ext?.EXT_004?.ok),
+    signed_conditional_waiver_gate: signedConditionalWaiverGate,
     poc_package_gate: Boolean(evidence.poc_all_pass),
   };
 
@@ -333,6 +347,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.audit_chain_gate) blockers.P0.push(`audit hash-chain verification failed: ${auditChain.message || auditChain.status}`);
   if (!gates.refund_policy_gate) blockers.P0.push("REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR must be true");
   if (!gates.settlement_policy_gate) blockers.P0.push("settlement_unresolved_review_policy must be block in commercial mode");
+  if (!gates.address_proof_gate) blockers.P0.push("receive address ownership proof gate is not scope-bound");
 
   if (!gates.production_env_gate) blockers.P1.push("APP_ENV is not production");
   if (!gates.commercial_go_mode_gate) blockers.P1.push("COMMERCIAL_GO_MODE is not enabled");
@@ -374,6 +389,17 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
 
   const p0Count = blockers.P0.length;
   const extAllPass = gates.wallet_evidence_gate && gates.real_payment_evidence_gate && gates.tls_evidence_gate && gates.store_ops_drill_gate;
+  const limitedEvidenceGate = extAllPass || gates.signed_conditional_waiver_gate;
+  const limitedPilotReady = [
+    gates.legal_gate,
+    gates.aml_gate,
+    gates.privacy_gate,
+    gates.appi_gate,
+    gates.policy_urls_gate,
+    gates.address_proof_gate,
+    gates.settlement_policy_gate,
+    limitedEvidenceGate,
+  ].every(Boolean);
 
   let verdict = "NO_GO";
   if (p0Count > 0) {
@@ -384,8 +410,10 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     verdict = "COMMERCIAL_GO";
   } else if (gates.commercial_go_mode_gate) {
     verdict = "CONDITIONAL_NO_GO_FOR_COMMERCIAL";
-  } else {
+  } else if (limitedPilotReady) {
     verdict = "READY_FOR_LIMITED_PILOT";
+  } else {
+    verdict = "NO_GO";
   }
 
   return {
@@ -398,6 +426,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     verdict,
     commercial_9_ready: verdict === "COMMERCIAL_GO" || verdict === "COMMERCIAL_GO_10",
     commercial_10_ready: verdict === "COMMERCIAL_GO_10",
+    limited_pilot_ready: limitedPilotReady && verdict === "READY_FOR_LIMITED_PILOT",
     gates,
     blockers,
     dangerous_flag_details: dangerousFlags.blockers,
@@ -406,6 +435,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     external_evidence: evidence.ext,
     poc_evidence: evidence.poc,
     ext_all_pass: evidence.ext_all_pass,
+    limited_evidence_gate: limitedEvidenceGate,
+    signed_conditional_waiver_ref: signedConditionalWaiverRef || null,
     poc_all_pass: evidence.poc_all_pass,
   };
 }
@@ -483,9 +514,10 @@ function main() {
 	      {
 	        ok: true,
         generated_at: new Date().toISOString(),
-        verdict: report.verdict,
-        score: report.score,
-        output_dir: outDir,
+	        verdict: report.verdict,
+	        score: report.score,
+	        limited_pilot_ready: report.limited_pilot_ready,
+	        output_dir: outDir,
         json: jsonPath,
         scorecard: scorecardPath,
 	        summary: summaryPath,
@@ -494,9 +526,12 @@ function main() {
 	      2
 	    );
 	  console.log(summary);
+		  if (args.get("limited-enforce") === "true" && report.limited_pilot_ready !== true) {
+		    process.exit(1);
+		  }
 	  if (args.get("enforce") === "true" && !["COMMERCIAL_GO", "COMMERCIAL_GO_10"].includes(report.verdict)) {
-	    process.exit(1);
-	  }
+		    process.exit(1);
+		  }
 	}
 
 const THIS_FILE = fileURLToPath(import.meta.url);

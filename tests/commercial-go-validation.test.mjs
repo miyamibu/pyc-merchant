@@ -81,3 +81,22 @@ test("commercial gate exits nonzero for NO_GO verdict", async () => {
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.verdict, "NO_GO");
 });
+
+test("limited gate exits nonzero unless limited pilot prerequisites are explicit", async () => {
+  const evidenceRoot = mkdtempSync(path.join(tmpdir(), "jpyc-limited-gate-"));
+  const outputDir = mkdtempSync(path.join(tmpdir(), "jpyc-limited-gate-out-"));
+  const result = await runNode("scripts/production-validation/validate-commercial-go.mjs", [
+    "--evidence-root",
+    evidenceRoot,
+    "--output-dir",
+    outputDir,
+    "--limited-enforce",
+  ], {
+    APP_ENV: "development",
+    COMMERCIAL_GO_MODE: "false",
+    DB_PATH: "./missing-limited-gate.db",
+  });
+  assert.notEqual(result.code, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.limited_pilot_ready, false);
+});

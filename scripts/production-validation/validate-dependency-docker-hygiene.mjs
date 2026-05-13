@@ -38,6 +38,24 @@ function readText(filePath) {
   return fs.readFileSync(path.join(ROOT, filePath), "utf8");
 }
 
+function loadEnvFile(filePath) {
+  const resolved = path.resolve(ROOT, filePath);
+  const env = {};
+  if (!fs.existsSync(resolved)) return env;
+  for (const line of fs.readFileSync(resolved, "utf8").split(/\r?\n/)) {
+    if (!line || line.trim().startsWith("#") || !line.includes("=")) continue;
+    const idx = line.indexOf("=");
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, "");
+    if (key) env[key] = value;
+  }
+  return env;
+}
+
+function isDigestPinnedImage(value) {
+  return /^.+@sha256:[0-9a-f]{64}$/.test(String(value || "").trim());
+}
+
 function hasDocker() {
   try {
     execFileSync("docker", ["version"], { stdio: "ignore" });
@@ -70,10 +88,11 @@ function collectLicensesFromLockfile(lockfile) {
 }
 
 function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const outputPath = args.get("output") ? path.resolve(ROOT, args.get("output")) : null;
-  const skipDocker = args.get("skip-docker") === "true";
-  const checks = [];
+	  const args = parseArgs(process.argv.slice(2));
+	  const outputPath = args.get("output") ? path.resolve(ROOT, args.get("output")) : null;
+	  const skipDocker = args.get("skip-docker") === "true";
+	  const requireResolvedDigests = args.get("require-resolved-digests") === "true";
+	  const checks = [];
 
   function record(name, ok, details = {}) {
     checks.push({ name, ok, ...details });
@@ -108,13 +127,29 @@ function main() {
 	    ensure(/ARG NODE_IMAGE/.test(dockerfile) && /FROM \$\{NODE_IMAGE\}/.test(dockerfile), "Dockerfile must use a digest-gated NODE_IMAGE build arg");
 	    record("dockerfile_runtime_hardening", true);
 
-    const compose = readText("docker-compose.prod.yml");
-	    ensure(/\.env\.production/.test(compose), "docker-compose.prod.yml must reference .env.production");
-	    ensure(/jpyc-terminal-production:local/.test(compose), "docker-compose.prod.yml must use the built local app image");
-	    ensure(/PRODUCTION_NODE_IMAGE:\?/.test(compose), "production compose must require digest-pinned PRODUCTION_NODE_IMAGE");
-	    ensure(/PRODUCTION_NGINX_IMAGE:\?/.test(compose), "production compose must require digest-pinned PRODUCTION_NGINX_IMAGE");
-	    ensure(/INTERNAL_API_BASE_URL:\s*http:\/\/app:4173/.test(compose), "production compose worker must use internal app URL");
-	    record("compose_uses_production_env", true);
+	    const compose = readText("docker-compose.prod.yml");
+		    ensure(/\.env\.production/.test(compose), "docker-compose.prod.yml must reference .env.production");
+		    ensure(/jpyc-terminal-production:local/.test(compose), "docker-compose.prod.yml must use the built local app image");
+		    ensure(/PRODUCTION_NODE_IMAGE:\?/.test(compose), "production compose must require digest-pinned PRODUCTION_NODE_IMAGE");
+		    ensure(/PRODUCTION_NGINX_IMAGE:\?/.test(compose), "production compose must require digest-pinned PRODUCTION_NGINX_IMAGE");
+		    ensure(/INTERNAL_API_BASE_URL:\s*http:\/\/app:4173/.test(compose), "production compose worker must use internal app URL");
+		    record("compose_uses_production_env", true);
+
+	    const resolvedEnv = { ...loadEnvFile(".env.production"), ...process.env };
+	    const resolvedDigestInputs = {
+	      PRODUCTION_NODE_IMAGE: resolvedEnv.PRODUCTION_NODE_IMAGE,
+	      PRODUCTION_NGINX_IMAGE: resolvedEnv.PRODUCTION_NGINX_IMAGE,
+	    };
+	    if (requireResolvedDigests || Object.values(resolvedDigestInputs).some(Boolean)) {
+	      for (const [key, value] of Object.entries(resolvedDigestInputs)) {
+	        ensure(isDigestPinnedImage(value), `${key} must be a production digest-pinned image`, { key, value: value || null });
+	      }
+	      record("resolved_production_image_digests", true, {
+	        images: Object.fromEntries(Object.entries(resolvedDigestInputs).map(([key, value]) => [key, String(value).replace(/@sha256:.+$/, "@sha256:<redacted>")])),
+	      });
+	    } else {
+	      record("resolved_production_image_digests", true, { skipped: true, reason: "no .env.production image values present" });
+	    }
 
     const lockfile = JSON.parse(readText("package-lock.json"));
     const licenses = collectLicensesFromLockfile(lockfile);
@@ -122,13 +157,19 @@ function main() {
     record("license_list_exportable", true, { count: licenses.length });
 
     let dockerBuildStatus = { skipped: true, reason: "docker_unavailable" };
-    if (!skipDocker && hasDocker()) {
-      execFileSync("docker", ["build", ".", "--tag", "jpyc-terminal-production:hygiene"], {
-        cwd: ROOT,
-        stdio: "ignore",
-      });
-      dockerBuildStatus = { skipped: false };
-    }
+	    if (!skipDocker && hasDocker()) {
+	      execFileSync("docker", ["build", ".", "--tag", "jpyc-terminal-production:hygiene"], {
+	        cwd: ROOT,
+	        stdio: "ignore",
+	      });
+	      if (fs.existsSync(path.join(ROOT, ".env.production"))) {
+	        execFileSync("docker", ["compose", "--env-file", ".env.production", "-f", "docker-compose.prod.yml", "config"], {
+	          cwd: ROOT,
+	          stdio: "ignore",
+	        });
+	      }
+	      dockerBuildStatus = { skipped: false };
+	    }
     record("docker_build", true, dockerBuildStatus);
 
     const summary = {

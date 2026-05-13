@@ -90,6 +90,22 @@ test("validate-production-config fails on chain drift", async () => {
   assert.match(JSON.stringify(payload), /CHAIN_ID must be 137/);
 });
 
+test("validate-production-config does not require policy URLs for ordinary dev validation", async () => {
+  const result = await runNode(
+    "scripts/production-validation/validate-production-config.mjs",
+    ["--skip-rpc", "--app-env", "development"],
+    {
+      APP_ENV: "development",
+      APP_HOST: "http://127.0.0.1:4173",
+      PUBLIC_LINK_GRACE_SEC: "900",
+    }
+  );
+  assert.equal(result.code, 0, result.stdout || result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+  assert.ok(payload.checks.some((row) => row.name === "policy_config_public_and_versioned" && row.skipped === true));
+});
+
 test("validate-evidence-sanitization rejects leaked bearer token", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "jpyc-evidence-test-"));
   fs.writeFileSync(path.join(dir, "bad.log"), "authorization: Bearer super-secret-token\n", "utf8");

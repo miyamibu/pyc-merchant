@@ -61,9 +61,12 @@
     },
     "invoice_no": { "type": ["string", "null"] },
     "checkout_session_id": { "type": ["string", "null"] },
+    "merchant_id": { "type": ["string", "null"] },
     "store_id": { "type": ["string", "null"] },
     "terminal_id": { "type": ["string", "null"] },
     "operator_id": { "type": ["string", "null"] },
+    "event_id": { "type": ["string", "null"] },
+    "booth_id": { "type": ["string", "null"] },
     "rail_type": {
       "type": "string",
       "enum": ["wallet_direct", "provider_external"]
@@ -76,6 +79,10 @@
       "type": "string",
       "minLength": 1
     },
+    "status_reason": { "type": ["string", "null"] },
+    "amount_jpy": { "type": ["integer", "number", "null"] },
+    "amount_jpyc_base": { "type": ["integer", "string", "null"] },
+    "paid_amount_jpyc_base": { "type": ["integer", "string", "null"] },
     "accounting_status": {
       "type": "string",
       "enum": [
@@ -126,10 +133,17 @@
       "minimum": 0
     },
     "payment_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "tx_hash": { "type": ["string", "null"] },
     "primary_tx_hash": { "type": ["string", "null"] },
     "primary_tx_log_index": { "type": ["integer", "null"] },
+    "reason_code": { "type": ["string", "null"] },
     "review_case_id": { "type": ["string", "null"] },
     "review_reason_type": { "type": ["string", "null"] },
+    "review_status": { "type": ["string", "null"] },
+    "block_timestamp": { "type": ["string", "null"] },
+    "detected_at": { "type": ["string", "null"] },
+    "audit_ref": { "type": ["string", "null"] },
+    "refund_status": { "type": ["string", "null"] },
     "refund_request_id": { "type": ["string", "null"] },
     "refund_tx_hash": { "type": ["string", "null"] },
     "audit_log_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
@@ -146,6 +160,59 @@
     "export_excluded_private_data": {
       "type": "integer",
       "enum": [1]
+    },
+    "refund_verified_at": { "type": ["string", "null"] },
+    "created_at": { "type": ["string", "null"] },
+    "updated_at": { "type": ["string", "null"] },
+    "settled_at": { "type": ["string", "null"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "accounting_status": { "const": "onchain_cash_confirmed" } }, "required": ["accounting_status"] },
+      "then": {
+        "anyOf": [
+          { "properties": { "primary_tx_hash": { "type": "string", "minLength": 1 } }, "required": ["primary_tx_hash"] },
+          { "properties": { "payment_attempt_ids": { "type": "array", "minItems": 1 } }, "required": ["payment_attempt_ids"] }
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "const": "exception_pending" } }, "required": ["accounting_status"] },
+      "then": {
+        "properties": {
+          "review_case_id": { "type": "string", "minLength": 1 },
+          "review_reason_type": { "type": "string", "minLength": 1 }
+        },
+        "required": ["review_case_id", "review_reason_type"]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "const": "refunded_onchain" } }, "required": ["accounting_status"] },
+      "then": {
+        "properties": {
+          "refund_request_id": { "type": "string", "minLength": 1 },
+          "refund_tx_hash": { "type": "string", "minLength": 1 }
+        },
+        "required": ["refund_request_id", "refund_tx_hash"]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "enum": ["provider_receivable", "provider_settlement_pending", "provider_settled_unallocated"] } }, "required": ["accounting_status"] },
+      "then": {
+        "properties": {
+          "external_sync_refs": { "type": "array", "minItems": 1 }
+        },
+        "required": ["external_sync_refs"]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "enum": ["onchain_cash_confirmed", "exception_pending", "refunded_onchain", "provider_receivable", "provider_settlement_pending", "provider_settled_unallocated", "provider_refunded", "voided"] } }, "required": ["accounting_status"] },
+      "then": {
+        "properties": {
+          "audit_log_refs": { "type": "array", "minItems": 1 }
+        },
+        "required": ["audit_log_refs"]
+      }
     }
-  }
+  ]
 }

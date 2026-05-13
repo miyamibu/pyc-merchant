@@ -1,11 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const ROOT = process.cwd();
+
+test("chain monitor caches block timestamps per block within a scan cycle", () => {
+  const source = readFileSync(path.join(ROOT, "src/chain-monitor.mjs"), "utf8");
+  assert.match(source, /const blockTimestampCache = new Map\(\)/);
+  assert.match(source, /blockTimestampCache\.has\(normalizedBlockNumber\)/);
+  assert.match(source, /blockTimestampIso\(log\.blockNumber\)/);
+});
 
 function withEnv(overrides, fn) {
   const previous = new Map();

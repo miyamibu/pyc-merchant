@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import crypto from "node:crypto";
 import {
   apiRequest,
   authHeaders,
@@ -16,6 +17,7 @@ import {
 } from "./helpers/server-process.mjs";
 
 const CWD = process.cwd();
+const sha256Json = (value) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
 test("receive address reissue keeps old QR on late-arrival review path and scoped kill switches block new invoices", async (t) => {
   const env = baseServerEnv();
@@ -315,14 +317,24 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
   const parsed = parsePaymentUrl(inv.data.payment_url);
   assert.ok(parsed.sig, "payment_url must include sig");
 
-	  const consentBody = JSON.stringify({
-	    terms_url: "https://terminal.example.com/legal/terms",
-	    privacy_url: "https://terminal.example.com/legal/privacy",
-	    refund_policy_url: "https://terminal.example.com/legal/refund",
-	    terms_version: "terms-2026-05",
-	    privacy_version: "privacy-2026-05",
-	    refund_policy_version: "refund-2026-05",
-	  });
+	  const policySnapshot = {
+	    terms_url: env.TERMS_URL,
+	    privacy_url: env.PRIVACY_URL,
+	    refund_policy_url: env.REFUND_POLICY_URL,
+	    terms_version: env.TERMS_VERSION,
+	    privacy_version: env.PRIVACY_VERSION,
+	    refund_policy_version: env.REFUND_POLICY_VERSION,
+	  };
+		  const consentBody = JSON.stringify({
+		    checked: true,
+		    displayed_policy_hash: sha256Json(policySnapshot),
+		    client_rendered_at: "2026-05-13T00:00:00.000Z",
+		  });
+		  const pollutedConsentBody = JSON.stringify({
+		    checked: true,
+		    displayed_policy_hash: sha256Json(policySnapshot),
+		    terms_url: "https://attacker.example.invalid/terms",
+		  });
 
   const consentUrl = `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`;
 
@@ -331,10 +343,27 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
     headers: { "content-type": "application/json" },
     body: consentBody,
   });
-	  assert.equal(ok.status, 200);
-	  assert.equal(ok.data.ok, true);
-	  assert.ok(ok.data.consent_record_id, "consent_record_id must be present");
-  assert.ok(ok.data.recorded_at, "recorded_at must be present");
+		  assert.equal(ok.status, 200);
+		  assert.equal(ok.data.ok, true);
+		  assert.ok(ok.data.consent_record_id, "consent_record_id must be present");
+		  assert.equal(ok.data.policy_snapshot_hash, sha256Json(policySnapshot));
+	  assert.ok(ok.data.recorded_at, "recorded_at must be present");
+
+	  const polluted = await apiRequest(started.baseUrl, consentUrl, {
+	    method: "POST",
+	    headers: { "content-type": "application/json" },
+	    body: pollutedConsentBody,
+	  });
+	  assert.equal(polluted.status, 400);
+	  assert.equal(polluted.data.error.code, "VALIDATION_ERROR");
+
+	  const mismatch = await apiRequest(started.baseUrl, consentUrl, {
+	    method: "POST",
+	    headers: { "content-type": "application/json" },
+	    body: JSON.stringify({ checked: true, displayed_policy_hash: "bad-hash" }),
+	  });
+	  assert.equal(mismatch.status, 409);
+	  assert.equal(mismatch.data.error.code, "POLICY_MISMATCH");
 
   const badSig = await apiRequest(
     started.baseUrl,

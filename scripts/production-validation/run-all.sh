@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
-EVIDENCE_ROOT="${PRODUCTION_EVIDENCE_ROOT:-./docs/production/evidence}"
+EVIDENCE_ROOT="${PRODUCTION_EVIDENCE_ROOT:-./artifacts/production-validation-evidence}"
 EVIDENCE_ROOT="${EVIDENCE_ROOT%/}"
 EVIDENCE_DIR="${PRODUCTION_EVIDENCE_DIR:-${EVIDENCE_ROOT}/${TIMESTAMP}}"
 mkdir -p "$EVIDENCE_DIR"
@@ -46,7 +46,7 @@ if [[ -z "${RPC_URLS:-}" ]]; then
   VALIDATE_PRODUCTION_CONFIG_ARGS+=(--skip-rpc)
 fi
 run_json_step validate-production-config node scripts/production-validation/validate-production-config.mjs "${VALIDATE_PRODUCTION_CONFIG_ARGS[@]}"
-run_json_step validate-dependency-docker-hygiene node scripts/production-validation/validate-dependency-docker-hygiene.mjs --output "$EVIDENCE_DIR/license-list.json"
+run_json_step validate-dependency-docker-hygiene node scripts/production-validation/validate-dependency-docker-hygiene.mjs --require-resolved-digests true --output "$EVIDENCE_DIR/license-list.json"
 run_json_step validate-public-invoice-api node scripts/production-validation/validate-public-invoice-api.mjs
 run_json_step validate-wallet-launch node scripts/production-validation/validate-wallet-launch.mjs
 run_json_step validate-smoke-payment-flow node scripts/production-validation/validate-smoke-payment-flow.mjs

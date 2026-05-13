@@ -598,6 +598,20 @@ async function runCycle() {
       topics: recipientTopics.length > 0 ? [transferInterface.getEvent("Transfer").topicHash, null, recipientTopics] : [transferInterface.getEvent("Transfer").topicHash]
     })
   );
+  const blockTimestampCache = new Map();
+
+  async function blockTimestampIso(blockNumber) {
+    const normalizedBlockNumber = Number(blockNumber);
+    if (!Number.isFinite(normalizedBlockNumber)) return null;
+    if (!blockTimestampCache.has(normalizedBlockNumber)) {
+      const block = await withProvider("getBlock", (provider) => provider.getBlock(normalizedBlockNumber));
+      blockTimestampCache.set(
+        normalizedBlockNumber,
+        block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : null
+      );
+    }
+    return blockTimestampCache.get(normalizedBlockNumber);
+  }
 
   for (const log of logs) {
     let parsed;
@@ -660,8 +674,7 @@ async function runCycle() {
       continue;
     }
 	    const selected = selectInvoiceForLog(invoices, toAddress, amountBase);
-	    const block = await withProvider("getBlock", (provider) => provider.getBlock(Number(log.blockNumber)));
-	    const blockTimestamp = block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : null;
+		    const blockTimestamp = await blockTimestampIso(log.blockNumber);
 	    if (!blockTimestamp) {
 	      upsertDeadLetter({
 	        chainId: CHAIN_ID,

@@ -9,10 +9,11 @@ limited-store pilot 直前に、コード、deployment pack、wallet launch payl
 - 実機、実送金、公開 TLS は external evidence として別管理する。
 
 ## Evidence directory
-- 保存先: [docs/production/evidence](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/production/evidence)
-- ローカル一時検証: `PRODUCTION_EVIDENCE_ROOT="$(mktemp -d)" npm run production:validate`
+- default local validation output: `artifacts/production-validation-evidence/<timestamp>/`
+- real private launch evidence remains outside git under [docs/production/evidence](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/production/evidence) and must not be committed.
+- override when needed: `PRODUCTION_EVIDENCE_ROOT="$(mktemp -d)" npm run production:validate`
 - 実行結果:
-  - `docs/production/evidence/<timestamp>/SUMMARY.md`
+  - `artifacts/production-validation-evidence/<timestamp>/SUMMARY.md`
   - 各 step の `.log` / `.json`
 
 ## Validation steps

@@ -9,6 +9,10 @@ on:
       - "v*"
       - "release-*"
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -64,7 +68,19 @@ jobs:
         run: npm ci
 
       - name: Prepare safe compose env
-        run: cp .env.production.example .env.production
+        run: |
+          docker pull node:20-bookworm-slim
+          docker pull nginx:1.27-alpine
+          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:20-bookworm-slim)"
+          NGINX_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' nginx:1.27-alpine)"
+          cp .env.production.example .env.production
+          NODE_IMAGE="$NODE_IMAGE" NGINX_IMAGE="$NGINX_IMAGE" node -e '
+            const fs = require("fs");
+            let text = fs.readFileSync(".env.production", "utf8");
+            text = text.replace(/^PRODUCTION_NODE_IMAGE=.*$/m, `PRODUCTION_NODE_IMAGE=${process.env.NODE_IMAGE}`);
+            text = text.replace(/^PRODUCTION_NGINX_IMAGE=.*$/m, `PRODUCTION_NGINX_IMAGE=${process.env.NGINX_IMAGE}`);
+            fs.writeFileSync(".env.production", text);
+          '
 
       - name: Secrets scan
         uses: gitleaks/gitleaks-action@v2
@@ -115,11 +131,10 @@ jobs:
         run: docker build . --tag jpyc-terminal-production:ci
 
       - name: Docker compose config
-        run: docker compose -f docker-compose.prod.yml config
+        run: docker compose --env-file .env.production -f docker-compose.prod.yml config
 
   production-validation-evidence:
     needs: validate
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -129,8 +144,9 @@ jobs:
       APP_SECRET: "ci-app-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       SERVICE_INGEST_SECRET: "ci-ingest-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
-      DB_PATH: "./docs/production/evidence/ci-validation.db"
-      BACKUP_DIR: "./docs/production/evidence/ci-backups"
+      DB_PATH: "./artifacts/production-validation-evidence/ci-validation.db"
+      BACKUP_DIR: "./artifacts/production-validation-evidence/ci-backups"
+      PRODUCTION_EVIDENCE_ROOT: "./artifacts/production-validation-evidence"
       TERMINAL_CODE: "TERM-001"
       STAFF_PIN: "1234"
       SECOND_ADMIN_PIN: "5678"
@@ -173,7 +189,19 @@ jobs:
         run: npm ci
 
       - name: Prepare safe compose env
-        run: cp .env.production.example .env.production
+        run: |
+          docker pull node:20-bookworm-slim
+          docker pull nginx:1.27-alpine
+          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:20-bookworm-slim)"
+          NGINX_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' nginx:1.27-alpine)"
+          cp .env.production.example .env.production
+          NODE_IMAGE="$NODE_IMAGE" NGINX_IMAGE="$NGINX_IMAGE" node -e '
+            const fs = require("fs");
+            let text = fs.readFileSync(".env.production", "utf8");
+            text = text.replace(/^PRODUCTION_NODE_IMAGE=.*$/m, `PRODUCTION_NODE_IMAGE=${process.env.NODE_IMAGE}`);
+            text = text.replace(/^PRODUCTION_NGINX_IMAGE=.*$/m, `PRODUCTION_NGINX_IMAGE=${process.env.NGINX_IMAGE}`);
+            fs.writeFileSync(".env.production", text);
+          '
 
       - name: Run production validation pack
         run: npm run production:validate
@@ -181,7 +209,7 @@ jobs:
       - name: Detect latest evidence dir
         id: evidence
         run: |
-          EVIDENCE_DIR="$(find docs/production/evidence -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          EVIDENCE_DIR="$(find artifacts/production-validation-evidence -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
           echo "path=${EVIDENCE_DIR}" >> "$GITHUB_OUTPUT"
           test -n "${EVIDENCE_DIR}"
 

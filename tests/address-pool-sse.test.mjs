@@ -21,6 +21,37 @@ function createSseToken(secret, payload) {
   return `${body}.${sig}`;
 }
 
+function receiveAddressProofScope({ env, address, sourceLabel, batchId, nonce }) {
+  return {
+    merchant_id: "merchant-001",
+    store_id: "store-001",
+    batch_id: batchId,
+    source_label: sourceLabel,
+    address: String(address).toLowerCase(),
+    network: String(env.CHAIN_ID),
+    token_contract: String(env.TOKEN_CONTRACT).toLowerCase(),
+    valid_from: "2026-01-01T00:00:00.000Z",
+    valid_until: "2099-01-01T00:00:00.000Z",
+    nonce,
+  };
+}
+
+function receiveAddressProofMessage(scope) {
+  return [
+    "JPYC Merchant Ops receive address control",
+    `merchant_id:${scope.merchant_id}`,
+    `store_id:${scope.store_id}`,
+    `batch_id:${scope.batch_id}`,
+    `source_label:${scope.source_label}`,
+    `address:${scope.address}`,
+    `network:${scope.network}`,
+    `token_contract:${scope.token_contract}`,
+    `valid_from:${scope.valid_from}`,
+    `valid_until:${scope.valid_until}`,
+    `nonce:${scope.nonce}`,
+  ].join("\n");
+}
+
 async function readFirstChunk(response) {
   const reader = response.body.getReader();
   const { value } = await reader.read();
@@ -89,14 +120,16 @@ test("address pool allocation, reissue, audit, and SSE short-lived tokens", asyn
     assert.equal(invalidProofImport.status, 400);
     assert.equal(invalidProofImport.data.error.code, "INVALID_CONTROL_PROOF");
 
-    const wallet = Wallet.createRandom();
-    const proofAddress = wallet.address.toLowerCase();
-    const signature = await wallet.signMessage([
-      "JPYC Merchant Ops receive address control",
-      `address:${proofAddress}`,
-      `network:${env.CHAIN_ID}`,
-      `token_contract:${env.TOKEN_CONTRACT.toLowerCase()}`,
-    ].join("\n"));
+	    const wallet = Wallet.createRandom();
+	    const proofAddress = wallet.address.toLowerCase();
+	    const proofScope = receiveAddressProofScope({
+	      env,
+	      address: proofAddress,
+	      sourceLabel: "ops-seed",
+	      batchId: "batch-address-pool-test",
+	      nonce: `nonce-${Date.now()}`,
+	    });
+	    const signature = await wallet.signMessage(receiveAddressProofMessage(proofScope));
     const signatureProofImport = await apiRequest(started.baseUrl, "/api/v1/admin/receive-addresses:import", {
       method: "POST",
       headers: authHeaders(admin.token, {
@@ -106,10 +139,14 @@ test("address pool allocation, reissue, audit, and SSE short-lived tokens", asyn
       body: JSON.stringify({
         source_label: "ops-seed",
         addresses: [{
-          address: proofAddress,
-          control_proof_type: "eip191_signature",
-          signature,
-        }],
+	          address: proofAddress,
+	          control_proof_type: "eip191_signature",
+	          signature,
+	          proof_batch_id: proofScope.batch_id,
+	          proof_nonce: proofScope.nonce,
+	          proof_valid_from: proofScope.valid_from,
+	          proof_valid_until: proofScope.valid_until,
+	        }],
       }),
     });
 	    assert.equal(signatureProofImport.status, 201);

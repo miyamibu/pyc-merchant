@@ -107,8 +107,13 @@ async function main() {
   }
 
   try {
-    const appEnv = String(env.APP_ENV || expectedAppEnv).trim().toLowerCase();
-    const productionChecks = appEnv === "production";
+	    const appEnv = String(env.APP_ENV || expectedAppEnv).trim().toLowerCase();
+	    const productionChecks = appEnv === "production";
+	    const policyConfigRequired =
+	      productionChecks
+	      || boolFlag(env.COMMERCIAL_GO_MODE)
+	      || boolFlag(env.LIMITED_PILOT_MODE)
+	      || boolFlag(args.get("require-policy-config"));
     const publicBaseUrl = String(env.PUBLIC_BASE_URL || env.APP_HOST || env.PAY_BASE_URL || "").trim();
     const appHost = String(env.APP_HOST || env.PUBLIC_BASE_URL || env.PAY_BASE_URL || (productionChecks ? "" : "http://127.0.0.1:4173")).trim();
 	    const payBaseUrl = String(env.PAY_BASE_URL || env.APP_HOST || env.PUBLIC_BASE_URL || appHost).trim();
@@ -198,14 +203,18 @@ async function main() {
 	      public_link_grace_sec: publicLinkGraceSec,
 	    });
 	    record("public_payment_link_grace_short", true, { public_link_grace_sec: publicLinkGraceSec });
-	    for (const key of ["TERMS_URL", "PRIVACY_URL", "REFUND_POLICY_URL"]) {
-	      const parsed = new URL(String(env[key] || ""));
-	      ensure(parsed.protocol === "https:" && !/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), `${key} must be public https`, { value: env[key] || "" });
-	    }
-	    for (const key of ["TERMS_VERSION", "PRIVACY_VERSION", "REFUND_POLICY_VERSION"]) {
-	      ensure(String(env[key] || "").trim() && !/draft|placeholder|todo|tbd/i.test(String(env[key] || "")), `${key} must be non-draft`, { value: env[key] || "" });
-	    }
-	    record("policy_config_public_and_versioned", true);
+		    if (policyConfigRequired) {
+		      for (const key of ["TERMS_URL", "PRIVACY_URL", "REFUND_POLICY_URL"]) {
+		        const parsed = new URL(String(env[key] || ""));
+		        ensure(parsed.protocol === "https:" && !/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), `${key} must be public https`, { value: env[key] || "" });
+		      }
+		      for (const key of ["TERMS_VERSION", "PRIVACY_VERSION", "REFUND_POLICY_VERSION"]) {
+		        ensure(String(env[key] || "").trim() && !/draft|placeholder|todo|tbd/i.test(String(env[key] || "")), `${key} must be non-draft`, { value: env[key] || "" });
+		      }
+		      record("policy_config_public_and_versioned", true, { required: true });
+		    } else {
+		      record("policy_config_public_and_versioned", true, { skipped: true, reason: "not production/commercial/limited" });
+		    }
 
     if (productionChecks && (!allowEmpty || corsOrigins.length > 0)) {
       ensure(corsOrigins.length > 0, "CORS_ALLOW_ORIGINS must not be empty", {});

@@ -47,7 +47,12 @@ test("settlement export schema pins canonical enums and export privacy exclusion
     "settlement_overdue",
     "disputed",
   ]);
-  assert.deepEqual(schema.properties.export_excluded_private_data.enum, [1]);
+	  assert.deepEqual(schema.properties.export_excluded_private_data.enum, [1]);
+	  assert.ok(Array.isArray(schema.allOf), "schema must include conditional traceability rules");
+	  assert.match(JSON.stringify(schema.allOf), /onchain_cash_confirmed/);
+	  assert.match(JSON.stringify(schema.allOf), /exception_pending/);
+	  assert.match(JSON.stringify(schema.allOf), /refunded_onchain/);
+	  assert.match(JSON.stringify(schema.allOf), /provider_receivable/);
   for (const field of [
     "export_reference",
     "settlement_id",
@@ -81,9 +86,11 @@ test("settlement export traceability invariants are documented", () => {
   assert.match(contractDoc, /Every exported row must include the traceability properties/);
   assert.match(contractDoc, /A paid row must carry payment evidence/);
   assert.match(contractDoc, /A review row must carry `review_case_id` and `review_reason_type`/);
-  assert.match(contractDoc, /A refund row must carry `refund_request_id` and `refund_tx_hash`/);
-  assert.match(contractDoc, /Vendor adapters are downstream transforms and must preserve all required trace fields/);
-});
+	  assert.match(contractDoc, /A refund row must carry `refund_request_id` and `refund_tx_hash`/);
+	  assert.match(contractDoc, /Business-impacting rows must carry at least one `audit_log_refs` entry/);
+	  assert.match(contractDoc, /CSV array\/object values are serialized with `JSON.stringify`/);
+	  assert.match(contractDoc, /Vendor adapters are downstream transforms and must preserve all required trace fields/);
+	});
 
 test("buildDailyAccountingSummary aggregates cancelled rows alongside other accounting statuses", () => {
   const rows = [

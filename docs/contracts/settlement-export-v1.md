@@ -17,6 +17,9 @@ Canonical contract summary for `Settlement Export Contract v1`.
 - A paid row must carry payment evidence through `primary_tx_hash` or `payment_attempt_ids`.
 - A review row must carry `review_case_id` and `review_reason_type`.
 - A refund row must carry `refund_request_id` and `refund_tx_hash` when the refund has on-chain execution evidence.
+- Business-impacting rows must carry at least one `audit_log_refs` entry.
+- `provider_receivable`, `provider_settlement_pending`, and `provider_settled_unallocated` rows must preserve provider/external sync trace references.
+- Daily JSON export, monthly JSON export, CSV export, and settlement evidence packs must serialize this same v1 row shape. CSV array/object values are serialized with `JSON.stringify` before CSV escaping.
 - Vendor adapters are downstream transforms and must preserve all required trace fields.
 
 The narrative specification lives in:
