@@ -103,18 +103,7 @@ jobs:
         run: npm run deploy:check
 
       - name: Smoke
-        run: |
-          mkdir -p /tmp/jpyc-ci
-          node src/server.mjs > /tmp/jpyc-ci/server.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true' EXIT
-          for i in $(seq 1 40); do
-            if curl -fsS "http://127.0.0.1:4173/healthz" >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          npm run test:smoke
+        run: npm run test:smoke
 
       - name: Audit chain
         run: npm run test:audit-chain
