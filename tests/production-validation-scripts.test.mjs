@@ -118,6 +118,18 @@ test("validate-evidence-sanitization rejects leaked bearer token", async () => {
   assert.equal(payload.violation_count, 1);
 });
 
+test("validate-evidence-sanitization allows public token contract evidence", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "jpyc-evidence-token-contract-"));
+  fs.writeFileSync(path.join(dir, "contract.json"), JSON.stringify({ token_contract: "0x1111111111111111111111111111111111111111" }), "utf8");
+  const result = await runNode("scripts/production-validation/validate-evidence-sanitization.mjs", ["--evidence-dir", dir], {
+    APP_SECRET: "x".repeat(48),
+    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+  });
+  assert.equal(result.code, 0, result.stdout || result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+});
+
 test("validate-evidence-sanitization accepts sanitized manifest and rejects sensitive manifest", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "jpyc-manifest-test-"));
   const manifestPath = path.join(dir, "release.json");

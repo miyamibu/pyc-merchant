@@ -82,6 +82,7 @@ function buildSecretNeedles() {
   const needles = [];
   for (const [key, value] of Object.entries(process.env)) {
     if (!String(value || "").trim()) continue;
+    if (/^(?:APPROVED_JPYC_)?TOKEN_CONTRACT$/i.test(key)) continue;
     if (/(?:secret|token|cookie)/i.test(key)) {
       needles.push({ key, value: String(value) });
     }
