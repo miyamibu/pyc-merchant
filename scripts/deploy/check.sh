@@ -18,7 +18,11 @@ node ./scripts/production-validation/validate-production-config.mjs --env-file .
 node ./scripts/production-validation/validate-dependency-docker-hygiene.mjs --skip-docker true >/dev/null
 
 if command -v docker >/dev/null 2>&1; then
-  docker compose -f docker-compose.prod.yml config >/dev/null
+  if [ -f .env.production ]; then
+    docker compose --env-file .env.production -f docker-compose.prod.yml config >/dev/null
+  else
+    docker compose -f docker-compose.prod.yml config >/dev/null
+  fi
 fi
 
 echo "deploy check ok"
