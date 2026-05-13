@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+      - "release-*"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      APP_ENV: "development"
+      APP_PORT: "4173"
+      APP_HOST: "http://127.0.0.1:4173"
+      APP_SECRET: "ci-app-secret-1234567890abcdefghijklmnopqrstuvwxyz"
+      SERVICE_INGEST_SECRET: "ci-ingest-secret-1234567890abcdefghijklmnopqrstuvwxyz"
+      METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
+      DB_PATH: "./data/ci.db"
+      TERMINAL_CODE: "TERM-001"
+      STAFF_PIN: "1234"
+      SECOND_ADMIN_PIN: "5678"
+      TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111"
+      RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222"
+      TOKEN_DECIMALS: "18"
+      JPYC_BASE_UNIT_SCALE: "1000000"
+      REQUIRED_CONFIRMATIONS: "2"
+      MIN_REQUIRED_CONFIRMATIONS: "2"
+      MONITOR_BACKSCAN_BLOCKS: "12"
+      MIN_MONITOR_BACKSCAN_BLOCKS: "12"
+      ENABLE_PUBLIC_PAYMENT_SIMULATION: "false"
+      DEMO_CONTROLS_ENABLED: "false"
+      DIAGNOSTIC_MODE_ENABLED: "false"
+      CORS_ALLOW_ORIGINS: "http://localhost:4173,http://127.0.0.1:4173"
+      SERVICE_AUTH_MAX_SKEW_SEC: "300"
+      SERVICE_AUTH_MAX_FUTURE_SEC: "30"
+      SERVICE_REPLAY_GUARD_TTL_SEC: "86400"
+      SESSION_TTL_SEC: "43200"
+      IDEMPOTENCY_TTL_SEC: "86400"
+      PIN_LOCKOUT_MAX_ATTEMPTS: "5"
+      PIN_LOCKOUT_SEC: "900"
+      SSE_TOKEN_MAX_TTL_SEC: "900"
+      WORKER_STALE_SEC: "999999"
+      REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR: "true"
+      WALLET_ADAPTER_TYPE: "mock"
+      ENABLE_REOWN: "false"
+      CHECKOUT_SESSION_IMPLEMENTED: "true"
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Prepare safe compose env
+        run: cp .env.production.example .env.production
+
+      - name: Secrets scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Audit
+        run: npm run audit
+
+      - name: Audit chain
+        run: npm run test:audit-chain
+
+      - name: Deploy check
+        run: npm run deploy:check
+
+      - name: Smoke
+        run: |
+          mkdir -p /tmp/jpyc-ci
+          node src/server.mjs > /tmp/jpyc-ci/server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 40); do
+            if curl -fsS "http://127.0.0.1:4173/healthz" >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          npm run test:smoke
+
+      - name: Smoke failure logs
+        if: failure()
+        run: |
+          if [ -f /tmp/jpyc-ci/server.log ]; then
+            echo "==== /tmp/jpyc-ci/server.log ===="
+            cat /tmp/jpyc-ci/server.log
+          fi
+
+      - name: Docker version
+        run: docker version
+
+      - name: Docker build
+        run: docker build . --tag jpyc-terminal-production:ci
+
+      - name: Docker compose config
+        run: docker compose -f docker-compose.prod.yml config
+
+  production-validation-evidence:
+    needs: validate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APP_ENV: "development"
+      APP_PORT: "4173"
+      APP_HOST: "http://127.0.0.1:4173"
+      APP_SECRET: "ci-app-secret-1234567890abcdefghijklmnopqrstuvwxyz"
+      SERVICE_INGEST_SECRET: "ci-ingest-secret-1234567890abcdefghijklmnopqrstuvwxyz"
+      METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
+      DB_PATH: "./docs/production/evidence/ci-validation.db"
+      BACKUP_DIR: "./docs/production/evidence/ci-backups"
+      TERMINAL_CODE: "TERM-001"
+      STAFF_PIN: "1234"
+      SECOND_ADMIN_PIN: "5678"
+      TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111"
+      RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222"
+      TOKEN_DECIMALS: "18"
+      JPYC_BASE_UNIT_SCALE: "1000000"
+      REQUIRED_CONFIRMATIONS: "2"
+      MIN_REQUIRED_CONFIRMATIONS: "2"
+      MONITOR_BACKSCAN_BLOCKS: "12"
+      MIN_MONITOR_BACKSCAN_BLOCKS: "12"
+      ENABLE_PUBLIC_PAYMENT_SIMULATION: "false"
+      DEMO_CONTROLS_ENABLED: "false"
+      DIAGNOSTIC_MODE_ENABLED: "false"
+      CORS_ALLOW_ORIGINS: "http://localhost:4173,http://127.0.0.1:4173"
+      SERVICE_AUTH_MAX_SKEW_SEC: "300"
+      SERVICE_AUTH_MAX_FUTURE_SEC: "30"
+      SERVICE_REPLAY_GUARD_TTL_SEC: "86400"
+      SESSION_TTL_SEC: "43200"
+      IDEMPOTENCY_TTL_SEC: "86400"
+      PIN_LOCKOUT_MAX_ATTEMPTS: "5"
+      PIN_LOCKOUT_SEC: "900"
+      SSE_TOKEN_MAX_TTL_SEC: "900"
+      WORKER_STALE_SEC: "999999"
+      REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR: "true"
+      WALLET_ADAPTER_TYPE: "mock"
+      ENABLE_REOWN: "false"
+      CHECKOUT_SESSION_IMPLEMENTED: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Prepare safe compose env
+        run: cp .env.production.example .env.production
+
+      - name: Run production validation pack
+        run: npm run production:validate
+
+      - name: Detect latest evidence dir
+        id: evidence
+        run: |
+          EVIDENCE_DIR="$(find docs/production/evidence -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          echo "path=${EVIDENCE_DIR}" >> "$GITHUB_OUTPUT"
+          test -n "${EVIDENCE_DIR}"
+
+      - name: Upload production validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-validation-evidence-${{ github.run_number }}
+          path: ${{ steps.evidence.outputs.path }}
+          if-no-files-found: error

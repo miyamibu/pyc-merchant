@@ -1,0 +1,21 @@
+title = "JPYC payment terminal gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore local-only protected data that is excluded from GitHub publication."
+paths = [
+  '''^data/''',
+  '''^runtime/''',
+  '''^artifacts/''',
+  '''^deliverables/''',
+  '''^docs/production/evidence/''',
+  '''^\.codex/''',
+  '''^\.env$''',
+  '''^\.env\.production$''',
+  '''^deploy/nginx/certs/''',
+  '''(^|/)\.DS_Store$''',
+  '''.*\.(db|sqlite|sqlite3)(-(wal|shm))?$''',
+  '''.*\.(log|tmp)$''',
+]

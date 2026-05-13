@@ -1,0 +1,18 @@
+[Unit]
+Description=JPYC Payment Terminal (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/jpyc-payment-terminal
+ExecStart=/usr/bin/env docker compose --project-name jpyc-terminal -f docker-compose.prod.yml up --build --remove-orphans
+ExecStop=/usr/bin/env docker compose --project-name jpyc-terminal -f docker-compose.prod.yml down
+ExecReload=/usr/bin/env docker compose --project-name jpyc-terminal -f docker-compose.prod.yml restart app worker nginx
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

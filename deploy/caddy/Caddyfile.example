@@ -1,0 +1,11 @@
+# pay.miyamibu.xyz must already resolve to this PC and ports 80/443 must reach Caddy.
+# Caddy will provision Let's Encrypt certificates automatically for public hostnames.
+pay.miyamibu.xyz {
+  encode zstd gzip
+  reverse_proxy 127.0.0.1:4173
+}
+
+# Optional apex redirect. Enable only after miyamibu.xyz also resolves to this PC.
+miyamibu.xyz {
+  redir https://pay.miyamibu.xyz{uri} permanent
+}

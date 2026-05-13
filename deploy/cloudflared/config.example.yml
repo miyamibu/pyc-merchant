@@ -1,0 +1,11 @@
+# Use this config when direct 80/443 exposure is unavailable and the final public URL
+# must still remain https://pay.miyamibu.xyz.
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /etc/cloudflared/YOUR_TUNNEL_ID.json
+
+ingress:
+  - hostname: pay.miyamibu.xyz
+    service: http://127.0.0.1:4173
+    originRequest:
+      httpHostHeader: pay.miyamibu.xyz
+  - service: http_status:404

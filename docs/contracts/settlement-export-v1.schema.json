@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/contracts/settlement-export-v1.schema.json",
+  "title": "Settlement Export Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "export_version",
+    "business_date",
+    "invoice_id",
+    "rail_type",
+    "provider_code",
+    "invoice_status",
+    "accounting_status",
+    "cash_recognition_status",
+    "receivable_status",
+    "onchain_cash_amount_jpyc_base",
+    "provider_receivable_amount_jpyc_base",
+    "exception_amount_jpyc_base",
+    "refund_amount_jpyc_base",
+    "void_amount_jpyc_base",
+    "evidence_hash",
+    "payload_schema_version",
+    "export_excluded_private_data"
+  ],
+  "properties": {
+    "export_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "business_date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "invoice_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rail_type": {
+      "type": "string",
+      "enum": ["wallet_direct", "provider_external"]
+    },
+    "provider_code": {
+      "type": "string",
+      "minLength": 1
+    },
+    "invoice_status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "accounting_status": {
+      "type": "string",
+      "enum": [
+        "onchain_cash_confirmed",
+        "provider_receivable",
+        "provider_settlement_pending",
+        "provider_settled_unallocated",
+        "exception_pending",
+        "voided",
+        "cancelled",
+        "refunded_onchain",
+        "provider_refunded"
+      ]
+    },
+    "cash_recognition_status": {
+      "type": "string",
+      "enum": ["none", "onchain_confirmed", "batch_confirmed", "disputed"]
+    },
+    "receivable_status": {
+      "type": "string",
+      "enum": [
+        "none",
+        "provider_accepted",
+        "provider_captured",
+        "settlement_reported",
+        "settlement_overdue",
+        "disputed"
+      ]
+    },
+    "onchain_cash_amount_jpyc_base": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "provider_receivable_amount_jpyc_base": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "exception_amount_jpyc_base": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "refund_amount_jpyc_base": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "void_amount_jpyc_base": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "evidence_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload_schema_version": {
+      "type": "string",
+      "const": "settlement_export_v1"
+    },
+    "export_excluded_private_data": {
+      "type": "integer",
+      "enum": [1]
+    }
+  }
+}

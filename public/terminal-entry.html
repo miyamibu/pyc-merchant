@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>JPYCお支払い準備中</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div class="wrap wrap-narrow">
+    <header class="section-header">
+      <div class="stack">
+        <h1 class="title">JPYCお支払い準備中</h1>
+        <p class="small">店舗側で会計を準備しています。準備ができると自動でお支払い画面に進みます。</p>
+      </div>
+      <span class="badge">お客様向け</span>
+    </header>
+
+    <p id="liveStatus" class="visually-hidden live-region" role="status" aria-live="polite" aria-atomic="true"></p>
+
+    <section class="card stack mt-16" aria-labelledby="entryStateTitle">
+      <div class="section-header">
+        <h2 id="entryStateTitle" class="title title-lg">会計状態</h2>
+        <span id="entryBadge" class="status-pill s-blue" role="status" aria-live="polite" aria-atomic="true">確認中</span>
+      </div>
+      <div class="info-list">
+        <div class="info-item">
+          <span class="info-label">店舗</span>
+          <p id="storeText" class="info-value">-</p>
+        </div>
+        <div class="info-item">
+          <span class="info-label">状態</span>
+          <p id="headlineText" class="info-value">会計を確認しています。</p>
+          <p id="bodyText" class="helper-text">この端末入口QRは会計準備画面です。会計準備が完了すると、その時点の請求ページへ自動で移動します。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card stack mt-16" aria-labelledby="entryHelpTitle">
+      <h2 id="entryHelpTitle" class="title title-lg">ご案内</h2>
+      <ul id="helpList" class="warning-list compact-list">
+        <li>お支払い画面が表示されるまで、この画面のままお待ちください。</li>
+        <li>表示後の請求内容は、その時点の会計に固定されます。</li>
+        <li>長く進まない場合は、店舗スタッフへお声がけください。</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="/terminal-entry.js" defer></script>
+</body>
+</html>
