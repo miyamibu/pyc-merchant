@@ -382,6 +382,23 @@ async function withProvider(label, fn) {
   throw lastError || new Error(`All providers failed for ${label}`);
 }
 
+const blockTimestampCache = new Map();
+async function blockTimestampIso(blockNumber) {
+  const normalizedBlockNumber = Number(blockNumber);
+  if (!Number.isFinite(normalizedBlockNumber)) return null;
+  if (!blockTimestampCache.has(normalizedBlockNumber)) {
+    const blockHex = `0x${BigInt(normalizedBlockNumber).toString(16)}`;
+    const block = await withProvider("getBlock", (provider) => provider.send("eth_getBlockByNumber", [blockHex, false]));
+    if (!block?.timestamp) {
+      blockTimestampCache.delete(normalizedBlockNumber);
+      return null;
+    }
+    const timestamp = String(block.timestamp).startsWith("0x") ? Number(BigInt(block.timestamp)) : Number(block.timestamp);
+    blockTimestampCache.set(normalizedBlockNumber, new Date(timestamp * 1000).toISOString());
+  }
+  return blockTimestampCache.get(normalizedBlockNumber);
+}
+
 async function postIngest(payload, idempotencyKey) {
   const timestamp = Math.floor(Date.now() / 1000);
   const serviceJti = crypto.randomUUID();
@@ -609,21 +626,6 @@ async function runCycle() {
       topics: recipientTopics.length > 0 ? [transferInterface.getEvent("Transfer").topicHash, null, recipientTopics] : [transferInterface.getEvent("Transfer").topicHash]
     })
   );
-  const blockTimestampCache = new Map();
-
-  async function blockTimestampIso(blockNumber) {
-    const normalizedBlockNumber = Number(blockNumber);
-    if (!Number.isFinite(normalizedBlockNumber)) return null;
-    if (!blockTimestampCache.has(normalizedBlockNumber)) {
-      const block = await withProvider("getBlock", (provider) => provider.getBlock(normalizedBlockNumber));
-      blockTimestampCache.set(
-        normalizedBlockNumber,
-        block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : null
-      );
-    }
-    return blockTimestampCache.get(normalizedBlockNumber);
-  }
-
   for (const log of logs) {
     let parsed;
     try {

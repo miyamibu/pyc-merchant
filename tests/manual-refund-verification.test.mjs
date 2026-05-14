@@ -118,6 +118,10 @@ async function verifyRefund(baseUrl, token, refundId, idemKey) {
   });
 }
 
+function businessDateJst() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 test("manual ingest verifies receipts on-chain before applying payment decisions", async (t) => {
   const rpc = await startMockRpcServer({ chainId: 137 });
   const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -483,6 +487,41 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     const verifyPending = await verifyRefund(started.baseUrl, admin.token, pending.refundId, `refund-pending-verify-${Date.now()}`);
     assert.equal(verifyPending.status, 200);
     assert.equal(verifyPending.data.status, "pending_verification");
+  });
+
+  await t.test("refund verification waits for block timestamp before succeeded export classification", async () => {
+    const missingTs = await createRefundScenario("refund-missing-ts", 2800, 3000, 200, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const missingTsTx = randomTxHash("refund-missing-ts");
+    await executeRefund(started.baseUrl, admin.token, missingTs.refundId, missingTsTx, "refund-missing-ts-execute");
+    rpc.registerTransfer({
+      txHash: missingTsTx,
+      tokenContract,
+      fromAddress: missingTs.invoice.chain.recipient_address,
+      toAddress: missingTs.refundToAddress,
+      amountBase: missingTs.refundAmountBase,
+      blockNumber: 660,
+      blockTimestamp: null,
+    });
+    rpc.setLatestBlock(662);
+    const verifyMissingTs = await verifyRefund(started.baseUrl, admin.token, missingTs.refundId, `refund-missing-ts-verify-${Date.now()}`);
+    assert.equal(verifyMissingTs.status, 200);
+    assert.equal(verifyMissingTs.data.status, "pending_verification");
+    assert.equal(verifyMissingTs.data.failure_reason, "missing_block_timestamp");
+    assert.equal(verifyMissingTs.data.block_timestamp, null);
+
+    const exported = await apiRequest(started.baseUrl, `/api/v1/settlements/daily:export?business_date=${businessDateJst()}&format=json`, {
+      headers: authHeaders(admin.token),
+    });
+    assert.equal(exported.status, 200);
+    const exportRow = exported.data.rows.find((row) => row.invoice_id === missingTs.invoice.invoice_id);
+    assert.ok(exportRow);
+    assert.notEqual(exportRow.accounting_status, "refunded_onchain");
+
+    rpc.setBlock(660, 1_710_000_660);
+    const verifyRecovered = await verifyRefund(started.baseUrl, admin.token, missingTs.refundId, `refund-recovered-ts-verify-${Date.now()}`);
+    assert.equal(verifyRecovered.status, 200);
+    assert.equal(verifyRecovered.data.status, "succeeded");
+    assert.equal(verifyRecovered.data.block_timestamp, "2024-03-09T16:11:00.000Z");
   });
 
   await t.test("refund verification is audited", async () => {

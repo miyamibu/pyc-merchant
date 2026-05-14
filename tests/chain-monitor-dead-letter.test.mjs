@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { startMockRpcServer } from "./helpers/mock-rpc.mjs";
 
 const ROOT = process.cwd();
 
@@ -32,6 +33,69 @@ test("missing block timestamp dead letters keep recoverable ingest payload", () 
     assert.match(source, new RegExp(field));
   }
   assert.match(source, /recoveredBlockTimestamp = await blockTimestampIso\(payload\.block_number\)/);
+});
+
+test("missing block timestamp dead letter retries recover after block timestamp is available", async (t) => {
+  const rpc = await startMockRpcServer({ chainId: 137 });
+  t.after(() => rpc.stop());
+  const mod = await loadMonitorModule({ RPC_URLS: rpc.url, MONITOR_DEAD_LETTER_MAX_RETRIES: "3" });
+  mod.db.prepare(`DELETE FROM chain_dead_letters`).run();
+  const txHash = "0x" + "e".repeat(64);
+  mod.upsertDeadLetter({
+    chainId: "137",
+    txHash,
+    logIndex: 7,
+    invoiceId: "inv-recover",
+    payload: {
+      invoice_id: "inv-recover",
+      amount_jpyc_base: "1000000",
+      amount_jpyc: "1",
+      chain_id: "137",
+      token_contract: "0x1111111111111111111111111111111111111111",
+      to_address: "0x2222222222222222222222222222222222222222",
+      from_address: "0x3333333333333333333333333333333333333333",
+      confirmations: 3,
+      tx_hash: txHash,
+      log_index: 7,
+      block_number: 777,
+      source: "chain_monitor",
+      missing_fields: ["block_timestamp"],
+    },
+    reason: "missing_block_timestamp",
+  });
+  mod.db.prepare(`UPDATE chain_dead_letters SET next_retry_at = ?`).run(new Date(Date.now() - 1000).toISOString());
+
+  const originalFetch = global.fetch;
+  const postedBodies = [];
+  global.fetch = async (_url, init) => {
+    postedBodies.push(JSON.parse(init.body));
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true }),
+    };
+  };
+  try {
+    await mod.retryPendingDeadLetters();
+    let row = mod.db.prepare(`SELECT status, last_error, resolved_at FROM chain_dead_letters WHERE tx_hash = ?`).get(txHash);
+    assert.equal(row.status, "pending");
+    assert.equal(row.resolved_at, null);
+    assert.match(String(row.last_error || ""), /missing_block_timestamp/);
+    assert.equal(postedBodies.length, 0);
+
+    mod.db.prepare(`UPDATE chain_dead_letters SET next_retry_at = ? WHERE tx_hash = ?`).run(new Date(Date.now() - 1000).toISOString(), txHash);
+    rpc.setBlock(777, 1_710_000_777);
+    await mod.retryPendingDeadLetters();
+    row = mod.db.prepare(`SELECT status, last_error, resolved_at FROM chain_dead_letters WHERE tx_hash = ?`).get(txHash);
+    assert.equal(row.status, "resolved");
+    assert.equal(row.last_error, null);
+    assert.ok(row.resolved_at);
+    assert.equal(postedBodies.length, 1);
+    assert.equal(postedBodies[0].block_timestamp, "2024-03-09T16:12:57.000Z");
+    assert.deepEqual(postedBodies[0].missing_fields, []);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 function withEnv(overrides, fn) {

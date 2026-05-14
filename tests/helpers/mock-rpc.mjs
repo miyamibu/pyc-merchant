@@ -37,10 +37,14 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
     const normalizedFrom = normalizeAddress(fromAddress);
     const normalizedTo = normalizeAddress(toAddress);
     latestBlock = Math.max(latestBlock, Number(blockNumber || 1));
-    blocks.set(Number(blockNumber), {
-      number: Number(blockNumber),
-      timestamp: Number(blockTimestamp),
-    });
+    if (blockTimestamp !== null) {
+      blocks.set(Number(blockNumber), {
+        number: Number(blockNumber),
+        timestamp: Number(blockTimestamp),
+      });
+    } else {
+      blocks.delete(Number(blockNumber));
+    }
     const logs = [];
     if (includeTransferLog) {
       const encoded = transferInterface.encodeEventLog("Transfer", [normalizedFrom, normalizedTo, BigInt(amountBase)]);
@@ -138,6 +142,13 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
     url,
     registerTransfer,
     setLatestBlock(blockNumber) {
+      latestBlock = Math.max(latestBlock, Number(blockNumber));
+    },
+    setBlock(blockNumber, blockTimestamp) {
+      blocks.set(Number(blockNumber), {
+        number: Number(blockNumber),
+        timestamp: Number(blockTimestamp),
+      });
       latestBlock = Math.max(latestBlock, Number(blockNumber));
     },
     stop() {

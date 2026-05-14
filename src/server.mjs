@@ -4114,8 +4114,13 @@ async function verifyTransferOnChain({
     const latestBlockHex = String(await provider.send("eth_blockNumber", []));
     const latestBlock = latestBlockHex.startsWith("0x") ? Number(BigInt(latestBlockHex)) : Number(latestBlockHex);
     const confirmations = Math.max(0, latestBlock - Number(receipt.blockNumber || 0) + 1);
-    const block = receipt.blockNumber != null ? await provider.getBlock(Number(receipt.blockNumber)) : null;
-    const blockTimestamp = block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : null;
+    const block = receipt.blockNumber != null
+      ? await provider.send("eth_getBlockByNumber", [`0x${BigInt(Number(receipt.blockNumber)).toString(16)}`, false])
+      : null;
+    const rawBlockTimestamp = block?.timestamp
+      ? (String(block.timestamp).startsWith("0x") ? Number(BigInt(block.timestamp)) : Number(block.timestamp))
+      : null;
+    const blockTimestamp = rawBlockTimestamp ? new Date(rawBlockTimestamp * 1000).toISOString() : null;
     const observedAt = nowIso();
 
     const transferLogs = getReceiptTransferLogs(receipt, expectedTokenContract).map(convertTokenTransferLogToAppBase);
@@ -4570,6 +4575,7 @@ function buildRefundEvidenceResponse(refund) {
     evidence_screenshot: refund.evidence_screenshot || null,
     evidence_note_path: refund.evidence_note_path || null,
     customer_note: refund.customer_note || null,
+    failure_reason: refund.failure_reason || null,
     audit_log_refs: auditRefs,
     chain_id: refund.chain_id || refund.refund_chain_id || null,
     token_contract: refund.token_contract || null,
@@ -6299,6 +6305,21 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
       tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
       blockNumber: verification.transfer?.blockNumber ?? null,
       blockTimestamp: verification.blockTimestamp || null,
+      detectedAt: nowIso(),
+    };
+  }
+  if (!verification.blockTimestamp) {
+    return {
+      status: "pending_verification",
+      refundTxHash: txHash,
+      refundTxLogIndex: verification.transfer.logIndex,
+      failureReason: "missing_block_timestamp",
+      fromAddress: verification.transfer?.from || null,
+      toAddress: verification.transfer?.to || refund.refund_to_address || null,
+      chainId: String(refund.refund_chain_id || CHAIN_ID),
+      tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
+      blockNumber: verification.transfer?.blockNumber ?? null,
+      blockTimestamp: null,
       detectedAt: nowIso(),
     };
   }
