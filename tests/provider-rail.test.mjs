@@ -308,6 +308,12 @@ test("provider authorized does not become paid and appears as provider_receivabl
     .prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? AND invoice_id = ?`)
     .get(closeRes.data.export_run_id, created.data.invoice_id);
   assert.equal(exportRow.accounting_status, "provider_receivable");
+  const payload = JSON.parse(exportRow.payload_json);
+  assert.equal(payload.rail_type, "provider_external");
+  assert.equal(payload.provider_code, "mock_provider");
+  assert.equal(payload.receivable_status, "provider_accepted");
+  assert.equal(Number(payload.provider_receivable_amount_jpyc_base), Number(detail.data.amounts.amount_jpyc_base));
+  assert.ok(payload.external_sync_refs.includes(`pay-auth-${payload.invoice_id}`) || payload.external_sync_refs.length > 0);
 });
 
 test("provider captured without tx_hash does not pollute paid amount", async (t) => {

@@ -494,3 +494,59 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     assert.ok(actions.includes("refund.verified_onchain"));
   });
 });
+
+test("verified transfer paths convert ERC-20 raw units to app base units exactly", async (t) => {
+  const rpc = await startMockRpcServer({ chainId: 137 });
+  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const env = baseServerEnv({
+    ALLOW_MANUAL_PAYMENT_INGEST: "true",
+    RPC_URLS: rpc.url,
+    TOKEN_CONTRACT: tokenContract,
+    APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
+    TOKEN_DECIMALS: "18",
+    JPYC_BASE_UNIT_SCALE: "1000000",
+  });
+  const started = await startServerProcess(CWD, env);
+  t.after(async () => {
+    await stopServerProcess(started.proc);
+    await rpc.stop();
+  });
+
+  const admin = await loginAs(started.baseUrl, {
+    terminalCode: env.TERMINAL_CODE,
+    pin: env.STAFF_PIN,
+    staffName: "Demo Staff",
+  });
+  await importReceiveAddresses(started.baseUrl, admin.token, 3, 500);
+
+  const { detail } = await createInvoiceDetail(started.baseUrl, admin.token, 1, "token-decimals-18");
+  assert.equal(String(detail.data.amounts.amount_jpyc_base), "1000000");
+  const txHash = randomTxHash("token-decimals-18");
+  rpc.registerTransfer({
+    txHash,
+    tokenContract,
+    fromAddress: "0x9999999999999999999999999999999999999999",
+    toAddress: detail.data.chain.recipient_address,
+    amountBase: "1000000000000000000",
+    blockNumber: 700,
+  });
+  rpc.setLatestBlock(702);
+  const ingest = await manualIngest(started.baseUrl, admin.token, detail.data.invoice_id, txHash, "token-decimals-18");
+  assert.equal(ingest.status, 200);
+  assert.equal(ingest.data.status, "paid");
+
+  const nonExactInvoice = await createInvoiceDetail(started.baseUrl, admin.token, 2, "token-decimals-non-exact");
+  const nonExactTx = randomTxHash("token-decimals-non-exact");
+  rpc.registerTransfer({
+    txHash: nonExactTx,
+    tokenContract,
+    fromAddress: "0x9999999999999999999999999999999999999999",
+    toAddress: nonExactInvoice.detail.data.chain.recipient_address,
+    amountBase: "2000000000000000001",
+    blockNumber: 710,
+  });
+  rpc.setLatestBlock(712);
+  const rejected = await manualIngest(started.baseUrl, admin.token, nonExactInvoice.detail.data.invoice_id, nonExactTx, "token-decimals-non-exact");
+  assert.equal(rejected.status, 400);
+  assert.equal(rejected.data.error.code, "NON_EXACT_DECIMAL_CONVERSION");
+});

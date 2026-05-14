@@ -57,6 +57,27 @@ function main() {
   const outputDir = path.resolve(process.cwd(), outputBase, utcTimestamp());
 
   const cleanedArgs = stripOutputDirArgs(stripOutputBaseArgs(rawArgs));
+  if (cleanedArgs.includes("--enforce") || cleanedArgs.includes("--limited-enforce")) {
+    const hygiene = spawnSync(
+      process.execPath,
+      [
+        path.join("scripts", "production-validation", "validate-dependency-docker-hygiene.mjs"),
+        "--require-resolved-digests",
+        "--skip-docker",
+        "true",
+      ],
+      {
+        cwd: process.cwd(),
+        env: process.env,
+        encoding: "utf8",
+      }
+    );
+    if (hygiene.stdout) process.stdout.write(hygiene.stdout);
+    if (hygiene.stderr) process.stderr.write(hygiene.stderr);
+    if (hygiene.status !== 0) {
+      process.exit(Number.isInteger(hygiene.status) ? hygiene.status : 1);
+    }
+  }
   const run = spawnSync(
     process.execPath,
     [

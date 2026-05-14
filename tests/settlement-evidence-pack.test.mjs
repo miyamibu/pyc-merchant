@@ -118,6 +118,10 @@ test("settlement evidence pack script emits required files and columns", async (
   for (const file of [
     "settlement-summary.json",
     "settlement-summary.csv",
+    "settlement-export-v1.jsonl",
+    "settlement-export-v1.csv",
+    "settlement-export-v1.schema-validation.json",
+    "settlement-export-v1-traceability-check.json",
     "invoices.csv",
     "payment-attempts.csv",
     "review-cases.csv",
@@ -134,4 +138,11 @@ test("settlement evidence pack script emits required files and columns", async (
   assert.match(invoicesCsv, /detected_at/);
   assert.match(invoicesCsv, /refund_status/);
   assert.match(invoicesCsv, /audit_ref/);
+  const schemaValidation = JSON.parse(fs.readFileSync(path.join(outDir, "settlement-export-v1.schema-validation.json"), "utf8"));
+  assert.equal(schemaValidation.ok, true);
+  assert.ok(schemaValidation.row_count > 0);
+  const traceability = JSON.parse(fs.readFileSync(path.join(outDir, "settlement-export-v1-traceability-check.json"), "utf8"));
+  assert.equal(traceability.ok, true);
+  const v1Jsonl = fs.readFileSync(path.join(outDir, "settlement-export-v1.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(v1Jsonl.every((row) => row.export_version === "v1" && row.payload_schema_version === "settlement_export_v1"));
 });

@@ -348,6 +348,23 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
 		  assert.ok(ok.data.consent_record_id, "consent_record_id must be present");
 		  assert.equal(ok.data.policy_snapshot_hash, sha256Json(policySnapshot));
 	  assert.ok(ok.data.recorded_at, "recorded_at must be present");
+	  const auditDb = new Database(env.DB_PATH, { readonly: true });
+	  const consentAudit = auditDb
+	    .prepare(`SELECT after_state FROM audit_logs WHERE action = 'customer_policy_consent' AND target_id = ? ORDER BY created_at DESC LIMIT 1`)
+	    .get(parsed.invoiceId);
+	  auditDb.close();
+	  const consentAfter = JSON.parse(consentAudit.after_state);
+	  assert.deepEqual({
+	    terms_url: consentAfter.terms_url,
+	    privacy_url: consentAfter.privacy_url,
+	    refund_policy_url: consentAfter.refund_policy_url,
+	    terms_version: consentAfter.terms_version,
+	    privacy_version: consentAfter.privacy_version,
+	    refund_policy_version: consentAfter.refund_policy_version,
+	  }, policySnapshot);
+	  assert.equal(consentAfter.consent_record_id.startsWith("consent_"), true);
+	  assert.equal(consentAfter.invoice_id, parsed.invoiceId);
+	  assert.equal(consentAfter.policy_snapshot_hash, sha256Json(policySnapshot));
 
 	  const polluted = await apiRequest(started.baseUrl, consentUrl, {
 	    method: "POST",
@@ -379,6 +396,47 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
     { method: "POST", headers: { "content-type": "application/json" }, body: consentBody }
   );
   assert.equal(noInvoice.status, 401);
+});
+
+test("consent policy snapshot hashes long server versions consistently and dev fallback stays usable", async (t) => {
+  const longVersion = `terms-${"v".repeat(90)}`;
+  const env = baseServerEnv({
+    TERMS_URL: "",
+    PRIVACY_URL: "",
+    REFUND_POLICY_URL: "",
+    TERMS_VERSION: longVersion,
+    PRIVACY_VERSION: `privacy-${"p".repeat(90)}`,
+    REFUND_POLICY_VERSION: `refund-${"r".repeat(90)}`,
+  });
+  const started = await startServerProcess(CWD, env);
+  t.after(async () => {
+    await stopServerProcess(started.proc);
+  });
+  const admin = await loginAs(started.baseUrl, {
+    terminalCode: env.TERMINAL_CODE,
+    pin: env.STAFF_PIN,
+  });
+  const inv = await createInvoice(started.baseUrl, admin.token, 700, `long-policy-${Date.now()}`);
+  const parsed = parsePaymentUrl(inv.data.payment_url);
+  const publicInvoice = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`
+  );
+  assert.equal(publicInvoice.status, 200);
+  assert.equal(publicInvoice.data.policy.terms_version, longVersion);
+  assert.match(publicInvoice.data.policy.terms_url, /\/legal\/dev-terms$/);
+  const hash = sha256Json(publicInvoice.data.policy);
+  const consent = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ checked: true, displayed_policy_hash: hash, client_rendered_at: "2026-05-14T00:00:00.000Z" }),
+    }
+  );
+  assert.equal(consent.status, 200);
+  assert.equal(consent.data.policy_snapshot_hash, hash);
 });
 
 test("session timeout expires API access without breaking login", async (t) => {

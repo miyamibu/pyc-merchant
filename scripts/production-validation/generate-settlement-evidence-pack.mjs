@@ -6,6 +6,20 @@ import Database from "better-sqlite3";
 import { DateTime } from "luxon";
 import { normalizeReviewReasonCode } from "../../src/reason-codes.mjs";
 
+const SETTLEMENT_EXPORT_HEADERS = [
+  "export_version", "export_reference", "settlement_id", "settlement_export_run_id", "settlement_export_row_id",
+  "business_date", "invoice_id", "invoice_no", "checkout_session_id", "merchant_id", "store_id", "terminal_id",
+  "operator_id", "event_id", "booth_id", "invoice_status", "status_reason", "amount_jpy", "amount_jpyc_base",
+  "paid_amount_jpyc_base", "tx_hash", "payment_attempt_ids", "primary_tx_hash", "primary_tx_log_index",
+  "reason_code", "review_case_id", "review_reason_type", "review_status", "block_timestamp", "detected_at",
+  "audit_ref", "refund_status", "refund_request_id", "refund_tx_hash", "audit_log_refs", "external_sync_refs",
+  "source_ledger_snapshot_hash", "rail_type", "provider_code", "accounting_status", "cash_recognition_status",
+  "receivable_status", "onchain_cash_amount_jpyc_base", "provider_receivable_amount_jpyc_base",
+  "exception_amount_jpyc_base", "refund_amount_jpyc_base", "void_amount_jpyc_base", "evidence_hash",
+  "payload_schema_version", "export_excluded_private_data", "refund_verified_at", "created_at", "updated_at",
+  "settled_at",
+];
+
 function parseArgs(argv) {
   const args = new Map();
   for (let i = 0; i < argv.length; i += 1) {
@@ -40,6 +54,50 @@ function toCsv(rows, headers) {
     lines.push(headers.map((key) => escape(row[key])).join(","));
   }
   return `${lines.join("\n")}\n`;
+}
+
+function toSettlementCsv(rows) {
+  return toCsv(
+    rows.map((row) => Object.fromEntries(
+      SETTLEMENT_EXPORT_HEADERS.map((key) => [
+        key,
+        Array.isArray(row[key]) || (row[key] && typeof row[key] === "object") ? JSON.stringify(row[key]) : row[key],
+      ])
+    )),
+    SETTLEMENT_EXPORT_HEADERS
+  );
+}
+
+function validateSettlementExportRows(rows, schemaRequired) {
+  const errors = [];
+  rows.forEach((row, index) => {
+    for (const key of schemaRequired) {
+      if (!Object.prototype.hasOwnProperty.call(row, key)) {
+        errors.push({ index, key, error: "missing_required_property" });
+      }
+    }
+    if (row.export_version !== "v1") errors.push({ index, key: "export_version", error: "must_be_v1" });
+    if (row.payload_schema_version !== "settlement_export_v1") errors.push({ index, key: "payload_schema_version", error: "invalid_payload_schema_version" });
+    if (row.export_excluded_private_data !== 1) errors.push({ index, key: "export_excluded_private_data", error: "must_be_1" });
+    if (row.accounting_status === "refunded_onchain" && (!row.refund_request_id || !row.refund_tx_hash || !row.refund_verified_at || !row.block_timestamp)) {
+      errors.push({ index, key: "refund", error: "refunded_onchain_requires_verified_chain_evidence" });
+    }
+    if (["issued", "payment_detected", "confirming", "expired"].includes(String(row.invoice_status)) && row.accounting_status === "cancelled") {
+      errors.push({ index, key: "accounting_status", error: "open_or_expired_unpaid_must_not_export_as_cancelled" });
+    }
+  });
+  return { ok: errors.length === 0, row_count: rows.length, errors };
+}
+
+function traceabilityCheck(db, rows) {
+  const errors = [];
+  for (const row of rows) {
+    for (const auditId of row.audit_log_refs || []) {
+      const found = db.prepare(`SELECT id FROM audit_logs WHERE id = ?`).get(auditId);
+      if (!found) errors.push({ settlement_export_row_id: row.settlement_export_row_id, audit_log_ref: auditId, error: "audit_log_ref_not_found" });
+    }
+  }
+  return { ok: errors.length === 0, checked_rows: rows.length, errors };
 }
 
 function utcRangeForBusinessDate(date, timezone) {
@@ -243,6 +301,25 @@ function main() {
     .all(storeId, range.fromUtc, range.toUtc);
 
   const settlement = db.prepare("SELECT * FROM settlements WHERE store_id = ? AND business_date = ?").get(storeId, businessDate);
+  const latestExportRun = db
+    .prepare(
+      `SELECT id
+       FROM settlement_export_runs
+       WHERE store_id = ?
+         AND business_date = ?
+       ORDER BY created_at DESC
+       LIMIT 1`
+    )
+    .get(storeId, businessDate);
+  const settlementExportRows = latestExportRun
+    ? db
+        .prepare(`SELECT payload_json FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC, id ASC`)
+        .all(latestExportRun.id)
+        .map((row) => JSON.parse(row.payload_json))
+    : [];
+  const schema = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), "docs/contracts/settlement-export-v1.schema.json"), "utf8"));
+  const schemaValidation = validateSettlementExportRows(settlementExportRows, schema.required || []);
+  const traceability = traceabilityCheck(db, settlementExportRows);
   const auditChain = verifyAuditChain(dbPath);
 
   const summary = {
@@ -255,6 +332,7 @@ function main() {
     store_id: storeId,
     settlement: settlement || null,
     counts: {
+      settlement_export_rows: settlementExportRows.length,
       invoices: invoices.length,
       payment_attempts: paymentAttempts.length,
       review_cases: reviews.length,
@@ -273,6 +351,10 @@ function main() {
   fs.mkdirSync(outputDir, { recursive: true });
   fs.writeFileSync(path.join(outputDir, "settlement-summary.json"), JSON.stringify(summary, null, 2));
   fs.writeFileSync(path.join(outputDir, "settlement-summary.csv"), toCsv([summary.counts], Object.keys(summary.counts)));
+  fs.writeFileSync(path.join(outputDir, "settlement-export-v1.jsonl"), settlementExportRows.map((row) => JSON.stringify(row)).join("\n") + (settlementExportRows.length ? "\n" : ""));
+  fs.writeFileSync(path.join(outputDir, "settlement-export-v1.csv"), toSettlementCsv(settlementExportRows));
+  fs.writeFileSync(path.join(outputDir, "settlement-export-v1.schema-validation.json"), JSON.stringify(schemaValidation, null, 2));
+  fs.writeFileSync(path.join(outputDir, "settlement-export-v1-traceability-check.json"), JSON.stringify(traceability, null, 2));
   fs.writeFileSync(path.join(outputDir, "invoices.csv"), toCsv(invoices, [
     "invoice_id",
     "invoice_no",
@@ -390,6 +472,10 @@ function main() {
       "",
       "- settlement-summary.json",
       "- settlement-summary.csv",
+      "- settlement-export-v1.jsonl",
+      "- settlement-export-v1.csv",
+      "- settlement-export-v1.schema-validation.json",
+      "- settlement-export-v1-traceability-check.json",
       "- invoices.csv",
       "- payment-attempts.csv",
       "- review-cases.csv",

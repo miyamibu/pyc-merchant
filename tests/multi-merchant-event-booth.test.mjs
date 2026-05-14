@@ -6,7 +6,10 @@ import {
   authHeaders,
   baseServerEnv,
   createInvoice,
+  getInvoice,
+  ingestManualPayment,
   loginAs,
+  randomTxHash,
   startServerProcess,
   stopServerProcess,
 } from "./helpers/server-process.mjs";
@@ -51,6 +54,18 @@ test("multi-merchant/event/booth schema exists and settlement export enforces ro
 
   const invoice = await createInvoice(started.baseUrl, admin.token, 1700, `multi-merchant-${Date.now()}`);
   assert.equal(invoice.status, 201);
+  const detail = await getInvoice(started.baseUrl, admin.token, invoice.data.invoice_id);
+  const paid = await ingestManualPayment(started.baseUrl, admin.token, {
+    invoice_id: invoice.data.invoice_id,
+    amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+    chain_id: env.CHAIN_ID,
+    token_contract: env.TOKEN_CONTRACT,
+    to_address: detail.data.chain.recipient_address,
+    confirmations: 2,
+    tx_hash: randomTxHash("multi-merchant-paid"),
+    from_address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  }, `multi-merchant-paid-${Date.now()}`);
+  assert.equal(paid.status, 200);
 
   const businessDateJst = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 

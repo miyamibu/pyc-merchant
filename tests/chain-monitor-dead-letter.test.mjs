@@ -14,6 +14,26 @@ test("chain monitor caches block timestamps per block within a scan cycle", () =
   assert.match(source, /blockTimestampIso\(log\.blockNumber\)/);
 });
 
+test("missing block timestamp dead letters keep recoverable ingest payload", () => {
+  const source = readFileSync(path.join(ROOT, "src/chain-monitor.mjs"), "utf8");
+  assert.match(source, /reason: "missing_block_timestamp"/);
+  for (const field of [
+    "invoice_id",
+    "amount_jpyc_base",
+    "amount_jpyc",
+    "chain_id",
+    "token_contract",
+    "to_address",
+    "from_address",
+    "confirmations",
+    "source: \"chain_monitor\"",
+    "missing_fields: \\[\"block_timestamp\"\\]",
+  ]) {
+    assert.match(source, new RegExp(field));
+  }
+  assert.match(source, /recoveredBlockTimestamp = await blockTimestampIso\(payload\.block_number\)/);
+});
+
 function withEnv(overrides, fn) {
   const previous = new Map();
   for (const [key, value] of Object.entries(overrides)) {

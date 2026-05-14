@@ -515,6 +515,17 @@ async function retryPendingDeadLetters() {
     const idemSeed = `${row.chain_id}:${row.tx_hash}:${row.log_index ?? -1}:${row.invoice_id || ""}:retry:${row.retry_count || 0}`;
     const idemKey = `chain-retry-${sha256(idemSeed).slice(0, 46)}`;
     try {
+      if (!payload.block_timestamp && Array.isArray(payload.missing_fields) && payload.missing_fields.includes("block_timestamp")) {
+        const recoveredBlockTimestamp = await blockTimestampIso(payload.block_number);
+        if (!recoveredBlockTimestamp) {
+          throw new Error("missing_block_timestamp");
+        }
+        payload = {
+          ...payload,
+          block_timestamp: recoveredBlockTimestamp,
+          missing_fields: payload.missing_fields.filter((field) => field !== "block_timestamp"),
+        };
+      }
       await postIngest(payload, idemKey);
       db.prepare(
         `UPDATE chain_dead_letters
@@ -682,9 +693,19 @@ async function runCycle() {
 	        logIndex: Number(log.index ?? log.logIndex ?? 0),
 	        invoiceId: selected.invoice?.id || null,
 	        payload: {
+	          invoice_id: selected.invoice?.id || null,
+	          amount_jpyc_base: amountBase,
+	          amount_jpyc: amountJpyc,
+	          chain_id: CHAIN_ID,
+	          token_contract: ACTIVE_TOKEN_CONTRACT,
+	          to_address: toAddress,
+	          from_address: String(parsed.args.from || "").toLowerCase(),
+	          confirmations,
 	          tx_hash: String(log.transactionHash),
 	          log_index: Number(log.index ?? log.logIndex ?? 0),
 	          block_number: Number(log.blockNumber ?? 0),
+	          source: "chain_monitor",
+	          missing_fields: ["block_timestamp"],
 	        },
 	        reason: "missing_block_timestamp",
 	      });
