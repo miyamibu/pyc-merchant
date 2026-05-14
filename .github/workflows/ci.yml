@@ -214,3 +214,77 @@ jobs:
           name: production-validation-evidence-${{ github.run_number }}
           path: ${{ steps.evidence.outputs.path }}
           if-no-files-found: error
+
+  release-gates:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APP_ENV: "development"
+      DB_PATH: "./artifacts/release-gates/ci-release-gates.db"
+      BACKUP_DIR: "./artifacts/release-gates/ci-backups"
+      PRODUCTION_EVIDENCE_ROOT: "./artifacts/release-gates"
+      COMMERCIAL_VALIDATE_SAFE_ROOT: "./artifacts/release-gates"
+      DEMO_CONTROLS_ENABLED: "false"
+      DIAGNOSTIC_MODE_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Prepare release gate environment
+        run: |
+          mkdir -p "$(dirname "$DB_PATH")" "$BACKUP_DIR" "$PRODUCTION_EVIDENCE_ROOT"
+          docker pull node:20-bookworm-slim
+          docker pull nginx:1.27-alpine
+          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:20-bookworm-slim)"
+          NGINX_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' nginx:1.27-alpine)"
+          cp .env.production.example .env.production
+          NODE_IMAGE="$NODE_IMAGE" NGINX_IMAGE="$NGINX_IMAGE" node -e '
+            const fs = require("fs");
+            let text = fs.readFileSync(".env.production", "utf8");
+            text = text.replace(/^PRODUCTION_NODE_IMAGE=.*$/m, `PRODUCTION_NODE_IMAGE=${process.env.NODE_IMAGE}`);
+            text = text.replace(/^PRODUCTION_NGINX_IMAGE=.*$/m, `PRODUCTION_NGINX_IMAGE=${process.env.NGINX_IMAGE}`);
+            fs.writeFileSync(".env.production", text);
+          '
+          echo "PRODUCTION_NODE_IMAGE=${NODE_IMAGE}" >> "$GITHUB_ENV"
+          echo "PRODUCTION_NGINX_IMAGE=${NGINX_IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Assert commercial gate fails closed without external evidence
+        run: |
+          set +e
+          npm run commercial:gate
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::commercial:gate unexpectedly passed without required external/legal evidence"
+            exit 1
+          fi
+          echo "commercial:gate failed closed as expected with status ${STATUS}"
+
+      - name: Assert limited gate fails closed without evidence or waiver
+        run: |
+          set +e
+          npm run limited:gate
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::limited:gate unexpectedly passed without required evidence or signed waiver"
+            exit 1
+          fi
+          echo "limited:gate failed closed as expected with status ${STATUS}"
+
+      - name: Upload release gate reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-reports-${{ github.run_number }}
+          path: artifacts/release-gates
+          if-no-files-found: error
