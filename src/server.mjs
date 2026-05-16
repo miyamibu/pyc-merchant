@@ -5106,7 +5106,12 @@ function findLatestProviderAllocationForPayment(providerPaymentId, invoiceId = n
   if (invoiceId) {
     return db
       .prepare(
-        `SELECT psa.*, ps.provider_settlement_id AS external_provider_settlement_id, ps.batch_reference, ps.settlement_status
+        `SELECT psa.*,
+                ps.provider_settlement_id AS external_provider_settlement_id,
+                ps.batch_reference,
+                ps.settlement_status,
+                ps.reported_at AS provider_settlement_reported_at,
+                ps.settled_at AS provider_settlement_settled_at
          FROM provider_settlement_allocations psa
          JOIN provider_settlements ps ON ps.id = psa.provider_settlement_id
          WHERE psa.provider_payment_id = ?
@@ -5118,7 +5123,12 @@ function findLatestProviderAllocationForPayment(providerPaymentId, invoiceId = n
   }
   return db
     .prepare(
-      `SELECT psa.*, ps.provider_settlement_id AS external_provider_settlement_id, ps.batch_reference, ps.settlement_status
+      `SELECT psa.*,
+              ps.provider_settlement_id AS external_provider_settlement_id,
+              ps.batch_reference,
+              ps.settlement_status,
+              ps.reported_at AS provider_settlement_reported_at,
+              ps.settled_at AS provider_settlement_settled_at
        FROM provider_settlement_allocations psa
        JOIN provider_settlements ps ON ps.id = psa.provider_settlement_id
        WHERE psa.provider_payment_id = ?
@@ -5418,7 +5428,14 @@ function canonicalBusinessDateForSettlementRow({ invoice, providerSession, provi
     return businessDateFromIso(refund.block_timestamp || refund.verified_at || invoice.created_at, timezone);
   }
   if (providerAllocation) {
-    return businessDateFromIso(providerAllocation.updated_at || providerAllocation.created_at || invoice.created_at, timezone);
+    return businessDateFromIso(
+      providerAllocation.provider_settlement_settled_at
+        || providerAllocation.provider_settlement_reported_at
+        || providerAllocation.updated_at
+        || providerAllocation.created_at
+        || invoice.created_at,
+      timezone
+    );
   }
   if (providerSession) {
     return businessDateFromIso(providerSession.updated_at || providerSession.created_at || invoice.created_at, timezone);

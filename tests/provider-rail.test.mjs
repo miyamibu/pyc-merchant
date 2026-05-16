@@ -687,3 +687,69 @@ test("private provider fields are rejected, void is not refund, and duplicate pr
   assert.equal(row.export_excluded_private_data, 1);
   assert.equal(Object.prototype.hasOwnProperty.call(row, "payer_ref_hash"), false);
 });
+
+test("monthly provider settlement export follows provider settlement business date", async (t) => {
+  const ctx = await startProviderTestServer();
+  t.after(async () => {
+    ctx.db.close();
+    await stopServerProcess(ctx.started.proc);
+  });
+
+  const created = await createInvoice(ctx.started.baseUrl, ctx.admin.token, 1760, `provider-date-${Date.now()}`);
+  assert.equal(created.status, 201);
+  const detail = await getInvoice(ctx.started.baseUrl, ctx.admin.token, created.data.invoice_id);
+  const providerPaymentId = `pay-date-${Date.now()}`;
+
+  const providerEvent = await ingestProviderEvent(ctx.started.baseUrl, ctx.env, {
+    provider_code: "mock_provider",
+    provider_event_id: `evt-date-${Date.now()}`,
+    provider_payment_id: providerPaymentId,
+    provider_session_id: `sess-date-${Date.now()}`,
+    invoice_id: created.data.invoice_id,
+    event_type: "captured",
+    provider_status: "captured",
+    amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+    occurred_at: "2026-01-31T08:30:00.000Z",
+  }, "date-captured");
+  assert.equal(providerEvent.status, 200);
+
+  ctx.db.prepare(`UPDATE invoices SET created_at = ?, updated_at = ? WHERE id = ?`)
+    .run("2026-01-31T08:00:00.000Z", "2026-01-31T08:31:00.000Z", created.data.invoice_id);
+  ctx.db.prepare(`UPDATE provider_payment_sessions SET created_at = ?, updated_at = ?, provider_captured_at = ? WHERE provider_payment_id = ?`)
+    .run("2026-01-31T08:30:00.000Z", "2026-01-31T08:31:00.000Z", "2026-01-31T08:30:00.000Z", providerPaymentId);
+
+  const providerSettlementId = `settlement-date-${Date.now()}`;
+  const settlement = await ingestProviderSettlement(ctx.started.baseUrl, ctx.env, {
+    provider_code: "mock_provider",
+    provider_settlement_id: providerSettlementId,
+    batch_reference: `batch-date-${Date.now()}`,
+    settlement_status: "confirmed",
+    settlement_amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+    reported_at: "2026-02-01T00:10:00.000Z",
+    settled_at: "2026-02-01T00:15:00.000Z",
+    allocations: [
+      {
+        provider_payment_id: providerPaymentId,
+        invoice_id: created.data.invoice_id,
+        allocated_amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+        allocation_status: "matched",
+      },
+    ],
+  }, "date-settlement");
+  assert.equal(settlement.status, 200);
+
+  const january = await apiRequest(ctx.started.baseUrl, "/api/v1/settlements/monthly:export?year_month=2026-01&format=json", {
+    headers: authHeaders(ctx.admin.token),
+  });
+  assert.equal(january.status, 200);
+  assert.equal(january.data.rows.some((row) => row.invoice_id === created.data.invoice_id), false);
+
+  const february = await apiRequest(ctx.started.baseUrl, "/api/v1/settlements/monthly:export?year_month=2026-02&format=json", {
+    headers: authHeaders(ctx.admin.token),
+  });
+  assert.equal(february.status, 200);
+  const row = february.data.rows.find((entry) => entry.invoice_id === created.data.invoice_id);
+  assert.ok(row);
+  assert.equal(row.business_date, "2026-02-01");
+  assert.equal(row.rail_type, "provider_external");
+});
