@@ -2126,6 +2126,8 @@ function utcRangeForBusinessDate(businessDate, timezone) {
   }
   const end = start.endOf("day");
   return {
+    businessDateFrom: start.toISODate(),
+    businessDateTo: end.toISODate(),
     fromUtc: start.toUTC().toISO({ suppressMilliseconds: false }),
     toUtc: end.toUTC().toISO({ suppressMilliseconds: false })
   };
@@ -2138,6 +2140,8 @@ function utcRangeForBusinessMonth(yearMonth, timezone) {
   }
   const end = start.endOf("month");
   return {
+    businessDateFrom: start.toISODate(),
+    businessDateTo: end.toISODate(),
     fromUtc: start.toUTC().toISO({ suppressMilliseconds: false }),
     toUtc: end.toUTC().toISO({ suppressMilliseconds: false })
   };
@@ -5046,10 +5050,55 @@ function buildSettlementExportBaseInvoices(storeId, range) {
       `SELECT i.*
        FROM invoices i
        WHERE i.store_id = ?
-         AND i.created_at BETWEEN ? AND ?
+         AND (
+           i.created_at BETWEEN ? AND ?
+           OR i.updated_at BETWEEN ? AND ?
+           OR EXISTS (
+             SELECT 1
+             FROM payment_events pe
+             WHERE pe.invoice_id = i.id
+               AND COALESCE(pe.block_timestamp, pe.detected_at, pe.observed_at, pe.created_at) BETWEEN ? AND ?
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM refund_requests rr
+             WHERE rr.invoice_id = i.id
+               AND COALESCE(rr.block_timestamp, rr.verified_at, rr.created_at) BETWEEN ? AND ?
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM payment_sessions ps
+             JOIN provider_payment_sessions pps ON pps.payment_session_id = ps.id
+             WHERE ps.invoice_id = i.id
+               AND COALESCE(pps.provider_captured_at, pps.provider_authorized_at, pps.updated_at, pps.created_at) BETWEEN ? AND ?
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM provider_settlement_allocations psa
+             JOIN provider_settlements pst ON pst.id = psa.provider_settlement_id
+             LEFT JOIN provider_payment_sessions pps ON pps.provider_payment_id = psa.provider_payment_id
+             LEFT JOIN payment_sessions ps ON ps.id = pps.payment_session_id
+             WHERE COALESCE(psa.invoice_id, ps.invoice_id) = i.id
+               AND COALESCE(pst.settled_at, pst.reported_at, psa.updated_at, psa.created_at) BETWEEN ? AND ?
+           )
+         )
        ORDER BY i.created_at ASC`
     )
-    .all(storeId, range.fromUtc, range.toUtc);
+    .all(
+      storeId,
+      range.fromUtc,
+      range.toUtc,
+      range.fromUtc,
+      range.toUtc,
+      range.fromUtc,
+      range.toUtc,
+      range.fromUtc,
+      range.toUtc,
+      range.fromUtc,
+      range.toUtc,
+      range.fromUtc,
+      range.toUtc
+    );
 }
 
 function findLatestProviderAllocationForPayment(providerPaymentId, invoiceId = null) {
@@ -5294,33 +5343,10 @@ function createSettlementExportSnapshot({
     ip,
   });
 
-  const invoices = buildSettlementExportBaseInvoices(store.id, range);
-  const rows = [];
-  for (const invoice of invoices) {
-    const review = findLatestReviewCase(invoice.id);
-    const refund = findLatestRefundRequest(invoice.id);
-    const sessions = getPaymentSessionsForInvoice(invoice);
-    for (const paymentSession of sessions) {
-      const providerSession = paymentSession.id
-        ? db.prepare(`SELECT * FROM provider_payment_sessions WHERE payment_session_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1`).get(paymentSession.id) || null
-        : null;
-      const providerAllocation = providerSession
-        ? findLatestProviderAllocationForPayment(providerSession.provider_payment_id, invoice.id)
-        : null;
-      const row = buildSettlementExportRow({
-        invoice,
-        paymentSession,
-        providerSession,
-        providerAllocation,
-        review,
-        refund,
-        exportRunId: runId,
-        businessDate,
-      });
-      if (!row) continue;
-      rows.push(row);
-      const payloadJson = JSON.stringify(serializeSettlementExportV1Row(row));
-      db.prepare(
+  const rows = buildSettlementExportRowsForRange({ store, range, exportRunId: runId });
+  for (const row of rows) {
+    const payloadJson = JSON.stringify(serializeSettlementExportV1Row(row));
+    db.prepare(
         `INSERT INTO settlement_export_rows
          (id, export_run_id, export_version, business_date, store_id, terminal_id, operator_id, invoice_id, checkout_session_id,
           payment_session_id, rail_type, provider_code, invoice_amount_jpyc_base, invoice_status, accounting_status,
@@ -5328,39 +5354,38 @@ function createSettlementExportSnapshot({
           exception_amount_jpyc_base, refund_amount_jpyc_base, void_amount_jpyc_base, provider_payment_ref, provider_settlement_ref,
           onchain_transfer_ref, evidence_hash, payload_json, payload_schema_version, export_excluded_private_data, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        row.id,
-        row.export_run_id,
-        row.export_version,
-        row.business_date,
-        row.store_id,
-        row.terminal_id,
-        row.operator_id,
-        row.invoice_id,
-        row.checkout_session_id,
-        row.payment_session_id,
-        row.rail_type,
-        row.provider_code,
-        row.invoice_amount_jpyc_base,
-        row.invoice_status,
-        row.accounting_status,
-        row.cash_recognition_status,
-        row.receivable_status,
-        row.onchain_cash_amount_jpyc_base,
-        row.provider_receivable_amount_jpyc_base,
-        row.exception_amount_jpyc_base,
-        row.refund_amount_jpyc_base,
-        row.void_amount_jpyc_base,
-        row.provider_payment_ref,
-        row.provider_settlement_ref,
-        row.onchain_transfer_ref,
-        row.evidence_hash,
-        payloadJson,
-        row.payload_schema_version,
-        row.export_excluded_private_data,
-        row.created_at
-      );
-    }
+    ).run(
+      row.id,
+      row.export_run_id,
+      row.export_version,
+      row.business_date,
+      row.store_id,
+      row.terminal_id,
+      row.operator_id,
+      row.invoice_id,
+      row.checkout_session_id,
+      row.payment_session_id,
+      row.rail_type,
+      row.provider_code,
+      row.invoice_amount_jpyc_base,
+      row.invoice_status,
+      row.accounting_status,
+      row.cash_recognition_status,
+      row.receivable_status,
+      row.onchain_cash_amount_jpyc_base,
+      row.provider_receivable_amount_jpyc_base,
+      row.exception_amount_jpyc_base,
+      row.refund_amount_jpyc_base,
+      row.void_amount_jpyc_base,
+      row.provider_payment_ref,
+      row.provider_settlement_ref,
+      row.onchain_transfer_ref,
+      row.evidence_hash,
+      payloadJson,
+      row.payload_schema_version,
+      row.export_excluded_private_data,
+      row.created_at
+    );
   }
 
   db.prepare(`UPDATE settlement_export_runs SET status = 'completed' WHERE id = ?`).run(runId);
@@ -5407,6 +5432,11 @@ function canonicalBusinessDateForSettlementRow({ invoice, providerSession, provi
   return businessDateFromIso(invoice.created_at, timezone);
 }
 
+function businessDateMatchesRange(businessDate, range) {
+  if (!range?.businessDateFrom || !range?.businessDateTo) return true;
+  return String(businessDate || "") >= String(range.businessDateFrom) && String(businessDate || "") <= String(range.businessDateTo);
+}
+
 function buildSettlementExportRowsForRange({ store, range, exportRunId, fixedBusinessDate = null }) {
   const invoices = buildSettlementExportBaseInvoices(store.id, range);
   const rows = [];
@@ -5438,7 +5468,7 @@ function buildSettlementExportRowsForRange({ store, range, exportRunId, fixedBus
         exportRunId,
         businessDate,
       });
-      if (row) rows.push(row);
+      if (row && businessDateMatchesRange(row.business_date, range)) rows.push(row);
     }
   }
   return rows;
