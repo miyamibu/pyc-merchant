@@ -130,6 +130,22 @@ test("validate-evidence-sanitization allows public token contract evidence", asy
   assert.equal(payload.ok, true);
 });
 
+test("validate-evidence-sanitization rejects database files in evidence artifacts", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "jpyc-evidence-db-artifact-"));
+  fs.writeFileSync(path.join(dir, "app.sqlite3"), "not-a-real-db", "utf8");
+  const result = await runNode("scripts/production-validation/validate-evidence-sanitization.mjs", ["--evidence-dir", dir]);
+  assert.notEqual(result.code, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.violations[0].reason, "database_file_in_sanitized_evidence");
+});
+
+test("ci uploads timestamped production evidence directory instead of backup directories", () => {
+  const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.match(workflow, /find artifacts\/production-validation-evidence .* -name '20\*T\*Z'/);
+  assert.doesNotMatch(workflow, /find artifacts\/production-validation-evidence -mindepth 1 -maxdepth 1 -type d \| sort \| tail -n 1/);
+});
+
 test("validate-evidence-sanitization accepts sanitized manifest and rejects sensitive manifest", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "jpyc-manifest-test-"));
   const manifestPath = path.join(dir, "release.json");

@@ -33,6 +33,71 @@ run_json_step() {
   echo "- ${name}: PASS" >> "$EVIDENCE_DIR/summary.tmp"
 }
 
+run_backup_restore_steps() {
+  local backup_log="$EVIDENCE_DIR/backup-sqlite.log"
+  local restore_log="$EVIDENCE_DIR/restore-drill.log"
+  local backup_output
+  local backup_file
+
+  echo "==> backup-sqlite"
+  if ! backup_output="$(bash ./scripts/deploy/backup-sqlite.sh 2>&1)"; then
+    printf "%s\n" "$backup_output" >"$backup_log"
+    return 1
+  fi
+  printf "%s\n" "$backup_output" >"$backup_log"
+  backup_file="$(printf "%s\n" "$backup_output" | tail -n 1)"
+  test -n "$backup_file"
+  echo "- backup-sqlite: PASS" >> "$EVIDENCE_DIR/summary.tmp"
+
+  echo "==> restore-drill"
+  bash ./scripts/deploy/restore-drill.sh "$backup_file" >"$restore_log" 2>&1
+  echo "- restore-drill: PASS" >> "$EVIDENCE_DIR/summary.tmp"
+
+  node - "$EVIDENCE_DIR" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const evidenceDir = path.resolve(process.argv[2]);
+const dbPattern = /\.(?:db|sqlite|sqlite3)$/i;
+const databaseFiles = [];
+
+function walk(dirPath) {
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    const fullPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      walk(fullPath);
+    } else if (entry.isFile() && dbPattern.test(entry.name)) {
+      databaseFiles.push(fullPath);
+    }
+  }
+}
+
+walk(evidenceDir);
+
+const sanitized = databaseFiles.map((filePath) => {
+  const bytes = fs.readFileSync(filePath);
+  const stat = fs.statSync(filePath);
+  return {
+    file_name: path.basename(filePath),
+    relative_path: path.relative(evidenceDir, filePath),
+    size_bytes: stat.size,
+    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    sanitized_action: "removed_from_evidence_artifact",
+  };
+});
+
+fs.writeFileSync(
+  path.join(evidenceDir, "database-artifact-manifest.json"),
+  `${JSON.stringify({ generated_at: new Date().toISOString(), sanitized }, null, 2)}\n`
+);
+
+for (const filePath of databaseFiles) {
+  fs.rmSync(filePath, { force: true });
+}
+NODE
+}
+
 bash ./scripts/production-validation/collect-evidence.sh "$EVIDENCE_DIR" >/dev/null
 
 run_step check npm run check
@@ -50,8 +115,7 @@ run_json_step validate-dependency-docker-hygiene node scripts/production-validat
 run_json_step validate-public-invoice-api node scripts/production-validation/validate-public-invoice-api.mjs
 run_json_step validate-wallet-launch node scripts/production-validation/validate-wallet-launch.mjs
 run_json_step validate-smoke-payment-flow node scripts/production-validation/validate-smoke-payment-flow.mjs
-run_step backup-sqlite bash ./scripts/deploy/backup-sqlite.sh
-run_step restore-drill bash ./scripts/deploy/restore-drill.sh
+run_backup_restore_steps
 run_json_step validate-evidence-sanitization node scripts/production-validation/validate-evidence-sanitization.mjs --evidence-dir "$EVIDENCE_DIR"
 
 {

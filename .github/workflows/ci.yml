@@ -204,7 +204,7 @@ jobs:
       - name: Detect latest evidence dir
         id: evidence
         run: |
-          EVIDENCE_DIR="$(find artifacts/production-validation-evidence -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          EVIDENCE_DIR="$(find artifacts/production-validation-evidence -mindepth 1 -maxdepth 1 -type d -name '20*T*Z' | sort | tail -n 1)"
           echo "path=${EVIDENCE_DIR}" >> "$GITHUB_OUTPUT"
           test -n "${EVIDENCE_DIR}"
 

@@ -99,6 +99,10 @@ function containsSuspiciousGenericPattern(content) {
   ].some((pattern) => pattern.test(content));
 }
 
+function isDatabaseArtifact(filePath) {
+  return /\.(?:db|sqlite|sqlite3)$/i.test(path.basename(filePath));
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const manifestPath = args.get("manifest") ? path.resolve(process.cwd(), args.get("manifest")) : null;
@@ -118,6 +122,13 @@ function main() {
   const violations = [];
   for (const filePath of walkFiles(evidenceDir)) {
     const relativePath = path.relative(process.cwd(), filePath);
+    if (isDatabaseArtifact(filePath)) {
+      violations.push({
+        file: relativePath,
+        reason: "database_file_in_sanitized_evidence",
+      });
+      continue;
+    }
     const content = fs.readFileSync(filePath, "utf8");
 
     if (containsSuspiciousGenericPattern(content)) {
