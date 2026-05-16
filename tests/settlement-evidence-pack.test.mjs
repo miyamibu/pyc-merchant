@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
 import {
   apiRequest,
   authHeaders,
@@ -145,4 +146,28 @@ test("settlement evidence pack script emits required files and columns", async (
   assert.equal(traceability.ok, true);
   const v1Jsonl = fs.readFileSync(path.join(outDir, "settlement-export-v1.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert.ok(v1Jsonl.every((row) => row.export_version === "v1" && row.payload_schema_version === "settlement_export_v1"));
+
+  const db = new Database(env.DB_PATH);
+  try {
+    db.prepare(`UPDATE settlement_export_rows SET payload_json = NULL WHERE export_run_id = ?`).run(close.data.export_run_id);
+  } finally {
+    db.close();
+  }
+  const legacyOutDir = mkdtempSync(path.join(tmpdir(), "jpyc-settlement-pack-legacy-"));
+  const legacyResult = await runNode("scripts/production-validation/generate-settlement-evidence-pack.mjs", [
+    "--db-path",
+    env.DB_PATH,
+    "--store-id",
+    "store-001",
+    "--business-date",
+    businessDateJst,
+    "--output-dir",
+    legacyOutDir,
+  ]);
+  assert.equal(legacyResult.code, 0, legacyResult.stderr || legacyResult.stdout);
+  const legacyValidation = JSON.parse(fs.readFileSync(path.join(legacyOutDir, "settlement-export-v1.schema-validation.json"), "utf8"));
+  assert.equal(legacyValidation.ok, false);
+  assert.ok(legacyValidation.errors.some((error) => error.error === "invalid_payload_schema_version"));
+  const legacyJsonl = fs.readFileSync(path.join(legacyOutDir, "settlement-export-v1.jsonl"), "utf8");
+  assert.match(legacyJsonl, /missing_payload_json/);
 });

@@ -162,7 +162,8 @@ test("refund evidence registry enforces two-person rule and keeps recorded state
   assert.match(blockedClose.data.error.message, /締めできません。未完了の返金証跡を先に処理してください。/);
   assert.ok(blockedClose.data.error.unresolved_refunds.some((row) => row.refund_case_id === request.data.refund_request_id));
 
-  db.prepare(`UPDATE refund_requests SET status = 'succeeded', verified_at = ?, updated_at = ? WHERE id = ?`).run(
+  db.prepare(`UPDATE refund_requests SET status = 'succeeded', verified_at = ?, block_timestamp = ?, updated_at = ? WHERE id = ?`).run(
+    new Date().toISOString(),
     new Date().toISOString(),
     new Date().toISOString(),
     request.data.refund_request_id
@@ -180,6 +181,14 @@ test("refund evidence registry enforces two-person rule and keeps recorded state
     }),
   });
   assert.equal(closeAfterResolvedRefund.status, 200);
+  const exportRows = db.prepare(`SELECT payload_json FROM settlement_export_rows WHERE export_run_id = ?`).all(closeAfterResolvedRefund.data.export_run_id);
+  const refundExport = exportRows.map((row) => JSON.parse(row.payload_json)).find((row) => row.refund_request_id === request.data.refund_request_id);
+  assert.ok(refundExport);
+  const refundAuditIds = db.prepare(`SELECT id FROM audit_logs WHERE target_type = 'refund' AND target_id = ?`).all(request.data.refund_request_id).map((row) => row.id);
+  assert.ok(refundAuditIds.length > 0);
+  for (const auditId of refundAuditIds) {
+    assert.ok(refundExport.audit_log_refs.includes(auditId), `refund audit log ref missing from settlement export: ${auditId}`);
+  }
 
   const auditLogs = await apiRequest(started.baseUrl, "/api/v1/audit-logs?limit=200", {
     headers: authHeaders(requester.token),

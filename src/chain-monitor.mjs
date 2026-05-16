@@ -686,34 +686,8 @@ async function runCycle() {
       );
       continue;
     }
-	    const selected = selectInvoiceForLog(invoices, toAddress, amountBase);
-		    const blockTimestamp = await blockTimestampIso(log.blockNumber);
-	    if (!blockTimestamp) {
-	      upsertDeadLetter({
-	        chainId: CHAIN_ID,
-	        txHash: String(log.transactionHash),
-	        logIndex: Number(log.index ?? log.logIndex ?? 0),
-	        invoiceId: selected.invoice?.id || null,
-	        payload: {
-	          invoice_id: selected.invoice?.id || null,
-	          amount_jpyc_base: amountBase,
-	          amount_jpyc: amountJpyc,
-	          chain_id: CHAIN_ID,
-	          token_contract: ACTIVE_TOKEN_CONTRACT,
-	          to_address: toAddress,
-	          from_address: String(parsed.args.from || "").toLowerCase(),
-	          confirmations,
-	          tx_hash: String(log.transactionHash),
-	          log_index: Number(log.index ?? log.logIndex ?? 0),
-	          block_number: Number(log.blockNumber ?? 0),
-	          source: "chain_monitor",
-	          missing_fields: ["block_timestamp"],
-	        },
-	        reason: "missing_block_timestamp",
-	      });
-	      continue;
-	    }
-	    if (!selected.invoice) {
+    const selected = selectInvoiceForLog(invoices, toAddress, amountBase);
+    if (!selected.invoice) {
       try {
         db.prepare(
           `INSERT INTO chain_unmatched_events
@@ -757,6 +731,33 @@ async function runCycle() {
           reason: selected.reason
         })
       );
+      continue;
+    }
+
+    const blockTimestamp = await blockTimestampIso(log.blockNumber);
+    if (!blockTimestamp) {
+      upsertDeadLetter({
+        chainId: CHAIN_ID,
+        txHash: String(log.transactionHash),
+        logIndex: Number(log.index ?? log.logIndex ?? 0),
+        invoiceId: selected.invoice.id,
+        payload: {
+          invoice_id: selected.invoice.id,
+          amount_jpyc_base: amountBase,
+          amount_jpyc: amountJpyc,
+          chain_id: CHAIN_ID,
+          token_contract: ACTIVE_TOKEN_CONTRACT,
+          to_address: toAddress,
+          from_address: String(parsed.args.from || "").toLowerCase(),
+          confirmations,
+          tx_hash: String(log.transactionHash),
+          log_index: Number(log.index ?? log.logIndex ?? 0),
+          block_number: Number(log.blockNumber ?? 0),
+          source: "chain_monitor",
+          missing_fields: ["block_timestamp"],
+        },
+        reason: "missing_block_timestamp",
+      });
       continue;
     }
 

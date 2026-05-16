@@ -33,6 +33,12 @@ test("missing block timestamp dead letters keep recoverable ingest payload", () 
     assert.match(source, new RegExp(field));
   }
   assert.match(source, /recoveredBlockTimestamp = await blockTimestampIso\(payload\.block_number\)/);
+  const selectedIndex = source.indexOf("const selected = selectInvoiceForLog");
+  const unmatchedIndex = source.indexOf("if (!selected.invoice)", selectedIndex);
+  const missingTimestampIndex = source.indexOf("if (!blockTimestamp)", selectedIndex);
+  assert.ok(selectedIndex > 0);
+  assert.ok(unmatchedIndex > selectedIndex);
+  assert.ok(missingTimestampIndex > unmatchedIndex, "unmatched logs must be recorded before missing timestamp dead-letter handling");
 });
 
 test("missing block timestamp dead letter retries recover after block timestamp is available", async (t) => {

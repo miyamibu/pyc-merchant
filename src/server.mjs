@@ -2233,24 +2233,20 @@ function buildSettlementExportCsv(rows) {
   return lines.join("\n");
 }
 
-function settlementAuditRefsForInvoice(invoiceId, extraIds = []) {
+function settlementAuditRefsForInvoice(invoiceId, extraTargetIds = []) {
+  const targetIds = [...new Set([invoiceId, ...extraTargetIds].filter(Boolean))];
+  if (targetIds.length === 0) return [];
   const refs = db
     .prepare(
       `SELECT id
        FROM audit_logs
-       WHERE target_id = ?
+       WHERE target_id IN (${targetIds.map(() => "?").join(",")})
        ORDER BY created_at ASC, id ASC
        LIMIT 20`
     )
-    .all(invoiceId)
+    .all(...targetIds)
     .map((row) => row.id);
-  const validatedExtraIds = extraIds.length > 0
-    ? db
-        .prepare(`SELECT id FROM audit_logs WHERE id IN (${extraIds.map(() => "?").join(",")})`)
-        .all(...extraIds)
-        .map((row) => row.id)
-    : [];
-  return [...new Set([...validatedExtraIds, ...refs])];
+  return [...new Set(refs)];
 }
 
 function settlementPaymentAttemptIds(invoiceId) {
@@ -5191,7 +5187,7 @@ function buildSettlementExportRow({
   const primaryEvent = invoice.paid_tx_hash
     ? db.prepare(`SELECT log_index, block_timestamp, detected_at FROM payment_events WHERE invoice_id = ? AND tx_hash = ? ORDER BY created_at ASC LIMIT 1`).get(invoice.id, invoice.paid_tx_hash)
     : null;
-  const auditRefs = settlementAuditRefsForInvoice(invoice.id);
+  const auditRefs = settlementAuditRefsForInvoice(invoice.id, [refund?.id, review?.id]);
   const evidenceHash = hashProviderEvidence({
     invoice_id: invoice.id,
     payment_session_id: paymentSession?.id || null,

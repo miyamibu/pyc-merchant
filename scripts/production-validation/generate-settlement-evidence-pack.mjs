@@ -100,6 +100,46 @@ function traceabilityCheck(db, rows) {
   return { ok: errors.length === 0, checked_rows: rows.length, errors };
 }
 
+function parseSettlementExportPayload(row, index) {
+  if (!row.payload_json) {
+    return {
+      settlement_export_row_id: row.id || `legacy-row-${index}`,
+      export_run_id: row.export_run_id || null,
+      export_version: null,
+      payload_schema_version: null,
+      export_excluded_private_data: null,
+      audit_log_refs: [],
+      legacy_payload_missing: true,
+      validation_error: "missing_payload_json",
+    };
+  }
+  try {
+    const payload = JSON.parse(row.payload_json);
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
+    return {
+      settlement_export_row_id: row.id || `invalid-row-${index}`,
+      export_run_id: row.export_run_id || null,
+      export_version: null,
+      payload_schema_version: null,
+      export_excluded_private_data: null,
+      audit_log_refs: [],
+      legacy_payload_missing: true,
+      validation_error: "payload_json_not_object",
+    };
+  } catch (error) {
+    return {
+      settlement_export_row_id: row.id || `invalid-row-${index}`,
+      export_run_id: row.export_run_id || null,
+      export_version: null,
+      payload_schema_version: null,
+      export_excluded_private_data: null,
+      audit_log_refs: [],
+      legacy_payload_missing: true,
+      validation_error: `invalid_payload_json:${String(error.message || error)}`,
+    };
+  }
+}
+
 function utcRangeForBusinessDate(date, timezone) {
   const dt = DateTime.fromISO(date, { zone: timezone });
   if (!dt.isValid) return null;
@@ -313,9 +353,9 @@ function main() {
     .get(storeId, businessDate);
   const settlementExportRows = latestExportRun
     ? db
-        .prepare(`SELECT payload_json FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC, id ASC`)
+        .prepare(`SELECT id, export_run_id, payload_json FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC, id ASC`)
         .all(latestExportRun.id)
-        .map((row) => JSON.parse(row.payload_json))
+        .map((row, index) => parseSettlementExportPayload(row, index))
     : [];
   const schema = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), "docs/contracts/settlement-export-v1.schema.json"), "utf8"));
   const schemaValidation = validateSettlementExportRows(settlementExportRows, schema.required || []);
