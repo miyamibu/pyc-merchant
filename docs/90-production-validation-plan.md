@@ -4,7 +4,7 @@
 limited-store pilot 直前に、コード、deployment pack、wallet launch payload、運用証跡準備を同じ手順で再現できるようにする。
 
 ## Context
-- support baseline は Node 20。
+- support baseline は Node 24.17.0。
 - `npm run production:validate` は repo/deploy validation pack を生成する。
 - 実機、実送金、公開 TLS は external evidence として別管理する。
 
@@ -43,7 +43,7 @@ limited-store pilot 直前に、コード、deployment pack、wallet launch payl
 - `npm run production:validate:env`
   実値 `.env.production` がある環境で drift と RPC 到達確認を 1 コマンドで実行する。
 - `.github/workflows/ci.yml`
-  Node 20 で `npm ci`, `npm run check`, `npm test`, `npm run audit`, `npm run test:smoke`, `npm run test:audit-chain`, `npm run deploy:check`, `docker build .`, `docker compose -f docker-compose.prod.yml config` を実行する。
+  Node 24.17.0 で `npm ci`, `npm run check`, `npm test`, `npm run audit`, `npm run test:smoke`, `npm run test:audit-chain`, `npm run deploy:check`, `docker build .`, `docker compose -f docker-compose.prod.yml config` を実行する。
 
 ## Docker off-host validation
 - ローカルに Docker がない場合は repo fail とみなさず、`environment limitation` として記録する。

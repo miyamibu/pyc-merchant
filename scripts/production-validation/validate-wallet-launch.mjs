@@ -29,8 +29,11 @@ try {
   );
 
   assert.equal(publicInvoice.status, 200);
-  assert.equal(publicInvoice.data.wallet_adapter.available, true);
-  assert.equal(publicInvoice.data.wallet_adapter.status, "ready");
+  assert.equal(publicInvoice.data.wallet_adapter.available, false);
+  assert.equal(publicInvoice.data.wallet_adapter.status, "transaction_session_not_implemented");
+  assert.equal(publicInvoice.data.wallet_adapter.capabilities.walletconnect_transaction_session, "not_implemented");
+  assert.equal(publicInvoice.data.wallet_adapter.capabilities.eip681_uri, "implemented");
+  assert.equal(publicInvoice.data.wallet_adapter.capabilities.manual_copy_fallback, "implemented");
   assert.match(publicInvoice.data.payment_uri, /^ethereum:/);
   assert.equal(
     publicInvoice.data.wallet_deeplink,
@@ -40,8 +43,8 @@ try {
 
   const mobileHtml = fs.readFileSync(path.join(cwd, "public/mobile.html"), "utf8");
   assert.match(mobileHtml, /ウォレットで支払う/);
-  assert.match(mobileHtml, /手動送金を表示/);
-  assert.match(mobileHtml, /支払い情報をコピー/);
+  assert.match(mobileHtml, /手動送金を表示|手動送金（代替）/);
+  assert.match(mobileHtml, /id="copyInfoBtn"[\s\S]*>[\s\S]*コピー[\s\S]*<\/button>/);
   assert.match(mobileHtml, /支払いネットワーク/);
   assert.match(mobileHtml, /支払い先/);
 
@@ -56,6 +59,7 @@ try {
       {
         status: "pass",
         checks: {
+          wallet_adapter: publicInvoice.data.wallet_adapter,
           payment_uri: publicInvoice.data.payment_uri,
           wallet_deeplink: publicInvoice.data.wallet_deeplink,
           wallet_url: publicInvoice.data.wallet_url,

@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
+export const OFFICIAL_JPYC_CONTRACT = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
+
 function randomPort() {
   return 43000 + Math.floor(Math.random() * 10000);
 }
@@ -19,7 +21,8 @@ export function baseServerEnv(overrides = {}) {
     SERVICE_INGEST_SECRET: "b".repeat(48),
     METRICS_SECRET: "c".repeat(48),
     CHAIN_ID: "137",
-    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+    TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
+    APPROVED_JPYC_TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
     RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
     TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
@@ -48,7 +51,7 @@ export function baseServerEnv(overrides = {}) {
 export function productionServerEnv(overrides = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "jpyc-terminal-prod-test-"));
   const port = overrides.APP_PORT ? Number(overrides.APP_PORT) : randomPort();
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = OFFICIAL_JPYC_CONTRACT;
   return {
     APP_ENV: "production",
     APP_PORT: String(port),
@@ -197,14 +200,14 @@ export function authHeaders(token, extra = {}) {
   return { authorization: `Bearer ${token}`, ...extra };
 }
 
-export async function createInvoice(baseUrl, token, amount, idem = `inv-${Date.now()}`) {
+export async function createInvoice(baseUrl, token, amount, idem = `inv-${Date.now()}`, paymentChainId = "137") {
   return apiRequest(baseUrl, "/api/v1/invoices", {
     method: "POST",
     headers: authHeaders(token, {
       "content-type": "application/json",
       "idempotency-key": idem,
     }),
-    body: JSON.stringify({ amount_jpy: amount }),
+    body: JSON.stringify({ amount_jpy: amount, payment_chain_id: paymentChainId }),
   });
 }
 

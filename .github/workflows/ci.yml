@@ -61,7 +61,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.17.0
           cache: npm
 
       - name: Install
@@ -72,9 +72,9 @@ jobs:
 
       - name: Prepare safe compose env
         run: |
-          docker pull node:20-bookworm-slim
+          docker pull node:24.17.0-bookworm-slim
           docker pull nginx:1.27-alpine
-          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:20-bookworm-slim)"
+          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:24.17.0-bookworm-slim)"
           NGINX_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' nginx:1.27-alpine)"
           cp .env.production.example .env.production
           NODE_IMAGE="$NODE_IMAGE" NGINX_IMAGE="$NGINX_IMAGE" node -e '
@@ -174,7 +174,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.17.0
           cache: npm
 
       - name: Install
@@ -185,9 +185,9 @@ jobs:
 
       - name: Prepare safe compose env
         run: |
-          docker pull node:20-bookworm-slim
+          docker pull node:24.17.0-bookworm-slim
           docker pull nginx:1.27-alpine
-          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:20-bookworm-slim)"
+          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:24.17.0-bookworm-slim)"
           NGINX_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' nginx:1.27-alpine)"
           cp .env.production.example .env.production
           NODE_IMAGE="$NODE_IMAGE" NGINX_IMAGE="$NGINX_IMAGE" node -e '
@@ -234,7 +234,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.17.0
           cache: npm
 
       - name: Install
@@ -243,9 +243,9 @@ jobs:
       - name: Prepare release gate environment
         run: |
           mkdir -p "$(dirname "$DB_PATH")" "$BACKUP_DIR" "$PRODUCTION_EVIDENCE_ROOT"
-          docker pull node:20-bookworm-slim
+          docker pull node:24.17.0-bookworm-slim
           docker pull nginx:1.27-alpine
-          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:20-bookworm-slim)"
+          NODE_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' node:24.17.0-bookworm-slim)"
           NGINX_IMAGE="$(docker image inspect --format='{{index .RepoDigests 0}}' nginx:1.27-alpine)"
           cp .env.production.example .env.production
           NODE_IMAGE="$NODE_IMAGE" NGINX_IMAGE="$NGINX_IMAGE" node -e '
@@ -270,14 +270,14 @@ jobs:
           fi
           echo "commercial:gate failed closed as expected with status ${STATUS}"
 
-      - name: Assert limited gate fails closed without evidence or waiver
+      - name: Assert limited gate fails closed without evidence
         run: |
           set +e
           npm run limited:gate
           STATUS=$?
           set -e
           if [ "$STATUS" -eq 0 ]; then
-            echo "::error::limited:gate unexpectedly passed without required evidence or signed waiver"
+            echo "::error::limited:gate unexpectedly passed without required evidence"
             exit 1
           fi
           echo "limited:gate failed closed as expected with status ${STATUS}"

@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { buildWalletLaunchPayload } from "../../src/wallet-adapter.mjs";
+import { parseEnabledPaymentChainIds } from "../../src/jpyc-contract-policy.mjs";
 
 function parseArgs(argv) {
   const args = new Map();
@@ -44,6 +45,35 @@ function boolFlag(value) {
 
 function normalizeAddress(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+const PLACEHOLDER_WORDS = [
+  "example.com",
+  "localhost",
+  "127.0.0.1",
+  "placeholder",
+  "draft",
+  "dev-",
+  "todo",
+  "tbd",
+  "replace",
+  "replace_with",
+];
+
+function isPlaceholderLike(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return true;
+  return PLACEHOLDER_WORDS.some((word) => raw.includes(word));
+}
+
+function isPublicApprovedHttpsUrl(value) {
+  if (isPlaceholderLike(value)) return false;
+  try {
+    const parsed = new URL(String(value || ""));
+    return parsed.protocol === "https:" && !isPlaceholderLike(parsed.hostname);
+  } catch (_error) {
+    return false;
+  }
 }
 
 function ensure(condition, message, details = {}) {
@@ -122,9 +152,12 @@ async function main() {
       .split(",")
       .map((value) => value.trim().replace(/\/$/, ""))
       .filter(Boolean);
-    const chainId = String(env.CHAIN_ID || "137").trim();
-    const tokenContract = normalizeAddress(env.TOKEN_CONTRACT);
+	    const chainId = String(env.CHAIN_ID || "137").trim();
+    const enabledChainIds = parseEnabledPaymentChainIds(env.ENABLED_PAYMENT_CHAIN_IDS || "137");
+	    const tokenContract = normalizeAddress(env.TOKEN_CONTRACT);
     const approvedTokenContract = normalizeAddress(env.APPROVED_JPYC_TOKEN_CONTRACT);
+    const officialJpycContract = "0xe7c3d8c9a439fede00d2600032d5db0be71c3c29";
+    const supportedChainIds = new Set(["1", "43114", "137"]);
     const rpcUrls = String(env.RPC_URLS || "")
       .split(",")
       .map((value) => value.trim())
@@ -135,11 +168,23 @@ async function main() {
       actual: appEnv,
     });
 
-    ensure(chainId === "137", "CHAIN_ID must be 137", { actual: chainId });
-    record("chain_id_polygon", true, { value: chainId });
+	    ensure(supportedChainIds.has(chainId), "CHAIN_ID must be one of 1, 43114, 137", { actual: chainId });
+	    record("chain_id_supported_jpyc", true, { value: chainId });
+    ensure(enabledChainIds.includes(chainId), "CHAIN_ID must be included in ENABLED_PAYMENT_CHAIN_IDS", {
+      chain_id: chainId,
+      enabled_chain_ids: enabledChainIds,
+    });
+    ensure(enabledChainIds.every((id) => supportedChainIds.has(id)), "ENABLED_PAYMENT_CHAIN_IDS must only contain supported JPYC chain IDs", {
+      enabled_chain_ids: enabledChainIds,
+    });
+    record("enabled_payment_chain_allowlist", true, { enabled_chain_ids: enabledChainIds });
 
     if (approvedTokenContract) {
-      ensure(tokenContract === approvedTokenContract, "TOKEN_CONTRACT must match APPROVED_JPYC_TOKEN_CONTRACT", {
+      ensure(tokenContract === officialJpycContract, "TOKEN_CONTRACT must match official funds-transfer JPYC contract", {
+        token_contract: tokenContract,
+        official_jpyc_contract: officialJpycContract,
+      });
+      ensure(approvedTokenContract === officialJpycContract, "APPROVED_JPYC_TOKEN_CONTRACT must match official funds-transfer JPYC contract", {
         token_contract: tokenContract,
         approved_jpyc_token_contract: approvedTokenContract,
       });
@@ -149,28 +194,34 @@ async function main() {
       record("token_contract_fixed", true, { skipped: true, reason: "approved_token_not_configured" });
     }
 
+    if (productionChecks) {
+      ensure(Number(env.TOKEN_DECIMALS || "18") === 18, "TOKEN_DECIMALS must be 18 for production/commercial JPYC transfers", {
+        token_decimals: env.TOKEN_DECIMALS || "",
+      });
+      ensure(String(env.JPYC_BASE_UNIT_SCALE || "1000000") === "1000000", "JPYC_BASE_UNIT_SCALE must be 1000000 for app accounting scale", {
+        jpyc_base_unit_scale: env.JPYC_BASE_UNIT_SCALE || "",
+      });
+      record("token_decimals_and_app_scale", true, { token_decimals: 18, jpyc_base_unit_scale: "1000000" });
+    } else {
+      record("token_decimals_and_app_scale", true, { skipped: true, reason: "not production/commercial/limited" });
+    }
+
     if (productionChecks && (!allowEmpty || appHost)) {
-      const parsed = new URL(appHost);
-      ensure(parsed.protocol === "https:", "APP_HOST must use https", { value: appHost });
-      ensure(!/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), "APP_HOST must use a public FQDN", { hostname: parsed.hostname });
+      ensure(isPublicApprovedHttpsUrl(appHost), "APP_HOST must use an approved public HTTPS FQDN", { value: appHost });
       record("app_host_https_fqdn", true, { value: appHost });
     } else {
       record("app_host_https_fqdn", true, { skipped: true, reason: "allow-empty" });
     }
 
     if (productionChecks && (!allowEmpty || publicBaseUrl)) {
-      const parsed = new URL(publicBaseUrl);
-      ensure(parsed.protocol === "https:", "PUBLIC_BASE_URL must use https", { value: publicBaseUrl });
-      ensure(!/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), "PUBLIC_BASE_URL must use a public FQDN", { hostname: parsed.hostname });
+      ensure(isPublicApprovedHttpsUrl(publicBaseUrl), "PUBLIC_BASE_URL must use an approved public HTTPS FQDN", { value: publicBaseUrl });
       record("public_base_url_https_fqdn", true, { value: publicBaseUrl });
     } else {
       record("public_base_url_https_fqdn", true, { skipped: true, reason: "allow-empty" });
     }
 
     if (productionChecks && (!allowEmpty || payBaseUrl)) {
-      const parsed = new URL(payBaseUrl);
-      ensure(parsed.protocol === "https:", "PAY_BASE_URL must use https", { value: payBaseUrl });
-      ensure(!/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), "PAY_BASE_URL must use a public FQDN", { hostname: parsed.hostname });
+      ensure(isPublicApprovedHttpsUrl(payBaseUrl), "PAY_BASE_URL must use an approved public HTTPS FQDN", { value: payBaseUrl });
       record("pay_base_url_https_fqdn", true, { value: payBaseUrl });
     } else {
       record("pay_base_url_https_fqdn", true, { skipped: true, reason: "allow-empty" });
@@ -203,13 +254,12 @@ async function main() {
 	      public_link_grace_sec: publicLinkGraceSec,
 	    });
 	    record("public_payment_link_grace_short", true, { public_link_grace_sec: publicLinkGraceSec });
-		    if (policyConfigRequired) {
+	    if (policyConfigRequired) {
 		      for (const key of ["TERMS_URL", "PRIVACY_URL", "REFUND_POLICY_URL"]) {
-		        const parsed = new URL(String(env[key] || ""));
-		        ensure(parsed.protocol === "https:" && !/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), `${key} must be public https`, { value: env[key] || "" });
+		        ensure(isPublicApprovedHttpsUrl(env[key]), `${key} must be an approved public HTTPS URL`, { value: env[key] || "" });
 		      }
 		      for (const key of ["TERMS_VERSION", "PRIVACY_VERSION", "REFUND_POLICY_VERSION"]) {
-		        ensure(String(env[key] || "").trim() && !/draft|placeholder|todo|tbd/i.test(String(env[key] || "")), `${key} must be non-draft`, { value: env[key] || "" });
+		        ensure(!isPlaceholderLike(env[key]), `${key} must be non-placeholder`, { value: env[key] || "" });
 		      }
 		      record("policy_config_public_and_versioned", true, { required: true });
 		    } else {

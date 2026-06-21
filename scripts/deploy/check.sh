@@ -17,11 +17,21 @@ bash ./scripts/deploy/preflight.sh .env.production.example --allow-empty
 node ./scripts/production-validation/validate-production-config.mjs --env-file .env.production.example --allow-empty --skip-rpc >/dev/null
 node ./scripts/production-validation/validate-dependency-docker-hygiene.mjs --skip-docker true >/dev/null
 
-if command -v docker >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_STATUS=0
+  COMPOSE_CMD=()
+  while IFS= read -r part; do
+    COMPOSE_CMD+=("$part")
+  done < <(node scripts/deploy/resolve-compose.mjs --print-lines) || COMPOSE_STATUS=$?
+  if [ "$COMPOSE_STATUS" -ne 0 ] || [ "${#COMPOSE_CMD[@]}" -eq 0 ]; then
+    node scripts/deploy/resolve-compose.mjs --json >&2 || true
+    echo "DOCKER_COMPOSE_UNAVAILABLE: install or enable the official Docker Compose plugin or docker-compose." >&2
+    exit 2
+  fi
   if [ -f .env.production ]; then
-    docker compose --env-file .env.production -f docker-compose.prod.yml config >/dev/null
+    "${COMPOSE_CMD[@]}" --env-file .env.production -f docker-compose.prod.yml config >/dev/null
   else
-    docker compose -f docker-compose.prod.yml config >/dev/null
+    "${COMPOSE_CMD[@]}" --env-file .env.production.example -f docker-compose.prod.yml config --no-env-resolution >/dev/null
   fi
 fi
 

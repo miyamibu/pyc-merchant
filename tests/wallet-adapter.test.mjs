@@ -22,9 +22,18 @@ test("reown adapter requires feature flag and project id", () => {
   assert.equal(missingId.available, false);
   assert.equal(missingId.status, "missing_project_id");
 
-  const enabled = createWalletAdapter({ WALLET_ADAPTER_TYPE: "reown", ENABLE_REOWN: "true", REOWN_PROJECT_ID: "real-project-id" });
+  const enabled = createWalletAdapter({
+    WALLET_ADAPTER_TYPE: "reown",
+    ENABLE_REOWN: "true",
+    REOWN_PROJECT_ID: "real-project-id",
+    WALLETCONNECT_TRANSACTION_SESSION_IMPLEMENTED: "true",
+  });
   assert.equal(enabled.available, true);
   assert.equal(enabled.status, "ready");
+
+  const falseReady = createWalletAdapter({ WALLET_ADAPTER_TYPE: "reown", ENABLE_REOWN: "true", REOWN_PROJECT_ID: "real-project-id" });
+  assert.equal(falseReady.available, false);
+  assert.equal(falseReady.status, "transaction_session_not_implemented");
 });
 
 test("wallet error classification keeps known categories", () => {
@@ -55,6 +64,7 @@ test("buildWalletLaunchPayload expands deeplink template and preserves copy fall
       WALLET_ADAPTER_TYPE: "reown",
       ENABLE_REOWN: "true",
       REOWN_PROJECT_ID: "real-project-id",
+      WALLETCONNECT_TRANSACTION_SESSION_IMPLEMENTED: "true",
       WALLET_HELP_URL: "https://wallet.example/help",
       WALLET_DEEPLINK_TEMPLATE: "hashport://pay?uri={{payment_uri_encoded}}&chain={{chain_id}}&token={{token_symbol_encoded}}",
       SUPPORTED_WALLETS: "HashPort Wallet,WalletConnect",
@@ -109,4 +119,25 @@ test("buildWalletLaunchPayload falls back to payment URI without deeplink templa
   assert.equal(payload.wallet_url, payload.payment_uri);
   assert.equal(payload.wallet_help_url, "https://walletconnect.com/");
   assert.equal(payload.wallet_adapter.status, "mock_only");
+});
+
+test("supported wallet display excludes WalletConnect when transaction session is not implemented", () => {
+  const payload = buildWalletLaunchPayload({
+    env: {
+      WALLET_ADAPTER_TYPE: "reown",
+      ENABLE_REOWN: "true",
+      REOWN_PROJECT_ID: "real-project-id",
+      SUPPORTED_WALLETS: "HashPort Wallet,WalletConnect,Injected Wallet",
+    },
+    chainId: "137",
+    network: "Polygon",
+    tokenSymbol: "JPYC",
+    tokenContract: "0x1111111111111111111111111111111111111111",
+    tokenDecimals: 18,
+    receiveAddress: "0x2222222222222222222222222222222222222222",
+    expectedAmountAtomic: "500000000000000000000",
+  });
+
+  assert.equal(payload.wallet_adapter.status, "transaction_session_not_implemented");
+  assert.deepEqual(payload.supported_wallets, ["HashPort Wallet", "Injected Wallet"]);
 });

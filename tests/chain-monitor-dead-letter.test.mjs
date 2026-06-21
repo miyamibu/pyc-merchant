@@ -7,12 +7,13 @@ import { pathToFileURL } from "node:url";
 import { startMockRpcServer } from "./helpers/mock-rpc.mjs";
 
 const ROOT = process.cwd();
+const OFFICIAL_JPYC_CONTRACT = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 
 test("chain monitor caches block timestamps per block within a scan cycle", () => {
   const source = readFileSync(path.join(ROOT, "src/chain-monitor.mjs"), "utf8");
-  assert.match(source, /const blockTimestampCache = new Map\(\)/);
-  assert.match(source, /blockTimestampCache\.has\(normalizedBlockNumber\)/);
-  assert.match(source, /blockTimestampIso\(log\.blockNumber\)/);
+  assert.match(source, /blockTimestampCache: new Map\(\)/);
+  assert.match(source, /chain\.blockTimestampCache\.has\(normalizedBlockNumber\)/);
+  assert.match(source, /blockTimestampIso\(log\.blockNumber, chain\)/);
 });
 
 test("missing block timestamp dead letters keep recoverable ingest payload", () => {
@@ -32,7 +33,7 @@ test("missing block timestamp dead letters keep recoverable ingest payload", () 
   ]) {
     assert.match(source, new RegExp(field));
   }
-  assert.match(source, /recoveredBlockTimestamp = await blockTimestampIso\(payload\.block_number\)/);
+  assert.match(source, /recoveredBlockTimestamp = await blockTimestampIso\(/);
   const selectedIndex = source.indexOf("const selected = selectInvoiceForLog");
   const unmatchedIndex = source.indexOf("if (!selected.invoice)", selectedIndex);
   const missingTimestampIndex = source.indexOf("if (!blockTimestamp)", selectedIndex);
@@ -57,7 +58,7 @@ test("missing block timestamp dead letter retries recover after block timestamp 
       amount_jpyc_base: "1000000",
       amount_jpyc: "1",
       chain_id: "137",
-      token_contract: "0x1111111111111111111111111111111111111111",
+      token_contract: OFFICIAL_JPYC_CONTRACT,
       to_address: "0x2222222222222222222222222222222222222222",
       from_address: "0x3333333333333333333333333333333333333333",
       confirmations: 3,
@@ -127,7 +128,8 @@ async function loadMonitorModule(extraEnv = {}) {
     APP_HOST: "http://127.0.0.1:49999",
     DB_PATH: path.join(dir, "monitor.db"),
     CHAIN_ID: "137",
-    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+    TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
+    APPROVED_JPYC_TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
     TOKEN_DECIMALS: "6",
     JPYC_BASE_UNIT_SCALE: "1000000",
     RPC_URLS: "http://127.0.0.1:8545",
@@ -185,7 +187,7 @@ test("SR-07 dead-letter retry success resolves pending rows", async () => {
       invoice_id: "inv-2",
       amount_jpyc: "1000",
       chain_id: "137",
-      token_contract: "0x1111111111111111111111111111111111111111",
+      token_contract: OFFICIAL_JPYC_CONTRACT,
       to_address: "0x2222222222222222222222222222222222222222",
       confirmations: 1,
       tx_hash: "0x" + "b".repeat(64),
@@ -224,7 +226,7 @@ test("SR-07 dead-letter retry abandons after max retries", async () => {
       invoice_id: "inv-3",
       amount_jpyc: "1000",
       chain_id: "137",
-      token_contract: "0x1111111111111111111111111111111111111111",
+      token_contract: OFFICIAL_JPYC_CONTRACT,
       to_address: "0x2222222222222222222222222222222222222222",
       confirmations: 1,
       tx_hash: "0x" + "c".repeat(64),
@@ -268,7 +270,7 @@ test("SR-07 dead-letter transient retry failure stays pending until max retries"
       invoice_id: "inv-4",
       amount_jpyc: "1000",
       chain_id: "137",
-      token_contract: "0x1111111111111111111111111111111111111111",
+      token_contract: OFFICIAL_JPYC_CONTRACT,
       to_address: "0x2222222222222222222222222222222222222222",
       confirmations: 1,
       tx_hash: "0x" + "d".repeat(64),

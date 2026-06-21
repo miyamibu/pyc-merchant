@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JPYC Merchant Ops Release Manifest",
+  "type": "object",
+  "required": [
+    "release_id",
+    "verdict",
+    "source_hash",
+    "issued_at",
+    "pending_external_evidence"
+  ],
+  "properties": {
+    "release_id": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "NO_GO",
+        "LIMITED_PRODUCTION_GO"
+      ]
+    },
+    "source_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "docker_image_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "approver_signatures": {
+      "type": "array"
+    },
+    "pending_external_evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 
 const ROOT = process.cwd();
+const OFFICIAL_JPYC_CONTRACT = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 
 function runNode(scriptPath, args = [], env = {}) {
   return new Promise((resolve) => {
@@ -34,21 +35,21 @@ test("validate-production-config passes for production-safe env with skip-rpc", 
     ["--skip-rpc"],
     {
       APP_ENV: "production",
-      APP_HOST: "https://terminal.example.com",
-      PUBLIC_BASE_URL: "https://terminal.example.com",
-      PAY_BASE_URL: "https://terminal.example.com",
+      APP_HOST: "https://terminal.miyamibu.jp",
+      PUBLIC_BASE_URL: "https://terminal.miyamibu.jp",
+      PAY_BASE_URL: "https://terminal.miyamibu.jp",
       INTERNAL_API_BASE_URL: "http://app:4173",
-      CORS_ALLOW_ORIGINS: "https://terminal.example.com",
+      CORS_ALLOW_ORIGINS: "https://terminal.miyamibu.jp",
       CHAIN_ID: "137",
-      TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
-      APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+      TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
+      APPROVED_JPYC_TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
       TOKEN_DECIMALS: "18",
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
       WALLET_DEEPLINK_TEMPLATE: "wallet://open?uri={{payment_uri_encoded}}",
       PUBLIC_LINK_GRACE_SEC: "900",
-      TERMS_URL: "https://terminal.example.com/legal/terms",
-      PRIVACY_URL: "https://terminal.example.com/legal/privacy",
-      REFUND_POLICY_URL: "https://terminal.example.com/legal/refund",
+      TERMS_URL: "https://terminal.miyamibu.jp/legal/terms",
+      PRIVACY_URL: "https://terminal.miyamibu.jp/legal/privacy",
+      REFUND_POLICY_URL: "https://terminal.miyamibu.jp/legal/refund",
       TERMS_VERSION: "terms-2026-05",
       PRIVACY_VERSION: "privacy-2026-05",
       REFUND_POLICY_VERSION: "refund-2026-05",
@@ -57,7 +58,7 @@ test("validate-production-config passes for production-safe env with skip-rpc", 
   assert.equal(result.code, 0, result.stdout || result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, true);
-  assert.ok(payload.checks.some((row) => row.name === "chain_id_polygon" && row.ok === true));
+  assert.ok(payload.checks.some((row) => row.name === "chain_id_supported_jpyc" && row.ok === true));
 });
 
 test("validate-production-config fails on chain drift", async () => {
@@ -66,19 +67,19 @@ test("validate-production-config fails on chain drift", async () => {
     ["--skip-rpc"],
     {
       APP_ENV: "production",
-      APP_HOST: "https://terminal.example.com",
-      PUBLIC_BASE_URL: "https://terminal.example.com",
-      PAY_BASE_URL: "https://terminal.example.com",
+      APP_HOST: "https://terminal.miyamibu.jp",
+      PUBLIC_BASE_URL: "https://terminal.miyamibu.jp",
+      PAY_BASE_URL: "https://terminal.miyamibu.jp",
       INTERNAL_API_BASE_URL: "http://app:4173",
-      CHAIN_ID: "1",
-      TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
-      APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+      CHAIN_ID: "999",
+      TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
+      APPROVED_JPYC_TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
       TOKEN_DECIMALS: "18",
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
       PUBLIC_LINK_GRACE_SEC: "900",
-      TERMS_URL: "https://terminal.example.com/legal/terms",
-      PRIVACY_URL: "https://terminal.example.com/legal/privacy",
-      REFUND_POLICY_URL: "https://terminal.example.com/legal/refund",
+      TERMS_URL: "https://terminal.miyamibu.jp/legal/terms",
+      PRIVACY_URL: "https://terminal.miyamibu.jp/legal/privacy",
+      REFUND_POLICY_URL: "https://terminal.miyamibu.jp/legal/refund",
       TERMS_VERSION: "terms-2026-05",
       PRIVACY_VERSION: "privacy-2026-05",
       REFUND_POLICY_VERSION: "refund-2026-05",
@@ -87,7 +88,7 @@ test("validate-production-config fails on chain drift", async () => {
   assert.notEqual(result.code, 0);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, false);
-  assert.match(JSON.stringify(payload), /CHAIN_ID must be 137/);
+  assert.match(JSON.stringify(payload), /CHAIN_ID must be one of 1, 43114, 137/);
 });
 
 test("validate-production-config does not require policy URLs for ordinary dev validation", async () => {
@@ -120,10 +121,10 @@ test("validate-evidence-sanitization rejects leaked bearer token", async () => {
 
 test("validate-evidence-sanitization allows public token contract evidence", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "jpyc-evidence-token-contract-"));
-  fs.writeFileSync(path.join(dir, "contract.json"), JSON.stringify({ token_contract: "0x1111111111111111111111111111111111111111" }), "utf8");
+  fs.writeFileSync(path.join(dir, "contract.json"), JSON.stringify({ token_contract: OFFICIAL_JPYC_CONTRACT }), "utf8");
   const result = await runNode("scripts/production-validation/validate-evidence-sanitization.mjs", ["--evidence-dir", dir], {
     APP_SECRET: "x".repeat(48),
-    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+    TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
   });
   assert.equal(result.code, 0, result.stdout || result.stderr);
   const payload = JSON.parse(result.stdout);

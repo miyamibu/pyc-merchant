@@ -35,6 +35,6 @@ test("store settings reflect configured supported wallets and wallet adapter", a
   });
 
   assert.equal(settings.status, 200);
-  assert.deepEqual(settings.data.supported_wallets, ["HashPort Wallet", "WalletConnect", "Injected Wallet"]);
-  assert.equal(settings.data.wallet_adapter?.status, "ready");
+  assert.deepEqual(settings.data.supported_wallets, ["HashPort Wallet", "Injected Wallet"]);
+  assert.equal(settings.data.wallet_adapter?.status, "transaction_session_not_implemented");
 });

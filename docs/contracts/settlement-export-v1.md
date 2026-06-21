@@ -13,7 +13,8 @@ Canonical contract summary for `Settlement Export Contract v1`.
 - `provider_settled_unallocated` is for provider batch settlement evidence that cannot be cleanly allocated in the export snapshot.
 - Provider `voided` evidence remains distinct from staff `cancelled`.
 - Every exported row must include the traceability properties defined by the schema, even when a business event has no review/refund/provider reference and the value is `null` or an empty array.
-- Required trace fields include `export_reference`, settlement/export row identity, invoice identity, checkout session/store/terminal/operator identity, payment attempt and primary transfer evidence, review/refund evidence fields, audit refs, external sync refs, and `source_ledger_snapshot_hash`.
+- Required trace fields include `export_reference`, settlement/export row identity, invoice identity, checkout session/store/terminal/operator identity, chain/token/recipient identity, payment attempt and primary transfer evidence, review/refund evidence fields, audit refs, external sync refs, and `source_ledger_snapshot_hash`.
+- `chain_id`, `network`, `token_contract`, and `recipient_address` must identify the exact JPYC rail used. For funds-transfer JPYC, `token_contract` must be `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29`; JPYC Prepaid/v2 contract `0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB` is not valid for this export.
 - A paid row must carry payment evidence through `primary_tx_hash` or `payment_attempt_ids`.
 - A review row must carry `review_case_id` and `review_reason_type`.
 - A refund row must carry `refund_request_id` and `refund_tx_hash` when the refund has on-chain execution evidence.

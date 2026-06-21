@@ -58,6 +58,7 @@ test("server security integration flows", async (t) => {
       }),
       body: JSON.stringify({
         amount_jpy: 1000,
+        payment_chain_id: "137",
         chain_id: "1",
       }),
     });
@@ -319,7 +320,7 @@ test("server security integration flows", async (t) => {
         "content-type": "application/json",
         "idempotency-key": "=EVIL()",
       }),
-      body: JSON.stringify({ amount_jpy: 1600 }),
+      body: JSON.stringify({ amount_jpy: 1600, payment_chain_id: "137" }),
     });
     assert.equal(invoice.status, 201);
 

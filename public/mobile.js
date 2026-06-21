@@ -3,6 +3,36 @@ const invoiceId = query.get("invoiceId");
 const sig = query.get("sig");
 const exp = query.get("exp");
 const nonce = query.get("nonce");
+const SETTINGS_KEY = "jpyc_terminal_settings";
+const FONT_SIZE_OPTIONS = new Set(["small", "standard", "large"]);
+
+function readDisplayFontSizeSetting() {
+  const querySize = query.get("fontSize") || query.get("displayFontSize");
+  if (FONT_SIZE_OPTIONS.has(querySize)) return querySize;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    return FONT_SIZE_OPTIONS.has(parsed?.display_font_size) ? parsed.display_font_size : "standard";
+  } catch (_error) {
+    return "standard";
+  }
+}
+
+function applyDisplayFontSizeSetting() {
+  document.body.dataset.terminalFontSize = readDisplayFontSizeSetting();
+}
+
+applyDisplayFontSizeSetting();
+
+function receiptFontStepPx() {
+  const size = readDisplayFontSizeSetting();
+  if (size === "small") return -1;
+  if (size === "large") return 2;
+  return 0;
+}
+
+function steppedReceiptPx(baseSize) {
+  return `${baseSize + receiptFontStepPx()}px`;
+}
 
 const POLICY_URLS = {
   terms: "",
@@ -23,17 +53,58 @@ const INVOICE_STATUS_ALIASES = Object.freeze({
 const POLL_INTERVAL_MS = 5000;
 const FINAL_STATUSES = new Set(["paid", "settled", "review_required", "expired", "cancelled"]);
 const WAITING_STATUSES = new Set(["issued", "open", "payment_detected", "confirming"]);
+const PAYMENT_INITIATION_STATUSES = new Set(["issued", "open"]);
+const STAFF_STATUSES = new Set(["review_required", "expired", "cancelled"]);
 
 const STATUS_COPY = {
   issued: { label: "支払い待ち", pill: "s-blue", title: "送金をお待ちしています" },
   open: { label: "支払い待ち", pill: "s-blue", title: "送金をお待ちしています" },
-  payment_detected: { label: "確認中", pill: "s-blue", title: "支払いを確認中です" },
-  confirming: { label: "確認中", pill: "s-blue", title: "支払いを確認中です" },
+  payment_detected: { label: "確認中", pill: "s-blue", title: "支払いを確認中です。追加で送金しないでください。この画面を閉じずにお待ちください。" },
+  confirming: { label: "確認中", pill: "s-blue", title: "支払いを確認中です。追加で送金しないでください。この画面を閉じずにお待ちください。" },
   paid: { label: "支払い確認済み", pill: "s-green", title: "支払いを確認しました" },
   settled: { label: "確定済み", pill: "s-green", title: "支払いは確定済みです" },
   review_required: { label: "確認が必要", pill: "s-yellow", title: "確認が必要な支払いです。店舗スタッフにお声がけください。" },
   expired: { label: "期限切れ", pill: "s-red", title: "この請求は期限切れです" },
   cancelled: { label: "無効", pill: "s-red", title: "この請求は無効です" },
+};
+
+const AUTO_STATUS_META = {
+  issued: {
+    pill: "s-blue",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M12 6v6l4 2" /><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z" /></svg>',
+  },
+  open: {
+    pill: "s-blue",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M12 6v6l4 2" /><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z" /></svg>',
+  },
+  payment_detected: {
+    pill: "s-blue",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M12 2v4" /><path d="M12 18v4" /><path d="m4.93 4.93 2.83 2.83" /><path d="m16.24 16.24 2.83 2.83" /><path d="M2 12h4" /><path d="M18 12h4" /></svg>',
+  },
+  confirming: {
+    pill: "s-blue",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M12 2v4" /><path d="M12 18v4" /><path d="m4.93 4.93 2.83 2.83" /><path d="m16.24 16.24 2.83 2.83" /><path d="M2 12h4" /><path d="M18 12h4" /></svg>',
+  },
+  paid: {
+    pill: "s-green",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M20 6 9 17l-5-5" /></svg>',
+  },
+  settled: {
+    pill: "s-green",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M20 6 9 17l-5-5" /><path d="M4 20h16" /></svg>',
+  },
+  review_required: {
+    pill: "s-yellow",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /></svg>',
+  },
+  expired: {
+    pill: "s-red",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M12 6v6l3 2" /><path d="M12 22a10 10 0 1 0-8.5-4.7" /><path d="m3 22 3-3 3 3" /></svg>',
+  },
+  cancelled: {
+    pill: "s-red",
+    icon: '<svg viewBox="0 0 24 24" focusable="false"><path d="M18 6 6 18" /><path d="m6 6 12 12" /><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z" /></svg>',
+  },
 };
 
 const state = {
@@ -45,36 +116,48 @@ const state = {
   manualRiskVisible: false,
   addressExpanded: false,
   manualActionHint: "",
-  consented: false,
-  consentRecordId: "",
+  policyAcknowledged: false,
+  policyAcknowledgementId: "",
 };
 
 const el = {
   liveStatus: document.getElementById("liveStatus"),
   errorBanner: document.getElementById("errorBanner"),
   errorBannerText: document.getElementById("errorBannerText"),
-  closeErrorBannerBtn: document.getElementById("closeErrorBannerBtn"),
+  errorBannerCloseBtn: document.getElementById("errorBannerCloseBtn"),
+  receiptView: document.getElementById("receiptView"),
+  mobilePayHeader: document.getElementById("mobilePayHeader"),
+  mobileSummaryCard: document.querySelector(".mobile-summary-card"),
+  amountHero: document.querySelector(".amount-hero"),
+  mobilePageWrap: document.querySelector(".mobile-surface .wrap") || document.querySelector(".wrap"),
+  mobileDisclosureStack: document.querySelector(".mobile-disclosure-stack:not(.receipt-disclosure-stack)"),
+  mobileAutoStatusCard: document.getElementById("mobileAutoStatusCard"),
+  mobileAutoStatusIcon: document.querySelector("#mobileAutoStatusCard .mobile-auto-status-icon"),
+  mobileAutoStatusTime: document.getElementById("mobileAutoStatusTime"),
   statusPill: document.getElementById("statusPill"),
   storeText: document.getElementById("storeText"),
   merchantTrustBadge: document.getElementById("merchantTrustBadge"),
   issuedAtText: document.getElementById("issuedAtText"),
   amountText: document.getElementById("amountText"),
   amountSubText: document.getElementById("amountSubText"),
+  mobileHeaderStoreName: document.getElementById("mobileHeaderStoreName"),
+  summaryNetworkText: document.getElementById("summaryNetworkText"),
+  summaryContractText: document.getElementById("summaryContractText"),
+  summaryStoreText: document.getElementById("summaryStoreText"),
   expiresText: document.getElementById("expiresText"),
   remainingText: document.getElementById("remainingText"),
   uxStateLabel: document.getElementById("uxStateLabel"),
   uxStateDetail: document.getElementById("uxStateDetail"),
   methodPanel: document.getElementById("methodPanel"),
   methodPanelText: document.getElementById("methodPanelText"),
+  customerActionCard: document.getElementById("customerActionCard"),
   customerActionBadge: document.getElementById("customerActionBadge"),
   customerActionTitle: document.getElementById("customerActionTitle"),
   customerActionBody: document.getElementById("customerActionBody"),
   customerActionList: document.getElementById("customerActionList"),
-  walletAvailabilityBadge: document.getElementById("walletAvailabilityBadge"),
   supportedWalletChips: document.getElementById("supportedWalletChips"),
-  walletSupportText: document.getElementById("walletSupportText"),
-  walletHelpLink: document.getElementById("walletHelpLink"),
   walletPayBtn: document.getElementById("walletPayBtn"),
+  walletDisabledReason: document.getElementById("walletDisabledReason"),
   showMethodsBtn: document.getElementById("showMethodsBtn"),
   copyInfoBtn: document.getElementById("copyInfoBtn"),
   networkText: document.getElementById("networkText"),
@@ -86,26 +169,36 @@ const el = {
   copyInvoiceBtn: document.getElementById("copyInvoiceBtn"),
   refreshBtn: document.getElementById("refreshBtn"),
   paymentConditionsCard: document.getElementById("paymentConditionsCard"),
-  paymentConditionsList: document.getElementById("paymentConditionsList"),
   paymentVerifyCard: document.getElementById("paymentVerifyCard"),
   verifyNetworkText: document.getElementById("verifyNetworkText"),
   verifyTokenText: document.getElementById("verifyTokenText"),
+  verifyTokenContractText: document.getElementById("verifyTokenContractText"),
   verifyAddressText: document.getElementById("verifyAddressText"),
   manualRiskText: document.getElementById("manualRiskText"),
+  policyConsentCheckbox: document.getElementById("policyConsentCheckbox"),
   toggleAddressBtn: document.getElementById("toggleAddressBtn"),
   receiptCard: document.getElementById("receiptCard"),
-  receiptStatusBadge: document.getElementById("receiptStatusBadge"),
+  receiptConfirmedText: document.getElementById("receiptConfirmedText"),
+  receiptConfirmedAt: document.getElementById("receiptConfirmedAt"),
+  receiptStatusText: document.getElementById("receiptStatusText"),
   receiptStoreName: document.getElementById("receiptStoreName"),
   receiptAmount: document.getElementById("receiptAmount"),
   receiptInvoiceId: document.getElementById("receiptInvoiceId"),
   receiptTxHash: document.getElementById("receiptTxHash"),
-  copyReceiptBtn: document.getElementById("copyReceiptBtn"),
-  consentGateSection: document.getElementById("consentGateSection"),
-  consentCheckbox: document.getElementById("consentCheckbox"),
-  consentLiveStatus: document.getElementById("consentLiveStatus"),
-  consentTermsLink: document.getElementById("consentTermsLink"),
-  consentPrivacyLink: document.getElementById("consentPrivacyLink"),
-  consentRefundLink: document.getElementById("consentRefundLink"),
+  receiptNetworkText: document.getElementById("receiptNetworkText"),
+  receiptDetailNetworkText: document.getElementById("receiptDetailNetworkText"),
+  receiptDetailContractText: document.getElementById("receiptDetailContractText"),
+  receiptDetailToText: document.getElementById("receiptDetailToText"),
+  downloadReceiptBtn: document.getElementById("downloadReceiptBtn"),
+  copyReceiptInvoiceBtn: document.getElementById("copyReceiptInvoiceBtn"),
+  copyReceiptTxBtn: document.getElementById("copyReceiptTxBtn"),
+  copyReceiptToBtn: document.getElementById("copyReceiptToBtn"),
+  showStaffBtn: document.getElementById("showStaffBtn"),
+  policyTermsLink: document.getElementById("policyTermsLink"),
+  policyPrivacyLink: document.getElementById("policyPrivacyLink"),
+  policyRefundLink: document.getElementById("policyRefundLink"),
+  paymentGuideDetails: document.querySelector(".payment-guide-details"),
+  technicalDetails: document.getElementById("technicalDetails"),
 };
 
 function announce(message) {
@@ -113,6 +206,7 @@ function announce(message) {
 }
 
 function showError(message) {
+  if (!el.errorBanner || !el.errorBannerText) return;
   if (!message) {
     el.errorBanner.classList.add("hidden");
     el.errorBannerText.textContent = "";
@@ -143,6 +237,15 @@ function getNetwork(invoice) {
   return String(invoice?.network || (invoice?.chain_id === "137" ? "Polygon" : invoice?.chain_id || "-"));
 }
 
+function getTokenContract(invoice) {
+  return String(invoice?.token_contract || invoice?.payment_chain?.token_contract_display || "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29");
+}
+
+function getContractSuffix(invoice) {
+  const contract = getTokenContract(invoice);
+  return contract.length > 10 ? `...${contract.slice(-5)}` : contract || "...C3c29";
+}
+
 function getReceiveAddress(invoice) {
   return String(invoice?.receive_address || invoice?.recipient_address || "");
 }
@@ -170,6 +273,7 @@ function renderChipGroup(host, values, fallback = "案内準備中") {
 }
 
 function setHelperLink(linkEl, href, label) {
+  if (!linkEl) return;
   if (typeof href === "string" && href.trim()) {
     linkEl.href = href.trim();
     linkEl.textContent = label;
@@ -178,6 +282,26 @@ function setHelperLink(linkEl, href, label) {
   }
   linkEl.classList.add("hidden");
   linkEl.removeAttribute("href");
+}
+
+function setPolicyLink(linkEl, href, label) {
+  if (!linkEl) return;
+  const url = typeof href === "string" ? href.trim() : "";
+  linkEl.textContent = url ? label : `${label}（準備中）`;
+  linkEl.setAttribute("aria-label", url ? `${label}（新しいタブで開く）` : `${label}は現在準備中です`);
+  if (url) {
+    linkEl.href = url;
+    linkEl.target = "_blank";
+    linkEl.rel = "noopener noreferrer";
+    linkEl.removeAttribute("aria-disabled");
+    linkEl.removeAttribute("title");
+    return;
+  }
+  linkEl.removeAttribute("href");
+  linkEl.removeAttribute("target");
+  linkEl.removeAttribute("rel");
+  linkEl.setAttribute("aria-disabled", "true");
+  linkEl.title = `${label}のURLはまだ設定されていません。`;
 }
 
 function middleEllipsis(value, head = 10, tail = 8) {
@@ -195,7 +319,13 @@ function formatRemaining(expiresAt) {
   const totalSec = Math.floor(remainMs / 1000);
   const mins = Math.floor(totalSec / 60);
   const secs = totalSec % 60;
-  return `残り ${String(mins)}分${String(secs).padStart(2, "0")}秒`;
+  return `残り ${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function isInvoiceExpired(invoice) {
+  const status = canonicalInvoiceStatus(invoice?.status);
+  if (status === "expired") return true;
+  return WAITING_STATUSES.has(status) && formatRemaining(invoice?.expires_at) === "期限切れです。";
 }
 
 function shouldPoll(status) {
@@ -228,8 +358,7 @@ function startRemainingTimer(invoice) {
   state.remainingTimer = setInterval(() => {
     updateRemainingAnnouncement(invoice.expires_at);
     if (formatRemaining(invoice.expires_at) === "期限切れです。") {
-      showError("この請求は期限切れです。送金せず、店舗スタッフに新しい請求を依頼してください。");
-      el.remainingText.classList.add("attention-pulse");
+      updateExpiredNotice(invoice);
     }
   }, 1000);
 }
@@ -245,12 +374,7 @@ function signedInvoicePath() {
   return `/api/v1/public/invoices/${encodeURIComponent(invoiceId)}?sig=${encodeURIComponent(sig)}&exp=${encodeURIComponent(exp)}&nonce=${encodeURIComponent(nonce)}`;
 }
 
-function signedPayPath() {
-  if (!invoiceId || !sig || !exp || !nonce) return null;
-  return `/api/v1/public/invoices/${encodeURIComponent(invoiceId)}/pay?sig=${encodeURIComponent(sig)}&exp=${encodeURIComponent(exp)}&nonce=${encodeURIComponent(nonce)}`;
-}
-
-function signedConsentPath() {
+function signedPolicyAcknowledgementPath() {
   if (!invoiceId || !sig || !exp || !nonce) return null;
   return `/api/v1/public/invoices/${encodeURIComponent(invoiceId)}/consent?sig=${encodeURIComponent(sig)}&exp=${encodeURIComponent(exp)}&nonce=${encodeURIComponent(nonce)}`;
 }
@@ -262,9 +386,9 @@ function initPolicyLinks() {
     privacy: policy.privacy_url || POLICY_URLS.privacy,
     refund: policy.refund_policy_url || POLICY_URLS.refund,
   };
-  if (el.consentTermsLink) el.consentTermsLink.href = urls.terms || "#";
-  if (el.consentPrivacyLink) el.consentPrivacyLink.href = urls.privacy || "#";
-  if (el.consentRefundLink) el.consentRefundLink.href = urls.refund || "#";
+  setPolicyLink(el.policyTermsLink, urls.terms, "利用規約");
+  setPolicyLink(el.policyPrivacyLink, urls.privacy, "プライバシー");
+  setPolicyLink(el.policyRefundLink, urls.refund, "返金ポリシー");
 }
 
 async function sha256Hex(value) {
@@ -286,11 +410,11 @@ async function displayedPolicyHash() {
   return sha256Hex(JSON.stringify(snapshot));
 }
 
-async function recordConsent() {
-  const path = signedConsentPath();
-  if (!path) throw new Error("同意記録URLが無効です。");
+async function recordPolicyAcknowledgement() {
+  const path = signedPolicyAcknowledgementPath();
+  if (!path) throw new Error("ポリシー確認記録URLが無効です。");
   const body = {
-    checked: true,
+    acknowledged: true,
     displayed_policy_hash: await displayedPolicyHash(),
     client_rendered_at: new Date().toISOString(),
   };
@@ -300,23 +424,17 @@ async function recordConsent() {
     body: JSON.stringify(body),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.consent_record_id) {
-    throw new Error(data?.error?.message || "サーバー同意記録に失敗しました。");
+  if (!response.ok || !data.policy_acknowledgement_id) {
+    throw new Error(data?.error?.message || "ポリシー確認記録に失敗しました。");
   }
-  state.consentRecordId = data.consent_record_id;
+  state.policyAcknowledgementId = data.policy_acknowledgement_id;
 }
 
-function renderConsentGate(invoice) {
-  const needsConsent = WAITING_STATUSES.has(canonicalInvoiceStatus(invoice?.status));
-  if (!el.consentGateSection) return;
-  el.consentGateSection.classList.toggle("hidden", !needsConsent);
-  if (!needsConsent) return;
-  if (el.consentCheckbox) el.consentCheckbox.checked = state.consented;
-  if (el.consentLiveStatus) {
-    el.consentLiveStatus.textContent = state.consented
-      ? "同意済みです。お支払い操作が可能です。"
-      : "利用規約・ポリシーをご確認のうえ、チェックを入れてください。";
-  }
+async function ensurePolicyAcknowledgementRecorded() {
+  if (state.policyAcknowledged && state.policyAcknowledgementId) return true;
+  await recordPolicyAcknowledgement();
+  state.policyAcknowledged = true;
+  return true;
 }
 
 function buildWalletLaunchTarget(invoice) {
@@ -392,36 +510,62 @@ function showManualRiskWarning(invoice) {
   announce("手動送金では金額、送金先、チェーンを必ず目視照合してください。");
 }
 
+function staffGuidanceMessage(invoice) {
+  const status = canonicalInvoiceStatus(invoice?.status);
+  if (status === "review_required") {
+    return "確認が必要な支払いです。追加送金せず、いまの状況・請求ID・支払い先を店舗スタッフに見せてください。";
+  }
+  if (status === "expired") {
+    return "この請求は期限切れです。送金せず、請求IDを店舗スタッフに見せて再発行を依頼してください。";
+  }
+  if (status === "cancelled") {
+    return "この請求は無効です。送金せず、店舗スタッフにこの画面を見せて新しい案内を受けてください。";
+  }
+  return "この画面を店舗スタッフに見せてください。";
+}
+
+function showStaffGuidance(invoice) {
+  if (isInvoiceExpired(invoice)) {
+    updateExpiredNotice(invoice);
+    setMethodPanel(false);
+    (el.mobileAutoStatusCard || el.mobileSummaryCard)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    showError("");
+    announce("この請求は期限切れです。送金せず、店舗スタッフに再発行を依頼してください。");
+    return;
+  }
+  setMethodPanel(false, "");
+  if (el.technicalDetails) el.technicalDetails.open = true;
+  const target = el.customerActionCard || el.mobileAutoStatusCard || el.technicalDetails;
+  target?.scrollIntoView({ behavior: "smooth", block: "center" });
+  showError("");
+  announce("店舗スタッフに見せる案内を表示しました");
+}
+
 function renderWalletSupport(invoice) {
+  if (!el.supportedWalletChips) {
+    return;
+  }
   const customerMode = invoice?.customer_payment_mode || {};
   if (customerMode.mode && customerMode.mode !== "wallet_qr") {
     renderChipGroup(el.supportedWalletChips, ["店頭端末でご案内"], "店頭端末でご案内");
-    el.walletAvailabilityBadge.textContent = "店頭案内";
-    el.walletSupportText.textContent = customerMode.body || "この会計は店頭端末でご案内します。";
-    el.walletHelpLink.classList.add("hidden");
-    el.walletHelpLink.removeAttribute("href");
     return;
   }
-  const launchTarget = buildWalletLaunchTarget(invoice);
-  const adapter = invoice?.wallet_adapter || {};
   const supportedWallets = Array.isArray(invoice?.supported_wallets) ? invoice.supported_wallets : [];
-  renderChipGroup(el.supportedWalletChips, supportedWallets, launchTarget ? "対応ウォレット確認中" : "手動送金も可能");
-
-  if (launchTarget) {
-    el.walletAvailabilityBadge.textContent = "起動導線あり";
-    el.walletSupportText.textContent = "メインボタンからウォレット起動を試せます。起動しない場合は支払い情報コピーか手動送金案内をご利用ください。";
-  } else if (adapter.reason) {
-    el.walletAvailabilityBadge.textContent = "手動案内";
-    el.walletSupportText.textContent = `自動起動が使えないため、手動送金をご案内します（${adapter.reason}）。`;
-  } else {
-    el.walletAvailabilityBadge.textContent = "コピー送金";
-    el.walletSupportText.textContent = "支払い情報をコピーして、お使いのウォレットから送金してください。";
-  }
-
-  setHelperLink(el.walletHelpLink, invoice?.wallet_help_url || "", "ウォレット案内を開く");
+  renderChipGroup(el.supportedWalletChips, supportedWallets, "確認中");
 }
 
 function renderCustomerAction(invoice) {
+  if (
+    !el.customerActionCard ||
+    !el.customerActionBadge ||
+    !el.customerActionTitle ||
+    !el.customerActionBody ||
+    !el.customerActionList
+  ) {
+    return;
+  }
+  const status = canonicalInvoiceStatus(invoice?.status) || "issued";
+  el.customerActionCard.classList.remove("hidden");
   const customerMode = invoice?.customer_payment_mode || {};
   if (customerMode.mode && customerMode.mode !== "wallet_qr") {
     el.customerActionBadge.textContent =
@@ -447,7 +591,6 @@ function renderCustomerAction(invoice) {
     state.manualActionHint = customerMode.body || "";
     return;
   }
-  const status = canonicalInvoiceStatus(invoice?.status) || "issued";
   const hasLaunchTarget = Boolean(buildWalletLaunchTarget(invoice));
   const actionMap = {
     issued: {
@@ -562,6 +705,7 @@ function renderCustomerAction(invoice) {
 function updateRemainingAnnouncement(expiresAt) {
   const remaining = formatRemaining(expiresAt);
   el.remainingText.textContent = remaining;
+  el.remainingText.classList.toggle("remaining-expired-label", remaining === "期限切れです。");
   const minuteKey = remaining.replace(/秒$/, "");
   if (minuteKey !== state.announcedMinute) {
     state.announcedMinute = minuteKey;
@@ -571,24 +715,31 @@ function updateRemainingAnnouncement(expiresAt) {
   }
 }
 
+function updateExpiredNotice(invoice) {
+  const expired = isInvoiceExpired(invoice);
+  el.remainingText?.classList.toggle("hidden", expired);
+  if (expired) setMethodPanel(false);
+  if (expired) {
+    el.statusPill.textContent = "期限切れ";
+    el.statusPill.className = "status-pill s-red";
+  }
+}
+
+function positionAutoStatusCard(invoice) {
+  if (!el.mobileAutoStatusCard) return;
+  if (isInvoiceExpired(invoice) && el.amountHero) {
+    el.amountHero.after(el.mobileAutoStatusCard);
+    return;
+  }
+  if (el.mobilePageWrap && el.mobileAutoStatusCard.parentElement !== el.mobilePageWrap) {
+    el.mobilePageWrap.appendChild(el.mobileAutoStatusCard);
+  }
+}
+
 function renderPaymentConditions(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status) || "issued";
   const show = WAITING_STATUSES.has(status);
   el.paymentConditionsCard.classList.toggle("hidden", !show);
-  if (!show) return;
-  const network = getNetwork(invoice) || "Polygon";
-  const chainId = invoice?.chain_id || "137";
-  const token = getTokenSymbol(invoice) || "JPYC";
-  el.paymentConditionsList.innerHTML = "";
-  const items = [
-    `対応チェーン: ${network}（チェーンID: ${chainId}）／支払いトークン: ${token}`,
-    "ガス代（MATIC）がウォレットに必要です。MATIC残高が不足していると送金できません。",
-  ];
-  for (const item of items) {
-    const li = document.createElement("li");
-    li.textContent = item;
-    el.paymentConditionsList.appendChild(li);
-  }
 }
 
 function renderPaymentVerification(invoice) {
@@ -600,13 +751,15 @@ function renderPaymentVerification(invoice) {
   const network = getNetwork(invoice) || "Polygon";
   const chainId = invoice?.chain_id || "137";
   const token = getTokenSymbol(invoice) || "JPYC";
+  const contract = getTokenContract(invoice);
   const receiveAddress = getReceiveAddress(invoice);
   el.verifyNetworkText.textContent = `${network}（チェーンID: ${chainId}）`;
   el.verifyTokenText.textContent = token;
+  if (el.verifyTokenContractText) el.verifyTokenContractText.textContent = contract;
   el.verifyAddressText.textContent = receiveAddress || "-";
   el.verifyAddressText.title = receiveAddress || "";
   if (el.manualRiskText && !state.manualRiskVisible) {
-    el.manualRiskText.textContent = "ウォレット画面で「Polygon」「JPYC」「この画面の送金先」の3つが一致していることを確認してから送信してください。";
+    el.manualRiskText.textContent = `ウォレット画面で「${network}」「JPYC」「公式コントラクト ${getContractSuffix(invoice)}」「この画面の送金先」が一致していることを確認してから送信してください。`;
   }
 }
 
@@ -614,14 +767,27 @@ function renderReceiptCard(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status);
   initPolicyLinks();
   const isPaid = status === "paid" || status === "settled";
-  el.receiptCard.classList.toggle("hidden", !isPaid);
+  el.receiptView.classList.toggle("hidden", !isPaid);
+  el.mobilePayHeader?.classList.toggle("hidden", isPaid);
+  el.mobileSummaryCard?.classList.toggle("hidden", isPaid);
+  el.mobileDisclosureStack?.classList.toggle("hidden", isPaid);
+  el.mobileAutoStatusCard?.classList.toggle("hidden", isPaid);
   if (!isPaid) return;
-  el.receiptStatusBadge.textContent = status === "settled" ? "確定済み" : "支払い確認済み";
+  const statusLabel = status === "settled" ? "確定済み" : "支払い確認済み";
+  const confirmedAt = invoice.paid_at || invoice.block_timestamp || invoice.verified_at || invoice.updated_at || new Date().toISOString();
+  el.receiptConfirmedText.textContent = status === "settled" ? "支払いは確定済みです" : "受領を確認しました";
+  el.receiptConfirmedAt.textContent = formatDateTime(confirmedAt);
+  el.receiptStatusText.textContent = statusLabel;
   el.receiptStoreName.textContent = invoice.store_name || "加盟店";
   el.receiptAmount.textContent =
     `${formatJpy(invoice.amount_jpy)} / ${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`;
   el.receiptInvoiceId.textContent = invoice.invoice_no || invoice.invoice_id || "-";
   el.receiptTxHash.textContent = invoice.paid_tx_hash || "-";
+  el.receiptNetworkText.textContent = getNetwork(invoice);
+  el.receiptDetailNetworkText.textContent = getNetwork(invoice);
+  if (el.receiptDetailContractText) el.receiptDetailContractText.textContent = getTokenContract(invoice);
+  el.receiptDetailToText.textContent = getReceiveAddress(invoice) || "-";
+  el.receiptDetailToText.title = getReceiveAddress(invoice) || "";
 }
 
 function renderStatus(invoice) {
@@ -635,6 +801,16 @@ function renderStatus(invoice) {
   el.statusPill.textContent = meta.label;
   el.statusPill.className = `status-pill ${meta.pill}`;
   el.uxStateLabel.textContent = meta.title;
+  if (el.mobileAutoStatusCard) {
+    const autoMeta = AUTO_STATUS_META[status] || { pill: "s-gray", icon: "" };
+    el.mobileAutoStatusCard.classList.remove("s-blue", "s-green", "s-yellow", "s-red", "s-gray");
+    el.mobileAutoStatusCard.classList.add(autoMeta.pill);
+    if (el.mobileAutoStatusIcon) {
+      el.mobileAutoStatusIcon.classList.remove("s-blue", "s-green", "s-yellow", "s-red", "s-gray");
+      el.mobileAutoStatusIcon.classList.add(autoMeta.pill);
+      if (autoMeta.icon) el.mobileAutoStatusIcon.innerHTML = autoMeta.icon;
+    }
+  }
   if (unknownStatus) {
     el.uxStateDetail.textContent = "不明な状態です。確認のため自動更新を継続しています。";
     return;
@@ -648,20 +824,26 @@ function renderInvoice(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status);
 
   el.storeText.textContent = invoice.store_name || "加盟店";
+  if (el.mobileHeaderStoreName) el.mobileHeaderStoreName.textContent = invoice.store_name || "";
   if (el.merchantTrustBadge) el.merchantTrustBadge.textContent = invoice.store_name ? "サーバー発行済み" : "発行元確認中";
   if (el.issuedAtText) el.issuedAtText.textContent = formatDateTime(invoice.issued_at || invoice.created_at);
-  el.amountText.textContent = formatJpy(invoice.amount_jpy);
-  el.amountSubText.textContent = `${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`;
+  el.amountText.textContent = `${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`;
+  el.amountSubText.textContent = formatJpy(invoice.amount_jpy);
+  if (el.summaryNetworkText) el.summaryNetworkText.textContent = getNetwork(invoice);
+  if (el.summaryContractText) el.summaryContractText.textContent = getContractSuffix(invoice);
+  if (el.summaryStoreText) el.summaryStoreText.textContent = invoice.store_name || "加盟店";
   el.expiresText.textContent = formatDateTime(invoice.expires_at);
   updateRemainingAnnouncement(invoice.expires_at);
+  updateExpiredNotice(invoice);
 
   renderCustomerAction(invoice);
   renderWalletSupport(invoice);
   renderPaymentConditions(invoice);
   renderPaymentVerification(invoice);
-  renderConsentGate(invoice);
   renderReceiptCard(invoice);
   renderStatus(invoice);
+  positionAutoStatusCard(invoice);
+  updateExpiredNotice(invoice);
 
   el.networkText.textContent = getNetwork(invoice);
   const receiveAddress = getReceiveAddress(invoice);
@@ -671,17 +853,59 @@ function renderInvoice(invoice) {
   el.txHashText.textContent = invoice.paid_tx_hash || "-";
 
   const customerMode = invoice?.customer_payment_mode || {};
-  const paymentActionAvailable = WAITING_STATUSES.has(status) && (!customerMode.mode || customerMode.mode === "wallet_qr");
-  const walletAllowed = paymentActionAvailable && state.consented && Boolean(state.consentRecordId);
-  el.walletPayBtn.disabled = !walletAllowed;
+  const paymentActionAvailable = PAYMENT_INITIATION_STATUSES.has(status) && (!customerMode.mode || customerMode.mode === "wallet_qr");
+  const isReceiptMode = status === "paid" || status === "settled";
+  const needsStaff = STAFF_STATUSES.has(status);
+  const inConfirmingState = WAITING_STATUSES.has(status) && !PAYMENT_INITIATION_STATUSES.has(status);
+  const consentChecked = el.policyConsentCheckbox ? el.policyConsentCheckbox.checked : true;
+  const walletAllowed = paymentActionAvailable && consentChecked;
+  const copyAllowed = Boolean(invoice) && !isReceiptMode && !inConfirmingState && consentChecked;
+  const primaryActionAllowed = walletAllowed || needsStaff;
+  if (el.paymentGuideDetails) el.paymentGuideDetails.classList.toggle("hidden", needsStaff || isReceiptMode);
+  if (needsStaff) setMethodPanel(false, "");
+  const primaryActionStack = el.walletPayBtn?.closest(".primary-action-stack");
+  if (primaryActionStack) primaryActionStack.classList.toggle("hidden", isReceiptMode);
+  if (needsStaff) {
+    el.walletPayBtn.innerHTML = '<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M8 4H5a1 1 0 0 0-1 1v3" /><path d="M16 4h3a1 1 0 0 1 1 1v3" /><path d="M20 16v3a1 1 0 0 1-1 1h-3" /><path d="M8 20H5a1 1 0 0 1-1-1v-3" /><path d="M7 12h10" /></svg><span>スタッフに見せる</span>';
+  } else {
+    el.walletPayBtn.innerHTML = '<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" /></svg><span>ウォレットで支払う</span>';
+  }
+  el.walletPayBtn.disabled = !primaryActionAllowed;
+  el.walletPayBtn.classList.toggle("is-ready", primaryActionAllowed);
   el.showMethodsBtn.disabled = !walletAllowed;
-  el.copyInfoBtn.disabled = !walletAllowed;
-  el.copyAddressBtn.disabled = !walletAllowed;
-  el.copyAmountBtn.disabled = !walletAllowed;
-  el.copyInvoiceBtn.disabled = !walletAllowed;
+  el.copyInfoBtn.disabled = !copyAllowed;
+  el.copyAddressBtn.disabled = !copyAllowed;
+  el.copyAmountBtn.disabled = !copyAllowed;
+  el.copyInvoiceBtn.disabled = !copyAllowed;
   if (el.toggleAddressBtn) {
     el.toggleAddressBtn.disabled = !receiveAddress;
     el.toggleAddressBtn.textContent = state.addressExpanded ? "支払い先を短縮表示" : "支払い先を全文表示";
+  }
+  if (el.walletDisabledReason) {
+    let reason = "";
+    const expiredDisplay = isInvoiceExpired(invoice);
+    if (isReceiptMode) {
+      reason = "支払い確認済みです。確認書をコピーできます。";
+    } else if (WAITING_STATUSES.has(status) && !paymentActionAvailable) {
+      reason = "支払いを確認中です。追加で送金しないでください。";
+    } else if (!paymentActionAvailable) {
+      reason = needsStaff
+        ? "この状態では送金せず、画面を店舗スタッフに見せてください。"
+        : "現在の状態では支払い操作を開始できません。";
+    } else if (!consentChecked) {
+      reason = "上のチェックボックスにチェックを入れてから進んでください。";
+    } else {
+      reason = "金額・ネットワーク・送金先を確認してから進んでください。";
+    }
+    el.walletDisabledReason.textContent = reason;
+    el.walletDisabledReason.classList.toggle("hidden", expiredDisplay || (walletAllowed && !needsStaff));
+  }
+  if (el.mobileAutoStatusTime) {
+    const checkedAt = new Date().toLocaleTimeString("ja-JP", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    el.mobileAutoStatusTime.textContent = `最終確認 ${checkedAt}`;
   }
   startPolling(status);
   startRemainingTimer(invoice);
@@ -706,8 +930,12 @@ async function copyText(text) {
   const value = String(text || "");
   if (!value) throw new Error("コピー対象がありません");
   if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(value);
-    return;
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back to the selection-based copy path when browser permissions deny clipboard writes.
+    }
   }
   const temp = document.createElement("textarea");
   temp.value = value;
@@ -721,9 +949,9 @@ async function copyText(text) {
   if (!ok) throw new Error("コピーに失敗しました");
 }
 
-function setMethodPanel(visible, message) {
+function setMethodPanel(visible, message = "") {
   el.methodPanel.classList.toggle("hidden", !visible);
-  if (message) el.methodPanelText.textContent = message;
+  el.methodPanelText.textContent = message;
 }
 
 async function handleWalletPay() {
@@ -732,17 +960,24 @@ async function handleWalletPay() {
     showError("請求情報を読み込み中です。");
     return;
   }
+  if (STAFF_STATUSES.has(canonicalInvoiceStatus(invoice.status))) {
+    showStaffGuidance(invoice);
+    return;
+  }
   if (invoice.customer_payment_mode?.mode && invoice.customer_payment_mode.mode !== "wallet_qr") {
     setMethodPanel(true, invoice.customer_payment_mode.body || "この会計は店頭端末でご案内します。");
     announce("店頭端末の案内をご確認ください");
     return;
   }
-  if (!WAITING_STATUSES.has(canonicalInvoiceStatus(invoice.status))) {
+  if (!PAYMENT_INITIATION_STATUSES.has(canonicalInvoiceStatus(invoice.status))) {
     showError("現在の状態ではお支払いを開始できません。");
     return;
   }
-  if (!state.consented) {
-    announceConsentRequired();
+  try {
+    await ensurePolicyAcknowledgementRecorded();
+  } catch (error) {
+    showError(String(error.message || error));
+    announce("支払い前の記録に失敗しました");
     return;
   }
   const launchTarget = buildWalletLaunchTarget(invoice);
@@ -752,35 +987,28 @@ async function handleWalletPay() {
     announce("手動送金の案内を表示しました");
     return;
   }
-  const launchMessage = launchTarget.type === "wallet_deeplink"
-    ? "ウォレット用の deeplink を開きます。内容をご確認のうえ送金してください。"
-    : launchTarget.type === "payment_uri"
-      ? "標準 payment URI でウォレット起動を試みます。内容をご確認のうえ送金してください。"
-      : "ウォレット起動URLを開きます。内容をご確認のうえ送金してください。";
-  setMethodPanel(true, launchMessage);
+  setMethodPanel(true, "ウォレットを開きます。金額と送金先を確認してから送金してください。");
   announce("ウォレットを開きます");
   location.href = launchTarget.url;
 }
 
-function announceConsentRequired() {
-  showError("利用規約・ポリシーをご確認のうえ、チェックを入れてください。");
-  if (el.consentGateSection) {
-    el.consentGateSection.classList.add("attention-pulse");
-    el.consentGateSection.scrollIntoView({ behavior: "smooth", block: "center" });
-    window.setTimeout(() => el.consentGateSection.classList.remove("attention-pulse"), 1400);
-  }
-  announce("同意が必要です");
-}
-
 async function handleCopyInfo() {
   if (!state.invoice) return;
-  if (!state.consented) {
-    announceConsentRequired();
+  try {
+    await ensurePolicyAcknowledgementRecorded();
+  } catch (error) {
+    showError(String(error.message || error));
     return;
   }
   try {
     await copyText(buildCopyPayload(state.invoice));
-    setMethodPanel(true, "支払い情報をコピーしました。ウォレットで内容を確認して送金してください。");
+    const status = canonicalInvoiceStatus(state.invoice.status);
+    setMethodPanel(
+      true,
+      PAYMENT_INITIATION_STATUSES.has(status)
+        ? "支払い情報をコピーしました。ウォレットで内容を確認して送金してください。"
+        : "請求情報をコピーしました。送金せず、店舗スタッフへの確認に使ってください。"
+    );
     announce("支払い情報をコピーしました");
   } catch (error) {
     showError(String(error.message || error));
@@ -789,8 +1017,10 @@ async function handleCopyInfo() {
 
 async function handleCopyAddress() {
   if (!state.invoice) return;
-  if (!state.consented) {
-    announceConsentRequired();
+  try {
+    await ensurePolicyAcknowledgementRecorded();
+  } catch (error) {
+    showError(String(error.message || error));
     return;
   }
   try {
@@ -803,8 +1033,10 @@ async function handleCopyAddress() {
 
 async function handleCopyAmount() {
   if (!state.invoice) return;
-  if (!state.consented) {
-    announceConsentRequired();
+  try {
+    await ensurePolicyAcknowledgementRecorded();
+  } catch (error) {
+    showError(String(error.message || error));
     return;
   }
   try {
@@ -817,8 +1049,10 @@ async function handleCopyAmount() {
 
 async function handleCopyInvoice() {
   if (!state.invoice) return;
-  if (!state.consented) {
-    announceConsentRequired();
+  try {
+    await ensurePolicyAcknowledgementRecorded();
+  } catch (error) {
+    showError(String(error.message || error));
     return;
   }
   try {
@@ -829,20 +1063,120 @@ async function handleCopyInvoice() {
   }
 }
 
-async function handleCopyReceipt() {
+function escapeReceiptHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+
+function receiptFileName(invoice) {
+  const reference = String(invoice?.invoice_no || invoice?.invoice_id || "payment-confirmation")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "payment-confirmation";
+  return `payment-confirmation-${reference}.html`;
+}
+
+function buildReceiptDownloadHtml(invoice) {
+  const status = canonicalInvoiceStatus(invoice?.status);
+  const statusLabel = status === "settled" ? "支払い確定済み" : "支払い確認済み";
+  const confirmedAt = invoice?.paid_at || invoice?.block_timestamp || invoice?.verified_at || invoice?.updated_at || new Date().toISOString();
+  const amount = `${formatJpy(invoice?.amount_jpy)} / ${toNumber(invoice?.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`;
+  const rows = [
+    ["店舗名", invoice?.store_name || "加盟店"],
+    ["お支払い金額", amount],
+    ["請求ID", invoice?.invoice_no || invoice?.invoice_id || "-"],
+    ["取引参照", invoice?.paid_tx_hash || "-"],
+    ["ネットワーク", getNetwork(invoice)],
+    ["支払い先", getReceiveAddress(invoice) || "-"],
+    ["確認日時", formatDateTime(confirmedAt)],
+    ["ステータス", statusLabel],
+  ];
+  const rowHtml = rows.map(([label, value]) => `
+      <tr>
+        <th>${escapeReceiptHtml(label)}</th>
+        <td>${escapeReceiptHtml(value)}</td>
+      </tr>`).join("");
+  return `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>支払い確認書 ${escapeReceiptHtml(invoice?.invoice_no || invoice?.invoice_id || "")}</title>
+  <style>
+    body { margin: 0; padding: 32px; color: #12213a; background: #f6f8fc; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif; font-size: ${steppedReceiptPx(16)}; }
+    main { max-width: 760px; margin: 0 auto; padding: 32px; border: 1px solid #cfe8d8; border-radius: 18px; background: #fff; }
+    h1 { margin: 0 0 8px; color: #107546; font-size: ${steppedReceiptPx(34)}; }
+    .lead { margin: 0 0 28px; color: #4a5870; font-size: ${steppedReceiptPx(16)}; }
+    table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+    th, td { padding: 14px 0; border-bottom: 1px solid #d4dce9; text-align: left; vertical-align: top; font-size: ${steppedReceiptPx(16)}; }
+    th { width: 150px; color: #5a6a82; }
+    td { font-weight: 700; overflow-wrap: anywhere; }
+    .amount { color: #12213a; font-size: ${steppedReceiptPx(24)}; font-weight: 900; }
+    .note { margin-top: 28px; padding: 16px; border-radius: 12px; background: #eefaf3; color: #23543b; font-size: ${steppedReceiptPx(14)}; line-height: 1.7; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>支払い確認書</h1>
+    <p class="lead">JPYCでのお支払いを確認しました。</p>
+    <table>
+      <tbody>${rowHtml}</tbody>
+    </table>
+    <p class="note">この支払い確認書はお客様向けの支払い確認用です。返金や送金は店舗側で別途確認されます。この画面・ファイルが秘密鍵、シードフレーズ、署名権限を扱うことはありません。</p>
+  </main>
+</body>
+</html>`;
+}
+
+function handleDownloadReceipt() {
   const invoice = state.invoice;
   if (!invoice) return;
   try {
-    const lines = [
-      "【お支払い確認書】",
-      `店舗: ${invoice.store_name || "加盟店"}`,
-      `金額: ${formatJpy(invoice.amount_jpy)} / ${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`,
-      `請求ID: ${invoice.invoice_no || invoice.invoice_id || "-"}`,
-      `取引番号: ${invoice.paid_tx_hash || "-"}`,
-      `確認日時: ${formatDateTime(new Date().toISOString())}`,
-    ];
-    await copyText(lines.join("\n"));
-    announce("お支払い確認書をコピーしました");
+    const blob = new Blob([buildReceiptDownloadHtml(invoice)], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = receiptFileName(invoice);
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    announce("支払い確認書を保存しました");
+  } catch (error) {
+    showError(String(error.message || error));
+  }
+}
+
+async function handleCopyReceiptInvoice() {
+  if (!state.invoice) return;
+  try {
+    await copyText(state.invoice.invoice_no || state.invoice.invoice_id || "");
+    announce("請求IDをコピーしました");
+  } catch (error) {
+    showError(String(error.message || error));
+  }
+}
+
+async function handleCopyReceiptTx() {
+  if (!state.invoice) return;
+  try {
+    await copyText(state.invoice.paid_tx_hash || "");
+    announce("取引参照をコピーしました");
+  } catch (error) {
+    showError(String(error.message || error));
+  }
+}
+
+async function handleCopyReceiptTo() {
+  if (!state.invoice) return;
+  try {
+    await copyText(getReceiveAddress(state.invoice) || "");
+    announce("支払い先をコピーしました");
   } catch (error) {
     showError(String(error.message || error));
   }
@@ -854,8 +1188,9 @@ async function loadInvoice(options = {}) {
   const path = signedInvoicePath();
   if (!path) {
     stopPolling();
-    showError("このURLは無効です。署名付きの支払いURLをご確認ください。");
+    showError("このURLは無効です。");
     el.walletPayBtn.disabled = true;
+    el.walletPayBtn.classList.remove("is-ready");
     return;
   }
   state.pollInFlight = true;
@@ -872,40 +1207,35 @@ async function loadInvoice(options = {}) {
   } catch (error) {
     showError(`請求情報の読み込みに失敗しました。${String(error.message || error)}`);
     setMethodPanel(true, "読み込みに失敗しました。時間をおいて再度お試しください。");
+    el.walletPayBtn.disabled = true;
+    el.walletPayBtn.classList.remove("is-ready");
+    el.showMethodsBtn.disabled = true;
+    el.copyInfoBtn.disabled = true;
+    if (el.walletDisabledReason) el.walletDisabledReason.textContent = "請求情報を読み込めないため、支払い操作は開始できません。";
     if (!silent) announce("請求情報の取得に失敗しました");
   } finally {
     state.pollInFlight = false;
   }
 }
 
-async function handleConsentChange() {
-  const checked = Boolean(el.consentCheckbox?.checked);
-  state.consented = false;
-  state.consentRecordId = "";
-  if (checked) {
-    try {
-      if (el.consentLiveStatus) el.consentLiveStatus.textContent = "同意をサーバーに記録しています。";
-      await recordConsent();
-      state.consented = true;
-    } catch (error) {
-      if (el.consentCheckbox) el.consentCheckbox.checked = false;
-      showError(String(error.message || error));
-    }
-  }
-  if (state.invoice) renderInvoice(state.invoice);
-  if (el.consentLiveStatus) {
-    el.consentLiveStatus.textContent = state.consented
-      ? "同意済みです。お支払い操作が可能です。"
-      : "利用規約・ポリシーをご確認のうえ、チェックを入れてください。";
-  }
-}
-
 function bindEvents() {
-  if (el.consentCheckbox) el.consentCheckbox.addEventListener("change", () => void handleConsentChange());
+  if (el.errorBannerCloseBtn) {
+    el.errorBannerCloseBtn.addEventListener("click", () => {
+      showError("");
+      announce("エラー表示を閉じました");
+    });
+  }
+  if (el.policyConsentCheckbox) {
+    el.policyConsentCheckbox.addEventListener("change", () => {
+      if (state.invoice) renderInvoice(state.invoice);
+    });
+  }
   el.walletPayBtn.addEventListener("click", () => void handleWalletPay());
-  el.showMethodsBtn.addEventListener("click", () => {
-    if (!state.consented) {
-      announceConsentRequired();
+  el.showMethodsBtn.addEventListener("click", async () => {
+    try {
+      await ensurePolicyAcknowledgementRecorded();
+    } catch (error) {
+      showError(String(error.message || error));
       return;
     }
     const visible = el.methodPanel.classList.contains("hidden");
@@ -917,9 +1247,18 @@ function bindEvents() {
   el.copyAddressBtn.addEventListener("click", () => void handleCopyAddress());
   el.copyAmountBtn.addEventListener("click", () => void handleCopyAmount());
   el.copyInvoiceBtn.addEventListener("click", () => void handleCopyInvoice());
-  el.copyReceiptBtn.addEventListener("click", () => void handleCopyReceipt());
+  el.downloadReceiptBtn.addEventListener("click", () => handleDownloadReceipt());
+  if (el.copyReceiptInvoiceBtn) el.copyReceiptInvoiceBtn.addEventListener("click", () => void handleCopyReceiptInvoice());
+  if (el.copyReceiptTxBtn) el.copyReceiptTxBtn.addEventListener("click", () => void handleCopyReceiptTx());
+  if (el.copyReceiptToBtn) el.copyReceiptToBtn.addEventListener("click", () => void handleCopyReceiptTo());
+  if (el.showStaffBtn) {
+    el.showStaffBtn.addEventListener("click", () => {
+      const target = el.receiptCard || el.receiptView;
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
+      announce("確認書の金額、請求ID、取引番号を店舗スタッフに見せてください");
+    });
+  }
   el.refreshBtn.addEventListener("click", () => void loadInvoice({ silent: false }));
-  el.closeErrorBannerBtn.addEventListener("click", () => showError(""));
   if (el.toggleAddressBtn) {
     el.toggleAddressBtn.addEventListener("click", () => {
       state.addressExpanded = !state.addressExpanded;
@@ -930,6 +1269,17 @@ function bindEvents() {
     stopPolling();
     stopRemainingTimer();
   });
+}
+
+for (const button of [
+  el.walletPayBtn,
+  el.showMethodsBtn,
+  el.copyInfoBtn,
+  el.copyAddressBtn,
+  el.copyAmountBtn,
+  el.copyInvoiceBtn,
+]) {
+  if (button) button.disabled = true;
 }
 
 bindEvents();

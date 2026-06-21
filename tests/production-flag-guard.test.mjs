@@ -7,6 +7,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const ROOT = process.cwd();
+const OFFICIAL_JPYC_CONTRACT = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 
 function read(filePath) {
   return fs.readFileSync(path.join(ROOT, filePath), "utf8");
@@ -40,8 +41,8 @@ const BASE_ENV = {
   APP_ENV: "production",
   COMMERCIAL_GO_MODE: "true",
   CHAIN_ID: "137",
-  TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
-  APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+  TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
+  APPROVED_JPYC_TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
   TOKEN_DECIMALS: "6",
   JPYC_BASE_UNIT_SCALE: "1000000",
   LEGAL_GATE_APPROVED: "true",

@@ -4,7 +4,7 @@
 commercial verdict を、同じコマンド列と同じ verdict 名で再現できるようにする。
 
 ## Baseline
-- Node 20 を使用する。
+- Node 24.17.0 を使用する。
 - evidence を repo の正本に増やしたくない場合は `mktemp -d` を使う。
 
 ## Command sequence

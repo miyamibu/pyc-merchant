@@ -33,7 +33,7 @@ test("commercial mode blocks invoice issuance but keeps read-only ops endpoints"
       "content-type": "application/json",
       "idempotency-key": `commercial-block-${Date.now()}`,
     }),
-    body: JSON.stringify({ amount_jpy: 1000 }),
+    body: JSON.stringify({ amount_jpy: 1000, payment_chain_id: "137" }),
   });
   assert.equal(blockedInvoice.status, 503);
   assert.equal(blockedInvoice.data.error.code, "COMMERCIAL_GATE_BLOCKED");

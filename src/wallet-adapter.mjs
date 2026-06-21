@@ -40,12 +40,18 @@ function uniq(values) {
 
 export function getSupportedWallets(env = process.env) {
   const configured = normalizeWalletList(env.SUPPORTED_WALLETS);
-  if (configured.length > 0) return uniq(configured);
+  const walletConnectTransactionSessionImplemented = parseFlag(env.WALLETCONNECT_TRANSACTION_SESSION_IMPLEMENTED, false);
+  if (configured.length > 0) {
+    return uniq(configured).filter((wallet) => {
+      if (/walletconnect/i.test(wallet)) return walletConnectTransactionSessionImplemented;
+      return true;
+    });
+  }
   const defaults = ["WalletConnect", "Injected Wallet"];
   if (normalizeString(env.HASHPORT_WALLET_DEEPLINK_TEMPLATE)) {
     defaults.unshift("HashPort Wallet");
   }
-  return uniq(defaults);
+  return uniq(defaults).filter((wallet) => walletConnectTransactionSessionImplemented || !/walletconnect/i.test(wallet));
 }
 
 function buildTemplateContext(payload) {
@@ -176,6 +182,7 @@ export function createWalletAdapter(env = process.env) {
   const reownProjectId = normalizeString(env.REOWN_PROJECT_ID);
   const walletHelpUrl = normalizeString(env.WALLET_HELP_URL || "https://walletconnect.com/");
   const reownEnabled = parseFlag(env.ENABLE_REOWN, false);
+  const walletConnectTransactionSessionImplemented = parseFlag(env.WALLETCONNECT_TRANSACTION_SESSION_IMPLEMENTED, false);
   const walletDeeplinkTemplateConfigured = Boolean(
     normalizeString(env.WALLET_DEEPLINK_TEMPLATE) || normalizeString(env.HASHPORT_WALLET_DEEPLINK_TEMPLATE)
   );
@@ -185,6 +192,12 @@ export function createWalletAdapter(env = process.env) {
     wallet_help_url: walletHelpUrl,
     reown_project_id_configured: hasApprovedProjectId(reownProjectId),
     wallet_deeplink_template_configured: walletDeeplinkTemplateConfigured,
+    capabilities: {
+      hashport_deeplink: walletDeeplinkTemplateConfigured ? "configured" : "not_configured",
+      eip681_uri: "implemented",
+      walletconnect_transaction_session: walletConnectTransactionSessionImplemented ? "implemented" : "not_implemented",
+      manual_copy_fallback: "implemented",
+    },
   };
 
   if (adapterType === "reown") {
@@ -202,6 +215,14 @@ export function createWalletAdapter(env = process.env) {
         available: false,
         status: "missing_project_id",
         reason: "Reown Project ID is not configured"
+      };
+    }
+    if (!walletConnectTransactionSessionImplemented) {
+      return {
+        ...baseConfig,
+        available: false,
+        status: "transaction_session_not_implemented",
+        reason: "WalletConnect/Reown Project ID is configured, but transaction session connect/request handling is not implemented"
       };
     }
     return {

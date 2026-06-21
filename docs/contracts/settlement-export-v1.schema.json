@@ -17,6 +17,10 @@
     "store_id",
     "terminal_id",
     "operator_id",
+    "chain_id",
+    "network",
+    "token_contract",
+    "recipient_address",
     "payment_attempt_ids",
     "primary_tx_hash",
     "primary_tx_log_index",
@@ -83,6 +87,13 @@
     "amount_jpy": { "type": ["integer", "number", "null"] },
     "amount_jpyc_base": { "type": ["integer", "string", "null"] },
     "paid_amount_jpyc_base": { "type": ["integer", "string", "null"] },
+    "chain_id": { "type": "string", "enum": ["1", "43114", "137"] },
+    "network": { "type": "string", "enum": ["Ethereum Mainnet", "Avalanche C-Chain", "Polygon"] },
+    "token_contract": {
+      "type": "string",
+      "pattern": "^0x[Ee]7[Cc]3[Dd]8[Cc]9[Aa]439[Ff][Ee][Dd][Ee]00[Dd]2600032[Dd]5[Dd][Bb]0[Bb][Ee]71[Cc]3[Cc]29$"
+    },
+    "recipient_address": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
     "accounting_status": {
       "type": "string",
       "enum": [

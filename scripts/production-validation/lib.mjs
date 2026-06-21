@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
+const OFFICIAL_JPYC_CONTRACT = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
+
 function randomPort() {
   return 47000 + Math.floor(Math.random() * 10000);
 }
@@ -19,12 +21,12 @@ export function createValidationEnv(overrides = {}) {
     SERVICE_INGEST_SECRET: "b".repeat(48),
     METRICS_SECRET: "c".repeat(48),
     CHAIN_ID: "137",
-    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
-    APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+    TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
+    APPROVED_JPYC_TOKEN_CONTRACT: OFFICIAL_JPYC_CONTRACT,
     JPYC_CONTRACT_APPROVAL_REF: "CAB-VALIDATION-001",
     RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
     TOKEN_SYMBOL: "JPYC",
-    TOKEN_DECIMALS: "6",
+    TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
     REQUIRED_CONFIRMATIONS: "2",
     MIN_REQUIRED_CONFIRMATIONS: "2",
@@ -132,7 +134,7 @@ export async function loginAs(baseUrl, { terminalCode, pin, staffName }) {
   return login.data.token;
 }
 
-export async function createInvoice(baseUrl, token, amountJpy, idempotencyKey) {
+export async function createInvoice(baseUrl, token, amountJpy, idempotencyKey, paymentChainId = "137") {
   const response = await apiRequest(baseUrl, "/api/v1/invoices", {
     method: "POST",
     headers: {
@@ -140,7 +142,7 @@ export async function createInvoice(baseUrl, token, amountJpy, idempotencyKey) {
       "content-type": "application/json",
       "idempotency-key": idempotencyKey,
     },
-    body: JSON.stringify({ amount_jpy: amountJpy }),
+    body: JSON.stringify({ amount_jpy: amountJpy, payment_chain_id: paymentChainId }),
   });
   if (response.status !== 201) {
     throw new Error(`validation invoice creation failed: ${JSON.stringify(response.data)}`);

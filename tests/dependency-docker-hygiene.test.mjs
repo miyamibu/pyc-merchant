@@ -43,7 +43,7 @@ test("dependency and docker hygiene validator fails closed for mutable resolved 
     "--require-resolved-digests",
     "true",
   ], {
-    PRODUCTION_NODE_IMAGE: "node:20-bookworm-slim",
+    PRODUCTION_NODE_IMAGE: "node:24.17.0-bookworm-slim",
     PRODUCTION_NGINX_IMAGE: "nginx:1.27-alpine",
   });
   assert.notEqual(result.code, 0);

@@ -4,6 +4,8 @@ data/
 .env.production
 .DS_Store
 **/.DS_Store
+__MACOSX/
+**/__MACOSX/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -12,6 +14,9 @@ runtime/
 artifacts/
 deliverables/
 .codex/
+.agents/
+.claude/launch.json
+.claude/settings.local.json
 docs/production/evidence/*
 !docs/production/evidence/.gitkeep
 deploy/nginx/certs/*.pem

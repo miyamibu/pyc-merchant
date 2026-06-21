@@ -298,7 +298,7 @@ test("negative permission, public exposure, and rate-limit guards stay enforced"
   assert.equal(wrongSig3.status, 429);
 });
 
-test("consent endpoint: requires valid signed URL, records audit, and rate-limits", async (t) => {
+test("policy acknowledgement endpoint: requires valid signed URL, records audit, and rate-limits", async (t) => {
   const env = baseServerEnv();
   const started = await startServerProcess(CWD, env);
 
@@ -312,93 +312,93 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
     staffName: "Demo Staff",
   });
 
-  const inv = await createInvoice(started.baseUrl, admin.token, 500, `consent-test-${Date.now()}`);
+  const inv = await createInvoice(started.baseUrl, admin.token, 500, `policy-ack-test-${Date.now()}`);
   assert.equal(inv.status, 201);
   const parsed = parsePaymentUrl(inv.data.payment_url);
   assert.ok(parsed.sig, "payment_url must include sig");
 
-	  const policySnapshot = {
-	    terms_url: env.TERMS_URL,
-	    privacy_url: env.PRIVACY_URL,
-	    refund_policy_url: env.REFUND_POLICY_URL,
-	    terms_version: env.TERMS_VERSION,
-	    privacy_version: env.PRIVACY_VERSION,
-	    refund_policy_version: env.REFUND_POLICY_VERSION,
-	  };
-		  const consentBody = JSON.stringify({
-		    checked: true,
-		    displayed_policy_hash: sha256Json(policySnapshot),
-		    client_rendered_at: "2026-05-13T00:00:00.000Z",
-		  });
-		  const pollutedConsentBody = JSON.stringify({
-		    checked: true,
-		    displayed_policy_hash: sha256Json(policySnapshot),
-		    terms_url: "https://attacker.example.invalid/terms",
-		  });
+  const policySnapshot = {
+    terms_url: env.TERMS_URL,
+    privacy_url: env.PRIVACY_URL,
+    refund_policy_url: env.REFUND_POLICY_URL,
+    terms_version: env.TERMS_VERSION,
+    privacy_version: env.PRIVACY_VERSION,
+    refund_policy_version: env.REFUND_POLICY_VERSION,
+  };
+  const policyAcknowledgementBody = JSON.stringify({
+    acknowledged: true,
+    displayed_policy_hash: sha256Json(policySnapshot),
+    client_rendered_at: "2026-05-13T00:00:00.000Z",
+  });
+  const pollutedPolicyAcknowledgementBody = JSON.stringify({
+    acknowledged: true,
+    displayed_policy_hash: sha256Json(policySnapshot),
+    terms_url: "https://attacker.example.invalid/terms",
+  });
 
-  const consentUrl = `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`;
+  const policyAcknowledgementUrl = `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/policy-acknowledgement?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`;
 
-  const ok = await apiRequest(started.baseUrl, consentUrl, {
+  const ok = await apiRequest(started.baseUrl, policyAcknowledgementUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: consentBody,
+    body: policyAcknowledgementBody,
   });
-		  assert.equal(ok.status, 200);
-		  assert.equal(ok.data.ok, true);
-		  assert.ok(ok.data.consent_record_id, "consent_record_id must be present");
-		  assert.equal(ok.data.policy_snapshot_hash, sha256Json(policySnapshot));
-	  assert.ok(ok.data.recorded_at, "recorded_at must be present");
-	  const auditDb = new Database(env.DB_PATH, { readonly: true });
-	  const consentAudit = auditDb
-	    .prepare(`SELECT after_state FROM audit_logs WHERE action = 'customer_policy_consent' AND target_id = ? ORDER BY created_at DESC LIMIT 1`)
-	    .get(parsed.invoiceId);
-	  auditDb.close();
-	  const consentAfter = JSON.parse(consentAudit.after_state);
-	  assert.deepEqual({
-	    terms_url: consentAfter.terms_url,
-	    privacy_url: consentAfter.privacy_url,
-	    refund_policy_url: consentAfter.refund_policy_url,
-	    terms_version: consentAfter.terms_version,
-	    privacy_version: consentAfter.privacy_version,
-	    refund_policy_version: consentAfter.refund_policy_version,
-	  }, policySnapshot);
-	  assert.equal(consentAfter.consent_record_id.startsWith("consent_"), true);
-	  assert.equal(consentAfter.invoice_id, parsed.invoiceId);
-	  assert.equal(consentAfter.policy_snapshot_hash, sha256Json(policySnapshot));
+  assert.equal(ok.status, 200);
+  assert.equal(ok.data.ok, true);
+  assert.ok(ok.data.policy_acknowledgement_id, "policy_acknowledgement_id must be present");
+  assert.equal(ok.data.policy_snapshot_hash, sha256Json(policySnapshot));
+  assert.ok(ok.data.recorded_at, "recorded_at must be present");
+  const auditDb = new Database(env.DB_PATH, { readonly: true });
+  const policyAcknowledgementAudit = auditDb
+    .prepare(`SELECT after_state FROM audit_logs WHERE action = 'customer_policy_acknowledgement' AND target_id = ? ORDER BY created_at DESC LIMIT 1`)
+    .get(parsed.invoiceId);
+  auditDb.close();
+  const policyAcknowledgementAfter = JSON.parse(policyAcknowledgementAudit.after_state);
+  assert.deepEqual({
+    terms_url: policyAcknowledgementAfter.terms_url,
+    privacy_url: policyAcknowledgementAfter.privacy_url,
+    refund_policy_url: policyAcknowledgementAfter.refund_policy_url,
+    terms_version: policyAcknowledgementAfter.terms_version,
+    privacy_version: policyAcknowledgementAfter.privacy_version,
+    refund_policy_version: policyAcknowledgementAfter.refund_policy_version,
+  }, policySnapshot);
+  assert.equal(policyAcknowledgementAfter.policy_acknowledgement_id.startsWith("policy_ack_"), true);
+  assert.equal(policyAcknowledgementAfter.invoice_id, parsed.invoiceId);
+  assert.equal(policyAcknowledgementAfter.policy_snapshot_hash, sha256Json(policySnapshot));
 
-	  const polluted = await apiRequest(started.baseUrl, consentUrl, {
-	    method: "POST",
-	    headers: { "content-type": "application/json" },
-	    body: pollutedConsentBody,
-	  });
-	  assert.equal(polluted.status, 400);
-	  assert.equal(polluted.data.error.code, "VALIDATION_ERROR");
+  const polluted = await apiRequest(started.baseUrl, policyAcknowledgementUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: pollutedPolicyAcknowledgementBody,
+  });
+  assert.equal(polluted.status, 400);
+  assert.equal(polluted.data.error.code, "VALIDATION_ERROR");
 
-	  const mismatch = await apiRequest(started.baseUrl, consentUrl, {
-	    method: "POST",
-	    headers: { "content-type": "application/json" },
-	    body: JSON.stringify({ checked: true, displayed_policy_hash: "bad-hash" }),
-	  });
-	  assert.equal(mismatch.status, 409);
-	  assert.equal(mismatch.data.error.code, "POLICY_MISMATCH");
+  const mismatch = await apiRequest(started.baseUrl, policyAcknowledgementUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ acknowledged: true, displayed_policy_hash: "bad-hash" }),
+  });
+  assert.equal(mismatch.status, 409);
+  assert.equal(mismatch.data.error.code, "POLICY_MISMATCH");
 
   const badSig = await apiRequest(
     started.baseUrl,
-    `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=invalidsig&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: consentBody }
+    `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/policy-acknowledgement?sig=invalidsig&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: policyAcknowledgementBody }
   );
   assert.equal(badSig.status, 401);
   assert.equal(badSig.data.error.code, "UNAUTHORIZED");
 
   const noInvoice = await apiRequest(
     started.baseUrl,
-    `/api/v1/public/invoices/nonexistent-id/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: consentBody }
+    `/api/v1/public/invoices/nonexistent-id/policy-acknowledgement?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: policyAcknowledgementBody }
   );
   assert.equal(noInvoice.status, 401);
 });
 
-test("consent policy snapshot hashes long server versions consistently and dev fallback stays usable", async (t) => {
+test("policy acknowledgement snapshot hashes long server versions consistently and dev fallback stays usable", async (t) => {
   const longVersion = `terms-${"v".repeat(90)}`;
   const env = baseServerEnv({
     TERMS_URL: "",
@@ -426,17 +426,17 @@ test("consent policy snapshot hashes long server versions consistently and dev f
   assert.equal(publicInvoice.data.policy.terms_version, longVersion);
   assert.match(publicInvoice.data.policy.terms_url, /\/legal\/dev-terms$/);
   const hash = sha256Json(publicInvoice.data.policy);
-  const consent = await apiRequest(
+  const policyAcknowledgement = await apiRequest(
     started.baseUrl,
-    `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
+    `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/policy-acknowledgement?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ checked: true, displayed_policy_hash: hash, client_rendered_at: "2026-05-14T00:00:00.000Z" }),
+      body: JSON.stringify({ acknowledged: true, displayed_policy_hash: hash, client_rendered_at: "2026-05-14T00:00:00.000Z" }),
     }
   );
-  assert.equal(consent.status, 200);
-  assert.equal(consent.data.policy_snapshot_hash, hash);
+  assert.equal(policyAcknowledgement.status, 200);
+  assert.equal(policyAcknowledgement.data.policy_snapshot_hash, hash);
 });
 
 test("session timeout expires API access without breaking login", async (t) => {

@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { resolveDockerCompose } from "../deploy/resolve-compose.mjs";
 
 const ROOT = process.cwd();
 
@@ -156,18 +157,20 @@ function main() {
     ensure(licenses.length > 0, "license export must contain at least one dependency");
     record("license_list_exportable", true, { count: licenses.length });
 
-    let dockerBuildStatus = { skipped: true, reason: "docker_unavailable" };
-	    if (!skipDocker && hasDocker()) {
-	      execFileSync("docker", ["build", ".", "--tag", "jpyc-terminal-production:hygiene"], {
-	        cwd: ROOT,
-	        stdio: "ignore",
-	      });
-	      if (fs.existsSync(path.join(ROOT, ".env.production"))) {
-	        execFileSync("docker", ["compose", "--env-file", ".env.production", "-f", "docker-compose.prod.yml", "config"], {
-	          cwd: ROOT,
-	          stdio: "ignore",
-	        });
-	      }
+	    let dockerBuildStatus = { skipped: true, reason: "docker_unavailable" };
+		    if (!skipDocker && hasDocker()) {
+		      execFileSync("docker", ["build", ".", "--tag", "jpyc-terminal-production:hygiene"], {
+		        cwd: ROOT,
+		        stdio: "ignore",
+		      });
+		      if (fs.existsSync(path.join(ROOT, ".env.production"))) {
+          const compose = resolveDockerCompose();
+          ensure(compose.available, "DOCKER_COMPOSE_UNAVAILABLE", compose);
+		        execFileSync(compose.command[0], [...compose.command.slice(1), "--env-file", ".env.production", "-f", "docker-compose.prod.yml", "config"], {
+		          cwd: ROOT,
+		          stdio: "ignore",
+		        });
+		      }
 	      dockerBuildStatus = { skipped: false };
 	    }
     record("docker_build", true, dockerBuildStatus);

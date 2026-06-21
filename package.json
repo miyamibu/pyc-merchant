@@ -5,17 +5,17 @@
   "type": "module",
   "private": true,
   "engines": {
-    "node": "20.x"
+    "node": "24.17.0"
   },
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
     "monitor": "node src/chain-monitor.mjs",
-    "check": "node --check src/server.mjs && node --check src/chain-monitor.mjs && node --check scripts/smoke-test.mjs && node --check scripts/verify-audit-chain.mjs && node --check scripts/ci/verify-github-actions-run.mjs && node --check scripts/production-validation/validate-production-config.mjs && node --check scripts/production-validation/validate-evidence-sanitization.mjs && node --check scripts/production-validation/validate-dependency-docker-hygiene.mjs && node --check scripts/production-validation/validate-commercial-evidence.mjs && node --check scripts/production-validation/validate-commercial-scorecard.mjs && node --check scripts/production-validation/validate-commercial-go.mjs && node --check scripts/production-validation/run-commercial-validate-safe.mjs && node --check scripts/production-validation/generate-settlement-evidence-pack.mjs && npm run security:destructive",
+    "check": "node --check src/server.mjs && node --check src/chain-monitor.mjs && node --check scripts/smoke-test.mjs && node --check scripts/verify-audit-chain.mjs && node --check scripts/ci/verify-github-actions-run.mjs && node --check scripts/deploy/resolve-compose.mjs && node --check scripts/production-validation/validate-production-config.mjs && node --check scripts/production-validation/validate-evidence-sanitization.mjs && node --check scripts/production-validation/validate-dependency-docker-hygiene.mjs && node --check scripts/production-validation/validate-commercial-evidence.mjs && node --check scripts/production-validation/validate-commercial-scorecard.mjs && node --check scripts/production-validation/validate-commercial-go.mjs && node --check scripts/production-validation/validate-device-pair-evidence.mjs && node --check scripts/production-validation/run-commercial-validate-safe.mjs && node --check scripts/production-validation/generate-settlement-evidence-pack.mjs && npm run security:destructive",
     "audit": "npm audit --audit-level=high",
     "security:destructive": "node scripts/security/check-destructive-ops.mjs",
-    "test": "find tests -name '*.test.mjs' -print0 | xargs -0 node --test",
-    "test:serial": "find tests -name '*.test.mjs' -print0 | xargs -0 node --test --test-concurrency=1",
+    "test": "node scripts/run-node-tests.mjs",
+    "test:serial": "node scripts/run-node-tests.mjs --serial",
     "test:smoke": "node scripts/smoke-test.mjs",
     "test:audit-chain": "node scripts/verify-audit-chain.mjs",
     "deploy:check": "bash scripts/deploy/check.sh",
@@ -31,17 +31,20 @@
     "evidence:collect": "bash scripts/production-validation/collect-evidence.sh",
     "evidence:device:prepare": "bash scripts/production-validation/prepare-device-diagnostics-evidence.sh",
     "evidence:external:prepare": "bash scripts/production-validation/prepare-external-validation-evidence.sh",
+    "validate:device-pair": "node scripts/production-validation/validate-device-pair-evidence.mjs",
     "ci:verify:github": "node scripts/ci/verify-github-actions-run.mjs",
     "hygiene:deps-docker": "node scripts/production-validation/validate-dependency-docker-hygiene.mjs",
     "backup:sqlite": "bash scripts/deploy/backup-sqlite.sh",
-    "restore:drill": "bash scripts/deploy/restore-drill.sh"
+    "restore:drill": "bash scripts/deploy/restore-drill.sh",
+    "handoff:audit": "node scripts/handoff/audit-source-hygiene.mjs",
+    "handoff:zip": "node scripts/handoff/create-clean-source-zip.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^11.8.1",
     "cors": "^2.8.5",
-    "ethers": "^6.15.0",
-    "express": "^4.21.2",
+    "ethers": "^6.17.0",
+    "express": "^4.22.2",
     "helmet": "^8.1.0",
     "luxon": "^3.5.0",
     "qrcode": "^1.5.4",

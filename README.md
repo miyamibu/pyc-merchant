@@ -41,7 +41,7 @@ cp .env.example .env
 npm start
 ```
 
-サポート基準ランタイムは Node 20 です。CI と Dockerfile は Node 20 に固定しており、ローカルでも [`.nvmrc`](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/.nvmrc) / [`.node-version`](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/.node-version) に合わせて検証してください。新しめの Node で動くことはありますが、release evidence の基準は Node 20 です。
+サポート基準ランタイムは Node 24.17.0 です。CI と Dockerfile は Node 24.17.0 に固定しており、ローカルでも [`.nvmrc`](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/.nvmrc) / [`.node-version`](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/.node-version) に合わせて検証してください。新しめの Node で動くことはありますが、release evidence の基準は Node 24.17.0 です。
 
 監視ワーカーは別プロセスで起動します。
 

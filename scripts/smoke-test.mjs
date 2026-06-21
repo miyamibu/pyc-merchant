@@ -10,7 +10,7 @@ const STAFF_PIN = process.env.STAFF_PIN || "1234";
 const SECOND_ADMIN_PIN = process.env.SECOND_ADMIN_PIN || "5678";
 const SECOND_ADMIN_NAME = process.env.SECOND_ADMIN_NAME || "Smoke Approver";
 const CHAIN_ID = process.env.CHAIN_ID || "137";
-const TOKEN_CONTRACT = process.env.TOKEN_CONTRACT || "0x1111111111111111111111111111111111111111";
+const TOKEN_CONTRACT = process.env.TOKEN_CONTRACT || "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 const RECIPIENT = process.env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222";
 const SERVICE_INGEST_ID = process.env.SERVICE_INGEST_ID || "chain-monitor";
 const SERVICE_INGEST_SECRET = process.env.SERVICE_INGEST_SECRET || "replace-with-very-long-random-ingest-secret";
@@ -51,6 +51,7 @@ function buildServerEnv(targetBaseUrl) {
   env.METRICS_SECRET = env.METRICS_SECRET || crypto.randomBytes(32).toString("hex");
   env.CHAIN_ID = env.CHAIN_ID || CHAIN_ID;
   env.TOKEN_CONTRACT = env.TOKEN_CONTRACT || TOKEN_CONTRACT;
+  env.APPROVED_JPYC_TOKEN_CONTRACT = env.APPROVED_JPYC_TOKEN_CONTRACT || TOKEN_CONTRACT;
   env.RECIPIENT_ADDRESS = env.RECIPIENT_ADDRESS || RECIPIENT;
   env.TOKEN_DECIMALS = env.TOKEN_DECIMALS || "18";
   env.JPYC_BASE_UNIT_SCALE = env.JPYC_BASE_UNIT_SCALE || "1000000";
@@ -199,7 +200,8 @@ async function createInvoice(authorization, idempotencyKey, amountJpy) {
       "idempotency-key": idempotencyKey
     },
     body: JSON.stringify({
-      amount_jpy: amountJpy
+      amount_jpy: amountJpy,
+      payment_chain_id: "137"
     })
   });
   assert(created.status === 201, "invoice creation failed", created);
@@ -210,7 +212,7 @@ async function createInvoice(authorization, idempotencyKey, amountJpy) {
 
 async function ingestPayment(authorization, idempotencyKey, link, amountJpyc, mode = "exact") {
   const chainId = mode === "wrong_chain" ? "1" : CHAIN_ID;
-  const tokenContract = mode === "wrong_token" ? "0xdeadbeef" : TOKEN_CONTRACT;
+  const tokenContract = mode === "wrong_token" ? "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" : TOKEN_CONTRACT;
   const amount = mode === "overpay" ? amountJpyc + 200 : amountJpyc;
   return request("/api/v1/payments/events:ingest", {
     method: "POST",
@@ -235,6 +237,18 @@ async function ingestPayment(authorization, idempotencyKey, link, amountJpyc, mo
 async function getInvoiceStatus(authorization, invoiceId) {
   return request(`/api/v1/invoices/${invoiceId}`, {
     headers: { authorization }
+  });
+}
+
+async function cancelInvoice(authorization, invoiceId, idempotencyKey) {
+  return request(`/api/v1/invoices/${invoiceId}/cancel`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization,
+      "idempotency-key": idempotencyKey
+    },
+    body: "{}"
   });
 }
 
@@ -305,7 +319,7 @@ async function main() {
   const missingIdem = await request("/api/v1/invoices", {
     method: "POST",
     headers: { "content-type": "application/json", authorization },
-    body: JSON.stringify({ amount_jpy: 100 })
+    body: JSON.stringify({ amount_jpy: 100, payment_chain_id: "137" })
   });
   assert(missingIdem.status === 400, "idempotency validation failed", missingIdem);
   summary.idempotency = { missingKeyStatus: missingIdem.status };
@@ -383,14 +397,16 @@ async function main() {
 
   const wrongTokenInvoice = await createInvoice(authorization, `smoke-invoice-wrong-token-${nonce}`, 1220);
   const wrongTokenPay = await ingestPayment(authorization, `smoke-pay-wrong-token-${nonce}`, wrongTokenInvoice, 1220, "wrong_token");
-  assert(wrongTokenPay.status === 200, "wrong token ingest failed", wrongTokenPay);
-  const wrongTokenStatus = await getInvoiceStatus(authorization, wrongTokenInvoice.invoiceId);
-  assert(wrongTokenStatus.data.status === "review_required", "wrong token did not become review_required", wrongTokenStatus);
+  assert(wrongTokenPay.status === 400, "wrong token ingest must be rejected", wrongTokenPay);
+  assert(wrongTokenPay.data?.error?.code === "VALIDATION_ERROR", "wrong token rejection must be explicit", wrongTokenPay);
+  const wrongTokenCancel = await cancelInvoice(authorization, wrongTokenInvoice.invoiceId, `smoke-cancel-wrong-token-${nonce}`);
+  assert(wrongTokenCancel.status === 200, "wrong token invoice cleanup failed", wrongTokenCancel);
   summary.mismatchCases = {
     wrongChainDecision: wrongChainPay.data.decision,
     wrongChainStatus: wrongChainStatus.data.status,
-    wrongTokenDecision: wrongTokenPay.data.decision,
-    wrongTokenStatus: wrongTokenStatus.data.status
+    wrongTokenRejectedStatus: wrongTokenPay.status,
+    wrongTokenRejectedCode: wrongTokenPay.data.error.code,
+    wrongTokenCleanupStatus: wrongTokenCancel.status
   };
 
   const shortageInvoice = await createInvoice(authorization, `smoke-invoice-shortage-${nonce}`, 2000);
@@ -531,15 +547,7 @@ async function main() {
   summary.publicPay = { disabledStatus: publicPayDisabled.status };
 
   const cancelledInvoice = await createInvoice(authorization, `smoke-invoice-cancel-${nonce}`, 1300);
-  const cancelResult = await request(`/api/v1/invoices/${cancelledInvoice.invoiceId}/cancel`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization,
-      "idempotency-key": `smoke-cancel-${nonce}`
-    },
-    body: "{}"
-  });
+  const cancelResult = await cancelInvoice(authorization, cancelledInvoice.invoiceId, `smoke-cancel-${nonce}`);
   assert(cancelResult.status === 200, "cancel invoice failed", cancelResult);
   const cancelPay = await ingestPayment(authorization, `smoke-pay-cancelled-${nonce}`, cancelledInvoice, 1300, "exact");
   assert(cancelPay.status === 409, "cancelled invoice accepted payment", cancelPay);

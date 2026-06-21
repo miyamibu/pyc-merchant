@@ -47,6 +47,8 @@ Define a stable accounting interface and frozen accounting snapshot for daily cl
 
 ## Snapshot rules
 - `paid` remains chain-verified only.
+- Every row must preserve `chain_id`, `network`, `token_contract`, and `recipient_address` so the exact JPYC rail is auditable after close.
+- Funds-transfer JPYC rows must use official contract `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29`; JPYC Prepaid/v2 contract `0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB` is explicitly out of scope.
 - Wallet-direct paid invoices export as `onchain_cash_confirmed`.
 - Provider accepted/captured without chain-paid evidence exports as `provider_receivable`.
 - Provider settlement reports with clean invoice allocation but without chain-paid evidence export as `provider_settlement_pending`.

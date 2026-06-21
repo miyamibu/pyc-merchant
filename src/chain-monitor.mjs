@@ -11,6 +11,14 @@ import {
   parseDecimalToBaseUnits,
   scaleToDecimals,
 } from "./amounts.mjs";
+import {
+  OFFICIAL_JPYC_CONTRACT_ADDRESS,
+  OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
+  isOfficialJpycContract,
+  listEnabledPaymentChains,
+  parseEnabledPaymentChainIds,
+  validateOfficialJpycContract,
+} from "./jpyc-contract-policy.mjs";
 
 const CWD = process.cwd();
 const DEFAULTS = {
@@ -19,12 +27,16 @@ const DEFAULTS = {
   INTERNAL_API_BASE_URL: "",
   DB_PATH: "./data/app.db",
   CHAIN_ID: "137",
+  ENABLED_PAYMENT_CHAIN_IDS: "137",
   TOKEN_CONTRACT: "",
   APPROVED_JPYC_TOKEN_CONTRACT: "",
   JPYC_CONTRACT_APPROVAL_REF: "",
   TOKEN_DECIMALS: "18",
   JPYC_BASE_UNIT_SCALE: "",
   RPC_URLS: "",
+  RPC_URLS_1: "",
+  RPC_URLS_43114: "",
+  RPC_URLS_137: "",
   MONITOR_POLL_INTERVAL_MS: "15000",
   MONITOR_BACKSCAN_BLOCKS: "12",
   MIN_MONITOR_BACKSCAN_BLOCKS: "12",
@@ -82,13 +94,13 @@ const APP_HOST = ENV.APP_HOST || DEFAULTS.APP_HOST;
 const INTERNAL_API_BASE_URL = String(ENV.INTERNAL_API_BASE_URL || (IS_PRODUCTION ? "" : APP_HOST)).trim();
 const DB_PATH = path.resolve(CWD, ENV.DB_PATH || DEFAULTS.DB_PATH);
 const CHAIN_ID = String(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID);
+const ENABLED_PAYMENT_CHAIN_IDS = parseEnabledPaymentChainIds(ENV.ENABLED_PAYMENT_CHAIN_IDS || DEFAULTS.ENABLED_PAYMENT_CHAIN_IDS);
 const TOKEN_CONTRACT = String(ENV.TOKEN_CONTRACT || DEFAULTS.TOKEN_CONTRACT).toLowerCase();
 const APPROVED_JPYC_TOKEN_CONTRACT = String(ENV.APPROVED_JPYC_TOKEN_CONTRACT || DEFAULTS.APPROVED_JPYC_TOKEN_CONTRACT).toLowerCase();
 const JPYC_CONTRACT_APPROVAL_REF = String(ENV.JPYC_CONTRACT_APPROVAL_REF || DEFAULTS.JPYC_CONTRACT_APPROVAL_REF || "");
 const TOKEN_DECIMALS = Number(ENV.TOKEN_DECIMALS || DEFAULTS.TOKEN_DECIMALS);
 const JPYC_BASE_UNIT_SCALE = String(ENV.JPYC_BASE_UNIT_SCALE || DEFAULTS.JPYC_BASE_UNIT_SCALE || "");
 const JPYC_DECIMALS = scaleToDecimals(JPYC_BASE_UNIT_SCALE);
-const CHAIN_ID_NUMERIC = Number(CHAIN_ID);
 const RPC_URLS = String(ENV.RPC_URLS || DEFAULTS.RPC_URLS)
   .split(",")
   .map((value) => value.trim())
@@ -106,12 +118,8 @@ const MONITOR_DEAD_LETTER_RETRY_INTERVAL_MS = Number(
 );
 const SERVICE_INGEST_ID = String(ENV.SERVICE_INGEST_ID || DEFAULTS.SERVICE_INGEST_ID);
 const SERVICE_INGEST_SECRET = String(ENV.SERVICE_INGEST_SECRET || DEFAULTS.SERVICE_INGEST_SECRET);
-const ACTIVE_TOKEN_CONTRACT = APPROVED_JPYC_TOKEN_CONTRACT || TOKEN_CONTRACT;
+const ACTIVE_TOKEN_CONTRACT = OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER;
 
-if (RPC_URLS.length === 0) {
-  console.error("FATAL: RPC_URLS is empty. Set at least one RPC endpoint.");
-  process.exit(1);
-}
 if (!SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET === DEFAULTS.SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET.length < 32) {
   console.error("FATAL: SERVICE_INGEST_SECRET must be configured with a strong random value.");
   process.exit(1);
@@ -131,6 +139,20 @@ if (!/^0x[0-9a-f]{40}$/.test(TOKEN_CONTRACT)) {
 if (APPROVED_JPYC_TOKEN_CONTRACT && !/^0x[0-9a-f]{40}$/.test(APPROVED_JPYC_TOKEN_CONTRACT)) {
   console.error("FATAL: APPROVED_JPYC_TOKEN_CONTRACT must be a 0x-prefixed 40-hex EVM address.");
   process.exit(1);
+}
+{
+  const tokenPolicy = validateOfficialJpycContract(TOKEN_CONTRACT, "TOKEN_CONTRACT");
+  if (!tokenPolicy.ok) {
+    console.error(`FATAL: ${tokenPolicy.message}`);
+    process.exit(1);
+  }
+  if (APPROVED_JPYC_TOKEN_CONTRACT) {
+    const approvedPolicy = validateOfficialJpycContract(APPROVED_JPYC_TOKEN_CONTRACT, "APPROVED_JPYC_TOKEN_CONTRACT");
+    if (!approvedPolicy.ok) {
+      console.error(`FATAL: ${approvedPolicy.message}`);
+      process.exit(1);
+    }
+  }
 }
 if (!Number.isFinite(REQUIRED_CONFIRMATIONS) || REQUIRED_CONFIRMATIONS < 0 || !Number.isInteger(REQUIRED_CONFIRMATIONS)) {
   console.error("FATAL: REQUIRED_CONFIRMATIONS must be a non-negative integer.");
@@ -169,8 +191,8 @@ if (IS_PRODUCTION && !INTERNAL_API_BASE_URL) {
   process.exit(1);
 }
 if (IS_PRODUCTION) {
-  if (!APPROVED_JPYC_TOKEN_CONTRACT || TOKEN_CONTRACT !== APPROVED_JPYC_TOKEN_CONTRACT) {
-    console.error("FATAL: TOKEN_CONTRACT must match APPROVED_JPYC_TOKEN_CONTRACT in production.");
+  if (!APPROVED_JPYC_TOKEN_CONTRACT || !isOfficialJpycContract(TOKEN_CONTRACT) || !isOfficialJpycContract(APPROVED_JPYC_TOKEN_CONTRACT)) {
+    console.error(`FATAL: TOKEN_CONTRACT and APPROVED_JPYC_TOKEN_CONTRACT must match official JPYC contract ${OFFICIAL_JPYC_CONTRACT_ADDRESS}.`);
     process.exit(1);
   }
   if (isPlaceholderLike(JPYC_CONTRACT_APPROVAL_REF)) {
@@ -187,7 +209,12 @@ if (IS_PRODUCTION) {
   }
 }
 
-const VALID_RPC_URLS = RPC_URLS.map((rawUrl) => {
+function parseRpcUrls(rawValue, label) {
+  return String(rawValue || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((rawUrl) => {
   try {
     const parsed = new URL(rawUrl);
     if (!["http:", "https:"].includes(parsed.protocol)) {
@@ -195,10 +222,41 @@ const VALID_RPC_URLS = RPC_URLS.map((rawUrl) => {
     }
     return parsed.toString();
   } catch (error) {
-    console.error(`FATAL: RPC_URLS contains invalid URL "${rawUrl}": ${String(error.message || error)}`);
+        console.error(`FATAL: ${label} contains invalid URL "${rawUrl}": ${String(error.message || error)}`);
     process.exit(1);
   }
-});
+    });
+}
+
+function rpcUrlsForChain(chainId) {
+  const chainSpecific = parseRpcUrls(ENV[`RPC_URLS_${chainId}`], `RPC_URLS_${chainId}`);
+  if (chainSpecific.length > 0) return chainSpecific;
+  if (String(chainId) === String(CHAIN_ID)) return parseRpcUrls(RPC_URLS.join(","), "RPC_URLS");
+  return [];
+}
+
+const MONITOR_CHAINS = listEnabledPaymentChains(ENABLED_PAYMENT_CHAIN_IDS)
+  .map((chain) => {
+    const rpcUrls = rpcUrlsForChain(chain.chain_id);
+    return {
+      ...chain,
+      rpcUrls,
+      providers: rpcUrls.map((url) => new JsonRpcProvider(url, Number(chain.chain_id), { staticNetwork: true })),
+      checkpointKey: `last_block:${chain.chain_id}:${chain.token_contract}`,
+      blockTimestampCache: new Map(),
+    };
+  })
+  .filter((chain) => chain.rpcUrls.length > 0);
+
+if (IS_PRODUCTION && MONITOR_CHAINS.length !== ENABLED_PAYMENT_CHAIN_IDS.length) {
+  console.error(`FATAL: production chain monitor requires RPC URLs for enabled chain IDs: ${ENABLED_PAYMENT_CHAIN_IDS.join(", ")}.`);
+  process.exit(1);
+}
+
+if (MONITOR_CHAINS.length === 0) {
+  console.error(`FATAL: RPC_URLS is empty. Set RPC_URLS for CHAIN_ID or chain-specific RPC_URLS_<chain> for enabled chain IDs: ${ENABLED_PAYMENT_CHAIN_IDS.join(", ")}.`);
+  process.exit(1);
+}
 
 const nowIso = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -274,10 +332,6 @@ addColumnIfMissing("chain_dead_letters", "next_retry_at", "next_retry_at TEXT");
 addColumnIfMissing("chain_dead_letters", "resolved_at", "resolved_at TEXT");
 
 const transferInterface = new Interface(["event Transfer(address indexed from, address indexed to, uint256 value)"]);
-const providers = VALID_RPC_URLS.map((url) =>
-  new JsonRpcProvider(url, Number.isFinite(CHAIN_ID_NUMERIC) ? CHAIN_ID_NUMERIC : undefined, { staticNetwork: true })
-);
-const checkpointKey = `last_block:${CHAIN_ID}:${ACTIVE_TOKEN_CONTRACT}`;
 
 function toInvoiceBaseUnits(invoice) {
   if (invoice?.amount_jpyc_base != null && String(invoice.amount_jpyc_base).trim() !== "") {
@@ -309,23 +363,23 @@ function toAddressTopic(address) {
   return `0x${normalized.slice(2).padStart(64, "0")}`;
 }
 
-function getCheckpoint() {
-  const row = db.prepare(`SELECT value FROM chain_monitor_state WHERE key = ?`).get(checkpointKey);
+function getCheckpoint(chain = MONITOR_CHAINS[0]) {
+  const row = db.prepare(`SELECT value FROM chain_monitor_state WHERE key = ?`).get(chain.checkpointKey);
   if (!row) return null;
   const parsed = Number(row.value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function setCheckpoint(blockNumber) {
+function setCheckpoint(blockNumber, chain = MONITOR_CHAINS[0]) {
   const ts = nowIso();
   db.prepare(
     `INSERT INTO chain_monitor_state (key, value, updated_at)
      VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
-  ).run(checkpointKey, String(blockNumber), ts);
+  ).run(chain.checkpointKey, String(blockNumber), ts);
 }
 
-function getCandidateInvoices() {
+function getCandidateInvoices(chain) {
   return db
     .prepare(
       `SELECT id, amount_jpyc, amount_jpyc_base, recipient_address, status
@@ -334,7 +388,7 @@ function getCandidateInvoices() {
          AND lower(token_contract) = ?
          AND status IN ('issued', 'payment_detected', 'confirming', 'expired', 'review_required')`
     )
-    .all(CHAIN_ID, ACTIVE_TOKEN_CONTRACT);
+    .all(chain.chain_id, chain.token_contract);
 }
 
 function selectInvoiceForLog(invoices, toAddress, amountJpyc) {
@@ -354,9 +408,9 @@ function selectInvoiceForLog(invoices, toAddress, amountJpyc) {
   return { invoice: null, reason: "ambiguous_recipient" };
 }
 
-async function withProvider(label, fn) {
+async function withProvider(chain, label, fn) {
   let lastError = null;
-  for (const provider of providers) {
+  for (const provider of chain.providers) {
     try {
       return await fn(provider);
     } catch (error) {
@@ -366,12 +420,13 @@ async function withProvider(label, fn) {
         `INSERT INTO chain_rpc_failovers(id, provider_url, label, error_message, created_at)
          VALUES (?, ?, ?, ?, ?)`
       ).run(crypto.randomUUID(), providerUrl, label, String(error.message || error), nowIso());
-      setState("worker:last_rpc_failover_at", nowIso());
+      setState(`worker:${chain.chain_id}:last_rpc_failover_at`, nowIso());
       console.error(
         JSON.stringify({
           ts: nowIso(),
           level: "warn",
           type: "chain.provider_failed",
+          chain_id: chain.chain_id,
           label,
           provider: providerUrl,
           message: String(error.message || error)
@@ -379,24 +434,23 @@ async function withProvider(label, fn) {
       );
     }
   }
-  throw lastError || new Error(`All providers failed for ${label}`);
+  throw lastError || new Error(`All providers failed for ${label} on chain ${chain.chain_id}`);
 }
 
-const blockTimestampCache = new Map();
-async function blockTimestampIso(blockNumber) {
+async function blockTimestampIso(blockNumber, chain = MONITOR_CHAINS[0]) {
   const normalizedBlockNumber = Number(blockNumber);
   if (!Number.isFinite(normalizedBlockNumber)) return null;
-  if (!blockTimestampCache.has(normalizedBlockNumber)) {
+  if (!chain.blockTimestampCache.has(normalizedBlockNumber)) {
     const blockHex = `0x${BigInt(normalizedBlockNumber).toString(16)}`;
-    const block = await withProvider("getBlock", (provider) => provider.send("eth_getBlockByNumber", [blockHex, false]));
+    const block = await withProvider(chain, "getBlock", (provider) => provider.send("eth_getBlockByNumber", [blockHex, false]));
     if (!block?.timestamp) {
-      blockTimestampCache.delete(normalizedBlockNumber);
+      chain.blockTimestampCache.delete(normalizedBlockNumber);
       return null;
     }
     const timestamp = String(block.timestamp).startsWith("0x") ? Number(BigInt(block.timestamp)) : Number(block.timestamp);
-    blockTimestampCache.set(normalizedBlockNumber, new Date(timestamp * 1000).toISOString());
+    chain.blockTimestampCache.set(normalizedBlockNumber, new Date(timestamp * 1000).toISOString());
   }
-  return blockTimestampCache.get(normalizedBlockNumber);
+  return chain.blockTimestampCache.get(normalizedBlockNumber);
 }
 
 async function postIngest(payload, idempotencyKey) {
@@ -533,7 +587,10 @@ async function retryPendingDeadLetters() {
     const idemKey = `chain-retry-${sha256(idemSeed).slice(0, 46)}`;
     try {
       if (!payload.block_timestamp && Array.isArray(payload.missing_fields) && payload.missing_fields.includes("block_timestamp")) {
-        const recoveredBlockTimestamp = await blockTimestampIso(payload.block_number);
+        const recoveredBlockTimestamp = await blockTimestampIso(
+          payload.block_number,
+          MONITOR_CHAINS.find((chain) => String(chain.chain_id) === String(row.chain_id)) || MONITOR_CHAINS[0]
+        );
         if (!recoveredBlockTimestamp) {
           throw new Error("missing_block_timestamp");
         }
@@ -580,25 +637,26 @@ async function retryPendingDeadLetters() {
 }
 
 let lastDeadLetterRetryMs = 0;
-async function runCycle() {
-  setState("worker:last_cycle_started_at", nowIso());
-  const invoices = getCandidateInvoices();
-  const latestBlock = await withProvider("getBlockNumber", (provider) => provider.getBlockNumber());
-  const previous = getCheckpoint();
+async function runCycle(chain = MONITOR_CHAINS[0]) {
+  setState(`worker:${chain.chain_id}:last_cycle_started_at`, nowIso());
+  const invoices = getCandidateInvoices(chain);
+  const latestBlock = await withProvider(chain, "getBlockNumber", (provider) => provider.getBlockNumber());
+  const previous = getCheckpoint(chain);
   if (previous == null) {
     console.warn(
       JSON.stringify({
         ts: nowIso(),
         level: "warn",
         type: "chain.checkpoint_missing",
+        chain_id: chain.chain_id,
         message: "checkpoint is not initialized yet; monitor will backscan from latest block window",
       })
     );
   }
   if (previous != null && latestBlock < previous) {
-    setState("worker:last_reorg_at", nowIso());
-    setState("worker:last_reorg_from", previous);
-    setState("worker:last_reorg_to", latestBlock);
+    setState(`worker:${chain.chain_id}:last_reorg_at`, nowIso());
+    setState(`worker:${chain.chain_id}:last_reorg_from`, previous);
+    setState(`worker:${chain.chain_id}:last_reorg_to`, latestBlock);
   }
   const fromBlock = previous == null ? Math.max(latestBlock - MONITOR_BACKSCAN_BLOCKS, 0) : Math.max(previous - MONITOR_BACKSCAN_BLOCKS, 0);
   const toBlock = latestBlock;
@@ -613,14 +671,14 @@ async function runCycle() {
         message: "scan skipped because toBlock < fromBlock",
       })
     );
-    setState("worker:last_cycle_at", nowIso());
+    setState(`worker:${chain.chain_id}:last_cycle_at`, nowIso());
     return;
   }
 
   const recipientTopics = [...new Set(invoices.map((invoice) => toAddressTopic(String(invoice.recipient_address || ""))).filter(Boolean))];
-  const logs = await withProvider("getLogs", (provider) =>
+  const logs = await withProvider(chain, "getLogs", (provider) =>
     provider.getLogs({
-      address: ACTIVE_TOKEN_CONTRACT,
+      address: chain.token_contract,
       fromBlock,
       toBlock,
       topics: recipientTopics.length > 0 ? [transferInterface.getEvent("Transfer").topicHash, null, recipientTopics] : [transferInterface.getEvent("Transfer").topicHash]
@@ -636,6 +694,7 @@ async function runCycle() {
           ts: nowIso(),
           level: "warn",
           type: "chain.log_parse_failed",
+          chain_id: chain.chain_id,
           tx_hash: String(log?.transactionHash || ""),
           log_index: Number(log?.index ?? log?.logIndex ?? 0),
           message: String(error.message || error),
@@ -648,7 +707,7 @@ async function runCycle() {
     if (amountConversion.error) {
       try {
         upsertDeadLetter({
-          chainId: CHAIN_ID,
+          chainId: chain.chain_id,
           txHash: String(log.transactionHash),
           logIndex: Number(log.index ?? log.logIndex ?? 0),
           invoiceId: null,
@@ -695,8 +754,8 @@ async function runCycle() {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           crypto.randomUUID(),
-          CHAIN_ID,
-          ACTIVE_TOKEN_CONTRACT,
+          chain.chain_id,
+          chain.token_contract,
           String(log.transactionHash),
           Number(log.index ?? log.logIndex ?? 0),
           Number(log.blockNumber ?? 0),
@@ -734,10 +793,10 @@ async function runCycle() {
       continue;
     }
 
-    const blockTimestamp = await blockTimestampIso(log.blockNumber);
+    const blockTimestamp = await blockTimestampIso(log.blockNumber, chain);
     if (!blockTimestamp) {
       upsertDeadLetter({
-        chainId: CHAIN_ID,
+        chainId: chain.chain_id,
         txHash: String(log.transactionHash),
         logIndex: Number(log.index ?? log.logIndex ?? 0),
         invoiceId: selected.invoice.id,
@@ -745,8 +804,8 @@ async function runCycle() {
           invoice_id: selected.invoice.id,
           amount_jpyc_base: amountBase,
           amount_jpyc: amountJpyc,
-          chain_id: CHAIN_ID,
-          token_contract: ACTIVE_TOKEN_CONTRACT,
+          chain_id: chain.chain_id,
+          token_contract: chain.token_contract,
           to_address: toAddress,
           from_address: String(parsed.args.from || "").toLowerCase(),
           confirmations,
@@ -764,8 +823,8 @@ async function runCycle() {
     const payload = {
       invoice_id: selected.invoice.id,
       amount_jpyc: amountJpyc,
-      chain_id: CHAIN_ID,
-      token_contract: ACTIVE_TOKEN_CONTRACT,
+      chain_id: chain.chain_id,
+      token_contract: chain.token_contract,
       to_address: toAddress,
       from_address: String(parsed.args.from || "").toLowerCase(),
       confirmations,
@@ -778,7 +837,7 @@ async function runCycle() {
 	      block_timestamp: blockTimestamp,
 	      source: "chain_monitor"
 	    };
-    const idemSeed = `${CHAIN_ID}:${payload.tx_hash}:${payload.log_index}:${payload.invoice_id}`;
+    const idemSeed = `${chain.chain_id}:${payload.tx_hash}:${payload.log_index}:${payload.invoice_id}`;
     const idemKey = `chain-${sha256(idemSeed).slice(0, 48)}`;
     try {
       const result = await postIngest(payload, idemKey);
@@ -795,7 +854,7 @@ async function runCycle() {
     } catch (error) {
       try {
         upsertDeadLetter({
-          chainId: CHAIN_ID,
+          chainId: chain.chain_id,
           txHash: payload.tx_hash,
           logIndex: payload.log_index,
           invoiceId: payload.invoice_id,
@@ -822,42 +881,45 @@ async function runCycle() {
     lastDeadLetterRetryMs = Date.now();
   }
 
-  setCheckpoint(toBlock);
-  setState("worker:last_cycle_at", nowIso());
-  setState("worker:last_checkpoint", toBlock);
+  setCheckpoint(toBlock, chain);
+  setState(`worker:${chain.chain_id}:last_cycle_at`, nowIso());
+  setState(`worker:${chain.chain_id}:last_checkpoint`, toBlock);
 }
 
 let stopping = false;
 async function main() {
   setState("worker:started_at", nowIso());
-  setState("worker:chain_id", CHAIN_ID);
+  setState("worker:chain_ids", MONITOR_CHAINS.map((chain) => chain.chain_id).join(","));
   setState("worker:token_contract", ACTIVE_TOKEN_CONTRACT);
-  setState("worker:rpc_count", providers.length);
+  setState("worker:rpc_count", MONITOR_CHAINS.reduce((sum, chain) => sum + chain.providers.length, 0));
   console.log(
     JSON.stringify({
       ts: nowIso(),
       level: "info",
       type: "chain.monitor_started",
-      chain_id: CHAIN_ID,
+      chain_ids: MONITOR_CHAINS.map((chain) => chain.chain_id),
       token_contract: ACTIVE_TOKEN_CONTRACT,
       db_path: DB_PATH,
-      rpc_count: providers.length
+      rpc_count: MONITOR_CHAINS.reduce((sum, chain) => sum + chain.providers.length, 0)
     })
   );
   while (!stopping) {
-    try {
-      await runCycle();
-    } catch (error) {
-      setState("worker:last_cycle_error_at", nowIso());
-      setState("worker:last_cycle_error", String(error.message || error));
-      console.error(
-        JSON.stringify({
-          ts: nowIso(),
-          level: "error",
-          type: "chain.monitor_cycle_failed",
-          message: String(error.message || error)
-        })
-      );
+    for (const chain of MONITOR_CHAINS) {
+      try {
+        await runCycle(chain);
+      } catch (error) {
+        setState(`worker:${chain.chain_id}:last_cycle_error_at`, nowIso());
+        setState(`worker:${chain.chain_id}:last_cycle_error`, String(error.message || error));
+        console.error(
+          JSON.stringify({
+            ts: nowIso(),
+            level: "error",
+            type: "chain.monitor_cycle_failed",
+            chain_id: chain.chain_id,
+            message: String(error.message || error)
+          })
+        );
+      }
     }
     await sleep(MONITOR_POLL_INTERVAL_MS);
   }
@@ -866,7 +928,7 @@ async function main() {
 
 process.on("SIGINT", () => {
   stopping = true;
-  for (const provider of providers) {
+  for (const provider of MONITOR_CHAINS.flatMap((chain) => chain.providers)) {
     try {
       provider.destroy();
     } catch (error) {
@@ -884,7 +946,7 @@ process.on("SIGINT", () => {
 });
 process.on("SIGTERM", () => {
   stopping = true;
-  for (const provider of providers) {
+  for (const provider of MONITOR_CHAINS.flatMap((chain) => chain.providers)) {
     try {
       provider.destroy();
     } catch (error) {

@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scaleToDecimals } from "../../src/amounts.mjs";
+import { parseEnabledPaymentChainIds } from "../../src/jpyc-contract-policy.mjs";
 import { validateCommercialEvidence } from "./validate-commercial-evidence.mjs";
 import { renderCommercialScorecard } from "./validate-commercial-scorecard.mjs";
 
@@ -204,9 +205,57 @@ function runAuditChainVerification(env) {
   };
 }
 
+function validateReleaseId(value) {
+  const raw = String(value || "").trim();
+  return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(raw) || /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
+}
+
+function loadReleaseManifest(manifestPath) {
+  if (!manifestPath) return { ok: false, path: null, blockers: ["missing_release_manifest"] };
+  const resolved = path.resolve(process.cwd(), manifestPath);
+  if (!fs.existsSync(resolved)) return { ok: false, path: resolved, blockers: ["missing_release_manifest"] };
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(resolved, "utf8"));
+  } catch (_error) {
+    return { ok: false, path: resolved, blockers: ["invalid_release_manifest_json"] };
+  }
+  const required = [
+    "release_id",
+    "mode",
+    "commit",
+    "source_hash",
+    "lockfile_hash",
+    "migration_hash",
+    "runtime",
+    "base_image_digest",
+    "app_image_digest",
+    "env_hash",
+    "db_snapshot_hash",
+    "backup_hash",
+    "audit_root",
+    "issued_at",
+    "expires_at",
+    "revocation_status",
+    "signatures",
+  ];
+  const blockers = [];
+  for (const key of required) {
+    if (manifest[key] == null || manifest[key] === "" || String(manifest[key]).toLowerCase() === "null") {
+      blockers.push(`manifest_missing_${key}`);
+    }
+  }
+  if (String(manifest.app_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_app_image_digest_null");
+  if (String(manifest.base_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_base_image_digest_null");
+  if (!Array.isArray(manifest.signatures) || manifest.signatures.length === 0) blockers.push("manifest_missing_signatures");
+  if (String(manifest.revocation_status || "").trim().toLowerCase() !== "valid") blockers.push("manifest_revocation_not_valid");
+  return { ok: blockers.length === 0, path: resolved, manifest, blockers };
+}
+
 function evaluateDangerousFlags(env) {
   const blockers = [];
   const simulation = boolFlag(env.ENABLE_PUBLIC_PAYMENT_SIMULATION, false);
+  const providerRailMock = boolFlag(env.ENABLE_PROVIDER_RAIL_MOCK, false);
   const demoControls = boolFlag(env.DEMO_CONTROLS_ENABLED, false);
   const diagnosticMode = boolFlag(env.DIAGNOSTIC_MODE_ENABLED, false);
   const manualIngest = boolFlag(env.ALLOW_MANUAL_PAYMENT_INGEST, false);
@@ -218,6 +267,7 @@ function evaluateDangerousFlags(env) {
   const trustProxy = boolFlag(env.TRUST_PROXY, true);
 
   if (simulation) blockers.push("ENABLE_PUBLIC_PAYMENT_SIMULATION must be false");
+  if (providerRailMock) blockers.push("ENABLE_PROVIDER_RAIL_MOCK must be false");
   if (demoControls) blockers.push("DEMO_CONTROLS_ENABLED must be false");
   if (diagnosticMode) blockers.push("DIAGNOSTIC_MODE_ENABLED must be false");
   if (manualIngest && isPlaceholderLike(env.MANUAL_INGEST_APPROVAL_REF)) {
@@ -255,9 +305,17 @@ function evaluateDangerousFlags(env) {
 function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const appEnv = String(env.APP_ENV || env.NODE_ENV || "development").trim().toLowerCase();
   const commercialMode = boolFlag(env.COMMERCIAL_GO_MODE, appEnv === "production");
+  const releaseMode = String(env.RELEASE_MODE || env.COMMERCIAL_RELEASE_MODE || (commercialMode ? "commercial" : "development")).trim().toLowerCase();
+  const releaseId = String(env.RELEASE_ID || "").trim();
+  const evidenceDir = String(env.COMMERCIAL_EVIDENCE_DIR || "").trim();
+  const manifestPath = String(env.RELEASE_MANIFEST || "").trim();
+  const releaseManifest = loadReleaseManifest(manifestPath);
+  const explicitReleaseSelectionGate = validateReleaseId(releaseId) && !!evidenceDir && !!manifestPath;
   const chainId = String(env.CHAIN_ID || "").trim();
+  const enabledChainIds = parseEnabledPaymentChainIds(env.ENABLED_PAYMENT_CHAIN_IDS || "137");
   const tokenContract = String(env.TOKEN_CONTRACT || "").trim().toLowerCase();
   const approvedTokenContract = String(env.APPROVED_JPYC_TOKEN_CONTRACT || "").trim().toLowerCase();
+  const officialJpycContract = "0xe7c3d8c9a439fede00d2600032d5db0be71c3c29";
   const tokenDecimals = Number(env.TOKEN_DECIMALS || NaN);
   const scaleDecimals = parseScaleDecimals(env.JPYC_BASE_UNIT_SCALE);
 
@@ -267,11 +325,12 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const appiGate = boolFlag(env.APPI_POLICY_APPROVED, false) && !isPlaceholderLike(env.APPI_POLICY_APPROVAL_REF);
 
   const jpycContractGate = !isPlaceholderLike(env.JPYC_CONTRACT_APPROVAL_REF)
-    && chainId === "137"
+    && enabledChainIds.includes(chainId)
     && !!approvedTokenContract
-    && tokenContract === approvedTokenContract
-    && Number.isFinite(tokenDecimals)
-	    && scaleDecimals != null;
+    && tokenContract === officialJpycContract
+    && approvedTokenContract === officialJpycContract
+    && tokenDecimals === 18
+    && scaleDecimals === 6;
 
   const requiredConfirmations = Number(env.REQUIRED_CONFIRMATIONS || 2);
   const minRequiredConfirmations = Number(env.MIN_REQUIRED_CONFIRMATIONS || 2);
@@ -293,10 +352,10 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const settlementPolicyGate = settlementPolicy === "block" || settlementBlockLegacy;
 
   const refundPolicyGate = boolFlag(env.REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR, true);
-	  const policyUrls = evaluatePolicyUrls({ sourcePath: policyUrlSource || env.POLICY_URL_SOURCE || "public/mobile.js", env });
+  const policyUrls = evaluatePolicyUrls({ sourcePath: policyUrlSource || env.POLICY_URL_SOURCE || "public/mobile.js", env });
   const dangerousFlags = evaluateDangerousFlags(env);
   const auditChain = runAuditChainVerification(env);
-  const evidence = validateCommercialEvidence({ evidenceRoot });
+  const evidence = validateCommercialEvidence({ evidenceRoot, evidenceDir: evidenceDir || null });
   const signedConditionalWaiverRef = String(env.SIGNED_CONDITIONAL_GO_WAIVER_REF || "").trim();
   const signedConditionalWaiverGate = !isPlaceholderLike(signedConditionalWaiverRef);
   const serverSource = fs.existsSync(path.resolve(process.cwd(), "src/server.mjs"))
@@ -318,6 +377,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     privacy_gate: privacyGate,
     appi_gate: appiGate,
     jpyc_contract_gate: jpycContractGate,
+    enabled_chain_allowlist_gate: enabledChainIds.includes(chainId),
     confirmation_policy_gate: confirmationPolicyGate,
     backscan_policy_gate: backscanPolicyGate,
     dangerous_flags_gate: dangerousFlags.ok,
@@ -326,6 +386,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     settlement_policy_gate: settlementPolicyGate,
     policy_urls_gate: policyUrls.ok,
     address_proof_gate: addressProofGate,
+    explicit_release_selection_gate: explicitReleaseSelectionGate,
+    release_manifest_gate: releaseManifest.ok,
     wallet_evidence_gate: Boolean(evidence.ext?.EXT_002?.ok),
     real_payment_evidence_gate: Boolean(evidence.ext?.EXT_001?.ok),
     tls_evidence_gate: Boolean(evidence.ext?.EXT_003?.ok),
@@ -341,6 +403,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.privacy_gate) blockers.P0.push("missing privacy approval gate/reference");
   if (!gates.appi_gate) blockers.P0.push("missing APPI approval gate/reference");
 	  if (!gates.jpyc_contract_gate) blockers.P0.push("JPYC contract gate failed (chain/contract/ref/decimal config)");
+  if (!gates.enabled_chain_allowlist_gate) blockers.P0.push("CHAIN_ID is not included in ENABLED_PAYMENT_CHAIN_IDS");
   if (!gates.confirmation_policy_gate) blockers.P0.push("confirmation policy gate failed");
   if (!gates.backscan_policy_gate) blockers.P0.push("backscan policy gate failed");
   if (!gates.dangerous_flags_gate) blockers.P0.push(...dangerousFlags.blockers);
@@ -348,6 +411,10 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.refund_policy_gate) blockers.P0.push("REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR must be true");
   if (!gates.settlement_policy_gate) blockers.P0.push("settlement_unresolved_review_policy must be block in commercial mode");
   if (!gates.address_proof_gate) blockers.P0.push("receive address ownership proof gate is not scope-bound");
+  if (!gates.explicit_release_selection_gate) blockers.P0.push("release gate requires explicit --release-id, --evidence-dir, and --manifest");
+  if (!gates.release_manifest_gate) blockers.P0.push(...releaseManifest.blockers);
+  if (evidence.evidence_dir_selection !== "explicit") blockers.P0.push("latest evidence auto-selection is forbidden for real-money release gates");
+  if (signedConditionalWaiverRef) blockers.P0.push("real-money release mode forbids conditional waivers");
 
   if (!gates.production_env_gate) blockers.P1.push("APP_ENV is not production");
   if (!gates.commercial_go_mode_gate) blockers.P1.push("COMMERCIAL_GO_MODE is not enabled");
@@ -389,7 +456,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
 
   const p0Count = blockers.P0.length;
   const extAllPass = gates.wallet_evidence_gate && gates.real_payment_evidence_gate && gates.tls_evidence_gate && gates.store_ops_drill_gate;
-  const limitedEvidenceGate = extAllPass || gates.signed_conditional_waiver_gate;
+  const limitedEvidenceGate = extAllPass;
   const limitedPilotReady = [
     gates.legal_gate,
     gates.aml_gate,
@@ -397,6 +464,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     gates.appi_gate,
     gates.policy_urls_gate,
     gates.address_proof_gate,
+    gates.explicit_release_selection_gate,
+    gates.release_manifest_gate,
     gates.settlement_policy_gate,
     limitedEvidenceGate,
   ].every(Boolean);
@@ -420,8 +489,14 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     generated_at: new Date().toISOString(),
     app_env: appEnv,
     commercial_go_mode: commercialMode,
+    release_mode: releaseMode,
+    release_id: releaseId || null,
+    release_manifest: releaseManifest.path,
     evidence_root: evidenceRoot,
+    evidence_dir: evidence.evidence_dir || null,
+    evidence_dir_selection: evidence.evidence_dir_selection,
     latest_evidence_dir: evidence.latest_evidence_dir || null,
+    enabled_chain_ids: enabledChainIds,
     score,
     verdict,
     commercial_9_ready: verdict === "COMMERCIAL_GO" || verdict === "COMMERCIAL_GO_10",
@@ -432,6 +507,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     dangerous_flag_details: dangerousFlags.blockers,
     audit_chain: auditChain,
     policy_urls: policyUrls,
+    release_manifest_gate: releaseManifest,
     external_evidence: evidence.ext,
     poc_evidence: evidence.poc,
     ext_all_pass: evidence.ext_all_pass,
@@ -488,15 +564,60 @@ function renderSummaryMarkdown(report, paths) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const env = loadEnvMap(args.get("env-file") || null);
-  const evidenceRoot = path.resolve(process.cwd(), args.get("evidence-root") || env.COMMERCIAL_EVIDENCE_ROOT || DEFAULT_EVIDENCE_ROOT);
+  const loadedEnv = loadEnvMap(args.get("env-file") || null);
+  const explicitEvidenceDir = args.get("evidence-dir") || loadedEnv.EVIDENCE_RELEASE_DIR || process.env.COMMERCIAL_EVIDENCE_DIR || "";
+  const env = {
+    ...loadedEnv,
+    RELEASE_ID: args.get("release-id") || process.env.RELEASE_ID || "",
+    RELEASE_MANIFEST: args.get("manifest") || process.env.RELEASE_MANIFEST || "",
+    COMMERCIAL_EVIDENCE_DIR: explicitEvidenceDir,
+  };
+  const enforceMode = args.get("enforce") === "true" || args.get("limited-enforce") === "true";
+  const evidenceRoot = path.resolve(
+    process.cwd(),
+    args.get("evidence-root")
+      || (explicitEvidenceDir ? path.dirname(explicitEvidenceDir) : "")
+      || env.COMMERCIAL_EVIDENCE_ROOT
+      || DEFAULT_EVIDENCE_ROOT
+  );
   const policyUrlSource = args.get("policy-url-source") || env.POLICY_URL_SOURCE || "public/mobile.js";
   const outDir = args.get("output-dir")
     ? path.resolve(process.cwd(), args.get("output-dir"))
     : path.join(evidenceRoot, utcTimestamp());
   fs.mkdirSync(outDir, { recursive: true });
 
-  const report = evaluateCommercialGo({ env, evidenceRoot, policyUrlSource });
+  if (enforceMode && !explicitEvidenceDir) {
+    const report = {
+      generated_at: new Date().toISOString(),
+      verdict: "NO_GO",
+      score: 0,
+      limited_pilot_ready: false,
+      blockers: { P0: ["--evidence-dir is required for enforced gates"], P1: [], P2: [] },
+      evidence_root: evidenceRoot,
+      latest_evidence_dir: null,
+    };
+    const jsonPath = path.join(outDir, "commercial-go-validation.json");
+    const summaryPath = path.join(outDir, "COMMERCIAL_GO_SUMMARY.md");
+    writeJson(jsonPath, report);
+    fs.writeFileSync(summaryPath, "# Commercial Go Validation Summary\n\n- Verdict: NO_GO\n- P0: --evidence-dir is required for enforced gates\n", "utf8");
+    console.log(JSON.stringify({
+      ok: true,
+      verdict: "NO_GO",
+      score: 0,
+      limited_pilot_ready: false,
+      blockers: report.blockers,
+      output_dir: outDir,
+      json: jsonPath,
+      summary: summaryPath,
+    }, null, 2));
+    process.exit(1);
+  }
+
+  const report = evaluateCommercialGo({
+    env: { ...env, EXPLICIT_EVIDENCE_DIR: explicitEvidenceDir || "" },
+    evidenceRoot,
+    policyUrlSource,
+  });
   const jsonPath = path.join(outDir, "commercial-go-validation.json");
   const scorecardPath = path.resolve(
     process.cwd(),

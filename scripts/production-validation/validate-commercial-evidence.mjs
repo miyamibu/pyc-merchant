@@ -188,19 +188,28 @@ function evaluatePocEvidence(dirPath) {
   }
   return results;
 }
-export function validateCommercialEvidence({ evidenceRoot = path.resolve(process.cwd(), "docs/production/evidence") } = {}) {
-  const latestDir = findLatestEvidenceDir(evidenceRoot);
+export function validateCommercialEvidence({
+  evidenceRoot = path.resolve(process.cwd(), "docs/production/evidence"),
+  evidenceDir = null,
+} = {}) {
+  const explicitDir = evidenceDir ? path.resolve(process.cwd(), evidenceDir) : null;
+  const latestDir = explicitDir || findLatestEvidenceDir(evidenceRoot);
   const result = {
     ok: false,
     generated_at: new Date().toISOString(),
     evidence_root: evidenceRoot,
-    latest_evidence_dir: latestDir,
+    evidence_dir: latestDir,
+    explicit_evidence_dir: explicitDir,
+    evidence_dir_selection: explicitDir ? "explicit" : "latest",
+    latest_evidence_dir: explicitDir ? null : latestDir,
     ext: {},
     poc: [],
     blockers: [],
   };
 
-  if (!latestDir) {
+  if (explicitDir && !fs.existsSync(explicitDir)) {
+    result.blockers.push("missing_explicit_evidence_dir");
+  } else if (!latestDir) {
     result.blockers.push("missing_latest_evidence_dir");
   } else {
     const ext001 = readEvidence(latestDir, ["EXT-001-real-jpyc-payment.md"]);
@@ -245,8 +254,9 @@ export function validateCommercialEvidence({ evidenceRoot = path.resolve(process
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const evidenceRoot = path.resolve(process.cwd(), args.get("evidence-root") || "docs/production/evidence");
+  const evidenceDir = args.get("evidence-dir") ? path.resolve(process.cwd(), args.get("evidence-dir")) : null;
   const strict = boolFlag(args.get("strict"));
-  const result = validateCommercialEvidence({ evidenceRoot });
+  const result = validateCommercialEvidence({ evidenceRoot, evidenceDir });
   if (args.get("output")) {
     const outputPath = path.resolve(process.cwd(), args.get("output"));
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });

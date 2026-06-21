@@ -6,6 +6,7 @@ import {
   baseServerEnv,
   createInvoice,
   getInvoice,
+  OFFICIAL_JPYC_CONTRACT,
   loginAs,
   randomTxHash,
   startServerProcess,
@@ -122,15 +123,19 @@ function businessDateJst() {
   return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
+function toTokenRawUnits(appBaseUnits) {
+  return String(BigInt(String(appBaseUnits)) * 1_000_000_000_000n);
+}
+
 test("manual ingest verifies receipts on-chain before applying payment decisions", async (t) => {
   const rpc = await startMockRpcServer({ chainId: 137 });
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = OFFICIAL_JPYC_CONTRACT;
   const env = baseServerEnv({
     ALLOW_MANUAL_PAYMENT_INGEST: "true",
     RPC_URLS: rpc.url,
     TOKEN_CONTRACT: tokenContract,
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
-    TOKEN_DECIMALS: "6",
+    TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
   });
   const started = await startServerProcess(CWD, env);
@@ -155,7 +160,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: detail.data.amounts.amount_jpyc_base,
+      amountBase: toTokenRawUnits(detail.data.amounts.amount_jpyc_base),
       blockNumber: 100,
       blockTimestamp: Math.floor(Date.now() / 1000),
     });
@@ -173,7 +178,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: detail.data.amounts.amount_jpyc_base,
+      amountBase: toTokenRawUnits(detail.data.amounts.amount_jpyc_base),
       blockNumber: 110,
     });
     rpc.setLatestBlock(112);
@@ -191,7 +196,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: "0x8888888888888888888888888888888888888888",
-      amountBase: detail.data.amounts.amount_jpyc_base,
+      amountBase: toTokenRawUnits(detail.data.amounts.amount_jpyc_base),
       blockNumber: 120,
     });
     rpc.setLatestBlock(122);
@@ -209,7 +214,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: String(BigInt(detail.data.amounts.amount_jpyc_base) + 200_000_000n),
+      amountBase: toTokenRawUnits(BigInt(detail.data.amounts.amount_jpyc_base) + 200_000_000n),
       blockNumber: 130,
     });
     rpc.setLatestBlock(132);
@@ -227,7 +232,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: detail.data.amounts.amount_jpyc_base,
+      amountBase: toTokenRawUnits(detail.data.amounts.amount_jpyc_base),
       blockNumber: 140,
       blockTimestamp: expiresAtSec + 30,
     });
@@ -245,7 +250,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: detail.data.amounts.amount_jpyc_base,
+      amountBase: toTokenRawUnits(detail.data.amounts.amount_jpyc_base),
       blockNumber: 150,
     });
     rpc.setLatestBlock(152);
@@ -272,7 +277,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: detail.data.amounts.amount_jpyc_base,
+      amountBase: toTokenRawUnits(detail.data.amounts.amount_jpyc_base),
       blockNumber: 160,
     });
     rpc.setLatestBlock(160);
@@ -284,13 +289,13 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
 
 test("manual ingest rejects wrong-chain RPC and refund verification promotes only exact confirmed transfers", async (t) => {
   const wrongChainRpc = await startMockRpcServer({ chainId: 1 });
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = OFFICIAL_JPYC_CONTRACT;
   const wrongChainEnv = baseServerEnv({
     ALLOW_MANUAL_PAYMENT_INGEST: "true",
     RPC_URLS: wrongChainRpc.url,
     TOKEN_CONTRACT: tokenContract,
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
-    TOKEN_DECIMALS: "6",
+    TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
   });
   const wrongChainStarted = await startServerProcess(CWD, wrongChainEnv);
@@ -312,7 +317,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     tokenContract,
     fromAddress: "0x9999999999999999999999999999999999999999",
     toAddress: wrongChainInvoice.detail.data.chain.recipient_address,
-    amountBase: wrongChainInvoice.detail.data.amounts.amount_jpyc_base,
+    amountBase: toTokenRawUnits(wrongChainInvoice.detail.data.amounts.amount_jpyc_base),
     blockNumber: 200,
   });
   wrongChainRpc.setLatestBlock(202);
@@ -332,7 +337,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     RPC_URLS: rpc.url,
     TOKEN_CONTRACT: tokenContract,
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
-    TOKEN_DECIMALS: "6",
+    TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
   });
   const started = await startServerProcess(CWD, env);
@@ -361,7 +366,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: "0x9999999999999999999999999999999999999999",
       toAddress: detail.data.chain.recipient_address,
-      amountBase: String(BigInt(detail.data.amounts.amount_jpyc_base) + BigInt(paidAmount - invoiceAmount) * 1_000_000n),
+      amountBase: toTokenRawUnits(BigInt(detail.data.amounts.amount_jpyc_base) + BigInt(paidAmount - invoiceAmount) * 1_000_000n),
       blockNumber: 300 + Math.floor(Math.random() * 100),
     });
     rpc.setLatestBlock(500);
@@ -392,7 +397,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: scenario.invoice.chain.recipient_address,
       toAddress: scenario.refundToAddress,
-      amountBase: scenario.refundAmountBase,
+      amountBase: toTokenRawUnits(scenario.refundAmountBase),
       blockNumber: 600,
     });
     rpc.setLatestBlock(602);
@@ -414,7 +419,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       fromAddress: wrongToken.invoice.chain.recipient_address,
       toAddress: wrongToken.refundToAddress,
-      amountBase: wrongToken.refundAmountBase,
+      amountBase: toTokenRawUnits(wrongToken.refundAmountBase),
       blockNumber: 610,
     });
     rpc.setLatestBlock(612);
@@ -430,7 +435,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: wrongTo.invoice.chain.recipient_address,
       toAddress: "0x7777777777777777777777777777777777777777",
-      amountBase: wrongTo.refundAmountBase,
+      amountBase: toTokenRawUnits(wrongTo.refundAmountBase),
       blockNumber: 620,
     });
     rpc.setLatestBlock(622);
@@ -446,7 +451,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       toAddress: wrongFrom.refundToAddress,
-      amountBase: wrongFrom.refundAmountBase,
+      amountBase: toTokenRawUnits(wrongFrom.refundAmountBase),
       blockNumber: 630,
     });
     rpc.setLatestBlock(632);
@@ -462,7 +467,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: wrongAmount.invoice.chain.recipient_address,
       toAddress: wrongAmount.refundToAddress,
-      amountBase: String(BigInt(wrongAmount.refundAmountBase) + 1_000_000n),
+      amountBase: toTokenRawUnits(BigInt(wrongAmount.refundAmountBase) + 1_000_000n),
       blockNumber: 640,
     });
     rpc.setLatestBlock(642);
@@ -480,7 +485,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: pending.invoice.chain.recipient_address,
       toAddress: pending.refundToAddress,
-      amountBase: pending.refundAmountBase,
+      amountBase: toTokenRawUnits(pending.refundAmountBase),
       blockNumber: 650,
     });
     rpc.setLatestBlock(650);
@@ -498,7 +503,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       tokenContract,
       fromAddress: missingTs.invoice.chain.recipient_address,
       toAddress: missingTs.refundToAddress,
-      amountBase: missingTs.refundAmountBase,
+      amountBase: toTokenRawUnits(missingTs.refundAmountBase),
       blockNumber: 660,
       blockTimestamp: null,
     });
@@ -536,7 +541,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
 
 test("verified transfer paths convert ERC-20 raw units to app base units exactly", async (t) => {
   const rpc = await startMockRpcServer({ chainId: 137 });
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = OFFICIAL_JPYC_CONTRACT;
   const env = baseServerEnv({
     ALLOW_MANUAL_PAYMENT_INGEST: "true",
     RPC_URLS: rpc.url,

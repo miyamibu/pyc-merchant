@@ -111,7 +111,11 @@ if [[ -z "${RPC_URLS:-}" ]]; then
   VALIDATE_PRODUCTION_CONFIG_ARGS+=(--skip-rpc)
 fi
 run_json_step validate-production-config node scripts/production-validation/validate-production-config.mjs "${VALIDATE_PRODUCTION_CONFIG_ARGS[@]}"
-run_json_step validate-dependency-docker-hygiene node scripts/production-validation/validate-dependency-docker-hygiene.mjs --require-resolved-digests true --output "$EVIDENCE_DIR/license-list.json"
+DEPENDENCY_DOCKER_HYGIENE_ARGS=(--output "$EVIDENCE_DIR/license-list.json")
+if [[ -n "${PRODUCTION_NODE_IMAGE:-}" || -n "${PRODUCTION_NGINX_IMAGE:-}" || -f ".env.production" ]]; then
+  DEPENDENCY_DOCKER_HYGIENE_ARGS+=(--require-resolved-digests true)
+fi
+run_json_step validate-dependency-docker-hygiene node scripts/production-validation/validate-dependency-docker-hygiene.mjs "${DEPENDENCY_DOCKER_HYGIENE_ARGS[@]}"
 run_json_step validate-public-invoice-api node scripts/production-validation/validate-public-invoice-api.mjs
 run_json_step validate-wallet-launch node scripts/production-validation/validate-wallet-launch.mjs
 run_json_step validate-smoke-payment-flow node scripts/production-validation/validate-smoke-payment-flow.mjs

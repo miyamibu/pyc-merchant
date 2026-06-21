@@ -4,9 +4,19 @@ const INVOICE_STATUS_ALIASES = Object.freeze({
   manual_review: "review_required",
 });
 const FALLBACK_POLL_INTERVAL_MS = 10_000;
+const INVOICE_DANGER_CONFIRM_MS = 5_000;
+const REFUND_EXECUTE_CONFIRM_MS = 8_000;
+const SETTLEMENT_CLOSE_CONFIRM_MS = 10_000;
 const SETTINGS_KEY = "jpyc_terminal_settings";
 const DEFAULT_AMOUNT_PRESETS = Object.freeze([500, 1000, 3000, 5000, 10000]);
+const DEFAULT_TERMINAL_SETTINGS = Object.freeze({
+  volume: 0.8,
+  brightness: 0.7,
+  display_font_size: "standard",
+  auto_reset_sec: 120,
+});
 const MAX_AMOUNT_PRESET_COUNT = 12;
+const FONT_SIZE_OPTIONS = new Set(["small", "standard", "large"]);
 const REVIEW_STATUS_SORT_ORDER = Object.freeze({
   open: 0,
   in_progress: 1,
@@ -32,9 +42,16 @@ const REFUND_CANDIDATE_REASONS = new Set([
   "CHAIN_INCONSISTENT",
   "ADDRESS_MISMATCH",
 ]);
+const REFUND_CHAIN_LABELS = Object.freeze({
+  1: "Ethereum",
+  137: "Polygon",
+  43114: "Avalanche",
+});
+const OFFICIAL_JPYC_CONTRACT_DISPLAY = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 const ADDRESS_POOL_WARN_THRESHOLD = 5;
 const WORKER_STALE_WARN_SEC = 300;
 const OPS_AUTO_REFRESH_INTERVAL_MS = 60_000;
+let localSimulatorAutoLoginStarted = false;
 
 function normalizeReviewReason(reasonType) {
   const raw = String(reasonType || "").trim();
@@ -142,6 +159,8 @@ const state = {
   sessionId: "",
   role: "",
   supportedWallets: [],
+  paymentChains: [],
+  selectedPaymentChainId: "",
   fixedQrUrl: "",
   fixedQrToken: "",
   invoiceId: "",
@@ -168,29 +187,71 @@ const state = {
   selectedReviewDetail: null,
   autoRefreshTimer: null,
   pendingDangerAction: "",
+  pendingDangerTimer: null,
+  pendingDangerCountdownTimer: null,
   pendingRefundExecute: false,
+  refundWorkflowStatus: "draft",
+  pendingRefundExecuteTimer: null,
+  pendingRefundExecuteCountdownTimer: null,
   pendingSettlementClose: "",
+  pendingSettlementCloseTimer: null,
+  pendingSettlementCloseCountdownTimer: null,
+  activeTab: "billing",
+  storeName: "",
+  staffName: "",
 };
 
 const el = {
   terminalCode: document.getElementById("terminalCode"),
   staffPin: document.getElementById("staffPin"),
   staffPinConfirm: document.getElementById("staffPinConfirm"),
+  staffNameInput: document.getElementById("staffNameInput"),
   loginFormPanel: document.getElementById("loginFormPanel"),
   staffPinConfirmLabel: document.getElementById("staffPinConfirmLabel"),
   loginBtn: document.getElementById("loginBtn"),
+  loginStartPanel: document.getElementById("loginStartPanel"),
+  terminalTabNav: document.getElementById("terminalTabNav"),
+  terminalWorkspace: document.getElementById("terminalWorkspace"),
+  adminLoginShortcutBtn: document.getElementById("adminLoginShortcutBtn"),
+  loginStatusDetailBtn: document.getElementById("loginStatusDetailBtn"),
+  lockTerminalBtn: document.getElementById("lockTerminalBtn"),
+  logoutTerminalBtn: document.getElementById("logoutTerminalBtn"),
   sessionText: document.getElementById("sessionText"),
+  settingsStoreName: document.getElementById("settingsStoreName"),
+  settingsStaffName: document.getElementById("settingsStaffName"),
   networkText: document.getElementById("networkText"),
   connectionStatusPanel: document.getElementById("connectionStatusPanel"),
   connectionStatusText: document.getElementById("connectionStatusText"),
+  connectionStatusHint: document.getElementById("connectionStatusHint"),
   connectionRefreshBtn: document.getElementById("connectionRefreshBtn"),
+  apiHealthText: document.getElementById("apiHealthText"),
+  updateRouteText: document.getElementById("updateRouteText"),
+  terminalDiagnosticsPanel: document.getElementById("terminalDiagnosticsPanel"),
+  terminalDiagnosticsBody: document.getElementById("terminalDiagnosticsBody"),
   sessionExpiryText: document.getElementById("sessionExpiryText"),
   volumeInput: document.getElementById("volumeInput"),
+  volumePercentText: document.getElementById("volumePercentText"),
+  testNotificationSoundBtn: document.getElementById("testNotificationSoundBtn"),
+  brightnessInput: document.getElementById("brightnessInput"),
+  brightnessPercentText: document.getElementById("brightnessPercentText"),
+  fontSizeButtons: Array.from(document.querySelectorAll("[data-font-size-option]")),
+  showOpsWarningsBtn: document.getElementById("showOpsWarningsBtn"),
+  openAuditLogsBtn: document.getElementById("openAuditLogsBtn"),
+  settingsAdminResultPanel: document.getElementById("settingsAdminResultPanel"),
+  settingsAdminResultTitle: document.getElementById("settingsAdminResultTitle"),
+  settingsAdminResultDescription: document.getElementById("settingsAdminResultDescription"),
+  settingsAdminResultBody: document.getElementById("settingsAdminResultBody"),
+  closeSettingsAdminResultBtn: document.getElementById("closeSettingsAdminResultBtn"),
   autoResetSecInput: document.getElementById("autoResetSecInput"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
   opsWarnings: document.getElementById("opsWarnings"),
   amountInput: document.getElementById("amountInput"),
+  amountJpycPreview: document.getElementById("amountJpycPreview"),
   amountInputError: document.getElementById("amountInputError"),
+  paymentChainList: document.getElementById("paymentChainList"),
+  paymentChainSummary: document.getElementById("paymentChainSummary"),
+  paymentChainHint: document.getElementById("paymentChainHint"),
+  officialContractBadge: document.getElementById("officialContractBadge"),
   amountPresetList: document.getElementById("amountPresetList"),
   presetAmountInput: document.getElementById("presetAmountInput"),
   addPresetBtn: document.getElementById("addPresetBtn"),
@@ -198,16 +259,24 @@ const el = {
   createInvoiceBtn: document.getElementById("createInvoiceBtn"),
   cancelInvoiceBtn: document.getElementById("cancelInvoiceBtn"),
   expireInvoiceBtn: document.getElementById("expireInvoiceBtn"),
+  stopQrReasonSelect: document.getElementById("stopQrReasonSelect"),
+  stopQrConfirmHint: document.getElementById("stopQrConfirmHint"),
   invoiceDangerActions: document.getElementById("invoiceDangerActions"),
   invoiceStatusPill: document.getElementById("invoiceStatusPill"),
+  billingCurrentPanel: document.querySelector(".billing-current-panel"),
+  billingCurrentEmptyHint: document.getElementById("billingCurrentEmptyHint"),
   invoiceIdText: document.getElementById("invoiceIdText"),
   fixedQrUrlLink: document.getElementById("fixedQrUrlLink"),
   paymentUrlLink: document.getElementById("paymentUrlLink"),
+  paymentUrlRow: document.getElementById("paymentUrlRow"),
+  copyPaymentUrlBtn: document.getElementById("copyPaymentUrlBtn"),
   qrCanvas: document.getElementById("qrCanvas"),
   qrAccessibleText: document.getElementById("qrAccessibleText"),
   expiresAtText: document.getElementById("expiresAtText"),
   amountText: document.getElementById("amountText"),
   paidText: document.getElementById("paidText"),
+  paymentChainText: document.getElementById("paymentChainText"),
+  paymentContractText: document.getElementById("paymentContractText"),
   amountComparePanel: document.getElementById("amountComparePanel"),
   amountCompareExpected: document.getElementById("amountCompareExpected"),
   amountComparePaid: document.getElementById("amountComparePaid"),
@@ -215,6 +284,7 @@ const el = {
   reasonText: document.getElementById("reasonText"),
   providerOperatorStateText: document.getElementById("providerOperatorStateText"),
   providerStatusText: document.getElementById("providerStatusText"),
+  handoverNote: document.getElementById("handoverNote"),
   refreshBtn: document.getElementById("refreshBtn"),
   reissueInvoiceBtn: document.getElementById("reissueInvoiceBtn"),
   presentTapBtn: document.getElementById("presentTapBtn"),
@@ -225,7 +295,6 @@ const el = {
   tapModeTitle: document.getElementById("tapModeTitle"),
   tapModeBody: document.getElementById("tapModeBody"),
   tapModeAmount: document.getElementById("tapModeAmount"),
-  customerDisplayHint: document.getElementById("customerDisplayHint"),
   operatorGuideBadge: document.getElementById("operatorGuideBadge"),
   operatorGuideHeadline: document.getElementById("operatorGuideHeadline"),
   operatorGuideBody: document.getElementById("operatorGuideBody"),
@@ -252,11 +321,16 @@ const el = {
   opsWorkerStatus: document.getElementById("opsWorkerStatus"),
   loadReviewsBtn: document.getElementById("loadReviewsBtn"),
   reviewStatusFilter: document.getElementById("reviewStatusFilter"),
+  reviewSearchInput: document.getElementById("reviewSearchInput"),
+  reviewCardList: document.getElementById("reviewCardList"),
   reviewSummaryChips: document.getElementById("reviewSummaryChips"),
   reviewListState: document.getElementById("reviewListState"),
-  reviewsTableBody: document.querySelector("#reviewsTable tbody"),
   reviewDetailBadge: document.getElementById("reviewDetailBadge"),
   reviewDetailSummary: document.getElementById("reviewDetailSummary"),
+  reviewDetailReasonText: document.getElementById("reviewDetailReasonText"),
+  reviewDetailExpectedAmount: document.getElementById("reviewDetailExpectedAmount"),
+  reviewDetailPaidAmount: document.getElementById("reviewDetailPaidAmount"),
+  reviewDetailDeltaAmount: document.getElementById("reviewDetailDeltaAmount"),
   reviewDetailId: document.getElementById("reviewDetailId"),
   reviewDetailInvoice: document.getElementById("reviewDetailInvoice"),
   reviewDetailAmount: document.getElementById("reviewDetailAmount"),
@@ -269,6 +343,8 @@ const el = {
   reviewNextStatus: document.getElementById("reviewNextStatus"),
   reviewNote: document.getElementById("reviewNote"),
   updateReviewBtn: document.getElementById("updateReviewBtn"),
+  reviewHoldBtn: document.getElementById("reviewHoldBtn"),
+  reviewRejectBtn: document.getElementById("reviewRejectBtn"),
   refundReviewCaseId: document.getElementById("refundReviewCaseId"),
   refundAmount: document.getElementById("refundAmount"),
   refundAddress: document.getElementById("refundAddress"),
@@ -287,15 +363,64 @@ const el = {
   refundStepRequestBadge: document.getElementById("refundStepRequestBadge"),
   refundStepApproveBadge: document.getElementById("refundStepApproveBadge"),
   refundStepEvidenceBadge: document.getElementById("refundStepEvidenceBadge"),
+  refreshRefundsBtn: document.getElementById("refreshRefundsBtn"),
+  refundCaseListState: document.getElementById("refundCaseListState"),
+  refundSourceInvoice: document.getElementById("refundSourceInvoice"),
+  refundSourceAmounts: document.getElementById("refundSourceAmounts"),
+  refundSourceEligible: document.getElementById("refundSourceEligible"),
+  refundSummaryAmount: document.getElementById("refundSummaryAmount"),
+  refundSummaryAddress: document.getElementById("refundSummaryAddress"),
+  refundSummaryReason: document.getElementById("refundSummaryReason"),
+  refundEvidencePathHint: document.getElementById("refundEvidencePathHint"),
+  refundStepRequestIndicator: document.getElementById("refundStepRequestIndicator"),
+  refundStepApproveIndicator: document.getElementById("refundStepApproveIndicator"),
+  refundStepEvidenceIndicator: document.getElementById("refundStepEvidenceIndicator"),
+  refundStepVerifyIndicator: document.getElementById("refundStepVerifyIndicator"),
   businessDateInput: document.getElementById("businessDateInput"),
   businessMonthInput: document.getElementById("businessMonthInput"),
+  businessDateHeaderText: document.getElementById("businessDateHeaderText"),
   closeSettlementBtn: document.getElementById("closeSettlementBtn"),
   settlementConfirmPanel: document.getElementById("settlementConfirmPanel"),
+  settlementBlockerTitle: document.getElementById("settlementBlockerTitle"),
+  settlementBlockerReason: document.getElementById("settlementBlockerReason"),
+  settlementBlockerNext: document.getElementById("settlementBlockerNext"),
+  settlementCompletionNote: document.getElementById("settlementCompletionNote"),
+  settlementChecklist: document.getElementById("settlementChecklist"),
+  settlementSalesText: document.getElementById("settlementSalesText"),
+  settlementPaidText: document.getElementById("settlementPaidText"),
+  settlementRefundText: document.getElementById("settlementRefundText"),
+  settlementDeltaText: document.getElementById("settlementDeltaText"),
+  settlementPaymentCountText: document.getElementById("settlementPaymentCountText"),
+  settlementReviewCountText: document.getElementById("settlementReviewCountText"),
+  settlementRefundCandidateText: document.getElementById("settlementRefundCandidateText"),
+  settlementUnresolvedList: document.getElementById("settlementUnresolvedList"),
   exportAuditCsvBtn: document.getElementById("exportAuditCsvBtn"),
+  exportAuditLogCsvBtn: document.getElementById("exportAuditLogCsvBtn"),
   exportMonthlyCsvBtn: document.getElementById("exportMonthlyCsvBtn"),
   closeSettlementHint: document.getElementById("closeSettlementHint"),
   toastHost: document.getElementById("toastHost"),
   adminSections: Array.from(document.querySelectorAll("[data-admin-only='true']")),
+  tabButtons: Array.from(document.querySelectorAll("[data-tab-target]")),
+  tabPanels: Array.from(document.querySelectorAll("[data-tab-panel]")),
+  topbarConnectionText: document.getElementById("topbarConnectionText"),
+  topbarConnectionDot: document.getElementById("topbarConnectionDot"),
+  topbarStoreText: document.getElementById("topbarStoreText"),
+  topbarTerminalNameText: document.getElementById("topbarTerminalNameText"),
+  topbarBusinessDateText: document.getElementById("topbarBusinessDateText"),
+  topbarOpenReviewCount: document.getElementById("topbarOpenReviewCount"),
+  topbarRolePill: document.getElementById("topbarRolePill"),
+  topbarSessionText: document.getElementById("topbarSessionText"),
+  topbarRefundStatusPill: document.getElementById("topbarRefundStatusPill"),
+  topbarRefundTimelineText: document.getElementById("topbarRefundTimelineText"),
+  reviewsLastUpdatedText: document.getElementById("reviewsLastUpdatedText"),
+  refundsLastUpdatedText: document.getElementById("refundsLastUpdatedText"),
+  settlementLastUpdatedText: document.getElementById("settlementLastUpdatedText"),
+  billingWaitingPill: document.getElementById("billingWaitingPill"),
+  tabBadgeReviews: document.getElementById("tabBadgeReviews"),
+  tabBadgeRefunds: document.getElementById("tabBadgeRefunds"),
+  tabBadgeSettlement: document.getElementById("tabBadgeSettlement"),
+  goRefundFromReviewBtn: document.getElementById("goRefundFromReviewBtn"),
+  reviewMobileBackBtn: document.getElementById("reviewMobileBackBtn"),
 };
 
 function nowIsoDate() {
@@ -306,8 +431,68 @@ function idempotencyKey(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function isAdminRole(role) {
   return role === "admin" || role === "manager";
+}
+
+function chainLabel(chainId) {
+  return REFUND_CHAIN_LABELS[Number(chainId)] || String(chainId || "-");
+}
+
+function selectedPaymentChain() {
+  return state.paymentChains.find((chain) => String(chain.chain_id) === String(state.selectedPaymentChainId)) || null;
+}
+
+function renderPaymentChains() {
+  if (!el.paymentChainList) return;
+  const chains = Array.isArray(state.paymentChains) ? state.paymentChains : [];
+  if (el.officialContractBadge) el.officialContractBadge.textContent = "公式JPYC ...C3c29";
+  el.paymentChainList.innerHTML = "";
+  if (chains.length === 0) {
+    if (el.paymentChainSummary) el.paymentChainSummary.textContent = "未取得";
+    el.paymentChainHint.textContent = "";
+    return;
+  }
+  if (!chains.some((chain) => String(chain.chain_id) === String(state.selectedPaymentChainId))) {
+    state.selectedPaymentChainId = "";
+  }
+  for (const chain of chains) {
+    const chainId = String(chain.chain_id);
+    const available = chain.issue_available !== false && chain.status !== "unavailable";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "payment-chain-option";
+    button.dataset.chainId = chainId;
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(chainId === String(state.selectedPaymentChainId)));
+    button.disabled = !available || Boolean(state.invoiceId && ACTIVE_INVOICE_STATUSES.has(state.invoiceStatus));
+    button.innerHTML = `
+      <span class="payment-chain-name">${escapeHtml(chain.short_name || chain.network || chainLabel(chainId))}</span>
+    `;
+    button.addEventListener("click", () => {
+      if (!available) return;
+      state.selectedPaymentChainId = chainId;
+      button.closest("details")?.removeAttribute("open");
+      renderPaymentChains();
+      updateAmountPreview();
+    });
+    el.paymentChainList.appendChild(button);
+  }
+  const selected = selectedPaymentChain();
+  const suffix = selected?.token_contract_suffix || "...C3c29";
+  if (el.paymentChainSummary) el.paymentChainSummary.textContent = selected
+    ? selected.short_name || selected.network || chainLabel(selected.chain_id)
+    : "選択する";
+  el.paymentChainHint.textContent = "";
 }
 
 function setNetworkStatus(message) {
@@ -344,24 +529,258 @@ function formatJpycAmount(value) {
   return amount.toLocaleString("ja-JP");
 }
 
+function formatShortTime(value = new Date()) {
+  const dt = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(dt.getTime())) return "-";
+  return dt.toLocaleTimeString("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function setLastUpdated(elm, value = new Date()) {
+  if (elm) elm.textContent = formatShortTime(value);
+}
+
+function setStatusPill(elm, label, className = "s-gray") {
+  if (!elm) return;
+  elm.textContent = label;
+  elm.className = `status-pill ${className}`;
+}
+
+function renderTopbarRole() {
+  const roleLabel = state.role ? formatRole(state.role) : "未ログイン";
+  if (el.topbarRolePill) el.topbarRolePill.textContent = state.role ? `${roleLabel}モード` : "未ログイン";
+  if (el.topbarSessionText) el.topbarSessionText.textContent = state.sessionId ? roleLabel : "未ログイン";
+}
+
+function renderSettingsSessionSummary() {
+  const roleLabel = state.role ? formatRole(state.role) : "";
+  if (el.settingsStoreName) el.settingsStoreName.textContent = state.storeName || "未ログイン";
+  if (el.settingsStaffName) {
+    const staffLabel = state.staffName || "スタッフ未選択";
+    el.settingsStaffName.textContent = roleLabel ? `${staffLabel}・${roleLabel}` : staffLabel;
+  }
+}
+
+function setSettlementChecklist(items) {
+  if (!el.settlementChecklist) return;
+  el.settlementChecklist.innerHTML = "";
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = item.kind || "warn";
+    const icon = document.createElement("span");
+    icon.textContent = item.kind === "done" ? "✓" : "!";
+    const label = document.createTextNode(item.label);
+    const stateText = document.createElement("strong");
+    stateText.textContent = item.state;
+    li.append(icon, label, stateText);
+    el.settlementChecklist.appendChild(li);
+  }
+}
+
+function appendSettlementUnresolvedItem({ pill, pillClass, title, detail, tabTarget }) {
+  if (!el.settlementUnresolvedList) return;
+  const article = document.createElement("article");
+  const status = document.createElement("span");
+  status.className = `status-pill ${pillClass}`;
+  status.textContent = pill;
+  const body = document.createElement("div");
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  const copy = document.createElement("p");
+  copy.textContent = detail;
+  body.append(heading, copy);
+  const button = document.createElement("button");
+  button.className = "btn btn-secondary btn-compact";
+  button.type = "button";
+  button.dataset.tabTargetProxy = tabTarget;
+  button.textContent = tabTarget === "refunds" ? "返金へ進む ›" : "確認待ちへ進む ›";
+  button.addEventListener("click", () => setActiveTab(tabTarget));
+  article.append(status, body, button);
+  el.settlementUnresolvedList.appendChild(article);
+}
+
+function renderSettlementUnresolved(openReviewCount, refundCandidateCount) {
+  if (!el.settlementUnresolvedList) return;
+  el.settlementUnresolvedList.innerHTML = "";
+  if (openReviewCount === 0 && refundCandidateCount === 0) {
+    const note = document.createElement("p");
+    note.className = "ops-note";
+    note.textContent = "未解決事項はありません。締め前に操作履歴を確認してください。";
+    el.settlementUnresolvedList.appendChild(note);
+    return;
+  }
+  if (openReviewCount > 0) {
+    appendSettlementUnresolvedItem({
+      pill: "要対応",
+      pillClass: "s-yellow",
+      title: `確認待ちレビュー ${openReviewCount}件`,
+      detail: "確認待ち一覧で理由・取引番号・商品引渡し可否を確認してください。",
+      tabTarget: "reviews",
+    });
+  }
+  if (refundCandidateCount > 0) {
+    appendSettlementUnresolvedItem({
+      pill: "返金確認",
+      pillClass: "s-blue",
+      title: `返金候補レビュー ${refundCandidateCount}件`,
+      detail: "返金が必要な場合は、外部ウォレット実行後の証跡を登録してください。",
+      tabTarget: "refunds",
+    });
+  }
+  const note = document.createElement("p");
+  note.className = "ops-note";
+  note.textContent = "未解決事項をすべて解決すると、締めが可能になります。";
+  el.settlementUnresolvedList.appendChild(note);
+}
+
+function renderTopbarRefundSummary(openReviewCount, refundCandidateCount) {
+  const hasRefundCandidates = refundCandidateCount > 0;
+  const hasOpenReviews = openReviewCount > 0;
+  setStatusPill(
+    el.topbarRefundStatusPill,
+    hasRefundCandidates ? `返金候補 ${refundCandidateCount}件` : hasOpenReviews ? "確認待ちあり" : "要対応なし",
+    hasRefundCandidates ? "s-yellow" : hasOpenReviews ? "s-blue" : "s-green"
+  );
+  if (el.topbarRefundTimelineText) {
+    el.topbarRefundTimelineText.textContent = hasRefundCandidates
+      ? `返金候補レビュー ${refundCandidateCount}件を確認してください`
+      : hasOpenReviews
+        ? `未解決レビュー ${openReviewCount}件を確認してください`
+        : "返金候補・未解決レビューはありません";
+  }
+}
+
+function renderSettlementDashboard({
+  businessDate,
+  settlementClosed,
+  settlement,
+  openReviewCount,
+  refundCandidateCount,
+}) {
+  const blocked = openReviewCount > 0 || refundCandidateCount > 0;
+  const statusLabel = settlementClosed
+    ? "締め済み"
+    : blocked
+      ? `締め不可：未解決レビュー ${openReviewCount}件、返金候補 ${refundCandidateCount}件`
+      : "締め前チェック完了";
+  if (el.settlementBlockerTitle) el.settlementBlockerTitle.textContent = statusLabel;
+  const blocker = el.settlementBlockerTitle?.closest(".settlement-blocker-banner");
+  if (blocker) {
+    blocker.classList.remove("settlement-blocker-banner-neutral", "settlement-blocker-banner-ready");
+    blocker.setAttribute("role", blocked ? "alert" : "status");
+    if (!blocked) blocker.classList.add(settlementClosed ? "settlement-blocker-banner-neutral" : "settlement-blocker-banner-ready");
+  }
+  if (el.settlementBlockerReason) {
+    el.settlementBlockerReason.textContent = blocked
+      ? "未解決事項が残っているため、日次締めを確定できません。"
+      : settlementClosed
+        ? `${businessDate} の日次締めは完了済みです。`
+        : "未解決レビューと返金候補はありません。";
+  }
+  if (el.settlementBlockerNext) {
+    el.settlementBlockerNext.textContent = blocked
+      ? "確認待ちまたは返金候補を処理してから日次締めを確定してください。"
+      : settlementClosed
+        ? "必要に応じてCSVや監査ログを確認してください。"
+        : "操作履歴を確認し、問題がなければ日次締めを確定してください。";
+  }
+  if (el.settlementCompletionNote) {
+    el.settlementCompletionNote.textContent = blocked
+      ? "すべての項目が完了すると、日次締めを確定できます。"
+      : "締め条件を満たしています。確定前に監査ログを確認してください。";
+  }
+  setSettlementChecklist([
+    {
+      kind: openReviewCount === 0 ? "done" : "blocked",
+      label: `確認待ちは ${openReviewCount}件`,
+      state: openReviewCount === 0 ? "完了" : "未完了",
+    },
+    {
+      kind: refundCandidateCount === 0 ? "done" : "blocked",
+      label: `返金候補は ${refundCandidateCount}件`,
+      state: refundCandidateCount === 0 ? "完了" : "未完了",
+    },
+    {
+      kind: settlementClosed ? "done" : "warn",
+      label: `${businessDate} の日次締め`,
+      state: settlementClosed ? "完了" : "未実施",
+    },
+    {
+      kind: "warn",
+      label: "操作履歴を確認",
+      state: "確認",
+    },
+    {
+      kind: blocked ? "blocked" : "done",
+      label: "管理者確認済み",
+      state: blocked ? "未完了" : "完了",
+    },
+  ]);
+
+  const totalBilled = settlement?.total_billed_jpy;
+  const totalPaid = settlement?.total_paid_jpyc;
+  if (el.settlementSalesText) el.settlementSalesText.textContent = totalBilled == null ? "-" : formatJpy(totalBilled);
+  if (el.settlementPaidText) el.settlementPaidText.textContent = totalPaid == null ? "-" : formatJpyc(totalPaid);
+  if (el.settlementRefundText) el.settlementRefundText.textContent = "-";
+  if (el.settlementDeltaText) el.settlementDeltaText.textContent = totalBilled == null || totalPaid == null ? "-" : formatJpyc(Number(totalPaid) - Number(totalBilled));
+  if (el.settlementPaymentCountText) el.settlementPaymentCountText.textContent = settlement?.invoice_count == null ? "-" : `${settlement.invoice_count}件`;
+  if (el.settlementReviewCountText) el.settlementReviewCountText.textContent = `${openReviewCount}件`;
+  if (el.settlementRefundCandidateText) el.settlementRefundCandidateText.textContent = `${refundCandidateCount}件`;
+  if (el.tabBadgeSettlement) {
+    el.tabBadgeSettlement.textContent = settlementClosed ? "済" : "未";
+    el.tabBadgeSettlement.classList.toggle("hidden", settlementClosed === true);
+  }
+  renderSettlementUnresolved(openReviewCount, refundCandidateCount);
+}
+
 function renderConnectionStatus() {
   if (!el.connectionStatusPanel || !el.connectionStatusText) return;
   const sse = state.sseStatus;
   const polling = state.fallbackPollingStatus;
   let kind = "idle";
   let text = "リアルタイム更新: 未接続";
+  let hint = "請求更新の受信経路を待機しています。";
+  let routeText = "待機中";
+  let routeTone = "s-yellow";
   if (sse === "open") {
     kind = "ok";
     text = "リアルタイム更新: 接続中";
+    hint = "請求・確認状態の変更を自動で受信しています。";
+    routeText = "SSE接続中";
+    routeTone = "s-green";
   } else if (sse === "connecting" || sse === "reconnecting" || polling === "active") {
     kind = "warn";
     text = polling === "active" ? "リアルタイム更新: 再接続中（自動更新中）" : "リアルタイム更新: 再接続中";
+    hint = polling === "active" ? "リアルタイム接続を復旧しながら、自動更新で補完しています。" : "リアルタイム接続を復旧しています。";
+    routeText = polling === "active" ? "自動更新中" : "再接続中";
+    routeTone = "s-yellow";
   } else if (state.token && state.invoiceId) {
     kind = "danger";
     text = "リアルタイム更新: 停止";
+    hint = "請求画面を開いている間は、更新ボタンで状態を確認してください。";
+    routeText = "停止";
+    routeTone = "s-red";
   }
   el.connectionStatusPanel.className = `connection-status status-${kind}`;
+  el.connectionStatusPanel.dataset.connectionState = kind;
   el.connectionStatusText.textContent = text;
+  if (el.topbarConnectionDot) {
+    el.topbarConnectionDot.className = `status-dot status-${kind}`;
+  }
+  if (el.connectionStatusHint) el.connectionStatusHint.textContent = hint;
+  if (el.updateRouteText) {
+    el.updateRouteText.className = `status-pill ${routeTone}`;
+    el.updateRouteText.textContent = routeText;
+  }
+  if (el.apiHealthText) {
+    el.apiHealthText.className = `status-pill ${state.token ? "s-green" : "s-yellow"}`;
+    el.apiHealthText.textContent = state.token ? "正常" : "待機";
+  }
+  if (el.topbarConnectionText) el.topbarConnectionText.textContent = text.replace("リアルタイム更新: ", "");
 }
 
 function formatTtl(expiresAt) {
@@ -373,6 +792,16 @@ function formatTtl(expiresAt) {
   const mins = Math.floor(remainSec / 60);
   const secs = remainSec % 60;
   return `${remainSec}s (${mins}m ${String(secs).padStart(2, "0")}s)`;
+}
+
+function formatRemainingClock(expiresAt) {
+  if (!expiresAt) return "-";
+  const expiryMs = new Date(expiresAt).getTime();
+  if (!Number.isFinite(expiryMs)) return String(expiresAt);
+  const remainSec = Math.max(0, Math.floor((expiryMs - Date.now()) / 1000));
+  const mins = Math.floor(remainSec / 60);
+  const secs = remainSec % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")} 残り時間`;
 }
 
 function stringifyJson(value) {
@@ -411,10 +840,16 @@ function normalizeAmountPresetList(values) {
   return normalized;
 }
 
+function parsePositiveInteger(value) {
+  const normalized = String(value ?? "").replace(/[^\d]/g, "");
+  if (!normalized) return 0;
+  const amount = Number(normalized);
+  return Number.isInteger(amount) && amount > 0 ? amount : 0;
+}
+
 function readTerminalSettings() {
   const fallback = {
-    volume: Number(el.volumeInput.value || 0.8),
-    auto_reset_sec: Number(el.autoResetSecInput.value || 120),
+    ...DEFAULT_TERMINAL_SETTINGS,
     amount_presets: [...DEFAULT_AMOUNT_PRESETS],
   };
   const raw = localStorage.getItem(SETTINGS_KEY);
@@ -423,6 +858,10 @@ function readTerminalSettings() {
     const parsed = JSON.parse(raw);
     return {
       volume: Number.isFinite(parsed?.volume) ? parsed.volume : fallback.volume,
+      brightness: Number.isFinite(parsed?.brightness) ? parsed.brightness : fallback.brightness,
+      display_font_size: FONT_SIZE_OPTIONS.has(parsed?.display_font_size)
+        ? parsed.display_font_size
+        : fallback.display_font_size,
       auto_reset_sec: Number.isFinite(parsed?.auto_reset_sec) ? parsed.auto_reset_sec : fallback.auto_reset_sec,
       amount_presets: Object.prototype.hasOwnProperty.call(parsed || {}, "amount_presets")
         ? normalizeAmountPresetList(parsed.amount_presets)
@@ -433,10 +872,103 @@ function readTerminalSettings() {
   }
 }
 
+function syncRangeControl(input, output) {
+  if (!input) return;
+  const min = Number(input.min || 0);
+  const max = Number(input.max || 1);
+  const value = Number(input.value || 0);
+  const safeMax = max > min ? max : min + 1;
+  const clamped = Math.min(Math.max(value, min), safeMax);
+  const percent = ((clamped - min) / (safeMax - min)) * 100;
+  input.style.setProperty("--range-progress", `${percent}%`);
+  if (output) output.textContent = `${Math.round(clamped * 100)}%`;
+}
+
+function syncSettingsRangeControls() {
+  syncRangeControl(el.volumeInput, el.volumePercentText);
+  syncRangeControl(el.brightnessInput, el.brightnessPercentText);
+}
+
+async function playNotificationTestSound() {
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextCtor) {
+    showToast("この端末では通知音の再生に対応していません");
+    return;
+  }
+
+  const volume = Math.min(Math.max(Number(el.volumeInput?.value || 0.8), 0), 1);
+  if (volume <= 0) {
+    showToast("音量が0%です。音量を上げてからテストしてください");
+    return;
+  }
+
+  const audioContext = new AudioContextCtor();
+  if (audioContext.state === "suspended" && typeof audioContext.resume === "function") {
+    await audioContext.resume();
+  }
+
+  const startAt = audioContext.currentTime;
+  const masterGain = audioContext.createGain();
+  masterGain.gain.setValueAtTime(0.0001, startAt);
+  masterGain.gain.exponentialRampToValueAtTime(Math.max(0.0001, volume * 0.28), startAt + 0.02);
+  masterGain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.34);
+  masterGain.connect(audioContext.destination);
+
+  const tones = [
+    { frequency: 880, startOffset: 0, duration: 0.14 },
+    { frequency: 1175, startOffset: 0.16, duration: 0.16 },
+  ];
+  for (const tone of tones) {
+    const oscillator = audioContext.createOscillator();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(tone.frequency, startAt + tone.startOffset);
+    oscillator.connect(masterGain);
+    oscillator.start(startAt + tone.startOffset);
+    oscillator.stop(startAt + tone.startOffset + tone.duration);
+  }
+
+  window.setTimeout(() => {
+    if (typeof audioContext.close === "function") {
+      void audioContext.close();
+    }
+  }, 600);
+  showToast("通知音を再生しました");
+}
+
+function applyDisplayFontSize(size) {
+  const nextSize = FONT_SIZE_OPTIONS.has(size) ? size : "standard";
+  document.body.dataset.terminalFontSize = nextSize;
+  for (const button of el.fontSizeButtons) {
+    const isActive = button.dataset.fontSizeOption === nextSize;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
+}
+
+function activeDisplayFontSize() {
+  const current = document.body.dataset.terminalFontSize || "standard";
+  return FONT_SIZE_OPTIONS.has(current) ? current : "standard";
+}
+
+function withDisplayFontSizeParam(url) {
+  if (!url) return url;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    parsed.searchParams.set("displayFontSize", activeDisplayFontSize());
+    return parsed.href;
+  } catch (_error) {
+    return url;
+  }
+}
+
 function writeTerminalSettings(nextSettings, { showSavedToast = false } = {}) {
   const current = readTerminalSettings();
   const merged = {
     volume: Number.isFinite(nextSettings?.volume) ? Number(nextSettings.volume) : current.volume,
+    brightness: Number.isFinite(nextSettings?.brightness) ? Number(nextSettings.brightness) : current.brightness,
+    display_font_size: FONT_SIZE_OPTIONS.has(nextSettings?.display_font_size)
+      ? nextSettings.display_font_size
+      : current.display_font_size,
     auto_reset_sec: Number.isFinite(nextSettings?.auto_reset_sec)
       ? Number(nextSettings.auto_reset_sec)
       : current.auto_reset_sec,
@@ -451,15 +983,37 @@ function writeTerminalSettings(nextSettings, { showSavedToast = false } = {}) {
   return merged;
 }
 
+function readCurrentTerminalSettingsForm() {
+  const saved = readTerminalSettings();
+  return {
+    volume: Number(el.volumeInput.value || 0.8),
+    brightness: Number(el.brightnessInput?.value || 0.7),
+    display_font_size: document.body.dataset.terminalFontSize || "standard",
+    auto_reset_sec: Number(el.autoResetSecInput.value || 120),
+    amount_presets: saved.amount_presets,
+  };
+}
+
+function settingsPayloadEquals(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function updateSettingsSaveState() {
+  const hasUnsavedChanges = !settingsPayloadEquals(readCurrentTerminalSettingsForm(), readTerminalSettings());
+  for (const button of [el.saveSettingsBtn]) {
+    if (!button) continue;
+    button.disabled = !hasUnsavedChanges;
+    button.setAttribute("aria-disabled", hasUnsavedChanges ? "false" : "true");
+    button.textContent = hasUnsavedChanges ? "設定を保存" : "変更なし";
+  }
+  el.saveSettingsBtn?.closest(".settings-save-status")?.classList.toggle("has-unsaved-changes", hasUnsavedChanges);
+}
+
 function renderAmountPresetButtons() {
   const settings = readTerminalSettings();
   const presets = settings.amount_presets;
   el.amountPresetList.innerHTML = "";
   if (presets.length === 0) {
-    const empty = document.createElement("span");
-    empty.className = "chip";
-    empty.textContent = "プリセット未登録";
-    el.amountPresetList.appendChild(empty);
     return;
   }
   for (const amount of presets) {
@@ -473,6 +1027,14 @@ function renderAmountPresetButtons() {
     useButton.dataset.amountPreset = String(amount);
     useButton.textContent = formatJpy(amount);
 
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.className = "btn btn-ghost btn-edit";
+    editButton.dataset.presetAction = "edit";
+    editButton.dataset.amountPreset = String(amount);
+    editButton.setAttribute("aria-label", `${formatJpy(amount)} のプリセットを編集`);
+    editButton.textContent = "編集";
+
     const removeButton = document.createElement("button");
     removeButton.type = "button";
     removeButton.className = "btn btn-ghost btn-remove";
@@ -481,7 +1043,7 @@ function renderAmountPresetButtons() {
     removeButton.setAttribute("aria-label", `${formatJpy(amount)} のプリセットを削除`);
     removeButton.textContent = "×";
 
-    chip.append(useButton, removeButton);
+    chip.append(useButton, editButton, removeButton);
     el.amountPresetList.appendChild(chip);
   }
 }
@@ -509,6 +1071,47 @@ function setChecklist(host, items, fallback = "重大な未処理はありませ
 
 function isLikelyEvmAddress(value) {
   return /^0x[0-9a-fA-F]{40}$/.test(String(value || ""));
+}
+
+function isValidIsoDate(value) {
+  const text = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return false;
+  const [year, month, day] = text.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+function clearCountdownTimer(timerName) {
+  if (!state[timerName]) return;
+  clearInterval(state[timerName]);
+  state[timerName] = null;
+}
+
+function clearTimeoutTimer(timerName) {
+  if (!state[timerName]) return;
+  clearTimeout(state[timerName]);
+  state[timerName] = null;
+}
+
+function startConfirmationCountdown({ hintEl, messageForSeconds, timeoutMs, countdownTimerName, timeoutTimerName, onExpire }) {
+  clearCountdownTimer(countdownTimerName);
+  clearTimeoutTimer(timeoutTimerName);
+  const startedAt = Date.now();
+  const render = () => {
+    const remainingMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+    const remainingSec = Math.ceil(remainingMs / 1000);
+    if (hintEl) {
+      hintEl.classList.remove("hidden");
+      hintEl.textContent = messageForSeconds(remainingSec);
+    }
+  };
+  render();
+  state[countdownTimerName] = setInterval(render, 250);
+  state[timeoutTimerName] = setTimeout(() => {
+    clearCountdownTimer(countdownTimerName);
+    state[timeoutTimerName] = null;
+    onExpire();
+  }, timeoutMs);
 }
 
 function shortId(value, head = 8, tail = 4) {
@@ -583,6 +1186,64 @@ function renderOpsWarningsList(warnings) {
     li.textContent = warning;
     el.opsWarnings.appendChild(li);
   }
+}
+
+function openSettingsAdminResult(title, description) {
+  if (!el.settingsAdminResultPanel) return;
+  el.settingsAdminResultTitle.textContent = title;
+  el.settingsAdminResultDescription.textContent = description;
+  el.settingsAdminResultBody.innerHTML = "";
+  el.settingsAdminResultPanel.classList.remove("hidden");
+}
+
+function toggleSettingsAdminResult(actionKey) {
+  if (!el.settingsAdminResultPanel) return false;
+  const isOpen = !el.settingsAdminResultPanel.classList.contains("hidden");
+  if (isOpen && el.settingsAdminResultPanel.dataset.activeAdminAction === actionKey) {
+    closeSettingsAdminResult();
+    return false;
+  }
+  el.settingsAdminResultPanel.dataset.activeAdminAction = actionKey;
+  return true;
+}
+
+function appendAdminResultRow(label, value, tone = "") {
+  const row = document.createElement("div");
+  row.className = "settings-admin-result-row";
+  if (tone) row.dataset.tone = tone;
+  const labelNode = document.createElement("span");
+  labelNode.textContent = label;
+  const valueNode = document.createElement("strong");
+  valueNode.textContent = value;
+  row.append(labelNode, valueNode);
+  el.settingsAdminResultBody.appendChild(row);
+}
+
+function appendAdminResultText(text, tone = "") {
+  const item = document.createElement("p");
+  item.className = "settings-admin-result-text";
+  if (tone) item.dataset.tone = tone;
+  item.textContent = text;
+  el.settingsAdminResultBody.appendChild(item);
+}
+
+function appendTerminalDiagnosticsRow(label, value, tone = "") {
+  if (!el.terminalDiagnosticsBody) return;
+  const row = document.createElement("div");
+  row.className = "terminal-diagnostics-row";
+  if (tone) row.dataset.tone = tone;
+  const labelNode = document.createElement("span");
+  labelNode.textContent = label;
+  const valueNode = document.createElement("strong");
+  valueNode.textContent = value;
+  row.append(labelNode, valueNode);
+  el.terminalDiagnosticsBody.appendChild(row);
+}
+
+function closeSettingsAdminResult() {
+  if (!el.settingsAdminResultPanel) return;
+  el.settingsAdminResultPanel.classList.add("hidden");
+  delete el.settingsAdminResultPanel.dataset.activeAdminAction;
 }
 
 function detectWorkerStaleSec(stateRows) {
@@ -807,6 +1468,19 @@ function renderOperatorGuide() {
   const providerFallback = providerSummary?.available ? providerGuideMap[providerSummary.operator_state?.code] : null;
   const resolvedGuide = providerFallback || fallback;
   const actionPolicy = getOperatorActionPolicy(providerFallback ? "review_required" : status);
+  if (providerFallback) {
+    renderChipGroup(el.operatorWalletChips, [
+      providerSummary.provider_code || "店頭端末連携",
+      providerSummary.payment_session_status || "presented",
+    ], "店頭端末連携");
+    el.operatorWalletHelpLink.classList.add("hidden");
+    el.operatorWalletHelpLink.removeAttribute("href");
+  } else {
+    renderChipGroup(el.operatorWalletChips, supportedWallets, walletAdapter.reason ? "手動送金案内" : "ウォレット確認待ち");
+    setHelperLink(el.operatorWalletHelpLink, invoice?.wallet_help_url || "", "お客様向けウォレット案内を開く");
+  }
+
+  if (!el.operatorGuideList) return;
   el.operatorGuideBadge.textContent = providerFallback ? resolvedGuide.badge : actionPolicy.label;
   el.operatorGuideHeadline.textContent = providerFallback ? resolvedGuide.headline : `${actionPolicy.label}: ${actionPolicy.handoff.replace("商品引渡し: ", "")}`;
   el.operatorGuideBody.textContent = providerFallback
@@ -820,22 +1494,10 @@ function renderOperatorGuide() {
   el.operatorGuideAction.textContent = providerFallback ? resolvedGuide.action : actionPolicy.action;
   el.operatorStreamStatus.textContent = streamStatus;
   el.operatorReviewId.textContent = reviewCaseId || "-";
-  if (providerFallback) {
-    renderChipGroup(el.operatorWalletChips, [
-      providerSummary.provider_code || "店頭端末連携",
-      providerSummary.payment_session_status || "presented",
-    ], "店頭端末連携");
-    el.operatorWalletHelpLink.classList.add("hidden");
-    el.operatorWalletHelpLink.removeAttribute("href");
-  } else {
-    renderChipGroup(el.operatorWalletChips, supportedWallets, walletAdapter.reason ? "手動送金案内" : "ウォレット確認待ち");
-    setHelperLink(el.operatorWalletHelpLink, invoice?.wallet_help_url || "", "お客様向けウォレット案内を開く");
-  }
-
   el.operatorGuideList.innerHTML = "";
   const actionItems = providerFallback
-    ? resolvedGuide.items
-    : [actionPolicy.handoff, actionPolicy.next, actionPolicy.manager, actionPolicy.script, ...resolvedGuide.items.slice(0, 2)];
+    ? resolvedGuide.items.slice(0, 3)
+    : [actionPolicy.handoff, actionPolicy.next, actionPolicy.manager];
   for (const item of actionItems) {
     const li = document.createElement("li");
     li.textContent = item;
@@ -908,7 +1570,7 @@ function computeReviewSuggestion(review) {
 
 async function loadOpsSnapshot() {
   if (!isAdminRole(state.role)) return;
-  const businessDate = /^\d{4}-\d{2}-\d{2}$/.test(String(el.businessDateInput.value || "").trim())
+  const businessDate = isValidIsoDate(String(el.businessDateInput.value || "").trim())
     ? String(el.businessDateInput.value || "").trim()
     : nowIsoDate();
   el.opsSnapshotState.textContent = "運用サマリーを更新中です。";
@@ -918,6 +1580,11 @@ async function loadOpsSnapshot() {
       requestJson(`/api/v1/settlements/daily-status?business_date=${encodeURIComponent(businessDate)}`),
       requestJson("/api/v1/chain-monitor/status"),
     ]);
+    const failedSources = [
+      reviewsResult.status === "rejected" ? "確認待ち" : "",
+      settlementResult.status === "rejected" ? "締め状態" : "",
+      monitorResult.status === "rejected" ? "監視状態" : "",
+    ].filter(Boolean);
 
     const reviews = reviewsResult.status === "fulfilled" && Array.isArray(reviewsResult.value.reviews)
       ? [...reviewsResult.value.reviews]
@@ -939,8 +1606,9 @@ async function loadOpsSnapshot() {
         : `${pendingDead + abandonedDead}件`;
 
     const settlementClosed = settlementResult.status === "fulfilled" ? settlementResult.value.closed === true : null;
+    const settlement = settlementResult.status === "fulfilled" ? settlementResult.value?.settlement || null : null;
     const settlementReviewCount = settlementResult.status === "fulfilled"
-      ? Number(settlementResult.value?.settlement?.review_count || 0)
+      ? Number(settlement?.review_count || 0)
       : null;
 
     renderOpsWarningsList(monitor ? buildMonitorWarnings(monitor) : ["監視状態を取得できませんでした"]);
@@ -1015,6 +1683,7 @@ async function loadOpsSnapshot() {
     el.opsWorkerStatus.textContent = workerStatusText || "-";
 
     el.opsOpenReviewCount.textContent = `${openReviewCount}件`;
+    if (el.topbarOpenReviewCount) el.topbarOpenReviewCount.textContent = `${openReviewCount}件`;
     el.opsDeadLetterCount.textContent = deadLabel;
     el.opsSettlementStatus.textContent =
       settlementClosed == null
@@ -1029,8 +1698,19 @@ async function loadOpsSnapshot() {
       ? `${reviewReasonLabel(priorityReview.reason_type)} / ${shortId(priorityReview.id)}`
       : "なし";
     el.opsRefundCandidateCount.textContent = `${refundCandidateCount}件`;
-    el.opsSnapshotState.textContent =
-      "小規模店舗の現場で、いま止まりやすい項目を review / refund / settlement / monitor で優先表示しています。";
+    renderTopbarRefundSummary(openReviewCount, refundCandidateCount);
+    renderSettlementDashboard({
+      businessDate,
+      settlementClosed,
+      settlement,
+      openReviewCount,
+      refundCandidateCount,
+    });
+    setLastUpdated(el.settlementLastUpdatedText);
+    setLastUpdated(el.refundsLastUpdatedText);
+    el.opsSnapshotState.textContent = failedSources.length > 0
+      ? `一部の運用情報を取得できませんでした: ${failedSources.join("、")}。表示中の値は取得できた情報だけで更新しています。`
+      : "小規模店舗の現場で、いま止まりやすい項目を review / refund / settlement / monitor で優先表示しています。";
     setChecklist(el.opsSnapshotChecklist, checklist);
   } catch (_error) {
     el.opsOpenReviewCount.textContent = "-";
@@ -1041,6 +1721,22 @@ async function loadOpsSnapshot() {
     el.opsRefundCandidateCount.textContent = "-";
     el.opsAddressPoolCount.textContent = "-";
     el.opsWorkerStatus.textContent = "-";
+    renderTopbarRefundSummary(0, 0);
+    renderSettlementDashboard({
+      businessDate,
+      settlementClosed: null,
+      settlement: null,
+      openReviewCount: 0,
+      refundCandidateCount: 0,
+    });
+    if (el.settlementBlockerTitle) el.settlementBlockerTitle.textContent = "締め前チェック取得失敗";
+    if (el.settlementBlockerReason) el.settlementBlockerReason.textContent = "締め状態または運用サマリーを取得できませんでした。";
+    if (el.settlementBlockerNext) el.settlementBlockerNext.textContent = "通信状態と権限を確認してから再取得してください。";
+    if (el.tabBadgeSettlement) {
+      el.tabBadgeSettlement.textContent = "!";
+      el.tabBadgeSettlement.classList.remove("hidden");
+    }
+    setLastUpdated(el.settlementLastUpdatedText);
     el.opsSnapshotState.textContent = "運用サマリーの取得に失敗しました。";
     renderOpsWarningsList(["監視状態を取得できませんでした"]);
     setChecklist(el.opsSnapshotChecklist, ["ネットワークまたは権限状態を確認してから再取得してください。"]);
@@ -1161,6 +1857,7 @@ function renderDiagnostics() {
 }
 
 function showToast(message, isError = false) {
+  el.toastHost.querySelectorAll(".toast").forEach((node) => node.remove());
   const toast = document.createElement("div");
   toast.textContent = message;
   toast.className = `toast ${isError ? "toast-error" : "toast-info"}`;
@@ -1171,39 +1868,207 @@ function showToast(message, isError = false) {
 }
 
 function setLoggedInUi(loggedIn) {
+  document.body.classList.toggle("is-terminal-logged-in", loggedIn);
+  if (!loggedIn && state.activeTab !== "billing") {
+    setActiveTab("billing");
+  }
+  if (el.loginStartPanel) el.loginStartPanel.classList.toggle("hidden", loggedIn);
+  if (el.terminalTabNav) el.terminalTabNav.classList.toggle("hidden", !loggedIn);
+  if (el.terminalWorkspace) el.terminalWorkspace.classList.toggle("hidden", !loggedIn);
   if (el.loginFormPanel) el.loginFormPanel.classList.toggle("collapsed-after-login", loggedIn);
-  if (el.staffPinConfirmLabel) el.staffPinConfirmLabel.classList.toggle("hidden", loggedIn);
+  if (el.staffPinConfirmLabel) el.staffPinConfirmLabel.classList.add("hidden");
+}
+
+function resetTerminalSessionUi(message) {
+  closeSse("セッション終了");
+  stopFallbackPolling();
+  stopOpsAutoRefresh();
+  state.token = "";
+  state.terminalId = "";
+  state.storeId = "";
+  state.sessionId = "";
+  state.role = "";
+  state.storeName = "";
+  state.staffName = "";
+  state.supportedWallets = [];
+  state.fixedQrUrl = "";
+  state.fixedQrToken = "";
+  state.diagnosticsEnabled = false;
+  clearInvoiceView();
+  setLoggedInUi(false);
+  applyAdminVisibility();
+  renderTopbarRole();
+  renderSettingsSessionSummary();
+  if (el.sessionText) el.sessionText.textContent = "未接続";
+  if (el.sessionExpiryText) el.sessionExpiryText.textContent = "-";
+  if (el.topbarOpenReviewCount) el.topbarOpenReviewCount.textContent = "-";
+  renderTopbarRefundSummary(0, 0);
+  setNetworkStatus("未接続");
+  renderDiagnostics();
+  renderOperatorGuide();
+  if (message) showToast(message);
+}
+
+function handleLockTerminal() {
+  resetTerminalSessionUi("端末をロックしました。再開するにはPINでログインしてください");
+}
+
+async function handleLogoutTerminal() {
+  if (!state.token) {
+    resetTerminalSessionUi("ログアウトしました");
+    return;
+  }
+  if (el.logoutTerminalBtn) el.logoutTerminalBtn.disabled = true;
+  try {
+    await requestJson("/api/v1/terminal-sessions/current", {
+      method: "DELETE",
+      headers: {
+        "idempotency-key": idempotencyKey("session-logout"),
+      },
+    });
+    resetTerminalSessionUi("ログアウトしました");
+  } catch (error) {
+    showToast(String(error.message || error), true);
+  } finally {
+    if (el.logoutTerminalBtn) el.logoutTerminalBtn.disabled = false;
+  }
+}
+
+function setRefundStepIndicators(stepName) {
+  const order = ["request", "approve", "evidence", "verify"];
+  const nodes = {
+    request: el.refundStepRequestIndicator,
+    approve: el.refundStepApproveIndicator,
+    evidence: el.refundStepEvidenceIndicator,
+    verify: el.refundStepVerifyIndicator,
+  };
+  const activeIndex = Math.max(0, order.indexOf(stepName));
+  for (const [index, key] of order.entries()) {
+    const node = nodes[key];
+    if (!node) continue;
+    node.classList.toggle("is-current", index === activeIndex);
+    node.classList.toggle("is-complete", index < activeIndex);
+    node.toggleAttribute("aria-current", index === activeIndex);
+  }
+  document.querySelectorAll(".refund-form-stack .step-panel").forEach((panel, index) => {
+    panel.dataset.stepState = index < activeIndex ? "complete" : index === activeIndex ? "current" : "locked";
+  });
+}
+
+function updateRefundSummary() {
+  const amount = Number(el.refundAmount?.value || 0);
+  if (el.refundSummaryAmount) el.refundSummaryAmount.textContent = Number.isFinite(amount) && amount > 0 ? formatJpyc(amount) : "-";
+  const address = String(el.refundAddress?.value || "").trim();
+  if (el.refundSummaryAddress) el.refundSummaryAddress.textContent = address || "未入力";
+}
+
+function updateRefundEvidencePathHint() {
+  if (!el.refundEvidencePathHint) return;
+  const value = String(el.refundEvidenceNotePathInput?.value || "");
+  el.refundEvidencePathHint.textContent = value === "docs/production/evidence/refunds/not-attached-yet"
+    ? "後で添付する場合は、返金IDと取引番号を控えてから管理PCまたは台帳の証跡欄に追記してください。"
+    : "証跡の保管先を選んでください。";
 }
 
 function updateRefundStepState(statusText = "") {
   const hasRefundId = Boolean(String(el.refundIdInput?.value || "").trim());
+  const hasTx = Boolean(String(el.refundTxHashInput?.value || "").trim());
+  const normalizedStatus = String(statusText || "").toLowerCase();
+  const workflowStatus = state.refundWorkflowStatus || "draft";
+  const stepName = normalizedStatus.includes("検証済") || normalizedStatus === "succeeded" || workflowStatus === "verified"
+    ? "verify"
+    : workflowStatus === "approved" || workflowStatus === "recorded" || hasTx
+      ? "evidence"
+      : hasRefundId || workflowStatus === "requested" || workflowStatus === "approved"
+        ? "approve"
+        : "request";
   if (el.refundStepRequestBadge) el.refundStepRequestBadge.textContent = hasRefundId ? "作成済み" : "入力";
   if (el.refundStepApproveBadge) el.refundStepApproveBadge.textContent = hasRefundId ? "承認待ち" : "返金ID待ち";
   if (el.refundStepEvidenceBadge) el.refundStepEvidenceBadge.textContent = statusText || (hasRefundId ? "証跡入力" : "返金ID待ち");
-  if (el.approveRefundBtn) el.approveRefundBtn.disabled = !hasRefundId;
-  if (el.executeRefundBtn) el.executeRefundBtn.disabled = !hasRefundId;
-  if (el.verifyRefundBtn) el.verifyRefundBtn.disabled = !hasRefundId;
+  if (el.approveRefundBtn) el.approveRefundBtn.disabled = !hasRefundId || ["approved", "recorded", "verified"].includes(workflowStatus);
+  if (el.executeRefundBtn) el.executeRefundBtn.disabled = workflowStatus !== "approved";
+  if (el.verifyRefundBtn) el.verifyRefundBtn.disabled = workflowStatus !== "recorded";
+  setRefundStepIndicators(stepName);
+  updateRefundSummary();
+  updateRefundEvidencePathHint();
 }
 
-function confirmDangerInvoiceAction(actionPath, label) {
+const STOP_QR_REASON_META = Object.freeze({
+  amount_mistake: { label: "金額ミス", actionPath: "cancel" },
+  payment_method_changed: { label: "支払い方法変更", actionPath: "cancel" },
+  customer_cancelled: { label: "お客様キャンセル", actionPath: "cancel" },
+  time_expired: { label: "時間切れ", actionPath: "expire" },
+  reissue_invoice: { label: "新しい請求を出す", actionPath: "cancel" },
+});
+
+function getSelectedStopQrReason() {
+  const reason = String(el.stopQrReasonSelect?.value || "amount_mistake");
+  return STOP_QR_REASON_META[reason] || STOP_QR_REASON_META.amount_mistake;
+}
+
+function confirmStopQrAction() {
+  if (["cancelled", "expired"].includes(state.invoiceStatus)) {
+    clearInvoiceView();
+    return;
+  }
+  const reasonMeta = getSelectedStopQrReason();
+  confirmDangerInvoiceAction(reasonMeta.actionPath, "QR停止", `理由: ${reasonMeta.label}`);
+}
+
+function confirmDangerInvoiceAction(actionPath, label, detail = "") {
   if (!state.invoiceId) {
     showToast("対象の請求がありません", true);
     return;
   }
-  if (state.pendingDangerAction !== actionPath) {
-    state.pendingDangerAction = actionPath;
-    showToast(`${label}するには、同じボタンをもう一度押してください`, true);
-    window.setTimeout(() => {
-      if (state.pendingDangerAction === actionPath) state.pendingDangerAction = "";
-    }, 5000);
+  const dangerHintEl = el.stopQrConfirmHint || el.amountInputError;
+  const pendingKey = `${actionPath}:${detail}`;
+  const detailText = detail ? `（${detail}）` : "";
+  if (state.pendingDangerAction !== pendingKey) {
+    state.pendingDangerAction = pendingKey;
+    if (dangerHintEl && dangerHintEl !== el.amountInputError) el.amountInputError.textContent = "";
+    showToast(`${label}するには、${Math.ceil(INVOICE_DANGER_CONFIRM_MS / 1000)}秒以内に同じボタンをもう一度押してください${detailText}`, true);
+    startConfirmationCountdown({
+      hintEl: dangerHintEl,
+      timeoutMs: INVOICE_DANGER_CONFIRM_MS,
+      countdownTimerName: "pendingDangerCountdownTimer",
+      timeoutTimerName: "pendingDangerTimer",
+      messageForSeconds: (remainingSec) => `あと${remainingSec}秒以内にもう一度押すと${label}します。${detailText}`,
+      onExpire: () => {
+        if (state.pendingDangerAction === pendingKey) {
+          state.pendingDangerAction = "";
+          dangerHintEl.textContent = `${label}の確認は時間切れです。必要ならもう一度押してください。`;
+        }
+      },
+    });
     return;
   }
   state.pendingDangerAction = "";
-  void postInvoiceAction(actionPath, `${label}しました`);
+  clearCountdownTimer("pendingDangerCountdownTimer");
+  clearTimeoutTimer("pendingDangerTimer");
+  if (dangerHintEl) dangerHintEl.textContent = "";
+  void postInvoiceAction(actionPath, `${label}しました${detailText}`);
 }
 
+const ERROR_MESSAGE_BY_CODE = {
+  ADDRESS_POOL_EXHAUSTED: "請求に使える受取アドレスがありません。店長またはサポートに確認してください。",
+  AML_POLICY_NOT_APPROVED: "高額請求は承認が完了するまで作成できません。店長またはサポートに確認してください。",
+  DAILY_STORE_AMOUNT_CAP_EXCEEDED: "本日の店舗上限額を超えています。店長またはサポートに確認してください。",
+  DAILY_STORE_INVOICE_CAP_EXCEEDED: "本日の請求作成上限を超えています。店長またはサポートに確認してください。",
+  DUPLICATE_REFUND_TX_HASH: "この返金取引番号はすでに別の返金記録で使われています。",
+  INVALID_STATE_TRANSITION: "現在の状態ではこの操作を実行できません。画面を更新して状態を確認してください。",
+  NOT_FOUND: "対象データが見つかりません。画面を更新して確認してください。",
+  PAYMENTS_DISABLED: "現在、新しい請求の作成は一時停止されています。",
+  STORE_PAYMENTS_DISABLED: "この店舗では新しい請求の作成が一時停止されています。",
+  TERMINAL_PAYMENTS_DISABLED: "この端末では新しい請求の作成が一時停止されています。",
+  TWO_PERSON_REQUIRED: "この操作は別の管理者による承認または実行が必要です。",
+  VALIDATION_ERROR: "入力内容を確認してください。",
+};
+
 function parseErrorMessage(data, fallback = "リクエストに失敗しました") {
-  return data?.error?.message || fallback;
+  const code = String(data?.error?.code || "");
+  if (ERROR_MESSAGE_BY_CODE[code]) return ERROR_MESSAGE_BY_CODE[code];
+  const serverMessage = String(data?.error?.message || "");
+  return /[ぁ-んァ-ン一-龯]/.test(serverMessage) ? serverMessage : fallback;
 }
 
 function authHeaders() {
@@ -1268,6 +2133,22 @@ function setInvoiceStatusPill(statusRaw) {
   el.invoiceStatusPill.className = `status-pill ${klass}`;
 }
 
+function invoiceStatusMeta(statusRaw) {
+  const status = canonicalInvoiceStatus(statusRaw);
+  const labelMap = {
+    issued: ["発行済み", "s-blue"],
+    payment_detected: ["入金検知", "s-blue"],
+    confirming: ["確認中", "s-blue"],
+    paid: ["支払い完了", "s-green"],
+    settled: ["確定済み", "s-green"],
+    review_required: ["確認が必要", "s-yellow"],
+    cancelled: ["無効化", "s-red"],
+    expired: ["期限切れ", "s-red"],
+  };
+  const [label, klass] = labelMap[status] || [status || "未発行", "s-gray"];
+  return { label, klass };
+}
+
 function clearQr() {
   const ctx = el.qrCanvas.getContext("2d");
   ctx.clearRect(0, 0, el.qrCanvas.width, el.qrCanvas.height);
@@ -1323,16 +2204,15 @@ function renderCustomerFacingDisplay(invoice) {
   el.tapModePanel.classList.toggle("hidden", !tapOnly);
   if (!tapOnly) {
     if (state.fixedQrUrl) {
-      drawQr(state.fixedQrUrl);
-      el.fixedQrUrlLink.textContent = state.fixedQrUrl;
-      el.fixedQrUrlLink.href = state.fixedQrUrl;
+      const fixedQrUrl = withDisplayFontSizeParam(state.fixedQrUrl);
+      drawQr(fixedQrUrl);
+      el.fixedQrUrlLink.textContent = fixedQrUrl;
+      el.fixedQrUrlLink.href = fixedQrUrl;
     } else {
       el.fixedQrUrlLink.textContent = "-";
       el.fixedQrUrlLink.removeAttribute("href");
       clearQr();
     }
-    el.customerDisplayHint.textContent =
-      "このQRは端末ごとの固定入口です。お客様画面は、その時点の current invoice に一度だけ解決されます。";
     return;
   }
 
@@ -1342,8 +2222,6 @@ function renderCustomerFacingDisplay(invoice) {
   el.tapModeBody.textContent =
     providerSummary.customer_payment_mode?.body || providerSummary.operator_state?.body || "店頭端末でタッチ決済をご案内しています。";
   el.tapModeAmount.textContent = formatJpy(invoice?.amounts?.amount_jpy || 0);
-  el.customerDisplayHint.textContent =
-    "タッチ案内中のため、端末入口QRからのウォレット導線は一時停止しています。QRに戻すときは店員が明示操作を行います。";
 }
 
 function renderCustomerFacingQr() {
@@ -1398,12 +2276,16 @@ function startFallbackPollingIfNeeded() {
 
 function renderProviderControls(invoice) {
   const providerSummary = invoice?.provider_summary || null;
+  const isMockRail = providerSummary?.available === true && providerSummary?.provider_code === "mock_provider";
+  el.presentTapBtn.classList.toggle("is-preview", isMockRail);
   if (!providerSummary?.available) {
     el.providerOperatorStateText.textContent = "QR案内";
     el.providerStatusText.textContent = "店頭端末未提示";
-    el.providerControlHint.textContent = "端末入口QRを入口として案内できます。タッチ決済を使う場合だけ明示的に提示を開始します。";
-    el.presentTapBtn.disabled = !state.invoiceId || invoice?.status !== "issued";
-    el.resumeQrBtn.disabled = true;
+    if (el.providerControlHint) {
+      el.providerControlHint.textContent = "タッチ決済の連携は現在の運用スコープ外です。お客様にはQRでご案内してください。";
+    }
+    el.presentTapBtn.disabled = true;
+    if (el.resumeQrBtn) el.resumeQrBtn.disabled = true;
     return;
   }
 
@@ -1414,11 +2296,13 @@ function renderProviderControls(invoice) {
       providerSummary.provider_status || null,
       providerSummary.fulfillment_decision === "allow_fulfillment" ? "allow_fulfillment" : null,
     ].filter(Boolean).join(" / ") || "-";
-  el.providerControlHint.textContent = providerSummary.qr_available
-    ? "QR案内に戻っています。必要なら改めて tap を提示できます。"
-    : (providerSummary.operator_state?.body || "タッチ案内中は端末入口QR導線を止め、同じ会計の二重導線を防ぎます。");
+  if (el.providerControlHint) {
+    el.providerControlHint.textContent = providerSummary.qr_available
+      ? "QR案内に戻っています。必要なら改めて tap を提示できます。"
+      : (providerSummary.operator_state?.body || "タッチ案内中は端末入口QR導線を止め、同じ会計の二重導線を防ぎます。");
+  }
   el.presentTapBtn.disabled = providerSummary.can_present !== true;
-  el.resumeQrBtn.disabled = providerSummary.can_cancel_presentation !== true;
+  if (el.resumeQrBtn) el.resumeQrBtn.disabled = providerSummary.can_cancel_presentation !== true;
 }
 
 function renderAmountCompare(invoice) {
@@ -1447,6 +2331,45 @@ function renderAmountCompare(invoice) {
   }
 }
 
+function updateAmountPreview() {
+  if (!el.amountJpycPreview) return;
+  const amount = Number(el.amountInput?.value || 0);
+  if (!Number.isInteger(amount) || amount <= 0) {
+    el.amountJpycPreview.textContent = "= 金額を入力してください";
+    if (!state.invoiceId && el.amountCompareDelta) el.amountCompareDelta.textContent = "未発行";
+    return;
+  }
+  el.amountJpycPreview.textContent = `= ${formatJpyc(amount)}`;
+  if (!state.invoiceId && el.amountComparePaid) el.amountComparePaid.textContent = "0 JPYC";
+  if (!state.invoiceId && el.amountCompareDelta) el.amountCompareDelta.textContent = "請求未発行";
+}
+
+function setBillingInvoicePresence(hasInvoice) {
+  el.billingCurrentPanel?.closest(".billing-left")?.classList.toggle("has-current-invoice", hasInvoice);
+  el.billingCurrentPanel?.classList.toggle("is-empty", !hasInvoice);
+  el.billingCurrentPanel?.classList.toggle("is-draft", !hasInvoice);
+  el.billingCurrentPanel?.classList.toggle("is-issued", hasInvoice);
+  el.billingCurrentEmptyHint?.classList.toggle("hidden", hasInvoice);
+  el.paymentUrlRow?.classList.toggle("hidden", !hasInvoice);
+  if (el.amountInput) el.amountInput.disabled = hasInvoice;
+}
+
+function renderHandoverNote(invoiceStatus) {
+  if (!el.handoverNote) return;
+  if (invoiceStatus === "paid" || invoiceStatus === "settled") {
+    el.handoverNote.textContent = "🟢 商品を渡してよいか: 支払い確認済みです。通常の引き渡し手順へ進めます。";
+    el.handoverNote.className = "ops-note handover-ok";
+    return;
+  }
+  if (invoiceStatus === "review_required") {
+    el.handoverNote.textContent = "🔴 商品を渡してよいか: 管理者確認が終わるまで、商品はまだ渡さないでください。";
+    el.handoverNote.className = "ops-note handover-admin";
+    return;
+  }
+  el.handoverNote.textContent = "🟡 商品を渡してよいか: お支払いを確認するまで、商品はまだ渡さないでください。";
+  el.handoverNote.className = "ops-note handover-wait";
+}
+
 function renderInvoice(invoice) {
   const previousInvoiceId = state.invoiceId;
   state.currentInvoice = invoice;
@@ -1454,19 +2377,48 @@ function renderInvoice(invoice) {
   state.invoiceId = invoice.invoice_id || "";
   const invoiceStatus = canonicalInvoiceStatus(invoice.status);
   state.invoiceStatus = invoiceStatus;
+  if (invoice.chain?.chain_id || invoice.chain_id || invoice.payment_chain?.chain_id) {
+    state.selectedPaymentChainId = String(invoice.payment_chain?.chain_id || invoice.chain?.chain_id || invoice.chain_id);
+  }
+  setBillingInvoicePresence(true);
   setInvoiceStatusPill(invoiceStatus);
-  el.invoiceIdText.textContent = invoice.invoice_id || "-";
+  if (el.billingWaitingPill) {
+    const meta = invoiceStatusMeta(invoiceStatus);
+    el.billingWaitingPill.textContent = invoiceStatus === "paid"
+      ? "支払い完了"
+      : ACTIVE_INVOICE_STATUSES.has(invoiceStatus)
+        ? "支払い待ち"
+        : meta.label;
+    el.billingWaitingPill.className = `status-pill ${meta.klass}`;
+  }
+  el.invoiceIdText.textContent = invoice.invoice_no || shortId(invoice.invoice_id || "", 10, 5) || "-";
   if (invoice.payment_url) {
-    el.paymentUrlLink.textContent = invoice.payment_url;
-    el.paymentUrlLink.href = invoice.payment_url;
+    const paymentUrl = withDisplayFontSizeParam(invoice.payment_url);
+    el.paymentUrlLink.textContent = paymentUrl;
+    el.paymentUrlLink.href = paymentUrl;
   } else {
     el.paymentUrlLink.textContent = "-";
     el.paymentUrlLink.removeAttribute("href");
   }
-  el.expiresAtText.textContent = invoice.expires_at || "-";
+  el.expiresAtText.textContent = formatRemainingClock(invoice.expires_at);
   el.amountText.textContent = `${invoice.amounts?.amount_jpyc_display ?? "-"} JPYC`;
   el.paidText.textContent = `${invoice.amounts?.paid_amount_jpyc_display ?? "-"} JPYC`;
+  const selectedChainMeta = invoice.payment_chain || invoice.chain || selectedPaymentChain() || {};
+  const selectedChainId = selectedChainMeta.chain_id || invoice.chain_id || "-";
+  const selectedNetwork = selectedChainMeta.network || chainLabel(selectedChainId);
+  if (el.paymentChainText) el.paymentChainText.textContent = `${selectedNetwork} / Chain ID ${selectedChainId}`;
+  if (el.paymentContractText) {
+    el.paymentContractText.textContent = selectedChainMeta.token_contract_display
+      || invoice.token_contract
+      || selectedChainMeta.token_contract
+      || OFFICIAL_JPYC_CONTRACT_DISPLAY;
+  }
+  if (ACTIVE_INVOICE_STATUSES.has(invoiceStatus) && invoice.amount_jpy != null) {
+    el.amountInput.value = String(invoice.amount_jpy);
+    updateAmountPreview();
+  }
   renderAmountCompare(invoice);
+  renderHandoverNote(invoiceStatus);
   if (el.qrAccessibleText) {
     el.qrAccessibleText.textContent =
       `決済QR。請求ID ${invoice.invoice_no || invoice.invoice_id || "-"}、請求額 ${invoice.amounts?.amount_jpyc_display ?? "-"} JPYC。`;
@@ -1474,6 +2426,14 @@ function renderInvoice(invoice) {
   el.reasonText.textContent = invoice.status_reason || "-";
   renderProviderControls(invoice);
   renderCustomerFacingQr();
+  el.createInvoiceBtn.textContent = "＋ 請求を作成";
+  if (el.cancelInvoiceBtn) {
+    el.cancelInvoiceBtn.textContent = ["cancelled", "expired"].includes(invoiceStatus) ? "もう一度請求作成" : "QR停止";
+  }
+  el.createInvoiceBtn.disabled = ACTIVE_INVOICE_STATUSES.has(invoiceStatus);
+  el.createInvoiceBtn.title = ACTIVE_INVOICE_STATUSES.has(invoiceStatus)
+    ? "現在の会計が残っています。再発行またはQR停止後に新規会計を開始してください。"
+    : "";
 
   if (state.terminalId && ACTIVE_INVOICE_STATUSES.has(invoiceStatus) && (!state.sse || previousInvoiceId !== state.invoiceId)) {
     void connectTerminalStream();
@@ -1481,9 +2441,10 @@ function renderInvoice(invoice) {
   if (FINAL_INVOICE_STATUSES.has(invoiceStatus)) {
     closeSse();
   }
-  startFallbackPollingIfNeeded();
+  if (state.sseStatus !== "open") startFallbackPollingIfNeeded();
   renderDiagnostics();
   renderOperatorGuide();
+  renderPaymentChains();
   renderConnectionStatus();
 }
 
@@ -1495,27 +2456,46 @@ function clearInvoiceView() {
   state.selectedReviewId = "";
   state.selectedReviewDetail = null;
   state.sseToken = "";
+  setBillingInvoicePresence(false);
   setInvoiceStatusPill("");
+  if (el.billingWaitingPill) {
+    el.billingWaitingPill.textContent = "未発行";
+    el.billingWaitingPill.className = "status-pill s-gray";
+  }
   el.invoiceIdText.textContent = "-";
   el.paymentUrlLink.textContent = "-";
   el.paymentUrlLink.removeAttribute("href");
   el.expiresAtText.textContent = "-";
   el.amountText.textContent = "-";
   el.paidText.textContent = "-";
+  if (el.paymentChainText) el.paymentChainText.textContent = "-";
+  if (el.paymentContractText) el.paymentContractText.textContent = "-";
+  if (el.stopQrConfirmHint) el.stopQrConfirmHint.textContent = "";
   renderAmountCompare(null);
+  if (el.amountComparePaid) el.amountComparePaid.textContent = "0 JPYC";
+  if (el.amountCompareDelta) el.amountCompareDelta.textContent = "請求未発行";
+  updateAmountPreview();
+  renderHandoverNote("");
   if (el.qrAccessibleText) el.qrAccessibleText.textContent = "請求IDと金額は現在の請求欄に表示されます。";
   el.reasonText.textContent = "-";
   el.providerOperatorStateText.textContent = "-";
   el.providerStatusText.textContent = "-";
-  el.providerControlHint.textContent = "QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。";
+  if (el.providerControlHint) {
+    el.providerControlHint.textContent = "QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。";
+  }
   el.presentTapBtn.disabled = true;
-  el.resumeQrBtn.disabled = true;
+  el.createInvoiceBtn.disabled = false;
+  el.createInvoiceBtn.textContent = "＋ 請求を作成";
+  el.createInvoiceBtn.removeAttribute("title");
+  if (el.cancelInvoiceBtn) el.cancelInvoiceBtn.textContent = "QR停止";
+  if (el.resumeQrBtn) el.resumeQrBtn.disabled = true;
   renderCustomerFacingQr();
   closeSse("未接続");
   stopFallbackPolling();
   setFallbackPollingStatus("idle", "未開始");
   renderDiagnostics();
   renderOperatorGuide();
+  renderPaymentChains();
   renderConnectionStatus();
 }
 
@@ -1534,21 +2514,27 @@ async function loadInvoice(invoiceId, options = {}) {
 }
 
 function applyAmountPreset(amount) {
-  el.amountInput.value = String(amount);
+  const addAmount = Number(amount);
+  if (!Number.isInteger(addAmount) || addAmount <= 0) {
+    showToast("プリセット金額を読み取れませんでした", true);
+    return;
+  }
+  const currentAmount = parsePositiveInteger(el.amountInput.value);
+  const nextAmount = currentAmount + addAmount;
+  el.amountInput.value = String(nextAmount);
   el.amountInputError.textContent = "";
-  showToast(`請求金額を ${formatJpy(amount)} に設定しました`);
+  updateAmountPreview();
+  showToast(`${formatJpy(addAmount)} を追加して ${formatJpy(nextAmount)} にしました`);
 }
 
 function handleAddAmountPreset() {
-  const amount = Number(el.presetAmountInput.value);
+  const amount = parsePositiveInteger(el.presetAmountInput.value);
   if (!Number.isInteger(amount) || amount <= 0) {
     showToast("追加する金額は 1円以上の整数で入力してください", true);
     return;
   }
   const current = readTerminalSettings();
   if (current.amount_presets.includes(amount)) {
-    el.amountInput.value = String(amount);
-    el.amountInputError.textContent = "";
     el.presetAmountInput.value = "";
     showToast("その金額はすでにプリセットにあります");
     return;
@@ -1561,6 +2547,30 @@ function handleAddAmountPreset() {
   renderAmountPresetButtons();
   applyAmountPreset(amount);
   el.presetAmountInput.value = "";
+}
+
+function handleEditAmountPreset(amount) {
+  const numericAmount = Number(amount);
+  const current = readTerminalSettings();
+  if (!current.amount_presets.includes(numericAmount)) {
+    showToast("編集するプリセットが見つかりません", true);
+    return;
+  }
+  const input = window.prompt("プリセット金額を変更", String(numericAmount));
+  if (input == null) return;
+  const nextAmount = parsePositiveInteger(input);
+  if (!Number.isInteger(nextAmount) || nextAmount <= 0) {
+    showToast("金額は 1円以上の整数で入力してください", true);
+    return;
+  }
+  if (nextAmount !== numericAmount && current.amount_presets.includes(nextAmount)) {
+    showToast("その金額はすでにプリセットにあります", true);
+    return;
+  }
+  const nextPresets = current.amount_presets.map((value) => (value === numericAmount ? nextAmount : value));
+  writeTerminalSettings({ amount_presets: nextPresets });
+  renderAmountPresetButtons();
+  showToast(`${formatJpy(numericAmount)} を ${formatJpy(nextAmount)} に変更しました`);
 }
 
 function handleRemoveAmountPreset(amount) {
@@ -1578,6 +2588,46 @@ function handleResetAmountPresets() {
   showToast("よく使う金額を初期セットに戻しました");
 }
 
+function setRefundCaseFilter(filterValue) {
+  const nextFilter = String(filterValue || "all");
+  const filterButtons = Array.from(document.querySelectorAll("[data-refund-filter]"));
+  const caseCards = Array.from(document.querySelectorAll(".refund-case-card[data-refund-status]"));
+
+  for (const button of filterButtons) {
+    const isActive = button.dataset.refundFilter === nextFilter;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
+
+  let firstVisible = null;
+  for (const card of caseCards) {
+    const matches = nextFilter === "all" || card.dataset.refundStatus === nextFilter;
+    card.classList.toggle("hidden", !matches);
+    if (matches && !firstVisible) firstVisible = card;
+  }
+
+  const activeVisible = caseCards.some((card) => card.classList.contains("is-active") && !card.classList.contains("hidden"));
+  if (!activeVisible && firstVisible) {
+    caseCards.forEach((card) => card.classList.remove("is-active"));
+    firstVisible.classList.add("is-active");
+  }
+}
+
+async function copyPaymentUrl() {
+  const href = el.paymentUrlLink?.href || "";
+  const text = href && href !== window.location.href ? href : "";
+  if (!text) {
+    showToast("コピーできる支払いURLがありません", true);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("支払いURLをコピーしました");
+  } catch (_error) {
+    showToast("このブラウザでは自動コピーできません。URLを手動で選択してください。", true);
+  }
+}
+
 async function fetchSseToken(invoiceId) {
   const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(invoiceId)}/sse-token`, {
     method: "POST",
@@ -1590,11 +2640,12 @@ async function fetchSseToken(invoiceId) {
 
 async function connectTerminalStream() {
   if (!state.token || !state.terminalId || !state.invoiceId) return;
+  const invoiceId = state.invoiceId;
   closeSse();
   let sseToken = "";
   setSseStatus("connecting", "SSE token を取得中");
   try {
-    sseToken = await fetchSseToken(state.invoiceId);
+    sseToken = await fetchSseToken(invoiceId);
   } catch (error) {
     setNetworkStatus("再接続中（トークン取得失敗）");
     setSseStatus("reconnecting", "トークン取得失敗");
@@ -1602,21 +2653,22 @@ async function connectTerminalStream() {
     scheduleSseReconnect();
     return;
   }
+  if (state.invoiceId !== invoiceId) return;
 
   const streamUrl =
     `/api/v1/streams/terminals/${encodeURIComponent(state.terminalId)}` +
-    `?invoice_id=${encodeURIComponent(state.invoiceId)}&sse_token=${encodeURIComponent(sseToken)}`;
+    `?invoice_id=${encodeURIComponent(invoiceId)}&sse_token=${encodeURIComponent(sseToken)}`;
 
   state.sse = new EventSource(streamUrl);
 
   state.sse.addEventListener("open", () => {
     setNetworkStatus("リアルタイム接続中");
     setSseStatus("open", "SSE 接続済み");
+    stopFallbackPolling();
     state.lastStreamEventAt = nowIso();
     if (state.invoiceId) {
       void loadInvoice(state.invoiceId, { silent: true });
     }
-    startFallbackPollingIfNeeded();
   });
 
   const refreshFromStream = (event) => {
@@ -1657,12 +2709,41 @@ function formatRole(role) {
   return "スタッフ";
 }
 
+function canShowTab(tabName) {
+  if (["reviews", "refunds", "settlement"].includes(tabName)) return isAdminRole(state.role);
+  if (tabName === "settings" && state.role && !isAdminRole(state.role)) return false;
+  return true;
+}
+
+function setActiveTab(tabName) {
+  const requested = String(tabName || "billing");
+  const nextTab = canShowTab(requested) ? requested : "billing";
+  state.activeTab = nextTab;
+  document.body.dataset.activeTerminalTab = nextTab;
+  for (const button of el.tabButtons) {
+    const isActive = button.dataset.tabTarget === nextTab;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+  for (const panel of el.tabPanels) {
+    panel.hidden = panel.dataset.tabPanel !== nextTab;
+  }
+  window.scrollTo({ top: 0, behavior: "auto" });
+}
+
 function applyAdminVisibility() {
   const visible = isAdminRole(state.role);
   for (const section of el.adminSections) {
     section.classList.toggle("hidden", !visible);
     section.setAttribute("aria-hidden", visible ? "false" : "true");
   }
+  for (const button of el.tabButtons) {
+    const isAdminTab = button.dataset.adminTab === "true";
+    const isSettingsTab = button.dataset.settingsTab === "true";
+    const showSettings = !state.role || isAdminRole(state.role);
+    button.classList.toggle("hidden", (isAdminTab && !visible) || (isSettingsTab && !showSettings));
+  }
+  setActiveTab(canShowTab(state.activeTab) ? state.activeTab : "billing");
 }
 
 function setReviewListState(kind, message) {
@@ -1712,6 +2793,16 @@ function renderReviewSummary(rows) {
       refundCandidateCount += 1;
     }
   }
+  if (el.topbarOpenReviewCount) el.topbarOpenReviewCount.textContent = `${counts.open + counts.in_progress}件`;
+  if (el.tabBadgeReviews) {
+    const activeCount = counts.open + counts.in_progress;
+    el.tabBadgeReviews.textContent = String(activeCount);
+    el.tabBadgeReviews.classList.toggle("hidden", activeCount === 0);
+  }
+  if (el.tabBadgeRefunds) {
+    el.tabBadgeRefunds.textContent = String(refundCandidateCount);
+    el.tabBadgeRefunds.classList.toggle("hidden", refundCandidateCount === 0);
+  }
 
   el.reviewSummaryChips.innerHTML = "";
   const chips = [
@@ -1732,6 +2823,7 @@ function renderReviewSummary(rows) {
 
 function applyRefundDraftFromReview(review, suggestion, events) {
   const hintParts = [];
+  state.refundWorkflowStatus = "draft";
   el.refundReviewCaseId.value = review.id || "";
   hintParts.push(`レビューID ${shortId(review.id, 10, 5)}`);
 
@@ -1749,11 +2841,16 @@ function applyRefundDraftFromReview(review, suggestion, events) {
       ""
   ).trim();
   if (chainCandidate) {
-    el.refundChainId.value = chainCandidate;
-    hintParts.push(`チェーン ${chainCandidate}`);
+    if (Object.prototype.hasOwnProperty.call(REFUND_CHAIN_LABELS, chainCandidate)) {
+      el.refundChainId.value = chainCandidate;
+      hintParts.push(`チェーン ${REFUND_CHAIN_LABELS[chainCandidate]}`);
+    } else {
+      el.refundChainId.value = "";
+      hintParts.push(`対応外チェーン ${chainCandidate}`);
+    }
   } else {
     el.refundChainId.value = "";
-    hintParts.push("チェーン要確認");
+    hintParts.push("チェーンを選択してください");
   }
 
   const fromAddressCandidate = events
@@ -1771,6 +2868,32 @@ function applyRefundDraftFromReview(review, suggestion, events) {
     hintParts.length > 0
       ? `返金フォーム下書き: ${hintParts.join(" / ")}`
       : "返金フォームの下書き候補はありません。必要な項目を手入力してください。";
+  if (el.refundSourceInvoice) el.refundSourceInvoice.textContent = review.invoice_no || review.invoice_id || shortId(review.id, 10, 5) || "未選択";
+  if (el.refundSourceAmounts) {
+    el.refundSourceAmounts.textContent = `請求 ${formatJpy(review.amount_jpy)} / 受取 ${formatJpyc(review.paid_amount_jpyc)}`;
+  }
+  if (el.refundSourceEligible) {
+    el.refundSourceEligible.textContent = suggestion.suggestedRefundAmount != null ? formatJpyc(suggestion.suggestedRefundAmount) : "-";
+  }
+  if (el.refundSummaryReason) el.refundSummaryReason.textContent = reviewReasonLabel(review.reason_type);
+  updateRefundSummary();
+  updateRefundStepState();
+  if (el.refundCaseListState) {
+    el.refundCaseListState.className = "refund-case-card is-active";
+    el.refundCaseListState.dataset.refundStatus = "approval";
+    el.refundCaseListState.innerHTML = "";
+    const pill = document.createElement("span");
+    pill.className = "status-pill s-yellow";
+    pill.textContent = "返金候補";
+    const invoice = document.createElement("strong");
+    invoice.className = "mono";
+    invoice.textContent = review.invoice_no || review.invoice_id || shortId(review.id, 10, 5) || "-";
+    const amount = document.createElement("span");
+    amount.textContent = suggestion.suggestedRefundAmount != null ? formatJpyc(suggestion.suggestedRefundAmount) : "-";
+    const reason = document.createElement("small");
+    reason.textContent = reviewReasonLabel(review.reason_type);
+    el.refundCaseListState.append(pill, invoice, amount, reason);
+  }
 }
 
 function renderReviewDetail(detail = null) {
@@ -1779,7 +2902,12 @@ function renderReviewDetail(detail = null) {
   const events = Array.isArray(detail?.events) ? detail.events : [];
 
   if (!review) {
+    state.refundWorkflowStatus = "draft";
     el.reviewDetailBadge.textContent = "未選択";
+    if (el.reviewDetailReasonText) el.reviewDetailReasonText.textContent = "-";
+    if (el.reviewDetailExpectedAmount) el.reviewDetailExpectedAmount.textContent = "-";
+    if (el.reviewDetailPaidAmount) el.reviewDetailPaidAmount.textContent = "-";
+    if (el.reviewDetailDeltaAmount) el.reviewDetailDeltaAmount.textContent = "-";
     el.reviewDetailSummary.textContent =
       "一覧から確認待ち支払いを選ぶと、原因・対象請求・直近イベント・返金候補をここで確認できます。";
     el.reviewDetailId.textContent = "-";
@@ -1793,6 +2921,18 @@ function renderReviewDetail(detail = null) {
     el.reviewRelatedInvoices.textContent = "レビューを選ぶと、同じ会計で再発行された関連請求をここへ表示します。";
     el.refundDraftHint.textContent =
       "レビューを選択すると、返金候補額・支払い元アドレス・チェーンIDを返金フォームへ下書きします。";
+    if (el.refundSourceInvoice) el.refundSourceInvoice.textContent = "未選択";
+    if (el.refundSourceAmounts) el.refundSourceAmounts.textContent = "確認待ちから返金候補を選択してください。";
+    if (el.refundSourceEligible) el.refundSourceEligible.textContent = "-";
+    if (el.refundSummaryAmount) el.refundSummaryAmount.textContent = "-";
+    if (el.refundSummaryAddress) el.refundSummaryAddress.textContent = "未入力";
+    if (el.refundSummaryReason) el.refundSummaryReason.textContent = "レビュー選択待ち";
+    if (el.refundCaseListState) {
+      el.refundCaseListState.className = "empty-state";
+      delete el.refundCaseListState.dataset.refundStatus;
+      el.refundCaseListState.textContent = "確認待ちページで返金候補を選ぶと、この一覧とフォームに反映されます。";
+    }
+    if (el.goRefundFromReviewBtn) el.goRefundFromReviewBtn.disabled = true;
     return;
   }
 
@@ -1802,6 +2942,18 @@ function renderReviewDetail(detail = null) {
   const ageMinutes = reviewAgeMinutes(review);
   const nextStatusLabel = reviewStatusLabel(suggestion.suggestedNextStatus || review.status);
   el.reviewDetailBadge.textContent = `${reviewStatusLabel(review.status)} / ${priority.label}`;
+  if (el.reviewDetailReasonText) el.reviewDetailReasonText.textContent = reviewReasonLabel(review.reason_type);
+  if (el.reviewDetailExpectedAmount) el.reviewDetailExpectedAmount.textContent = formatJpy(review.amount_jpy);
+  if (el.reviewDetailPaidAmount) el.reviewDetailPaidAmount.textContent = formatJpyc(review.paid_amount_jpyc);
+  if (el.reviewDetailDeltaAmount) {
+    const expected = Number(review.amount_jpy);
+    const paid = Number(review.paid_amount_jpyc);
+    const delta = Number.isFinite(expected) && Number.isFinite(paid) ? paid - expected : null;
+    el.reviewDetailDeltaAmount.textContent = delta == null ? "-" : formatJpyc(delta);
+    el.reviewDetailDeltaAmount.classList.toggle("danger-text", delta != null && delta < 0);
+    el.reviewDetailDeltaAmount.classList.toggle("success-text", delta != null && delta === 0);
+    el.reviewDetailDeltaAmount.classList.toggle("warning-text", delta != null && delta > 0);
+  }
   el.reviewDetailSummary.textContent =
     `${reviewReasonLabel(review.reason_type)} / ${formatJpy(review.amount_jpy)} / 請求状態 ${reviewStatusLabel(review.invoice_status || review.status)} / 経過 ${ageMinutes}分`;
   el.reviewDetailId.textContent = review.id || "-";
@@ -1853,12 +3005,15 @@ function renderReviewDetail(detail = null) {
 
   applyRefundDraftFromReview(review, suggestion, events);
   el.reviewNextStatus.value = suggestion.suggestedNextStatus || review.status;
+  if (el.goRefundFromReviewBtn) el.goRefundFromReviewBtn.disabled = false;
 }
 
 function highlightSelectedReviewRow() {
-  const rows = Array.from(el.reviewsTableBody.querySelectorAll("tr"));
-  for (const row of rows) {
-    row.classList.toggle("is-selected", row.dataset.reviewId === state.selectedReviewId);
+  const cards = Array.from(el.reviewCardList?.querySelectorAll("[data-review-id]") || []);
+  for (const card of cards) {
+    const isSelected = card.dataset.reviewId === state.selectedReviewId;
+    card.classList.toggle("is-selected", isSelected);
+    card.setAttribute("aria-selected", isSelected ? "true" : "false");
   }
 }
 
@@ -1877,52 +3032,57 @@ async function selectReview(reviewId) {
   }
 }
 
-function createReviewRow(row) {
-  const tr = document.createElement("tr");
-  tr.className = "clickable-row";
-  tr.dataset.reviewId = row.id;
-  tr.tabIndex = 0;
+function createReviewCard(row) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "review-case-card";
+  button.dataset.reviewId = row.id;
+  button.setAttribute("aria-selected", "false");
+
   const priority = reviewPriorityMeta(row);
+  const expected = Number(row.amount_jpy);
+  const paid = Number(row.paid_amount_jpyc);
+  const delta = Number.isFinite(expected) && Number.isFinite(paid) ? paid - expected : null;
+  const age = reviewAgeMinutes(row);
+  const statusClass = priority.className || "s-yellow";
+  const deltaClass = delta == null ? "" : delta < 0 ? "danger-text" : delta > 0 ? "warning-text" : "success-text";
 
-  const cells = [
-    { className: "mono", text: row.id },
-    { badge: priority },
-    { className: "mono", text: row.invoice_no || row.invoice_id || "-" },
-    { text: reviewReasonLabel(row.reason_type) },
-    { text: reviewStatusLabel(row.status) },
-  ];
+  const createdAt = row.created_at
+    ? new Date(row.created_at).toLocaleString("ja-JP", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    : "-";
 
-  for (const cell of cells) {
-    const td = document.createElement("td");
-    if (cell.className) td.className = cell.className;
-    if (cell.badge) {
-      const badge = document.createElement("span");
-      badge.className = `status-pill ${cell.badge.className}`;
-      badge.textContent = cell.badge.label;
-      td.appendChild(badge);
-    } else {
-      td.textContent = cell.text || "-";
-    }
-    tr.appendChild(td);
-  }
+  button.innerHTML = `
+    <span class="review-priority-rail" aria-hidden="true"></span>
+    <span class="review-card-topline">
+      <span class="status-pill ${statusClass}">${priority.label}</span>
+      <strong class="mono">${escapeHtml(row.invoice_no || row.invoice_id || row.id || "-")}</strong>
+      <span>${escapeHtml(reviewReasonLabel(row.reason_type))}</span>
+      <span class="review-age">${Number.isFinite(age) ? `${age}分前` : "-"}</span>
+    </span>
+    <span class="review-card-amounts">
+      <span><small>請求額</small><strong>${escapeHtml(formatJpy(row.amount_jpy))}</strong></span>
+      <span><small>受取額</small><strong>${escapeHtml(formatJpyc(row.paid_amount_jpyc))}</strong></span>
+      <span><small>差額</small><strong class="${deltaClass}">${delta == null ? "-" : escapeHtml(formatJpyc(delta))}</strong></span>
+    </span>
+    <span class="review-card-meta">
+      <time class="mono">${escapeHtml(createdAt)}</time>
+      <span>詳細を確認 ›</span>
+    </span>
+  `;
 
   const activate = () => {
+    document.querySelector(".review-workbench")?.classList.add("has-detail-open");
     void selectReview(row.id);
   };
-  tr.addEventListener("click", activate);
-  tr.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      activate();
-    }
-  });
-  return tr;
+  button.addEventListener("click", activate);
+  return button;
 }
 
 async function handleLogin() {
   const terminalCode = String(el.terminalCode.value || "").trim();
   const staffPin = String(el.staffPin.value || "").trim();
   const staffPinConfirm = String(el.staffPinConfirm.value || "").trim();
+  const staffName = String(el.staffNameInput?.value || "").trim();
   if (!terminalCode || !staffPin) {
     showToast("端末コードとスタッフPINを入力してください", true);
     return;
@@ -1937,26 +3097,37 @@ async function handleLogin() {
     const data = await requestJson("/api/v1/terminal-sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ terminalCode, staffPin }),
+      body: JSON.stringify({ terminalCode, staffPin, ...(staffName ? { staffName } : {}) }),
     });
     state.token = data.token;
     state.terminalId = data.terminalId;
     state.storeId = data.storeId;
     state.sessionId = data.sessionId;
     state.role = String(data.role || "staff");
+    state.storeName = String(data.store_name || data.storeName || "JPYC Store");
+    state.staffName = String(data.staff_name || data.staffName || staffName || "スタッフ");
     state.diagnosticsEnabled = data.diagnostic_mode_enabled === true;
     state.supportedWallets = Array.isArray(data.supported_wallets) ? data.supported_wallets : [];
+    state.paymentChains = Array.isArray(data.payment_chains) ? data.payment_chains : [];
+    state.selectedPaymentChainId = "";
     state.fixedQrUrl = typeof data.fixed_qr_url === "string" ? data.fixed_qr_url : "";
     state.fixedQrToken = typeof data.public_entry_token === "string" ? data.public_entry_token : "";
 
     setLoggedInUi(true);
-    el.sessionText.textContent = `${state.sessionId}（${formatRole(state.role)}）`;
+    el.sessionText.textContent = state.sessionId;
+    if (el.topbarStoreText) el.topbarStoreText.textContent = state.storeName;
+    if (el.topbarTerminalNameText) el.topbarTerminalNameText.textContent = state.terminalId || terminalCode;
+    if (el.topbarBusinessDateText) el.topbarBusinessDateText.textContent = new Date().toISOString().slice(0, 10);
+    renderTopbarRole();
+    renderSettingsSessionSummary();
     el.sessionExpiryText.textContent = `${data.session_ttl_sec} 秒`;
     setNetworkStatus("認証済み");
     renderCustomerFacingQr();
     applyAdminVisibility();
+    setActiveTab("billing");
     renderDiagnostics();
     renderOperatorGuide();
+    renderPaymentChains();
     if (data.current_invoice?.invoice_id) {
       await loadInvoice(data.current_invoice.invoice_id, { silent: true });
     } else {
@@ -1968,8 +3139,10 @@ async function handleLogin() {
       void loadReviews();
     } else {
       await loadOpsWarnings();
+      if (el.topbarOpenReviewCount) el.topbarOpenReviewCount.textContent = "管理者のみ";
       setReviewListState("empty", "管理者権限でログインすると確認待ち一覧を表示できます。");
     }
+    void refreshTerminalDiagnostics();
     showToast("ログインしました");
   } catch (error) {
     showToast(String(error.message || error), true);
@@ -1978,17 +3151,36 @@ async function handleLogin() {
   }
 }
 
+window.handleLogin = handleLogin;
+
 async function handleCreateInvoice() {
   if (!state.token) {
     showToast("先にログインしてください", true);
     return;
   }
+  if (state.invoiceId && ACTIVE_INVOICE_STATUSES.has(state.invoiceStatus)) {
+    showToast("現在の会計が残っています。再発行またはQR停止後に新規会計を開始してください。", true);
+    return;
+  }
   const amount = Number(el.amountInput.value);
   if (!Number.isInteger(amount) || amount <= 0) {
     el.amountInputError.textContent = "金額は1円以上の整数で入力してください。";
+    if (el.paymentChainHint) el.paymentChainHint.textContent = "";
+    return;
+  }
+  const chain = selectedPaymentChain();
+  if (!chain?.chain_id) {
+    el.amountInputError.textContent = "";
+    if (el.paymentChainHint) el.paymentChainHint.textContent = "チェーン選択から支払いチェーンを選択してください";
+    return;
+  }
+  if (chain.issue_available === false || chain.status === "unavailable") {
+    el.amountInputError.textContent = "";
+    if (el.paymentChainHint) el.paymentChainHint.textContent = chain.unavailable_reason || "このチェーンでは現在請求を作成できません。";
     return;
   }
   el.amountInputError.textContent = "";
+  if (el.paymentChainHint) el.paymentChainHint.textContent = "";
   el.createInvoiceBtn.disabled = true;
   el.createInvoiceBtn.classList.add("loading");
   try {
@@ -1998,9 +3190,9 @@ async function handleCreateInvoice() {
         "content-type": "application/json",
         "idempotency-key": idempotencyKey("invoice"),
       },
-      body: JSON.stringify({ amount_jpy: amount }),
+      body: JSON.stringify({ amount_jpy: amount, payment_chain_id: String(chain.chain_id) }),
     });
-    showToast("請求を作成しました");
+    showToast(`${chain.short_name || chain.network || "選択チェーン"}で請求を作成しました`);
     await loadInvoice(data.invoice_id);
   } catch (error) {
     if (error?.payload?.error?.code === "TERMINAL_ACTIVE_INVOICE_EXISTS") {
@@ -2012,7 +3204,7 @@ async function handleCreateInvoice() {
           // no-op
         }
       }
-      showToast("現在の会計が残っています。再発行または取消/期限切れ処理後に新規会計を開始してください。", true);
+      showToast("現在の会計が残っています。再発行またはQR停止後に新規会計を開始してください。", true);
     } else {
       showToast(String(error.message || error), true);
     }
@@ -2037,6 +3229,15 @@ async function postInvoiceAction(actionPath, actionLabel) {
       body: "{}",
     });
     showToast(actionLabel);
+    if (["cancel", "expire"].includes(actionPath)) {
+      await loadInvoice(state.invoiceId, { silent: true });
+      if (isAdminRole(state.role)) {
+        void loadOpsSnapshot();
+      } else {
+        void loadOpsWarnings();
+      }
+      return;
+    }
     await loadInvoice(state.invoiceId, { silent: true });
   } catch (error) {
     showToast(String(error.message || error), true);
@@ -2049,6 +3250,8 @@ async function handleReissueInvoice() {
     return;
   }
   el.reissueInvoiceBtn.disabled = true;
+  closeSse("再発行中");
+  stopFallbackPolling();
   try {
     const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(state.invoiceId)}/reissue`, {
       method: "POST",
@@ -2104,7 +3307,7 @@ async function handleResumeQr() {
     showToast("QRへ戻す対象の請求がありません", true);
     return;
   }
-  el.resumeQrBtn.disabled = true;
+  if (el.resumeQrBtn) el.resumeQrBtn.disabled = true;
   try {
     const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(state.invoiceId)}/provider-sessions:cancel`, {
       method: "POST",
@@ -2122,7 +3325,7 @@ async function handleResumeQr() {
     if (state.currentInvoice) {
       renderProviderControls(state.currentInvoice);
     } else {
-      el.resumeQrBtn.disabled = false;
+      if (el.resumeQrBtn) el.resumeQrBtn.disabled = false;
     }
   }
 }
@@ -2130,7 +3333,7 @@ async function handleResumeQr() {
 async function loadReviews() {
   if (!isAdminRole(state.role)) return;
   setReviewListState("loading", "確認待ち支払いを読み込み中です...");
-  el.reviewsTableBody.innerHTML = "";
+  if (el.reviewCardList) el.reviewCardList.innerHTML = "";
 
   const status = String(el.reviewStatusFilter.value || "");
   const query = status ? `?status=${encodeURIComponent(status)}` : "";
@@ -2140,6 +3343,7 @@ async function loadReviews() {
     const rows = Array.isArray(data.reviews) ? [...data.reviews].sort(compareReviewsByPriority) : [];
     state.reviewRows = rows;
     renderReviewSummary(rows);
+    setLastUpdated(el.reviewsLastUpdatedText);
     if (rows.length === 0) {
       state.selectedReviewId = "";
       renderReviewDetail(null);
@@ -2155,7 +3359,7 @@ async function loadReviews() {
         : `${rows.length} 件のレビューがあります。`
     );
     for (const row of rows) {
-      el.reviewsTableBody.appendChild(createReviewRow(row));
+      if (el.reviewCardList) el.reviewCardList.appendChild(createReviewCard(row));
     }
     const nextSelection = rows.some((row) => row.id === state.selectedReviewId) ? state.selectedReviewId : rows[0]?.id;
     if (nextSelection) {
@@ -2166,6 +3370,7 @@ async function loadReviews() {
     state.selectedReviewId = "";
     renderReviewDetail(null);
     renderReviewSummary([]);
+    setLastUpdated(el.reviewsLastUpdatedText);
     setReviewListState("error", "読み込みに失敗しました。もう一度お試しください。");
     showToast(String(error.message || error), true);
   }
@@ -2212,8 +3417,12 @@ async function handleRequestRefund() {
     showToast("返金申請の入力項目を確認してください", true);
     return;
   }
+  if (!Object.prototype.hasOwnProperty.call(REFUND_CHAIN_LABELS, refundChainId)) {
+    showToast("返金チェーンは Polygon または Avalanche を選択してください", true);
+    return;
+  }
   if (!isLikelyEvmAddress(refundToAddress)) {
-    showToast("返金先アドレスは 0x から始まる40桁hexで入力してください", true);
+    showToast("返金先アドレスの形式を確認してください", true);
     return;
   }
   try {
@@ -2233,6 +3442,7 @@ async function handleRequestRefund() {
       }),
     });
     el.refundIdInput.value = data.refund_request_id || "";
+    state.refundWorkflowStatus = "requested";
     updateRefundStepState("承認待ち");
     showToast("返金申請を作成しました");
   } catch (error) {
@@ -2255,6 +3465,7 @@ async function handleApproveRefund() {
       },
       body: "{}",
     });
+    state.refundWorkflowStatus = "approved";
     updateRefundStepState("外部実行待ち");
     showToast("返金申請を承認しました");
   } catch (error) {
@@ -2277,21 +3488,31 @@ async function handleExecuteRefund() {
     return;
   }
   if (executedWallet && !isLikelyEvmAddress(executedWallet)) {
-    showToast("返金に使った店舗ウォレットは 0x から始まる40桁hexで入力してください", true);
+    showToast("返金に使った店舗ウォレットの形式を確認してください", true);
     return;
   }
   if (!state.pendingRefundExecute) {
     state.pendingRefundExecute = true;
-    el.executeRefundHint.classList.remove("hidden");
-    el.executeRefundHint.textContent =
-      `外部ウォレットで返金を実行済みであることを確認してください。返金記録 ${shortId(txHash)} を保存するには同じボタンをもう一度押してください。`;
-    showToast("返金記録の保存はもう一度押すと実行します", true);
-    window.setTimeout(() => {
-      state.pendingRefundExecute = false;
-    }, 8000);
+    const shortTx = shortId(txHash);
+    showToast(`返金記録を保存するには${Math.ceil(REFUND_EXECUTE_CONFIRM_MS / 1000)}秒以内にもう一度押してください`, true);
+    startConfirmationCountdown({
+      hintEl: el.executeRefundHint,
+      timeoutMs: REFUND_EXECUTE_CONFIRM_MS,
+      countdownTimerName: "pendingRefundExecuteCountdownTimer",
+      timeoutTimerName: "pendingRefundExecuteTimer",
+      messageForSeconds: (remainingSec) =>
+        `外部ウォレットで返金を実行済みであることを確認してください。返金記録 ${shortTx} を保存するには、あと${remainingSec}秒以内に同じボタンをもう一度押してください。`,
+      onExpire: () => {
+        state.pendingRefundExecute = false;
+        el.executeRefundHint.classList.remove("hidden");
+        el.executeRefundHint.textContent = "返金記録保存の確認は時間切れです。必要ならもう一度押してください。";
+      },
+    });
     return;
   }
   state.pendingRefundExecute = false;
+  clearCountdownTimer("pendingRefundExecuteCountdownTimer");
+  clearTimeoutTimer("pendingRefundExecuteTimer");
   try {
     const data = await requestJson(`/api/v1/refunds/${encodeURIComponent(refundId)}/execute`, {
       method: "POST",
@@ -2310,8 +3531,10 @@ async function handleExecuteRefund() {
     el.executeRefundHint.classList.remove("hidden");
     if (data.status === "recorded") {
       el.executeRefundHint.textContent = "返金記録を保存しました。検証待ちです。";
+      state.refundWorkflowStatus = "recorded";
       updateRefundStepState("検証待ち");
     } else {
+      state.refundWorkflowStatus = String(data.status || "").includes("succeeded") ? "verified" : "recorded";
       el.executeRefundHint.textContent = `返金状態: ${data.status}`;
       updateRefundStepState(String(data.status || "証跡入力"));
     }
@@ -2351,8 +3574,9 @@ async function handleVerifyRefund() {
     el.executeRefundHint.classList.remove("hidden");
     el.executeRefundHint.textContent =
       data.status === "succeeded" ? "返金のオンチェーン検証が完了しました。" : `返金状態: ${data.status}`;
+    state.refundWorkflowStatus = data.status === "succeeded" ? "verified" : "recorded";
     updateRefundStepState(data.status === "succeeded" ? "検証済み" : String(data.status || "証跡入力"));
-    showToast("返金検証を実行しました");
+    showToast("返金txの検証が完了しました");
   } catch (error) {
     el.executeRefundHint.classList.remove("hidden");
     el.executeRefundHint.textContent = String(error.message || error);
@@ -2362,7 +3586,7 @@ async function handleVerifyRefund() {
 
 async function handleCloseSettlement() {
   const businessDate = String(el.businessDateInput.value || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) {
+  if (!isValidIsoDate(businessDate)) {
     showToast("対象営業日は YYYY-MM-DD 形式で入力してください", true);
     return;
   }
@@ -2370,17 +3594,27 @@ async function handleCloseSettlement() {
     state.pendingSettlementClose = businessDate;
     const openReviews = el.opsOpenReviewCount?.textContent || "-";
     const refundCandidates = el.opsRefundCandidateCount?.textContent || "-";
-    el.closeSettlementHint.classList.remove("hidden");
-    el.closeSettlementHint.textContent =
-      `${businessDate} の日次締めを確認中です。未解決レビュー ${openReviews} 件、返金候補 ${refundCandidates} 件、操作履歴を確認し、同じボタンをもう一度押すと実行します。`;
     if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.remove("hidden");
-    showToast("日次締めはもう一度押すと実行します", true);
-    window.setTimeout(() => {
-      if (state.pendingSettlementClose === businessDate) state.pendingSettlementClose = "";
-    }, 10000);
+    showToast(`日次締めは${Math.ceil(SETTLEMENT_CLOSE_CONFIRM_MS / 1000)}秒以内にもう一度押すと実行します`, true);
+    startConfirmationCountdown({
+      hintEl: el.closeSettlementHint,
+      timeoutMs: SETTLEMENT_CLOSE_CONFIRM_MS,
+      countdownTimerName: "pendingSettlementCloseCountdownTimer",
+      timeoutTimerName: "pendingSettlementCloseTimer",
+      messageForSeconds: (remainingSec) =>
+        `${businessDate} の日次締めを確認中です。未解決レビュー ${openReviews}、返金候補 ${refundCandidates}、操作履歴を確認し、あと${remainingSec}秒以内に同じボタンをもう一度押すと実行します。`,
+      onExpire: () => {
+        if (state.pendingSettlementClose === businessDate) state.pendingSettlementClose = "";
+        if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
+        el.closeSettlementHint.classList.remove("hidden");
+        el.closeSettlementHint.textContent = "日次締め確認は時間切れです。必要ならもう一度押してください。";
+      },
+    });
     return;
   }
   state.pendingSettlementClose = "";
+  clearCountdownTimer("pendingSettlementCloseCountdownTimer");
+  clearTimeoutTimer("pendingSettlementCloseTimer");
   if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
   try {
     const data = await requestJson("/api/v1/settlements/daily:close", {
@@ -2407,22 +3641,54 @@ async function handleCloseSettlement() {
   }
 }
 
-async function handleExportAuditCsv() {
+function downloadTextFile(body, headers, fallbackFileName) {
+  const nameHint = headers.get("content-disposition");
+  const fileNameMatch = nameHint ? nameHint.match(/filename=\"?([^\";]+)\"?/) : null;
+  const fileName = fileNameMatch?.[1] || fallbackFileName;
+  const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+function updateBusinessDateHeader() {
+  if (!el.businessDateHeaderText) return;
+  const businessDate = String(el.businessDateInput?.value || "").trim();
+  if (!isValidIsoDate(businessDate)) {
+    el.businessDateHeaderText.textContent = "--/--/--";
+    return;
+  }
+  const [, month, day] = businessDate.split("-");
+  el.businessDateHeaderText.textContent = `${month}/${day}`;
+}
+
+async function handleExportDailyCsv() {
+  const businessDate = String(el.businessDateInput.value || "").trim();
+  if (!isValidIsoDate(businessDate)) {
+    showToast("対象日は YYYY-MM-DD 形式で入力してください", true);
+    return;
+  }
+  try {
+    const { body, headers } = await requestText(
+      `/api/v1/settlements/daily:export?business_date=${encodeURIComponent(businessDate)}&format=csv`
+    );
+    downloadTextFile(body, headers, `settlement-${businessDate}.csv`);
+    showToast(`${businessDate} の日次CSVを出力しました`);
+  } catch (error) {
+    showToast(String(error.message || error), true);
+  }
+}
+
+async function handleExportAuditLogCsv() {
   try {
     const { body, headers } = await requestText("/api/v1/audit-logs/export?format=csv&limit=1000");
-    const nameHint = headers.get("content-disposition");
-    const fileNameMatch = nameHint ? nameHint.match(/filename=\"?([^\";]+)\"?/) : null;
-    const fileName = fileNameMatch?.[1] || `audit-${nowIsoDate()}.csv`;
-    const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl;
-    anchor.download = fileName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(objectUrl);
-    showToast("CSVを出力しました");
+    downloadTextFile(body, headers, `audit-${nowIsoDate()}.csv`);
+    showToast("操作履歴CSVを出力しました");
   } catch (error) {
     showToast(String(error.message || error), true);
   }
@@ -2438,18 +3704,7 @@ async function handleExportMonthlyCsv() {
     const { body, headers } = await requestText(
       `/api/v1/settlements/monthly:export?year_month=${encodeURIComponent(yearMonth)}&format=csv`
     );
-    const nameHint = headers.get("content-disposition");
-    const fileNameMatch = nameHint ? nameHint.match(/filename=\"?([^\";]+)\"?/) : null;
-    const fileName = fileNameMatch?.[1] || `settlement-monthly-${yearMonth}.csv`;
-    const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl;
-    anchor.download = fileName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(objectUrl);
+    downloadTextFile(body, headers, `settlement-monthly-${yearMonth}.csv`);
     showToast(`${yearMonth} の月次CSVを出力しました`);
   } catch (error) {
     showToast(String(error.message || error), true);
@@ -2459,37 +3714,138 @@ async function handleExportMonthlyCsv() {
 async function loadOpsWarnings() {
   try {
     const monitor = await requestJson("/api/v1/chain-monitor/status");
-    renderOpsWarningsList(buildMonitorWarnings(monitor));
+    const warnings = buildMonitorWarnings(monitor);
+    renderOpsWarningsList(warnings);
+    return warnings;
   } catch (_error) {
-    renderOpsWarningsList(["監視状態を取得できませんでした"]);
+    const warnings = ["監視状態を取得できませんでした"];
+    renderOpsWarningsList(warnings);
+    return warnings;
   }
+}
+
+async function handleShowOpsWarnings() {
+  if (!toggleSettingsAdminResult("warnings")) return;
+  openSettingsAdminResult(
+    "運用警告",
+    "通信監視・状態更新・受取アドレス残数など、店舗運用に影響する警告を確認します。"
+  );
+  appendAdminResultText("最新の警告を取得しています...");
+  const warnings = await loadOpsWarnings();
+  el.settingsAdminResultBody.innerHTML = "";
+  if (!warnings.length) {
+    appendAdminResultText("重大な警告はありません。", "ok");
+  } else {
+    warnings.forEach((warning) => appendAdminResultText(warning, "warning"));
+  }
+  el.opsWarnings?.closest(".settings-warnings-row")?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function handleOpenAuditLogs() {
+  if (!toggleSettingsAdminResult("audit")) return;
+  openSettingsAdminResult(
+    "監査ログ",
+    "ログイン、請求、返金証跡、締め、設定変更などの操作履歴を最新順で表示します。"
+  );
+  appendAdminResultText("最新の監査ログを取得しています...");
+  try {
+    const data = await requestJson("/api/v1/audit-logs?limit=8");
+    const rows = Array.isArray(data?.audit_logs) ? data.audit_logs : [];
+    el.settingsAdminResultBody.innerHTML = "";
+    if (rows.length === 0) {
+      appendAdminResultText("表示できる監査ログはありません。");
+      return;
+    }
+    for (const row of rows) {
+      appendAdminResultRow(
+        `${formatDateTime(row.created_at)} / ${row.action || "-"}`,
+        `${row.target_type || "-"} ${row.target_id || ""}`.trim()
+      );
+    }
+  } catch (error) {
+    el.settingsAdminResultBody.innerHTML = "";
+    appendAdminResultText(`監査ログを取得できませんでした: ${error.message || error}`, "danger");
+  }
+}
+
+async function refreshTerminalDiagnostics({ showUpdatedToast = false } = {}) {
+  if (!el.terminalDiagnosticsPanel || !el.terminalDiagnosticsBody) return;
+  el.terminalDiagnosticsPanel.classList.remove("hidden");
+  el.terminalDiagnosticsBody.innerHTML = "";
+  appendTerminalDiagnosticsRow("診断状態", "端末状態を確認しています...");
+  let warnings = [];
+  try {
+    warnings = await loadOpsWarnings();
+  } catch (_error) {
+    warnings = ["運用警告を取得できませんでした"];
+  }
+  el.terminalDiagnosticsBody.innerHTML = "";
+  appendTerminalDiagnosticsRow("ログイン状態", state.token ? `ログイン中（${state.role || "-"}）` : "未ログイン", state.token ? "ok" : "warning");
+  appendTerminalDiagnosticsRow("接続状態", el.networkText?.textContent || "-", state.token ? "ok" : "");
+  appendTerminalDiagnosticsRow("リアルタイム更新", `${state.sseStatus || "-"} / ${state.fallbackPollingStatus || "-"}`);
+  appendTerminalDiagnosticsRow("現在の請求", state.invoiceId || "未作成");
+  appendTerminalDiagnosticsRow("最終請求更新", formatDateTime(state.lastInvoiceRefreshAt));
+  appendTerminalDiagnosticsRow("運用警告", warnings.length ? `${warnings.length}件` : "0件", warnings.length ? "warning" : "ok");
+  if (showUpdatedToast) showToast("端末診断を更新しました");
 }
 
 function saveTerminalSettings() {
   writeTerminalSettings(
     {
       volume: Number(el.volumeInput.value || 0.8),
+      brightness: Number(el.brightnessInput?.value || 0.7),
+      display_font_size: document.body.dataset.terminalFontSize || "standard",
       auto_reset_sec: Number(el.autoResetSecInput.value || 120),
     },
     { showSavedToast: true }
   );
+  updateSettingsSaveState();
 }
 
 function loadTerminalSettings() {
   const settings = readTerminalSettings();
   el.volumeInput.value = String(settings.volume);
+  if (el.brightnessInput) el.brightnessInput.value = String(settings.brightness);
   el.autoResetSecInput.value = String(settings.auto_reset_sec);
+  syncSettingsRangeControls();
+  applyDisplayFontSize(settings.display_font_size);
   renderAmountPresetButtons();
+  updateSettingsSaveState();
 }
 
 function bindEvents() {
+  for (const button of el.tabButtons) {
+    button.addEventListener("click", () => setActiveTab(button.dataset.tabTarget));
+  }
   el.loginBtn.addEventListener("click", () => void handleLogin());
+  if (el.adminLoginShortcutBtn) {
+    el.adminLoginShortcutBtn.addEventListener("click", () => {
+      el.staffPin?.focus();
+      showToast("管理者PINを入力して端末を開始してください");
+    });
+  }
+  if (el.loginStatusDetailBtn) {
+    el.loginStatusDetailBtn.addEventListener("click", () => {
+      if (state.token) {
+        void loadOpsWarnings();
+        showToast("通信状態と運用警告を更新しました");
+        return;
+      }
+      showToast("端末開始後に詳細な運用状態を確認できます");
+    });
+  }
+  el.lockTerminalBtn?.addEventListener("click", handleLockTerminal);
+  el.logoutTerminalBtn?.addEventListener("click", () => void handleLogoutTerminal());
   el.amountPresetList.addEventListener("click", (event) => {
     const actionButton = event.target.closest("[data-preset-action]");
     if (!actionButton) return;
     const amount = actionButton.dataset.amountPreset || "";
     if (actionButton.dataset.presetAction === "use") {
       applyAmountPreset(amount);
+      return;
+    }
+    if (actionButton.dataset.presetAction === "edit") {
+      handleEditAmountPreset(amount);
       return;
     }
     if (actionButton.dataset.presetAction === "remove") {
@@ -2504,9 +3860,10 @@ function bindEvents() {
       handleAddAmountPreset();
     }
   });
+  el.amountInput.addEventListener("input", updateAmountPreview);
   el.createInvoiceBtn.addEventListener("click", () => void handleCreateInvoice());
-  el.cancelInvoiceBtn.addEventListener("click", () => confirmDangerInvoiceAction("cancel", "請求を無効化"));
-  el.expireInvoiceBtn.addEventListener("click", () => confirmDangerInvoiceAction("expire", "請求を期限切れに"));
+  el.cancelInvoiceBtn.addEventListener("click", confirmStopQrAction);
+  el.expireInvoiceBtn?.addEventListener("click", () => confirmDangerInvoiceAction("expire", "請求を期限切れに"));
   el.refreshBtn.addEventListener("click", () => {
     if (!state.invoiceId) return;
     void loadInvoice(state.invoiceId);
@@ -2521,25 +3878,130 @@ function bindEvents() {
     });
   }
   el.reissueInvoiceBtn.addEventListener("click", () => void handleReissueInvoice());
+  if (el.copyPaymentUrlBtn) el.copyPaymentUrlBtn.addEventListener("click", () => void copyPaymentUrl());
   el.presentTapBtn.addEventListener("click", () => void handlePresentTap());
-  el.resumeQrBtn.addEventListener("click", () => void handleResumeQr());
+  if (el.resumeQrBtn) el.resumeQrBtn.addEventListener("click", () => void handleResumeQr());
 
   el.loadReviewsBtn.addEventListener("click", () => void loadReviews());
   el.reviewStatusFilter.addEventListener("change", () => void loadReviews());
+  document.querySelectorAll("[data-review-filter-value]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextValue = button.dataset.reviewFilterValue || "";
+      el.reviewStatusFilter.value = nextValue;
+      document.querySelectorAll("[data-review-filter-value]").forEach((node) => {
+        node.classList.toggle("is-active", node === button);
+      });
+      void loadReviews();
+    });
+  });
+  if (el.reviewSearchInput) {
+    el.reviewSearchInput.addEventListener("input", () => {
+      const query = String(el.reviewSearchInput.value || "").trim().toLowerCase();
+      const cards = Array.from(el.reviewCardList?.querySelectorAll("[data-review-id]") || []);
+      let visibleCount = 0;
+      for (const card of cards) {
+        const matches = !query || card.textContent.toLowerCase().includes(query);
+        card.classList.toggle("hidden", !matches);
+        if (matches) visibleCount += 1;
+      }
+      if (query && cards.length > 0 && visibleCount === 0) {
+        setReviewListState("empty", `「${query}」に一致する確認待ちはありません。`);
+      } else if (query && visibleCount > 0) {
+        setReviewListState("empty", `${visibleCount} 件の確認待ちが一致しました。`);
+      } else if (cards.length > 0) {
+        const activeRows = state.reviewRows.filter((row) => ["open", "in_progress"].includes(String(row.status || "")));
+        const topReview = activeRows[0] || null;
+        setReviewListState(
+          "empty",
+          topReview
+            ? `${state.reviewRows.length} 件のレビュー。最優先: ${reviewReasonLabel(topReview.reason_type)}（${shortId(topReview.id)}）`
+            : `${state.reviewRows.length} 件のレビューがあります。`
+        );
+      }
+    });
+  }
   el.updateReviewBtn.addEventListener("click", () => void handleUpdateReview());
+  if (el.reviewHoldBtn) {
+    el.reviewHoldBtn.addEventListener("click", () => {
+      el.reviewNextStatus.value = "open";
+      void handleUpdateReview();
+    });
+  }
+  if (el.reviewRejectBtn) {
+    el.reviewRejectBtn.addEventListener("click", () => {
+      el.reviewNextStatus.value = "rejected";
+      void handleUpdateReview();
+    });
+  }
+  if (el.goRefundFromReviewBtn) {
+    el.goRefundFromReviewBtn.addEventListener("click", () => {
+      setActiveTab("refunds");
+      showToast("選択中レビューの返金候補を返金フォームに引き継ぎました");
+      el.refundReviewCaseId?.focus();
+    });
+  }
+  if (el.reviewMobileBackBtn) {
+    el.reviewMobileBackBtn.addEventListener("click", () => {
+      document.querySelector(".review-workbench")?.classList.remove("has-detail-open");
+    });
+  }
 
   el.requestRefundBtn.addEventListener("click", () => void handleRequestRefund());
-  el.refundIdInput.addEventListener("input", () => updateRefundStepState());
+  el.refundIdInput.addEventListener("input", () => {
+    state.refundWorkflowStatus = String(el.refundIdInput.value || "").trim() ? "requested" : "draft";
+    updateRefundStepState();
+  });
+  el.refundAmount?.addEventListener("input", () => updateRefundStepState());
+  el.refundAddress?.addEventListener("input", () => updateRefundStepState());
+  el.refundTxHashInput?.addEventListener("input", () => updateRefundStepState());
+  el.refundEvidenceNotePathInput?.addEventListener("change", updateRefundEvidencePathHint);
+  el.refreshRefundsBtn?.addEventListener("click", () => {
+    void loadOpsSnapshot();
+    showToast("返金候補と締め前チェックを更新しました");
+  });
+  document.querySelectorAll("[data-refund-filter]").forEach((button) => {
+    button.addEventListener("click", () => setRefundCaseFilter(button.dataset.refundFilter));
+  });
   el.approveRefundBtn.addEventListener("click", () => void handleApproveRefund());
   el.executeRefundBtn.addEventListener("click", () => void handleExecuteRefund());
   el.verifyRefundBtn.addEventListener("click", () => void handleVerifyRefund());
 
   el.closeSettlementBtn.addEventListener("click", () => void handleCloseSettlement());
-  el.exportAuditCsvBtn.addEventListener("click", () => void handleExportAuditCsv());
+  el.exportAuditCsvBtn.addEventListener("click", () => void handleExportDailyCsv());
+  el.exportAuditLogCsvBtn?.addEventListener("click", () => void handleExportAuditLogCsv());
   el.exportMonthlyCsvBtn.addEventListener("click", () => void handleExportMonthlyCsv());
   el.saveSettingsBtn.addEventListener("click", saveTerminalSettings);
+  el.showOpsWarningsBtn?.addEventListener("click", () => void handleShowOpsWarnings());
+  el.openAuditLogsBtn?.addEventListener("click", () => void handleOpenAuditLogs());
+  el.closeSettingsAdminResultBtn?.addEventListener("click", closeSettingsAdminResult);
+  el.testNotificationSoundBtn?.addEventListener("click", () => {
+    void playNotificationTestSound().catch(() => {
+      showToast("通知音を再生できませんでした。端末の音量設定を確認してください");
+    });
+  });
+  el.volumeInput.addEventListener("input", () => {
+    syncSettingsRangeControls();
+    updateSettingsSaveState();
+  });
+  el.brightnessInput?.addEventListener("input", () => {
+    syncSettingsRangeControls();
+    updateSettingsSaveState();
+  });
+  el.autoResetSecInput.addEventListener("input", updateSettingsSaveState);
+  for (const button of el.fontSizeButtons) {
+    button.addEventListener("click", () => {
+      const nextSize = button.dataset.fontSizeOption || "standard";
+      applyDisplayFontSize(nextSize);
+      updateSettingsSaveState();
+    });
+  }
   el.refreshOpsSnapshotBtn.addEventListener("click", () => void loadOpsSnapshot());
+  document.querySelectorAll("[data-tab-target-proxy]").forEach((button) => {
+    button.addEventListener("click", () => setActiveTab(button.dataset.tabTargetProxy));
+  });
+  document.getElementById("refreshSettlementCheckBtn")?.addEventListener("click", () => void loadOpsSnapshot());
   el.businessDateInput.addEventListener("change", () => {
+    updateBusinessDateHeader();
     if (!isAdminRole(state.role)) return;
     void loadOpsSnapshot();
   });
@@ -2551,6 +4013,31 @@ function bindEvents() {
   });
 }
 
+function shouldRunLocalSimulatorAutoLogin() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("simulatorAutoLogin") !== "1") return false;
+  const hostname = window.location.hostname;
+  const isPrivateLanHost = /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)
+    || /^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)
+    || /^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname);
+  return ["localhost", "127.0.0.1"].includes(hostname) || isPrivateLanHost;
+}
+
+async function maybeRunLocalSimulatorAutoLogin() {
+  if (!shouldRunLocalSimulatorAutoLogin()) return;
+  if (state.token) return;
+  if (localSimulatorAutoLoginStarted) return;
+  localSimulatorAutoLoginStarted = true;
+  window.__jpycSimulatorAutoLoginStarted = true;
+  if (el.terminalCode) {
+    el.terminalCode.value = "TERM-001";
+  }
+  if (el.staffPin) el.staffPin.value = "1234";
+  if (el.staffPinConfirm) el.staffPinConfirm.value = "";
+  if (el.staffNameInput) el.staffNameInput.value = "";
+  await handleLogin();
+}
+
 function init() {
   if (!["localhost", "127.0.0.1", ""].includes(window.location.hostname)) {
     document.querySelectorAll(".dev-only-link").forEach((node) => node.classList.add("hidden"));
@@ -2558,7 +4045,9 @@ function init() {
   clearInvoiceView();
   setLoggedInUi(false);
   loadTerminalSettings();
+  updateAmountPreview();
   bindEvents();
+  void maybeRunLocalSimulatorAutoLogin();
   applyAdminVisibility();
   renderReviewSummary([]);
   setReviewListState("empty", "ログイン後に確認待ち一覧を読み込めます。");
@@ -2570,13 +4059,31 @@ function init() {
   el.opsRecommendedAction.textContent = "-";
   el.opsPriorityReview.textContent = "-";
   el.opsRefundCandidateCount.textContent = "-";
+  renderTopbarRole();
+  renderSettingsSessionSummary();
+  if (el.topbarOpenReviewCount) el.topbarOpenReviewCount.textContent = "-";
   setChecklist(el.opsSnapshotChecklist, ["小規模現場向けに、必要な運用項目だけをコンパクトに表示します。"]);
   el.businessDateInput.value = nowIsoDate();
   el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+  updateBusinessDateHeader();
   setNetworkStatus("未接続");
   updateRefundStepState();
   renderDiagnostics();
   renderOperatorGuide();
+  void refreshTerminalDiagnostics();
+  setActiveTab("billing");
+  void maybeRunLocalSimulatorAutoLogin();
+  window.setTimeout(() => void maybeRunLocalSimulatorAutoLogin(), 500);
 }
 
-init();
+try {
+  init();
+} catch (error) {
+  console.error(error);
+  void maybeRunLocalSimulatorAutoLogin();
+}
+
+window.addEventListener("load", () => {
+  void maybeRunLocalSimulatorAutoLogin();
+  window.setTimeout(() => void maybeRunLocalSimulatorAutoLogin(), 800);
+}, { once: true });

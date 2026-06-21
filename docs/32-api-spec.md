@@ -12,7 +12,8 @@
 - non-custodial 方針を崩さない。
 - 更新系 API では監査ログと状態遷移整合を壊さない。
 - 公開 API に秘密情報を出さない。
-- invoice ごとの pay payload は Polygon / JPYC に限定する。
+- invoice ごとの pay payload は Ethereum Mainnet / Avalanche C-Chain / Polygon 上の資金移動業JPYCに限定する。
+- JPYC token contract は公式 `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29` のみ許可し、JPYC Prepaid/v2系 contract は拒否する。
 
 ## Common rules
 - Base path: `/api/v1`
@@ -40,6 +41,9 @@
   - store / terminal scope で kill switch が無効
   - store / terminal status が `active`
   - address pool 構成時は `1 invoice = 1 receive_address`
+- request body:
+  - `amount_jpy`: 正の整数
+  - `payment_chain_id`: `1`, `43114`, `137` のいずれか。`chain_id` / `token_contract` / `recipient_address` の任意指定は不可。
 - 主なレスポンス項目:
   - `invoice_id`
   - `status`
@@ -165,7 +169,9 @@
 ```
 
 ## Wallet URI rules
-- `chain_id` は `137`
+- `chain_id` は `1` (Ethereum Mainnet), `43114` (Avalanche C-Chain), `137` (Polygon) のいずれか
+- `token_contract` は資金移動業JPYCの公式コントラクト `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29`
+- JPYC Prepaid/v2文脈の `0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB` は支払い導線で使用しない
 - `payment_uri` は EIP-681 形式を採用する
 - 形式:
 

@@ -1,11 +1,14 @@
-ARG NODE_IMAGE=node:20-bookworm-slim
+ARG NODE_IMAGE=node:24.17.0-bookworm-slim
 FROM ${NODE_IMAGE} AS deps
 
 WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-ARG NODE_IMAGE=node:20-bookworm-slim
+ARG NODE_IMAGE=node:24.17.0-bookworm-slim
 FROM ${NODE_IMAGE} AS runtime
 
 ENV NODE_ENV=production

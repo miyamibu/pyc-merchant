@@ -3,68 +3,247 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#dce8ff" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>JPYCお支払い案内</title>
-  <link rel="stylesheet" href="/app.css" />
+  <link rel="stylesheet" href="/app.css?v=terminal-ops-redesign-20260527-font-size-all-pages" />
 </head>
 <body class="mobile-surface">
   <div class="wrap wrap-narrow">
-    <header class="section-header">
-      <div class="stack">
-        <h1 class="title">JPYCお支払い案内</h1>
-        <p class="small">請求金額・ネットワーク・送金先を確認し、送金後は二重送金せず確認完了までお待ちください。</p>
+    <header id="mobilePayHeader" class="mobile-pay-header">
+      <div class="mobile-brand-row">
+        <span class="mobile-brand-mark" aria-hidden="true">
+          <img class="jpyc-token-logo" src="/assets/jpyc-token-logo.jpg" alt="" width="40" height="40" decoding="async" />
+        </span>
+        <div class="mobile-brand-copy">
+          <h1 class="title">JPYCでお支払い</h1>
+          <p class="small">金額・送金先を確認してください。</p>
+          <p id="mobileHeaderStoreName" class="small" aria-live="polite"></p>
+        </div>
       </div>
-      <span class="badge">お客様向け</span>
     </header>
 
     <p id="liveStatus" class="visually-hidden live-region" role="status" aria-live="polite" aria-atomic="true"></p>
-    <div id="errorBanner" class="error-banner error-banner-row hidden" role="alert">
-      <span id="errorBannerText" class="flex-1"></span>
-      <button id="closeErrorBannerBtn" type="button" class="btn btn-secondary btn-compact" aria-label="エラー表示を閉じる">閉じる</button>
+    <div id="errorBanner" class="error-banner hidden" role="alert">
+      <span id="errorBannerText"></span>
+      <button id="errorBannerCloseBtn" type="button" class="error-banner-close" aria-label="エラーを閉じる">
+        <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M6 6l12 12" /><path d="M18 6 6 18" /></svg>
+      </button>
     </div>
 
-    <section class="card stack mt-16 mobile-summary-card" aria-labelledby="invoiceSummaryTitle">
-      <div class="section-header">
-        <h2 id="invoiceSummaryTitle" class="title title-lg">ご請求内容</h2>
-        <span id="statusPill" class="status-pill s-gray" role="status" aria-live="polite" aria-atomic="true">読み込み中</span>
+    <section id="receiptView" class="receipt-view stack mt-16 hidden" aria-labelledby="receiptHeroTitle">
+      <div class="receipt-success-card" role="status" aria-live="polite" aria-atomic="true">
+        <span class="receipt-success-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false"><path d="M20 6 9 17l-5-5" /></svg>
+        </span>
+        <div class="stack gap-tight">
+          <h2 id="receiptHeroTitle" class="title title-lg">支払い確認済み</h2>
+          <p id="receiptConfirmedText" class="helper-text">受領を確認しました</p>
+          <p id="receiptConfirmedAt" class="info-value mono">-</p>
+        </div>
       </div>
-      <div class="trust-row" aria-label="請求の発行元">
-        <span id="merchantTrustBadge" class="badge">サーバー発行済み</span>
-        <span class="small">発行時刻: <span id="issuedAtText" class="mono">-</span></span>
+
+      <section id="receiptCard" class="receipt-detail-card stack" aria-labelledby="receiptTitle" aria-live="polite" aria-atomic="true">
+        <h3 id="receiptTitle" class="title title-md">お支払い確認書</h3>
+        <div class="receipt-amount-block">
+          <span class="info-label">お支払い金額</span>
+          <p id="receiptAmount" class="amount-primary amount-receipt">-</p>
+        </div>
+        <div class="receipt-info-list">
+          <div class="receipt-info-row">
+            <span class="receipt-row-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M4 10h16l-2-5H6l-2 5Z" /><path d="M5 10v9h14v-9" /><path d="M9 19v-5h6v5" /></svg>
+            </span>
+            <div class="info-item">
+              <span class="info-label">店舗名</span>
+              <p id="receiptStoreName" class="info-value">-</p>
+            </div>
+          </div>
+          <div class="receipt-info-row">
+            <span class="receipt-row-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M7 7h10" /><path d="M7 12h10" /><path d="M7 17h6" /><path d="M5 3h14v18H5z" /></svg>
+            </span>
+            <div class="info-item">
+              <span class="info-label">請求ID</span>
+              <p id="receiptInvoiceId" class="info-value mono">-</p>
+            </div>
+            <button id="copyReceiptInvoiceBtn" type="button" class="btn btn-ghost btn-icon" aria-label="請求IDをコピー">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M9 9h10v10H9z" /><path d="M5 15H4V4h11v1" /></svg>
+            </button>
+          </div>
+          <div class="receipt-info-row">
+            <span class="receipt-row-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M10 3 8 21" /><path d="m16 3-2 18" /><path d="M4 8h17" /><path d="M3 16h17" /></svg>
+            </span>
+            <div class="info-item">
+              <span class="info-label">取引参照</span>
+              <p id="receiptTxHash" class="info-value mono">-</p>
+            </div>
+            <button id="copyReceiptTxBtn" type="button" class="btn btn-ghost btn-icon" aria-label="取引参照をコピー">
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M9 9h10v10H9z" /><path d="M5 15H4V4h11v1" /></svg>
+            </button>
+          </div>
+          <div class="receipt-info-row">
+            <span class="receipt-row-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1" /><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" /></svg>
+            </span>
+            <div class="info-item">
+              <span class="info-label">ネットワーク</span>
+              <p id="receiptNetworkText" class="info-value">-</p>
+            </div>
+          </div>
+          <div class="receipt-info-row">
+            <span class="receipt-row-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6l-8-3Z" /><path d="m8.5 12 2.5 2.5 5-5" /></svg>
+            </span>
+            <div class="info-item">
+              <span class="info-label">ステータス</span>
+              <p id="receiptStatusText" class="receipt-status-text">支払い確認済み</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="receipt-no-more-card">
+        <span class="receipt-success-icon receipt-success-icon-sm" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false"><path d="M20 6 9 17l-5-5" /></svg>
+        </span>
+        <div class="stack gap-tight">
+          <h3 class="title title-md">追加の送金は不要です</h3>
+          <p class="helper-text">この支払いはすでに受領済みです。</p>
+        </div>
+      </section>
+
+      <div class="receipt-action-stack">
+        <button id="showStaffBtn" type="button" class="btn btn-primary btn-xl">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M8 4H5a1 1 0 0 0-1 1v3" /><path d="M16 4h3a1 1 0 0 1 1 1v3" /><path d="M20 16v3a1 1 0 0 1-1 1h-3" /><path d="M8 20H5a1 1 0 0 1-1-1v-3" /><path d="M7 12h10" /></svg>
+          <span>店舗スタッフに見せる</span>
+        </button>
+        <button id="downloadReceiptBtn" class="btn btn-secondary btn-xl" aria-label="支払い確認書を保存">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+          <span>支払い確認書を保存</span>
+        </button>
+      </div>
+
+      <section class="mobile-disclosure-stack receipt-disclosure-stack" aria-label="確認書の詳細">
+        <details class="details" id="receiptTransactionDetails">
+          <summary>
+            <span class="receipt-summary-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M6 2h9l5 5v15H6z" /><path d="M14 2v6h6" /></svg></span>
+            <span>取引詳細</span>
+          </summary>
+          <div class="details-content">
+            <div class="info-item">
+              <span class="info-label">支払いネットワーク</span>
+              <p id="receiptDetailNetworkText" class="info-value">-</p>
+            </div>
+            <div class="info-item">
+              <span class="info-label">支払い通貨</span>
+              <p class="info-value">JPYC</p>
+              <p id="receiptDetailContractText" class="helper-text mono">0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29</p>
+            </div>
+            <div class="info-item">
+              <span class="info-label">支払い先</span>
+              <div class="receipt-detail-copy-row">
+                <p id="receiptDetailToText" class="info-value mono">-</p>
+                <button id="copyReceiptToBtn" type="button" class="btn btn-ghost btn-icon" aria-label="支払い先をコピー">
+                  <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M9 9h10v10H9z" /><path d="M5 15H4V4h11v1" /></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </details>
+        <details class="details" id="receiptPolicyDetails">
+          <summary>
+            <span class="receipt-summary-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6l-8-3Z" /></svg></span>
+            <span>ポリシー・利用規約</span>
+          </summary>
+          <div class="details-content">
+            <p class="helper-text">返金・紛争はご利用店舗の窓口へお問い合わせください。</p>
+          </div>
+        </details>
+        <details class="details" id="receiptSupportDetails">
+          <summary>
+            <span class="receipt-summary-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M12 18h.01" /><path d="M9.5 9a2.5 2.5 0 1 1 4 2c-.9.6-1.5 1.2-1.5 2.5" /><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z" /></svg></span>
+            <span>サポート・お問い合わせ</span>
+          </summary>
+          <div class="details-content">
+            <p class="helper-text">金額や取引参照に不明点がある場合は、この画面を店舗スタッフに見せてください。</p>
+          </div>
+        </details>
+      </section>
+
+      <p class="receipt-footnote helper-text">これはJPYC支払いの確認用控えです。税務上の領収書または適格請求書ではありません。正式な領収書が必要な場合は店舗へお申し出ください。</p>
+
+    </section>
+
+    <section class="card stack mt-16 mobile-summary-card" aria-labelledby="invoiceSummaryTitle">
+      <div class="mobile-payment-status-row">
+        <h2 id="invoiceSummaryTitle" class="visually-hidden">ご請求内容</h2>
+        <span id="statusPill" class="status-pill s-gray" role="status" aria-live="polite" aria-atomic="true">読み込み中</span>
+        <p id="remainingText" class="mobile-remaining-text" aria-live="polite" aria-atomic="true">残り時間を計算中です。</p>
       </div>
       <div class="amount-hero" aria-label="お支払い金額">
         <span class="info-label">お支払い金額</span>
         <p id="amountText" class="amount-primary">-</p>
         <p id="amountSubText" class="amount-sub">-</p>
+        <div class="mobile-summary-meta" aria-label="支払い先の要約">
+          <div class="info-item">
+            <span class="info-label">ネットワーク</span>
+            <p id="summaryNetworkText" class="info-value mobile-network-value">-</p>
+          </div>
+          <div class="info-item mobile-contract-summary">
+            <span class="info-label">公式JPYC</span>
+            <p id="summaryContractText" class="info-value mono">...C3c29</p>
+          </div>
+          <div class="info-item">
+            <span class="info-label">店舗</span>
+            <p id="summaryStoreText" class="info-value">-</p>
+          </div>
+        </div>
       </div>
-      <div class="state-box">
-        <strong id="uxStateLabel">状況を確認中</strong>
-        <p id="uxStateDetail" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">請求情報と店舗側の確認状態を読み込み中です。</p>
+      <div class="policy-consent-row" id="policyConsentRow">
+        <label class="policy-check-label">
+          <input type="checkbox" id="policyConsentCheckbox" />
+          <span>規約・返金方針を確認しました</span>
+        </label>
+        <p class="helper-text policy-consent-note">金額・送金先・ネットワークを確認してから進んでください。誤送金の返金は保証されません。</p>
       </div>
       <div class="primary-action-stack" aria-label="支払い操作">
-        <button id="walletPayBtn" class="btn btn-primary btn-xl" aria-label="ウォレットで支払う">ウォレットで支払う</button>
-        <p class="helper-text payment-safety-note">送金は1回のみ有効です。金額・ネットワーク・送金先を確認してから進んでください。</p>
+        <button id="walletPayBtn" class="btn btn-primary btn-xl mobile-primary-pay-btn" aria-label="ウォレットで支払う">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" /></svg>
+          <span>ウォレットで支払う</span>
+        </button>
+        <p id="walletDisabledReason" class="helper-text mobile-cta-reason" role="status" aria-live="polite" aria-atomic="true">請求情報を確認中です。</p>
+        <p class="helper-text mobile-manual-hint" id="manualPaymentHint">ウォレットが自動で開かない場合のみ使用してください。</p>
         <div class="secondary-action-row">
-          <button id="copyInfoBtn" class="btn btn-ghost btn-compact">支払い情報をコピー</button>
-          <button id="showMethodsBtn" class="btn btn-ghost btn-compact">手動送金を表示</button>
+          <button id="copyInfoBtn" class="btn btn-ghost btn-compact">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M9 9h10v10H9z" /><path d="M5 15H4V4h11v1" /></svg>
+            <span>コピー</span>
+          </button>
+          <button id="showMethodsBtn" class="btn btn-ghost btn-compact">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="M21 3 10 14" /><path d="m21 3-7 18-4-7-7-4 18-7Z" /></svg>
+            <span>手動送金（代替）</span>
+          </button>
         </div>
       </div>
-      <div class="info-list info-list-compact">
-        <div class="info-item">
-          <span class="info-label">店舗</span>
-          <p id="storeText" class="info-value">-</p>
-        </div>
-        <div class="info-item">
-          <span class="info-label">お支払い期限</span>
-          <p id="expiresText" class="info-value">-</p>
-          <p id="remainingText" class="helper-text">残り時間を計算中です。</p>
-        </div>
+      <div class="mobile-safety-strip" aria-label="お支払い前の安全確認">
+        <p>店舗スタッフが秘密鍵・シードフレーズを聞くことはありません。</p>
+        <p>二重送金しないでください。送金後、この画面は自動で更新されます。</p>
       </div>
     </section>
 
-    <section class="card stack mt-16" aria-labelledby="paymentActionTitle">
-      <h2 id="paymentActionTitle" class="title title-lg">迷わないお支払い手順</h2>
-      <details class="details payment-guide-details" open>
-        <summary>はじめての方へ</summary>
+    <section class="mobile-disclosure-stack mt-16" aria-labelledby="paymentActionTitle">
+      <section id="paymentConditionsCard" class="wallet-support-inline mobile-wallet-support-card hidden" aria-labelledby="walletSupportTitle">
+        <h3 id="walletSupportTitle">対応ウォレット</h3>
+        <div id="supportedWalletChips" class="chip-group" aria-live="polite" aria-atomic="true"></div>
+      </section>
+      <details class="details payment-guide-details payment-guide-compact">
+        <summary id="paymentActionTitle">
+          <span class="mobile-disclosure-icon mobile-step-icon" aria-hidden="true">123</span>
+          <span>3ステップでかんたんお支払い</span>
+          <span class="visually-hidden">迷わないお支払い手順</span>
+        </summary>
         <section class="details-content" aria-labelledby="paymentGuideTitle">
         <div class="section-header">
           <h3 id="paymentGuideTitle" class="title title-md">はじめての方へ</h3>
@@ -79,7 +258,7 @@
           <article class="step-card">
             <span class="step-index">2</span>
             <strong>金額と送金先を確認</strong>
-            <p class="helper-text">ウォレット画面で「Polygon」「JPYC」「この画面の送金先」の3つが一致していることを確認してから送信します。</p>
+            <p class="helper-text">ウォレット画面で「選択されたチェーン」「JPYC」「公式コントラクト」「この画面の送金先」が一致していることを確認してから送信します。</p>
           </article>
           <article class="step-card">
             <span class="step-index">3</span>
@@ -89,93 +268,56 @@
         </div>
         </section>
       </details>
-      <section id="consentGateSection" class="panel stack hidden" aria-labelledby="consentGateTitle">
-        <div class="section-header">
-          <h3 id="consentGateTitle" class="title title-md">お支払い前の確認・同意</h3>
-          <span class="badge">必須</span>
-        </div>
-        <ul class="warning-list compact-list">
-          <li>請求金額・ネットワーク・送金先を確認してください。この画面に表示された内容以外には送金しないでください。</li>
-          <li>送金は1回のみ有効です。二重送金・分割送金は手動確認の対象になります。</li>
-          <li>誤チェーン・誤トークン・誤アドレスへの送金は返金対応外、または返金が困難な場合があります。</li>
-          <li>ガス代（MATIC等）がウォレットに必要です。残高不足の場合は送金できません。</li>
-          <li>店舗スタッフが秘密鍵・シードフレーズを聞くことはありません。絶対に入力・共有しないでください。</li>
-        </ul>
-        <div class="inline-action-group">
-          <a id="consentTermsLink" class="btn btn-secondary btn-compact" target="_blank" rel="noopener noreferrer" aria-label="利用規約（新しいタブで開く）">利用規約</a>
-          <a id="consentPrivacyLink" class="btn btn-secondary btn-compact" target="_blank" rel="noopener noreferrer" aria-label="プライバシーポリシー（新しいタブで開く）">プライバシーポリシー</a>
-          <a id="consentRefundLink" class="btn btn-secondary btn-compact" target="_blank" rel="noopener noreferrer" aria-label="返金ポリシー（新しいタブで開く）">返金ポリシー</a>
-        </div>
-        <div class="row">
-          <input type="checkbox" id="consentCheckbox" aria-describedby="consentCheckboxLabel" />
-          <label for="consentCheckbox" id="consentCheckboxLabel" class="consent-checkbox-label">上記の内容と利用規約・プライバシーポリシー・返金ポリシーを確認しました</label>
-        </div>
-        <div id="consentLiveStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
-      </section>
-      <section id="paymentVerifyCard" class="panel stack hidden" aria-labelledby="paymentVerifyTitle">
-        <div class="section-header">
-          <h3 id="paymentVerifyTitle" class="title title-md">送金前の3点照合</h3>
-          <span class="badge">必ず確認</span>
-        </div>
-        <p class="helper-text">ウォレットで送信する前に、以下の3つがこの画面と完全に一致していることを確認してください。</p>
-        <div class="verify-grid">
-          <div class="verify-item">
-            <span class="info-label">ネットワーク</span>
-            <p id="verifyNetworkText" class="info-value">-</p>
-          </div>
-          <div class="verify-item">
-            <span class="info-label">トークン</span>
-            <p id="verifyTokenText" class="info-value">JPYC</p>
-          </div>
-          <div class="verify-item verify-item-wide">
-            <span class="info-label">送金先</span>
-            <p id="verifyAddressText" class="info-value mono address-text">-</p>
-          </div>
-        </div>
-        <p id="manualRiskText" class="helper-text">手動送金する場合は、金額・送金先・チェーンを必ず目視で照合してください。</p>
-      </section>
-      <div id="methodPanel" class="panel hidden" role="status" aria-live="polite" aria-atomic="true">
+      <div id="methodPanel" class="panel mobile-bottom-sheet hidden" role="status" aria-live="polite" aria-atomic="true">
         <p id="methodPanelText" class="helper-text">支払い方法を読み込み中です。</p>
       </div>
-      <section id="customerActionCard" class="panel stack" aria-labelledby="customerActionTitleHeading">
-        <div class="section-header">
-          <h3 id="customerActionTitleHeading" class="title title-md">いまの状況と次の行動</h3>
-          <span id="customerActionBadge" class="badge">確認中</span>
-        </div>
-        <p id="customerActionTitle" class="title title-md">請求内容を読み込み中です</p>
-        <p id="customerActionBody" class="helper-text">この画面は、お客様のウォレット送金と店舗側の確認導線を合わせて案内します。</p>
-        <ul id="customerActionList" class="warning-list compact-list">
-          <li>ウォレットを開く準備ができるまでお待ちください。</li>
-        </ul>
-      </section>
-      <section id="walletSupportCard" class="panel stack" aria-labelledby="walletSupportTitle">
-        <div class="section-header">
-          <h3 id="walletSupportTitle" class="title title-md">対応ウォレットとサポート</h3>
-          <span id="walletAvailabilityBadge" class="badge">確認中</span>
-        </div>
-        <div id="supportedWalletChips" class="chip-group" aria-live="polite" aria-atomic="true"></div>
-        <p id="walletSupportText" class="helper-text">ウォレット起動方法を確認しています。</p>
-        <a
-          id="walletHelpLink"
-          class="btn btn-secondary btn-compact hidden"
-          href="#"
-          target="_blank"
-          rel="noopener noreferrer"
-        >ウォレット案内を開く</a>
-      </section>
-      <section id="paymentConditionsCard" class="panel stack hidden" aria-labelledby="paymentConditionsTitle">
-        <div class="section-header">
-          <h3 id="paymentConditionsTitle" class="title title-md">支払い前の確認事項</h3>
-          <span class="badge">重要</span>
-        </div>
-        <ul id="paymentConditionsList" class="warning-list compact-list">
-          <li>対応チェーン・トークンは送金前にウォレットでご確認ください。</li>
-          <li>ガス代（MATIC）がウォレットに必要です。</li>
-        </ul>
-      </section>
       <details class="details" id="technicalDetails">
-        <summary>詳細情報を表示する</summary>
+        <summary>
+          <span class="mobile-disclosure-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M6 2h9l5 5v15H6z" /><path d="M14 2v6h6" /></svg></span>
+          <span>詳細情報</span>
+        </summary>
         <div class="details-content">
+          <div class="info-list info-list-compact mobile-secondary-meta">
+            <div class="info-item">
+              <span class="info-label">発行元</span>
+              <p id="merchantTrustBadge" class="info-value">サーバー発行済み</p>
+            </div>
+            <div class="info-item">
+              <span class="info-label">店舗</span>
+              <p id="storeText" class="info-value">-</p>
+            </div>
+            <div class="info-item">
+              <span class="info-label">発行時刻</span>
+              <p id="issuedAtText" class="info-value mono">-</p>
+            </div>
+            <div class="info-item">
+              <span class="info-label">お支払い期限</span>
+              <p id="expiresText" class="info-value">-</p>
+            </div>
+          </div>
+          <section id="paymentVerifyCard" class="panel stack hidden" aria-labelledby="paymentVerifyTitle">
+            <div class="section-header">
+              <h3 id="paymentVerifyTitle" class="title title-md">送金前の3点照合</h3>
+              <span class="badge">必ず確認</span>
+            </div>
+            <p class="helper-text">ウォレットで送信する前に、以下の3つがこの画面と完全に一致していることを確認してください。</p>
+            <div class="verify-grid">
+              <div class="verify-item">
+                <span class="info-label">ネットワーク</span>
+                <p id="verifyNetworkText" class="info-value">-</p>
+              </div>
+              <div class="verify-item">
+                <span class="info-label">トークン</span>
+                <p id="verifyTokenText" class="info-value">JPYC</p>
+                <p id="verifyTokenContractText" class="helper-text mono">0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29</p>
+              </div>
+              <div class="verify-item verify-item-wide">
+                <span class="info-label">送金先</span>
+                <p id="verifyAddressText" class="info-value mono">-</p>
+              </div>
+            </div>
+            <p id="manualRiskText" class="helper-text">手動送金する場合は、金額・送金先・チェーンを必ず目視で照合してください。</p>
+          </section>
           <div class="info-item">
             <span class="info-label">支払いネットワーク</span>
             <p id="networkText" class="info-value">-</p>
@@ -204,37 +346,49 @@
           </div>
         </div>
       </details>
-      <section id="receiptCard" class="panel stack hidden" aria-labelledby="receiptTitle" aria-live="polite" aria-atomic="true">
-        <div class="section-header">
-          <h3 id="receiptTitle" class="title title-md">お支払い確認書</h3>
-          <span id="receiptStatusBadge" class="status-pill s-green">支払い確認済み</span>
+      <details class="details" id="policyDetails">
+        <summary>
+          <span class="mobile-disclosure-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6l-8-3Z" /></svg></span>
+          <span>ポリシー</span>
+        </summary>
+        <div class="details-content">
+          <ul class="warning-list compact-list">
+            <li>請求金額・ネットワーク・送金先を確認してください。この画面に表示された内容以外には送金しないでください。</li>
+            <li>送金は1回のみ有効です。二重送金・分割送金は手動確認の対象になります。</li>
+            <li>誤チェーン・誤トークン・誤アドレスへの送金は返金対応外、または返金が困難な場合があります。</li>
+            <li>ガス代（MATIC等）がウォレットに必要です。残高不足の場合は送金できません。</li>
+            <li>店舗スタッフが秘密鍵・シードフレーズを聞くことはありません。絶対に入力・共有しないでください。</li>
+          </ul>
+          <ul class="policy-link-list" aria-label="各ポリシーへのリンク">
+            <li><a id="policyTermsLink" target="_blank" rel="noopener noreferrer" aria-label="利用規約（新しいタブで開く）">利用規約</a></li>
+            <li><a id="policyPrivacyLink" target="_blank" rel="noopener noreferrer" aria-label="プライバシーポリシー（新しいタブで開く）">プライバシー</a></li>
+            <li><a id="policyRefundLink" target="_blank" rel="noopener noreferrer" aria-label="返金ポリシー（新しいタブで開く）">返金ポリシー</a></li>
+          </ul>
         </div>
-        <div class="info-list">
-          <div class="info-item">
-            <span class="info-label">店舗</span>
-            <p id="receiptStoreName" class="info-value">-</p>
-          </div>
-          <div class="info-item">
-            <span class="info-label">お支払い金額</span>
-            <p id="receiptAmount" class="amount-primary amount-receipt">-</p>
-          </div>
-          <div class="info-item">
-            <span class="info-label">請求ID</span>
-            <p id="receiptInvoiceId" class="info-value mono">-</p>
-          </div>
-          <div class="info-item">
-            <span class="info-label">取引番号</span>
-            <p id="receiptTxHash" class="info-value mono">-</p>
-          </div>
-        </div>
-        <div class="inline-action-group">
-          <button id="copyReceiptBtn" class="btn btn-secondary btn-compact" aria-label="お支払い確認書をコピー">確認書をコピー</button>
-        </div>
-        <p class="helper-text">この画面をスクリーンショットするか、確認書をコピーして保管してください。</p>
-      </section>
+      </details>
       <div class="inline-action-group">
-        <button id="refreshBtn" class="btn btn-secondary">最新の状態に更新</button>
+        <button id="refreshBtn" class="btn btn-secondary">更新</button>
       </div>
+    </section>
+
+    <section id="customerActionCard" class="card stack mt-16 hidden" aria-labelledby="customerActionTitle">
+      <div class="section-header">
+        <span id="customerActionBadge" class="badge">支払い前</span>
+      </div>
+      <strong id="customerActionTitle" class="title title-md"></strong>
+      <p id="customerActionBody" class="helper-text"></p>
+      <ul id="customerActionList" class="warning-list compact-list"></ul>
+    </section>
+
+    <section id="mobileAutoStatusCard" class="mobile-auto-status-card state-box mt-16">
+      <span class="mobile-auto-status-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false"><path d="M20 6 9 17l-5-5" /></svg>
+      </span>
+      <div>
+        <strong id="uxStateLabel">状況を確認中</strong>
+        <p id="uxStateDetail" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">請求情報と店舗側の確認状態を読み込み中です。</p>
+      </div>
+      <time id="mobileAutoStatusTime" class="mono" aria-hidden="true">--:--</time>
     </section>
   </div>
 

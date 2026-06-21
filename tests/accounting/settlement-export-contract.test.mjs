@@ -65,6 +65,10 @@ test("settlement export schema pins canonical enums and export privacy exclusion
     "store_id",
     "terminal_id",
     "operator_id",
+    "chain_id",
+    "network",
+    "token_contract",
+    "recipient_address",
     "payment_attempt_ids",
     "primary_tx_hash",
     "primary_tx_log_index",
@@ -79,6 +83,8 @@ test("settlement export schema pins canonical enums and export privacy exclusion
     assert.ok(schema.required.includes(field), `${field} must be required for traceability`);
     assert.ok(schema.properties[field], `${field} must have schema`);
   }
+  assert.deepEqual(schema.properties.chain_id.enum, ["1", "43114", "137"]);
+  assert.match(schema.properties.token_contract.pattern, /\[Ee\]7/);
 });
 
 test("settlement export traceability invariants are documented", () => {
