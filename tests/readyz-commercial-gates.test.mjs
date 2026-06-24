@@ -34,14 +34,18 @@ test("readyz returns commercial gate fields and not-ready when blockers exist", 
   assert.equal(typeof ready.data.jpyc_contract_gate, "boolean");
   assert.equal(typeof ready.data.confirmation_policy_gate, "boolean");
   assert.equal(typeof ready.data.backscan_policy_gate, "boolean");
+  assert.equal(typeof ready.data.policy_urls_gate, "boolean");
   assert.equal(typeof ready.data.wallet_evidence_gate, "boolean");
   assert.equal(typeof ready.data.real_payment_evidence_gate, "boolean");
   assert.equal(typeof ready.data.tls_evidence_gate, "boolean");
   assert.equal(typeof ready.data.store_ops_drill_gate, "boolean");
+  assert.equal(typeof ready.data.poc_package_gate, "boolean");
   assert.equal(typeof ready.data.audit_chain_gate, "boolean");
   assert.equal(typeof ready.data.settlement_policy_gate, "boolean");
   assert.equal(typeof ready.data.refund_policy_gate, "boolean");
   assert.equal(typeof ready.data.dangerous_flags_gate, "boolean");
   assert.equal(typeof ready.data.commercial_verdict, "string");
   assert.ok(Array.isArray(ready.data.blockers));
+  assert.ok(ready.data.blockers.includes("policy_urls_gate"));
+  assert.ok(ready.data.blockers.includes("poc_package_gate"));
 });

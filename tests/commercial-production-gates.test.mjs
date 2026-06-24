@@ -38,6 +38,10 @@ test("commercial mode blocks invoice issuance but keeps read-only ops endpoints"
   assert.equal(blockedInvoice.status, 503);
   assert.equal(blockedInvoice.data.error.code, "COMMERCIAL_GATE_BLOCKED");
   assert.ok(Array.isArray(blockedInvoice.data.error.details.blockers));
+  assert.ok(blockedInvoice.data.error.details.blockers.includes("policy_urls_gate"));
+  assert.ok(blockedInvoice.data.error.details.blockers.includes("poc_package_gate"));
+  assert.equal(typeof blockedInvoice.data.error.details.policy_urls, "object");
+  assert.equal(typeof blockedInvoice.data.error.details.poc_evidence, "object");
 
   const auditRead = await apiRequest(started.baseUrl, "/api/v1/audit-logs?limit=20", {
     headers: authHeaders(admin.token),

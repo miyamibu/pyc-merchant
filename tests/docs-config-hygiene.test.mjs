@@ -86,3 +86,13 @@ test("production env example declares the required approval and verification gat
     assert.match(content, new RegExp(`^${key}=`, "m"), `${key} is missing from .env.production.example`);
   }
 });
+
+test("env examples keep JPYC token decimals aligned with the configured base unit scale", () => {
+  for (const fileName of [".env.example", ".env.production.example"]) {
+    const content = fs.readFileSync(path.join(ROOT, fileName), "utf8");
+    const decimals = content.match(/^TOKEN_DECIMALS=(\d+)$/m)?.[1];
+    const scale = content.match(/^JPYC_BASE_UNIT_SCALE=(\d+)$/m)?.[1];
+    assert.equal(decimals, "6", `${fileName} TOKEN_DECIMALS must match 1_000_000 base unit scale`);
+    assert.equal(scale, "1000000", `${fileName} JPYC_BASE_UNIT_SCALE must stay at 1_000_000`);
+  }
+});

@@ -62,3 +62,31 @@ test("commercial validation generates JSON, scorecard, and summary without fake 
   assert.equal(report.commercial_10_ready, false);
   assert.ok(Array.isArray(report.blockers.P0));
 });
+
+test("real-money release gates reject latest evidence auto-selection and conditional waivers", async () => {
+  const evidenceRoot = mkdtempSync(path.join(tmpdir(), "jpyc-latest-evidence-"));
+  const latestDir = path.join(evidenceRoot, "20260422T000000Z");
+  fs.mkdirSync(latestDir, { recursive: true });
+  fs.writeFileSync(path.join(latestDir, "EXT-001-real-jpyc-payment.md"), "- status: pass\n", "utf8");
+
+  const outputDir = mkdtempSync(path.join(tmpdir(), "jpyc-latest-out-"));
+  const result = await runNode("scripts/production-validation/validate-commercial-go.mjs", [
+    "--evidence-root",
+    evidenceRoot,
+    "--output-dir",
+    outputDir,
+  ], {
+    APP_ENV: "production",
+    COMMERCIAL_GO_MODE: "true",
+    SIGNED_CONDITIONAL_GO_WAIVER_REF: "WAIVER-1",
+    DB_PATH: "./missing-real-money-gate.db",
+  });
+
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  const report = JSON.parse(fs.readFileSync(path.join(outputDir, "commercial-go-validation.json"), "utf8"));
+  assert.equal(report.verdict, "NO_GO");
+  assert.equal(report.evidence_dir_selection, "latest");
+  assert.ok(report.blockers.P0.some((row) => String(row).includes("latest evidence auto-selection")));
+  assert.ok(report.blockers.P0.some((row) => String(row).includes("forbids conditional waivers")));
+  assert.ok(report.blockers.P0.some((row) => String(row).includes("--release-id")));
+});

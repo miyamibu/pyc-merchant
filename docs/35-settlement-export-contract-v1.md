@@ -46,6 +46,12 @@ Define a stable accounting interface and frozen accounting snapshot for daily cl
 - `disputed`
 
 ## Snapshot rules
+- `GET` endpoints must not create settlement exports, export runs, export rows, audit entries, files, or other accounting side effects.
+- `POST /api/v1/settlements/daily:close` creates the daily close settlement export snapshot as part of the close operation.
+- `POST /api/v1/settlement-exports` creates an on-demand immutable settlement export snapshot and requires `Idempotency-Key`; same key and same payload must return the same response, while same key and different payload must conflict.
+- `GET /api/v1/settlement-exports/:id` returns existing snapshot metadata and rows scoped to the caller's store and must not recalculate or mutate accounting state.
+- `GET /api/v1/settlement-exports/:id/download` returns the existing snapshot as JSON or UTF-8 BOM CSV and must not recalculate or mutate accounting state.
+- Formal export snapshots include content hash metadata so downloaded JSON/CSV payloads can be reconciled to the immutable export record.
 - `paid` remains chain-verified only.
 - Wallet-direct paid invoices export as `onchain_cash_confirmed`.
 - Provider accepted/captured without chain-paid evidence exports as `provider_receivable`.

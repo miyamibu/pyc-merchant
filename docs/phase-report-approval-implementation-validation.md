@@ -11,7 +11,7 @@
 ## Repo-internal work completed
 - 承認パック、release record、commercial scorecard、external evidence flow、POC evidence flow を closeout 向けに整理した。
 - `.env.production.example` と README の production / commercial gate 説明を合わせた。
-- Node 20 baseline と test 再現コマンドを package metadata / docs に固定した。
+- Node 24.17.0 baseline と test 再現コマンドを package metadata / docs に固定した。
 - stale roadmap / phase report の「未実装」表現を除去した。
 
 ## Remaining external work

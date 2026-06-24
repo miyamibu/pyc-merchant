@@ -188,25 +188,33 @@ function evaluatePocEvidence(dirPath) {
   }
   return results;
 }
-export function validateCommercialEvidence({ evidenceRoot = path.resolve(process.cwd(), "docs/production/evidence") } = {}) {
-  const latestDir = findLatestEvidenceDir(evidenceRoot);
+export function validateCommercialEvidence({
+  evidenceRoot = path.resolve(process.cwd(), "docs/production/evidence"),
+  evidenceDir = null,
+} = {}) {
+  const explicitDir = evidenceDir ? path.resolve(process.cwd(), evidenceDir) : null;
+  const selectedDir = explicitDir || findLatestEvidenceDir(evidenceRoot);
   const result = {
     ok: false,
     generated_at: new Date().toISOString(),
     evidence_root: evidenceRoot,
-    latest_evidence_dir: latestDir,
+    evidence_dir: selectedDir,
+    evidence_dir_selection: explicitDir ? "explicit" : "latest",
+    latest_evidence_dir: explicitDir ? null : selectedDir,
     ext: {},
     poc: [],
     blockers: [],
   };
 
-  if (!latestDir) {
+  if (explicitDir && !fs.existsSync(explicitDir)) {
+    result.blockers.push("missing_explicit_evidence_dir");
+  } else if (!selectedDir) {
     result.blockers.push("missing_latest_evidence_dir");
   } else {
-    const ext001 = readEvidence(latestDir, ["EXT-001-real-jpyc-payment.md"]);
-    const ext002 = readEvidence(latestDir, ["EXT-002-wallet-device-launch.md", "EXT-002-hashport-device-launch.md"]);
-    const ext003 = readEvidence(latestDir, ["EXT-003-public-fqdn-tls.md"]);
-    const ext004 = readEvidence(latestDir, ["EXT-004-store-ops-drill.md"]);
+    const ext001 = readEvidence(selectedDir, ["EXT-001-real-jpyc-payment.md"]);
+    const ext002 = readEvidence(selectedDir, ["EXT-002-wallet-device-launch.md", "EXT-002-hashport-device-launch.md"]);
+    const ext003 = readEvidence(selectedDir, ["EXT-003-public-fqdn-tls.md"]);
+    const ext004 = readEvidence(selectedDir, ["EXT-004-store-ops-drill.md"]);
 
     result.ext.EXT_001 = {
       file: ext001.file,
@@ -233,7 +241,7 @@ export function validateCommercialEvidence({ evidenceRoot = path.resolve(process
       if (!value.ok) result.blockers.push(`${key}:${value.errors.join(",")}`);
     }
 
-    result.poc = evaluatePocEvidence(latestDir);
+    result.poc = evaluatePocEvidence(selectedDir);
   }
 
   result.ext_all_pass = Object.values(result.ext).length > 0 && Object.values(result.ext).every((entry) => entry.ok);
@@ -245,8 +253,9 @@ export function validateCommercialEvidence({ evidenceRoot = path.resolve(process
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const evidenceRoot = path.resolve(process.cwd(), args.get("evidence-root") || "docs/production/evidence");
+  const evidenceDir = args.get("evidence-dir") ? path.resolve(process.cwd(), args.get("evidence-dir")) : null;
   const strict = boolFlag(args.get("strict"));
-  const result = validateCommercialEvidence({ evidenceRoot });
+  const result = validateCommercialEvidence({ evidenceRoot, evidenceDir });
   if (args.get("output")) {
     const outputPath = path.resolve(process.cwd(), args.get("output"));
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });

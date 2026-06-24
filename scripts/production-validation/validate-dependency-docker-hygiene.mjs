@@ -103,6 +103,8 @@ function main() {
 
     const dockerfile = readText("Dockerfile");
     ensure(/npm ci --omit=dev/.test(dockerfile), "Dockerfile must use npm ci --omit=dev");
+    ensure(/FROM node@sha256:[a-f0-9]{64} AS deps/.test(dockerfile), "Dockerfile deps stage must pin Node image by digest");
+    ensure(/FROM node@sha256:[a-f0-9]{64} AS runtime/.test(dockerfile), "Dockerfile runtime stage must pin Node image by digest");
     ensure(/USER appuser/.test(dockerfile), "Dockerfile must drop root privileges");
     ensure(!/COPY \. \./.test(dockerfile), "Dockerfile must not copy the full workspace blindly");
     record("dockerfile_runtime_hardening", true);

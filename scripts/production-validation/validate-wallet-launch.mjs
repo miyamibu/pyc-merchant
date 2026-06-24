@@ -40,7 +40,7 @@ try {
 
   const mobileHtml = fs.readFileSync(path.join(cwd, "public/mobile.html"), "utf8");
   assert.match(mobileHtml, /ウォレットで支払う/);
-  assert.match(mobileHtml, /支払い方法を見る/);
+  assert.match(mobileHtml, /手動送金を表示/);
   assert.match(mobileHtml, /支払い情報をコピー/);
   assert.match(mobileHtml, /支払いネットワーク/);
   assert.match(mobileHtml, /支払い先/);

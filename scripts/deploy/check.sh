@@ -18,7 +18,27 @@ node ./scripts/production-validation/validate-production-config.mjs --env-file .
 node ./scripts/production-validation/validate-dependency-docker-hygiene.mjs --skip-docker true >/dev/null
 
 if command -v docker >/dev/null 2>&1; then
-  docker compose -f docker-compose.prod.yml config >/dev/null
+  if [[ -f .env.production ]]; then
+    docker compose -f docker-compose.prod.yml config >/dev/null
+  else
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/jpyc-compose-check.XXXXXX")"
+    cleanup() {
+      if [[ -n "${tmp_dir:-}" && "$tmp_dir" == "${TMPDIR:-/tmp}"/jpyc-compose-check.* && -d "$tmp_dir" ]]; then
+        rm -r -- "$tmp_dir"
+      fi
+    }
+    trap cleanup EXIT
+    cp docker-compose.prod.yml "$tmp_dir/docker-compose.prod.yml"
+    cp .env.production.example "$tmp_dir/.env.production"
+    mkdir -p "$tmp_dir/deploy/nginx/certs"
+    if [[ -f deploy/nginx/jpyc-payment-terminal.conf ]]; then
+      cp deploy/nginx/jpyc-payment-terminal.conf "$tmp_dir/deploy/nginx/jpyc-payment-terminal.conf"
+    fi
+    (
+      cd "$tmp_dir"
+      docker compose -f docker-compose.prod.yml config >/dev/null
+    )
+  fi
 fi
 
 echo "deploy check ok"

@@ -106,3 +106,29 @@ test("settlement export docs state provider accepted/captured is not paid", () =
   assert.match(contractDoc, /derived from `invoice \+ payment evidence \+ reconciliation`/);
   assert.match(contractDoc, /Provider raw payload must not be exported\./);
 });
+
+test("settlement export HTTP contract separates read-only GET from snapshot POST", () => {
+  const contractDoc = fs.readFileSync(path.join(ROOT, "docs/35-settlement-export-contract-v1.md"), "utf8");
+  const serverSource = fs.readFileSync(path.join(ROOT, "src/server.mjs"), "utf8");
+  assert.match(contractDoc, /GET` endpoints must not create settlement exports/);
+  assert.match(contractDoc, /POST \/api\/v1\/settlements\/daily:close` creates the daily close settlement export snapshot/);
+  assert.match(contractDoc, /POST \/api\/v1\/settlement-exports` creates an on-demand immutable settlement export snapshot/);
+  assert.match(contractDoc, /GET \/api\/v1\/settlement-exports\/:id\/download` returns the existing snapshot as JSON or UTF-8 BOM CSV/);
+  assert.match(contractDoc, /content hash metadata/);
+  assert.match(serverSource, /app\.post\("\/api\/v1\/settlements\/daily:close"/);
+  assert.match(serverSource, /app\.post\("\/api\/v1\/settlement-exports"/);
+  assert.match(serverSource, /app\.get\("\/api\/v1\/settlement-exports\/:id\/download"/);
+  assert.match(serverSource, /Idempotency-Key/);
+  assert.match(serverSource, /content_hashes/);
+  assert.match(serverSource, /buildSettlementExportSnapshotCsv\(rows, \{ bom: true \}\)/);
+
+  const dailyGet = serverSource.match(/app\.get\("\/api\/v1\/settlements\/daily:export"[\s\S]*?\n\}\);/);
+  const monthlyGet = serverSource.match(/app\.get\("\/api\/v1\/settlements\/monthly:export"[\s\S]*?\n\}\);/);
+  const dailyClosePost = serverSource.match(/app\.post\("\/api\/v1\/settlements\/daily:close"[\s\S]*?app\.get\("\/api\/v1\/settlements\/daily:export"/);
+  assert.ok(dailyGet, "daily export GET route should exist");
+  assert.ok(monthlyGet, "monthly export GET route should exist");
+  assert.ok(dailyClosePost, "daily close POST route should exist");
+  assert.match(dailyClosePost[0], /createSettlementExportSnapshot/);
+  assert.doesNotMatch(dailyGet[0], /createSettlementExportSnapshot|INSERT INTO settlement_exports/);
+  assert.doesNotMatch(monthlyGet[0], /createSettlementExportSnapshot|INSERT INTO settlement_exports/);
+});

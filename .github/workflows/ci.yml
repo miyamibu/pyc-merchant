@@ -57,7 +57,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.17.0
           cache: npm
 
       - name: Install
@@ -79,6 +79,20 @@ jobs:
 
       - name: Audit
         run: npm run audit
+
+      - name: Commercial gate fails closed without production evidence
+        run: |
+          set +e
+          npm run commercial:gate
+          status=$?
+          test "$status" -eq 10
+
+      - name: Limited gate fails closed without production evidence
+        run: |
+          set +e
+          npm run limited:gate
+          status=$?
+          test "$status" -eq 10
 
       - name: Audit chain
         run: npm run test:audit-chain
@@ -166,7 +180,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.17.0
           cache: npm
 
       - name: Install

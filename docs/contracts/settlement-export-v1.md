@@ -3,6 +3,12 @@
 Canonical contract summary for `Settlement Export Contract v1`.
 
 - This contract is an accounting interface and frozen accounting snapshot.
+- `GET` export endpoints are read-only.
+- `POST /api/v1/settlements/daily:close` creates the daily close immutable snapshot as part of close.
+- `POST /api/v1/settlement-exports` creates on-demand immutable snapshots and requires `Idempotency-Key`.
+- `GET /api/v1/settlement-exports/:id` reads existing snapshot metadata and rows only.
+- `GET /api/v1/settlement-exports/:id/download` downloads the existing snapshot as JSON or UTF-8 BOM CSV only.
+- Formal export snapshots include content hash metadata for JSON/CSV reconciliation.
 - It is derived from invoice, payment evidence, and reconciliation data.
 - It is not the primary operational ledger.
 - Provider raw statuses must be canonicalized before export.

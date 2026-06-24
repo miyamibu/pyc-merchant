@@ -1,10 +1,10 @@
-FROM node:20-bookworm-slim AS deps
+FROM node@sha256:032e78d7e54e352129831743737e3a83171d9cc5b5896f411649c597ce0b11ea AS deps
 
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-FROM node:20-bookworm-slim AS runtime
+FROM node@sha256:032e78d7e54e352129831743737e3a83171d9cc5b5896f411649c597ce0b11ea AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app

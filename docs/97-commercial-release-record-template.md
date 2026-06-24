@@ -14,7 +14,7 @@
 - external evidence 未完了を pass と記載しない。
 
 ## Runtime snapshot
-- Node baseline: `20.x`
+- Node baseline: `24.17.0`
 - `.env.production` revision:
 - `/readyz` snapshot ref:
 - `commercial-go-validation.json` ref:

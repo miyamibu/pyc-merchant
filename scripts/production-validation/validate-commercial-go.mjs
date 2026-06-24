@@ -182,6 +182,56 @@ function runAuditChainVerification(env) {
   };
 }
 
+function validateReleaseId(value) {
+  const raw = String(value || "").trim();
+  return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(raw)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
+}
+
+function loadReleaseManifest(manifestPath) {
+  if (!manifestPath) return { ok: false, path: null, blockers: ["missing_release_manifest"] };
+  const resolved = path.resolve(process.cwd(), manifestPath);
+  if (!fs.existsSync(resolved)) return { ok: false, path: resolved, blockers: ["missing_release_manifest"] };
+
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(resolved, "utf8"));
+  } catch (_error) {
+    return { ok: false, path: resolved, blockers: ["invalid_release_manifest_json"] };
+  }
+
+  const required = [
+    "release_id",
+    "mode",
+    "commit",
+    "source_hash",
+    "lockfile_hash",
+    "migration_hash",
+    "runtime",
+    "base_image_digest",
+    "app_image_digest",
+    "env_hash",
+    "db_snapshot_hash",
+    "backup_hash",
+    "audit_root",
+    "issued_at",
+    "expires_at",
+    "revocation_status",
+    "signatures",
+  ];
+  const blockers = [];
+  for (const key of required) {
+    if (manifest[key] == null || manifest[key] === "" || String(manifest[key]).toLowerCase() === "null") {
+      blockers.push(`manifest_missing_${key}`);
+    }
+  }
+  if (String(manifest.app_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_app_image_digest_null");
+  if (String(manifest.base_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_base_image_digest_null");
+  if (!Array.isArray(manifest.signatures) || manifest.signatures.length === 0) blockers.push("manifest_missing_signatures");
+  if (String(manifest.revocation_status || "").trim().toLowerCase() !== "valid") blockers.push("manifest_revocation_not_valid");
+  return { ok: blockers.length === 0, path: resolved, manifest, blockers };
+}
+
 function evaluateDangerousFlags(env) {
   const blockers = [];
   const simulation = boolFlag(env.ENABLE_PUBLIC_PAYMENT_SIMULATION, false);
@@ -233,6 +283,12 @@ function evaluateDangerousFlags(env) {
 function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const appEnv = String(env.APP_ENV || env.NODE_ENV || "development").trim().toLowerCase();
   const commercialMode = boolFlag(env.COMMERCIAL_GO_MODE, appEnv === "production");
+  const releaseMode = String(env.RELEASE_MODE || env.COMMERCIAL_RELEASE_MODE || (commercialMode ? "commercial" : "development")).trim().toLowerCase();
+  const releaseId = String(env.RELEASE_ID || "").trim();
+  const evidenceDir = String(env.COMMERCIAL_EVIDENCE_DIR || "").trim();
+  const manifestPath = String(env.RELEASE_MANIFEST || "").trim();
+  const releaseManifest = loadReleaseManifest(manifestPath);
+  const explicitReleaseSelectionGate = validateReleaseId(releaseId) && Boolean(evidenceDir) && Boolean(manifestPath);
   const chainId = String(env.CHAIN_ID || "").trim();
   const tokenContract = String(env.TOKEN_CONTRACT || "").trim().toLowerCase();
   const approvedTokenContract = String(env.APPROVED_JPYC_TOKEN_CONTRACT || "").trim().toLowerCase();
@@ -275,7 +331,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const policyUrls = evaluatePolicyUrls({ sourcePath: policyUrlSource || env.POLICY_URL_SOURCE || "public/mobile.js" });
   const dangerousFlags = evaluateDangerousFlags(env);
   const auditChain = runAuditChainVerification(env);
-  const evidence = validateCommercialEvidence({ evidenceRoot });
+  const evidence = validateCommercialEvidence({ evidenceRoot, evidenceDir: evidenceDir || null });
+  const signedConditionalWaiverRef = String(env.SIGNED_CONDITIONAL_GO_WAIVER_REF || "").trim();
 
   const gates = {
     production_env_gate: appEnv === "production",
@@ -292,6 +349,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     refund_policy_gate: refundPolicyGate,
     settlement_policy_gate: settlementPolicyGate,
     policy_urls_gate: policyUrls.ok,
+    explicit_release_selection_gate: explicitReleaseSelectionGate,
+    release_manifest_gate: releaseManifest.ok,
     wallet_evidence_gate: Boolean(evidence.ext?.EXT_002?.ok),
     real_payment_evidence_gate: Boolean(evidence.ext?.EXT_001?.ok),
     tls_evidence_gate: Boolean(evidence.ext?.EXT_003?.ok),
@@ -312,6 +371,10 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.audit_chain_gate) blockers.P0.push(`audit hash-chain verification failed: ${auditChain.message || auditChain.status}`);
   if (!gates.refund_policy_gate) blockers.P0.push("REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR must be true");
   if (!gates.settlement_policy_gate) blockers.P0.push("settlement_unresolved_review_policy must be block in commercial mode");
+  if (!gates.explicit_release_selection_gate) blockers.P0.push("release gate requires explicit --release-id, --evidence-dir, and --manifest");
+  if (!gates.release_manifest_gate) blockers.P0.push(...releaseManifest.blockers);
+  if (evidence.evidence_dir_selection !== "explicit") blockers.P0.push("latest evidence auto-selection is forbidden for real-money release gates");
+  if (signedConditionalWaiverRef) blockers.P0.push("real-money release mode forbids conditional waivers");
 
   if (!gates.production_env_gate) blockers.P1.push("APP_ENV is not production");
   if (!gates.commercial_go_mode_gate) blockers.P1.push("COMMERCIAL_GO_MODE is not enabled");
@@ -371,7 +434,12 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     generated_at: new Date().toISOString(),
     app_env: appEnv,
     commercial_go_mode: commercialMode,
+    release_mode: releaseMode,
+    release_id: releaseId || null,
+    release_manifest: releaseManifest.path,
     evidence_root: evidenceRoot,
+    evidence_dir: evidence.evidence_dir || null,
+    evidence_dir_selection: evidence.evidence_dir_selection,
     latest_evidence_dir: evidence.latest_evidence_dir || null,
     score,
     verdict,
@@ -382,6 +450,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     dangerous_flag_details: dangerousFlags.blockers,
     audit_chain: auditChain,
     policy_urls: policyUrls,
+    release_manifest_gate: releaseManifest,
     external_evidence: evidence.ext,
     poc_evidence: evidence.poc,
     ext_all_pass: evidence.ext_all_pass,
@@ -436,7 +505,13 @@ function renderSummaryMarkdown(report, paths) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const env = loadEnvMap(args.get("env-file") || null);
+  const loadedEnv = loadEnvMap(args.get("env-file") || null);
+  const env = {
+    ...loadedEnv,
+    RELEASE_ID: args.get("release-id") || loadedEnv.RELEASE_ID || "",
+    RELEASE_MANIFEST: args.get("manifest") || loadedEnv.RELEASE_MANIFEST || "",
+    COMMERCIAL_EVIDENCE_DIR: args.get("evidence-dir") || loadedEnv.COMMERCIAL_EVIDENCE_DIR || "",
+  };
   const evidenceRoot = path.resolve(process.cwd(), args.get("evidence-root") || env.COMMERCIAL_EVIDENCE_ROOT || DEFAULT_EVIDENCE_ROOT);
   const policyUrlSource = args.get("policy-url-source") || env.POLICY_URL_SOURCE || "public/mobile.js";
   const outDir = args.get("output-dir")

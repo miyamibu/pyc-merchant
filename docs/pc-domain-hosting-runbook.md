@@ -4,7 +4,7 @@
 `独自ドメインだけ課金` + `つけっぱなしPCをサーバ` + `HTTPSは無料` の前提で、`https://pay.miyamibu.xyz` を final public URL に固定したまま QR 先行の限定実証へ進める。
 
 ## Context
-- この repo は `Node 20 + SQLite + worker + SSE` 前提で、静的ホスティング向けではない。
+- この repo は `Node 24.17.0 + SQLite + worker + SSE` 前提で、静的ホスティング向けではない。
 - fixed QR は印刷物になるので、customer-facing URL は早めに固定する必要がある。
 - 取引の正本は常に `invoice` であり、fixed QR は入口だけである。
 - external account 操作は repo の外で行い、repo には手順・テンプレート・安全なローカル確認コマンドだけを置く。

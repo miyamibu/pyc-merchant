@@ -52,6 +52,7 @@ import {
   RECEIVABLE_STATUS_VALUES,
   buildDailyAccountingSummary,
 } from "./settlement-export.mjs";
+import { validateCommercialEvidence } from "../scripts/production-validation/validate-commercial-evidence.mjs";
 
 const CWD = process.cwd();
 const DEFAULTS = {
@@ -2099,6 +2100,60 @@ function buildSettlementExportCsv(rows) {
   return lines.join("\n");
 }
 
+const SETTLEMENT_EXPORT_SNAPSHOT_HEADERS = [
+  "export_run_id",
+  "export_version",
+  "business_date",
+  "store_id",
+  "terminal_id",
+  "operator_id",
+  "invoice_id",
+  "checkout_session_id",
+  "payment_session_id",
+  "rail_type",
+  "provider_code",
+  "invoice_amount_jpyc_base",
+  "invoice_status",
+  "accounting_status",
+  "cash_recognition_status",
+  "receivable_status",
+  "onchain_cash_amount_jpyc_base",
+  "provider_receivable_amount_jpyc_base",
+  "exception_amount_jpyc_base",
+  "refund_amount_jpyc_base",
+  "void_amount_jpyc_base",
+  "provider_payment_ref",
+  "provider_settlement_ref",
+  "onchain_transfer_ref",
+  "evidence_hash",
+  "payload_schema_version",
+  "export_excluded_private_data",
+  "created_at",
+];
+
+function buildSettlementExportSnapshotCsv(rows, { bom = false } = {}) {
+  const lines = [SETTLEMENT_EXPORT_SNAPSHOT_HEADERS.join(",")];
+  for (const row of rows) {
+    lines.push(SETTLEMENT_EXPORT_SNAPSHOT_HEADERS.map((header) => escapeCsvCell(row[header])).join(","));
+  }
+  const csv = lines.join("\n");
+  return bom ? `\uFEFF${csv}` : csv;
+}
+
+function buildSettlementExportSnapshotJsonPayload({ exportRow, metadata, rows }) {
+  return {
+    export_id: exportRow.id,
+    export_run_id: metadata?.export_run_id || null,
+    export_version: "v1",
+    business_date: exportRow.business_date,
+    format: exportRow.format,
+    generated_at: exportRow.generated_at,
+    output_path: exportRow.output_path,
+    metadata,
+    rows,
+  };
+}
+
 function invoiceNo() {
   const date = new Date();
   const y = String(date.getFullYear());
@@ -3200,53 +3255,72 @@ function detectLatestEvidenceDirectory(rootDir = COMMERCIAL_EVIDENCE_ROOT) {
   return candidates[0] || null;
 }
 
-function evaluateExternalEvidenceGates() {
-  const latest = detectLatestEvidenceDirectory();
-  if (!latest) {
-    return {
-      latest_dir: null,
-      wallet_evidence_gate: { ok: false, status: "missing", file: null },
-      real_payment_evidence_gate: { ok: false, status: "missing", file: null },
-      tls_evidence_gate: { ok: false, status: "missing", file: null },
-      store_ops_drill_gate: { ok: false, status: "missing", file: null },
-    };
+function isCommercialHttpsUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""));
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    if (!host || host === "localhost" || host.endsWith(".local") || host.endsWith(".example.com")) return false;
+    return true;
+  } catch {
+    return false;
   }
+}
 
-  function evaluateOne(candidates) {
-    const file = resolveEvidenceFilePath(latest.fullPath, candidates);
-    if (!file) return { ok: false, status: "missing", file: null };
-    const content = fs.readFileSync(file, "utf8");
-    const status = extractStatusFromMarkdown(content);
-    const kv = extractMarkdownKeyValues(content);
-    return {
-      ok: status === "pass",
-      status,
-      file,
-      fields: kv,
-    };
-  }
-
-  const realPayment = evaluateOne(["EXT-001-real-jpyc-payment.md"]);
-  const wallet = evaluateOne(["EXT-002-wallet-device-launch.md", "EXT-002-hashport-device-launch.md"]);
-  const tls = evaluateOne(["EXT-003-public-fqdn-tls.md"]);
-  const storeOps = evaluateOne(["EXT-004-store-ops-drill.md"]);
-
-  if (wallet.ok) {
-    const ios = parseEvidenceStatus(wallet.fields?.hashport_wallet_ios_status || wallet.fields?.hashport_ios_status || "");
-    const android = parseEvidenceStatus(wallet.fields?.hashport_wallet_android_status || wallet.fields?.hashport_android_status || "");
-    const copyFallback = parseEvidenceStatus(wallet.fields?.copy_fallback_status || "");
-    if ((ios && ios !== "pass") || (android && android !== "pass") || (copyFallback && copyFallback !== "pass")) {
-      wallet.ok = false;
-      wallet.status = "fail";
+function evaluatePolicyUrlsGate({ sourcePath = path.join(CWD, "public/mobile.js") } = {}) {
+  const requiredKeys = ["terms", "privacy", "refund"];
+  try {
+    const content = fs.readFileSync(sourcePath, "utf8");
+    const values = {};
+    for (const key of requiredKeys) {
+      const match = content.match(new RegExp(`${key}\\s*:\\s*["'\`]([^"'\`]+)["'\`]`));
+      values[key] = match?.[1] || "";
     }
+    const missing_keys = requiredKeys.filter((key) => !isCommercialHttpsUrl(values[key]));
+    return {
+      ok: missing_keys.length === 0,
+      source_path: sourcePath,
+      values,
+      missing_keys,
+      errors: missing_keys.map((key) => `POLICY_URLS.${key} must be a production https URL`),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      source_path: sourcePath,
+      values: {},
+      missing_keys: requiredKeys,
+      errors: [error?.message || "policy url source could not be read"],
+    };
   }
+}
+
+function evaluateExternalEvidenceGates() {
+  const report = validateCommercialEvidence({ evidenceRoot: COMMERCIAL_EVIDENCE_ROOT });
+  const ext = report.ext || {};
+  const poc = report.poc || {};
+  const empty = (key) => ({
+    ok: false,
+    status: "missing",
+    file: null,
+    errors: [`${key} evidence is missing`],
+  });
+  const pocItems = Object.entries(poc);
+  const pocErrors = pocItems.flatMap(([key, item]) => (item?.ok ? [] : [`${key}: ${(item?.errors || ["missing"]).join("; ")}`]));
 
   return {
-    latest_dir: latest.fullPath,
-    wallet_evidence_gate: wallet,
-    real_payment_evidence_gate: realPayment,
-    tls_evidence_gate: tls,
-    store_ops_drill_gate: storeOps,
+    latest_dir: report.latest_evidence_dir || null,
+    wallet_evidence_gate: ext.EXT_002 || empty("EXT-002"),
+    real_payment_evidence_gate: ext.EXT_001 || empty("EXT-001"),
+    tls_evidence_gate: ext.EXT_003 || empty("EXT-003"),
+    store_ops_drill_gate: ext.EXT_004 || empty("EXT-004"),
+    poc_package_gate: {
+      ok: Boolean(report.poc_all_pass),
+      status: report.poc_all_pass ? "pass" : "fail",
+      items: poc,
+      errors: pocErrors,
+    },
+    strict_report: report,
   };
 }
 
@@ -3282,6 +3356,7 @@ function evaluateDangerousFlagsGate() {
 function evaluateCommercialRuntimeGate(metrics = null) {
   const runtimeMetrics = metrics || collectRuntimeMetrics();
   const externalEvidence = evaluateExternalEvidenceGates();
+  const policyUrlsGate = evaluatePolicyUrlsGate();
   const dangerousFlagsGate = evaluateDangerousFlagsGate();
   const settlementPolicy = resolveSettlementUnresolvedReviewPolicy(null);
   const auditChainOk = Boolean(runtimeMetrics.audit_chain?.ok);
@@ -3304,10 +3379,12 @@ function evaluateCommercialRuntimeGate(metrics = null) {
       !isPlaceholderLike(CONFIRMATIONS_POLICY_APPROVAL_REF)
       && REQUIRED_CONFIRMATIONS >= MIN_REQUIRED_CONFIRMATIONS,
     backscan_policy_gate: !isPlaceholderLike(BACKSCAN_POLICY_APPROVAL_REF) && MONITOR_BACKSCAN_BLOCKS >= MIN_MONITOR_BACKSCAN_BLOCKS,
+    policy_urls_gate: policyUrlsGate.ok,
     wallet_evidence_gate: externalEvidence.wallet_evidence_gate.ok,
     real_payment_evidence_gate: externalEvidence.real_payment_evidence_gate.ok,
     tls_evidence_gate: externalEvidence.tls_evidence_gate.ok,
     store_ops_drill_gate: externalEvidence.store_ops_drill_gate.ok,
+    poc_package_gate: externalEvidence.poc_package_gate.ok,
     audit_chain_gate: auditChainOk,
     settlement_policy_gate: settlementPolicy === "block",
     refund_policy_gate: REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR,
@@ -3327,15 +3404,17 @@ function evaluateCommercialRuntimeGate(metrics = null) {
   if (!gates.refund_policy_gate) blockers.push("refund_policy_gate");
   if (!gates.dangerous_flags_gate) blockers.push("dangerous_flags_gate");
   if (gates.commercial_go_mode) {
+    if (!gates.policy_urls_gate) blockers.push("policy_urls_gate");
     if (!gates.wallet_evidence_gate) blockers.push("wallet_evidence_gate");
     if (!gates.real_payment_evidence_gate) blockers.push("real_payment_evidence_gate");
     if (!gates.tls_evidence_gate) blockers.push("tls_evidence_gate");
     if (!gates.store_ops_drill_gate) blockers.push("store_ops_drill_gate");
+    if (!gates.poc_package_gate) blockers.push("poc_package_gate");
   }
 
   let commercialVerdict = "LIMITED_PILOT_MODE";
   if (gates.commercial_go_mode) {
-    commercialVerdict = blockers.length === 0 ? "COMMERCIAL_GO" : "CONDITIONAL_NO_GO_FOR_COMMERCIAL";
+    commercialVerdict = blockers.length === 0 ? "COMMERCIAL_GO_10" : "CONDITIONAL_NO_GO_FOR_COMMERCIAL";
   } else if (blockers.length === 0) {
     commercialVerdict = "READY_FOR_LIMITED_PILOT";
   } else {
@@ -3348,6 +3427,7 @@ function evaluateCommercialRuntimeGate(metrics = null) {
     commercial_verdict: commercialVerdict,
     blockers: [...new Set(blockers)],
     dangerous_flag_details: dangerousFlagsGate.blockers,
+    policy_urls: policyUrlsGate,
     external_evidence: externalEvidence,
   };
 }
@@ -3364,6 +3444,8 @@ function getCommercialGateBlockedError() {
       blockers: gate.blockers,
       payments_disabled: gate.payments_disabled,
       evidence_dir: gate.external_evidence?.latest_dir || null,
+      policy_urls: gate.policy_urls || null,
+      poc_evidence: gate.external_evidence?.poc_package_gate || null,
     },
   };
 }
@@ -6066,6 +6148,10 @@ app.use((req, res, next) => {
 app.use("/public", express.static(path.join(CWD, "public")));
 app.use(express.static(path.join(CWD, "public")));
 
+app.get("/favicon.ico", (_req, res) => {
+  res.status(204).end();
+});
+
 app.get("/prototype.html", (_req, res) => {
   res.sendFile(path.join(CWD, "index.html"));
 });
@@ -6245,10 +6331,12 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     jpyc_contract_gate: commercial.jpyc_contract_gate,
     confirmation_policy_gate: commercial.confirmation_policy_gate,
     backscan_policy_gate: commercial.backscan_policy_gate,
+    policy_urls_gate: commercial.policy_urls_gate,
     wallet_evidence_gate: commercial.wallet_evidence_gate,
     real_payment_evidence_gate: commercial.real_payment_evidence_gate,
     tls_evidence_gate: commercial.tls_evidence_gate,
     store_ops_drill_gate: commercial.store_ops_drill_gate,
+    poc_package_gate: commercial.poc_package_gate,
     audit_chain_gate: commercial.audit_chain_gate,
     settlement_policy_gate: commercial.settlement_policy_gate,
     refund_policy_gate: commercial.refund_policy_gate,
@@ -6256,6 +6344,7 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     commercial_verdict: commercial.commercial_verdict,
     blockers: commercial.blockers,
     checks: metrics,
+    policy_urls: commercial.policy_urls,
     external_evidence: commercial.external_evidence,
     approvals: {
       legal_gate_approved: LEGAL_GATE_APPROVED,
@@ -8926,52 +9015,17 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
     refund_requested_count: rows.filter((row) => String(row.refund_status) === "requested").length,
     refund_completed_count: rows.filter((row) => String(row.refund_status) === "succeeded").length,
   };
-  const snapshot = db.transaction(() =>
-    createSettlementExportSnapshot({
-      businessDate,
-      store,
-      terminalId: null,
-      actorId: req.session.staff_user_id,
-      requestId: requestIdFromReq(req),
-      idempotencyKey: null,
-      ip: req.ip,
-      range,
-    })
-  )();
-
-  const exportId = uuid();
-  const generatedAt = nowIso();
-  const exportPath = `api://settlements/${businessDate}/${exportId}.${format}`;
-  db.prepare(
-    `INSERT INTO settlement_exports
-     (id, merchant_id, store_id, business_date, format, output_path, generated_by, generated_at, metadata_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    exportId,
-    store.merchant_id || "merchant-001",
-    store.id,
-    businessDate,
-    format,
-    exportPath,
-    req.session.staff_user_id,
-    generatedAt,
-    JSON.stringify({ totals, timezone: store.timezone, period_start_utc: range.fromUtc, period_end_utc: range.toUtc })
-  );
-
   if (format === "csv") {
     res.setHeader("content-type", "text/csv; charset=utf-8");
     return res.send(buildSettlementExportCsv(rows));
   }
 
   return res.json({
-    export_id: exportId,
-    export_run_id: snapshot.exportRunId,
     business_date: businessDate,
     timezone: store.timezone || "Asia/Tokyo",
     period_start_utc: range.fromUtc,
     period_end_utc: range.toUtc,
     totals,
-    accounting_summary: snapshot.accountingSummary,
     rows: rows.map((row) => ({
       ...row,
       reason_code: normalizeReviewReasonCode(row.reason_code || REVIEW_REASON_CODES.OTHER),
@@ -9046,32 +9100,6 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
     refund_completed_count: rows.filter((row) => String(row.refund_status) === "succeeded").length,
   };
 
-  const exportId = uuid();
-  const generatedAt = nowIso();
-  const exportPath = `api://settlements/monthly/${yearMonth}/${exportId}.${format}`;
-  db.prepare(
-    `INSERT INTO settlement_exports
-     (id, merchant_id, store_id, business_date, format, output_path, generated_by, generated_at, metadata_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    exportId,
-    store.merchant_id || "merchant-001",
-    store.id,
-    `${yearMonth}-01`,
-    format,
-    exportPath,
-    req.session.staff_user_id,
-    generatedAt,
-    JSON.stringify({
-      export_scope: "monthly",
-      year_month: yearMonth,
-      totals,
-      timezone,
-      period_start_utc: range.fromUtc,
-      period_end_utc: range.toUtc,
-    })
-  );
-
   if (format === "csv") {
     res.setHeader("content-type", "text/csv; charset=utf-8");
     res.setHeader("content-disposition", `attachment; filename="settlement-monthly-${yearMonth}.csv"`);
@@ -9079,7 +9107,6 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
   }
 
   return res.json({
-    export_id: exportId,
     year_month: yearMonth,
     timezone,
     period_start_utc: range.fromUtc,
@@ -9090,6 +9117,159 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
       reason_code: normalizeReviewReasonCode(row.reason_code || REVIEW_REASON_CODES.OTHER),
       reason_label: reasonCodeLabelJa(row.reason_code || REVIEW_REASON_CODES.OTHER),
     })),
+  });
+});
+
+app.post("/api/v1/settlement-exports", requirePermission("settlement.export"), (req, res) => {
+  const actorId = req.session.staff_user_id;
+  return idempotent(req, res, "POST:/api/v1/settlement-exports", actorId, () => {
+    const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(req.session.store_id);
+    if (!store) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Store not found" } } };
+
+    const defaultDate = DateTime.now().setZone(store.timezone || "Asia/Tokyo").toISODate();
+    const businessDate = String(req.body?.business_date || defaultDate || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) {
+      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "business_date must be YYYY-MM-DD" } } };
+    }
+    const format = String(req.body?.format || "json").trim().toLowerCase();
+    if (!["json", "csv"].includes(format)) {
+      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "format must be json or csv" } } };
+    }
+    const range = utcRangeForBusinessDate(businessDate, store.timezone || "Asia/Tokyo");
+    if (range.error) {
+      return {
+        status: 400,
+        body: { error: { code: "VALIDATION_ERROR", message: "Invalid business_date for timezone", details: range.details || {} } },
+      };
+    }
+
+    const result = db.transaction(() => {
+      const snapshot = createSettlementExportSnapshot({
+        businessDate,
+        store,
+        terminalId: null,
+        actorId,
+        requestId: requestIdFromReq(req),
+        idempotencyKey: req.header("Idempotency-Key"),
+        ip: req.ip,
+        range,
+      });
+      const exportId = uuid();
+      const generatedAt = nowIso();
+      const exportPath = `api://settlement-exports/${exportId}.${format}`;
+      const exportRowForPayload = {
+        id: exportId,
+        business_date: businessDate,
+        format,
+        generated_at: generatedAt,
+        output_path: exportPath,
+      };
+      const metadata = {
+        export_run_id: snapshot.exportRunId,
+        export_version: "v1",
+        export_scope: "daily",
+        totals: buildDailyAccountingSummary(snapshot.rows),
+        timezone: store.timezone || "Asia/Tokyo",
+        period_start_utc: range.fromUtc,
+        period_end_utc: range.toUtc,
+        row_count: snapshot.rows.length,
+      };
+      const jsonPayload = buildSettlementExportSnapshotJsonPayload({
+        exportRow: exportRowForPayload,
+        metadata,
+        rows: snapshot.rows,
+      });
+      const csvPayload = buildSettlementExportSnapshotCsv(snapshot.rows, { bom: true });
+      metadata.content_hashes = {
+        json: sha256(JSON.stringify(jsonPayload)),
+        csv: sha256(csvPayload),
+      };
+      metadata.content_hash = metadata.content_hashes[format];
+      db.prepare(
+        `INSERT INTO settlement_exports
+         (id, merchant_id, store_id, business_date, format, output_path, generated_by, generated_at, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        exportId,
+        store.merchant_id || "merchant-001",
+        store.id,
+        businessDate,
+        format,
+        exportPath,
+        actorId,
+        generatedAt,
+        JSON.stringify(metadata)
+      );
+      return {
+        status: 201,
+        body: {
+          export_id: exportId,
+          export_run_id: snapshot.exportRunId,
+          business_date: businessDate,
+          format,
+          generated_at: generatedAt,
+          output_path: exportPath,
+          accounting_summary: metadata.totals,
+          row_count: snapshot.rows.length,
+          content_hash: metadata.content_hash,
+          content_hashes: metadata.content_hashes,
+        },
+      };
+    })();
+
+    return result;
+  });
+});
+
+app.get("/api/v1/settlement-exports/:id", requirePermission("settlement.export"), (req, res) => {
+  const exportRow = db
+    .prepare(`SELECT * FROM settlement_exports WHERE id = ? AND store_id = ?`)
+    .get(String(req.params.id || ""), req.session.store_id);
+  if (!exportRow) return jsonError(res, 404, "NOT_FOUND", "Settlement export not found");
+  const metadata = parseJsonWithWarning(exportRow.metadata_json, "settlement_exports.metadata_json", {});
+  const exportRunId = metadata?.export_run_id || null;
+  const rows = exportRunId
+    ? db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId)
+    : [];
+  return res.json({
+    export_id: exportRow.id,
+    export_run_id: exportRunId,
+    business_date: exportRow.business_date,
+    format: exportRow.format,
+    generated_at: exportRow.generated_at,
+    output_path: exportRow.output_path,
+    content_hash: metadata?.content_hash || null,
+    content_hashes: metadata?.content_hashes || null,
+    metadata,
+    rows,
+  });
+});
+
+app.get("/api/v1/settlement-exports/:id/download", requirePermission("settlement.export"), (req, res) => {
+  const exportRow = db
+    .prepare(`SELECT * FROM settlement_exports WHERE id = ? AND store_id = ?`)
+    .get(String(req.params.id || ""), req.session.store_id);
+  if (!exportRow) return jsonError(res, 404, "NOT_FOUND", "Settlement export not found");
+  const metadata = parseJsonWithWarning(exportRow.metadata_json, "settlement_exports.metadata_json", {});
+  const exportRunId = metadata?.export_run_id || null;
+  const rows = exportRunId
+    ? db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId)
+    : [];
+  const format = String(req.query.format || exportRow.format || "json").trim().toLowerCase();
+  if (!["json", "csv"].includes(format)) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "format must be json or csv");
+  }
+  const filename = `settlement-export-${exportRow.business_date}-${exportRow.id}.${format}`;
+  res.setHeader("content-disposition", `attachment; filename="${filename}"`);
+  if (format === "csv") {
+    res.setHeader("content-type", "text/csv; charset=utf-8");
+    return res.send(buildSettlementExportSnapshotCsv(rows, { bom: true }));
+  }
+  const payload = buildSettlementExportSnapshotJsonPayload({ exportRow, metadata, rows });
+  return res.json({
+    ...payload,
+    content_hash: metadata?.content_hashes?.json || metadata?.content_hash || null,
+    content_hashes: metadata?.content_hashes || null,
   });
 });
 
