@@ -3,13 +3,23 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import net from "node:net";
 import Database from "better-sqlite3";
 import { pathToFileURL } from "node:url";
 
 const ROOT = process.cwd();
 
-function randomPort() {
-  return 52000 + Math.floor(Math.random() * 5000);
+async function getAvailablePort() {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => resolve(port));
+    });
+  });
 }
 
 function withEnv(overrides, fn) {
@@ -30,16 +40,18 @@ function withEnv(overrides, fn) {
 
 async function waitForHealth(baseUrl, timeoutMs = 12000) {
   const start = Date.now();
+  let lastError = null;
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await fetch(`${baseUrl}/healthz`);
       if (res.ok) return;
+      lastError = `status ${res.status}`;
     } catch (_error) {
-      // retry
+      lastError = _error?.message || String(_error);
     }
     await new Promise((resolve) => setTimeout(resolve, 120));
   }
-  throw new Error("server health check timeout");
+  throw new Error(`server health check timeout for ${baseUrl}; last_error=${lastError || "none"}`);
 }
 
 async function request(baseUrl, pathName, options = {}) {
@@ -55,7 +67,7 @@ async function request(baseUrl, pathName, options = {}) {
 }
 
 test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", async () => {
-  const port = randomPort();
+  const port = await getAvailablePort();
   const tmp = mkdtempSync(path.join(tmpdir(), "jpyc-sweep-test-"));
   const dbPath = path.join(tmp, "app.db");
   const env = {

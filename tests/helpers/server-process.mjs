@@ -1,10 +1,14 @@
 import { mkdtempSync } from "node:fs";
+import { randomInt } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
+let portCounter = 0;
+
 function randomPort() {
-  return 43000 + Math.floor(Math.random() * 10000);
+  portCounter = (portCounter + 1) % 50_000;
+  return 10_000 + ((process.pid * 997 + portCounter * 131 + randomInt(0, 50_000)) % 50_000);
 }
 
 export function baseServerEnv(overrides = {}) {
