@@ -1,0 +1,21 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "status": "PASS_LOCAL_GUARDRAIL_WITH_COMMERCIAL_BLOCKERS",
+  "evidence": [
+    "docs/21-chain-and-token-spec.md",
+    "README.md",
+    "src/server.mjs",
+    "tests/manual-refund-controller.test.mjs",
+    "scripts/production-validation/validate-commercial-go.mjs"
+  ],
+  "findings": [
+    "Current docs and validators require non-custodial operation and prohibit private-key custody/server-side signing.",
+    "Commercial validation blocks mock wallet adapter and weak/default secrets.",
+    "No production wallet signing, real transfer, or production secret operation was executed in this run."
+  ],
+  "limitations": [
+    "This is a source/test/validator review plus local execution; it is not a public production runtime attestation.",
+    "Real JPYC transfer and real HashPort Wallet device proof remain absent."
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "immutable_external_evidence_modified": false,
+  "run_local_evidence": [
+    {
+      "id": "commercial-validation",
+      "path": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/commercial-validate/20260625T000548Z/commercial-go-validation.json",
+      "status": "NO_GO",
+      "sha256": "6f44874587c52696a17b65332d6051679121146cec9a6d97eb8381ccc57a78cf"
+    },
+    {
+      "id": "production-validation",
+      "path": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/production-validate/20260625T000549Z/SUMMARY.md",
+      "status": "PASS_LOCAL_ONLY"
+    },
+    {
+      "id": "story-ui-retest",
+      "path": "output/playwright/story-ui-retest-20260625T000539Z/manifest.json",
+      "status": "PASS_LOCAL_ONLY",
+      "stories_covered": 20
+    },
+    {
+      "id": "story-api-retest",
+      "path": "output/story-api-retest/20260625T000546Z/manifest.json",
+      "status": "PASS_LOCAL_ONLY",
+      "stories_covered": 30
+    },
+    {
+      "id": "canonical-workbook",
+      "path": "artifacts/story-tracker/jpyc-feature-story-status.xlsx",
+      "status": "SCHEMA_VALIDATED_CURRENT_CONTENT_NOT_UPDATED_WITH_SIDE_RUN",
+      "sha256": "431b89669f67b9c07f2f6fdc798494f828a894b7617eb2909ecdf387676b95b1"
+    }
+  ],
+  "external_evidence_status": {
+    "EXT_001": {
+      "file": null,
+      "status": "missing",
+      "ok": false,
+      "errors": [
+        "missing_file",
+        "status_missing",
+        "missing_actual_tx_hash",
+        "missing_tx_hash",
+        "missing_invoice_id",
+        "missing_amount",
+        "missing_expected_amount_atomic",
+        "missing_block_number",
+        "missing_block_timestamp",
+        "missing_detected_at",
+        "missing_status_transition",
+        "missing_tester"
+      ]
+    },
+    "EXT_002": {
+      "file": null,
+      "status": "missing",
+      "ok": false,
+      "errors": [
+        "missing_file",
+        "status_missing",
+        "ios_missing",
+        "android_missing",
+        "copy_fallback_missing",
+        "missing_screenshot_ref",
+        "missing_tester",
+        "missing_checked_at"
+      ]
+    },
+    "EXT_003": {
+      "file": "/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/production/evidence/20260619T061150Z/EXT-003-public-fqdn-tls.md",
+      "status": "pending",
+      "ok": false,
+      "errors": [
+        "status_pending",
+        "missing_tls_issuer",
+        "missing_tls_expiry"
+      ]
+    },
+    "EXT_004": {
+      "file": null,
+      "status": "missing",
+      "ok": false,
+      "errors": [
+        "missing_file",
+        "status_missing",
+        "missing_participant",
+        "missing_scenario",
+        "missing_invoice_issue_time",
+        "missing_qr_display_time",
+        "missing_review_handling",
+        "missing_refund_evidence_handling",
+        "missing_daily_close",
+        "missing_incident_escalation",
+        "missing_self_resolution_result",
+        "missing_operator_signature"
+      ]
+    },
+    "POC_001": {
+      "status": "missing"
+    },
+    "POC_002": {
+      "status": "missing"
+    },
+    "POC_003": {
+      "status": "missing"
+    }
+  }
+}

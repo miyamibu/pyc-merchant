@@ -1,0 +1,54 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "status": "NO_ID_DRIFT_DETECTED_WITH_NOTED_ALIAS",
+  "external_evidence_ids": {
+    "EXT-001": {
+      "name": "real JPYC payment",
+      "canonical_template": "docs/production/evidence/templates/EXT-001-real-jpyc-payment.md",
+      "current_status": "missing"
+    },
+    "EXT-002": {
+      "name": "wallet device launch",
+      "canonical_template": "docs/production/evidence/templates/EXT-002-wallet-device-launch.md",
+      "aliases": [
+        "EXT-002-hashport-device-launch.md"
+      ],
+      "current_status": "missing"
+    },
+    "EXT-003": {
+      "name": "public FQDN TLS",
+      "canonical_template": "docs/production/evidence/templates/EXT-003-public-fqdn-tls.md",
+      "current_status": "pending"
+    },
+    "EXT-004": {
+      "name": "store ops drill",
+      "canonical_template": "docs/production/evidence/templates/EXT-004-store-ops-drill.md",
+      "current_status": "missing"
+    }
+  },
+  "poc_ids": {
+    "POC-001": {
+      "name": "store operator KPI",
+      "template": "docs/production/evidence/templates/POC-001-template.md",
+      "current_status": "missing"
+    },
+    "POC-002": {
+      "name": "accounting/reconciliation KPI",
+      "template": "docs/production/evidence/templates/POC-002-template.md",
+      "current_status": "missing"
+    },
+    "POC-003": {
+      "name": "support/refund KPI",
+      "template": "docs/production/evidence/templates/POC-003-template.md",
+      "current_status": "missing"
+    }
+  },
+  "machine_verdict_enum": [
+    "NO_GO",
+    "COMMERCIAL_GO_10",
+    "COMMERCIAL_GO",
+    "CONDITIONAL_NO_GO_FOR_COMMERCIAL",
+    "READY_FOR_LIMITED_PILOT"
+  ]
+}

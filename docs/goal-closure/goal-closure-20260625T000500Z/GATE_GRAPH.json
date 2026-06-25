@@ -1,0 +1,107 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "nodes": [
+    {
+      "id": "workspace_protection",
+      "status": "PASS_WITH_DIRTY_TREE",
+      "evidence": "git status showed existing modified/untracked files; no reset/clean performed"
+    },
+    {
+      "id": "contract_discovery",
+      "status": "BLOCKED_RELEASE_PROFILE_AMBIGUITY",
+      "evidence": "CONTRACT_SNAPSHOT.json"
+    },
+    {
+      "id": "local_quality",
+      "status": "PASS",
+      "commands": [
+        "npm run check",
+        "npm test",
+        "npm run test:smoke",
+        "npm run test:audit-chain",
+        "npm run deploy:check",
+        "npm audit --audit-level=high"
+      ]
+    },
+    {
+      "id": "story_retest",
+      "status": "PASS_LOCAL_ONLY",
+      "evidence": [
+        "output/playwright/story-ui-retest-20260625T000539Z/manifest.json",
+        "output/story-api-retest/20260625T000546Z/manifest.json"
+      ]
+    },
+    {
+      "id": "production_validation_pack",
+      "status": "PASS_LOCAL_ONLY",
+      "evidence": [
+        "artifacts/work/goal-closure/goal-closure-20260625T000500Z/production-validate/20260625T000549Z/SUMMARY.md",
+        "artifacts/work/goal-closure/goal-closure-20260625T000500Z/production-validate/20260625T000549Z/validate-production-config.json"
+      ],
+      "limitations": [
+        "not real payment",
+        "not real wallet device launch",
+        "not public TLS proof"
+      ]
+    },
+    {
+      "id": "commercial_validate",
+      "status": "NO_GO",
+      "evidence": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/commercial-validate/20260625T000548Z/commercial-go-validation.json"
+    },
+    {
+      "id": "commercial_gate",
+      "status": "FAIL_CLOSED",
+      "exit_code": 10
+    },
+    {
+      "id": "limited_gate",
+      "status": "FAIL_CLOSED",
+      "exit_code": 10
+    },
+    {
+      "id": "signed_release_decision",
+      "status": "PENDING_HUMAN_OWNER",
+      "evidence": "HUMAN_INPUTS_REQUIRED.md"
+    }
+  ],
+  "edges": [
+    [
+      "workspace_protection",
+      "contract_discovery"
+    ],
+    [
+      "contract_discovery",
+      "local_quality"
+    ],
+    [
+      "local_quality",
+      "story_retest"
+    ],
+    [
+      "local_quality",
+      "production_validation_pack"
+    ],
+    [
+      "production_validation_pack",
+      "commercial_validate"
+    ],
+    [
+      "commercial_validate",
+      "commercial_gate"
+    ],
+    [
+      "commercial_validate",
+      "limited_gate"
+    ],
+    [
+      "commercial_gate",
+      "signed_release_decision"
+    ],
+    [
+      "limited_gate",
+      "signed_release_decision"
+    ]
+  ]
+}

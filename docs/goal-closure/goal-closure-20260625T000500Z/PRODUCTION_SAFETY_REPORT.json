@@ -1,0 +1,142 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "status": "LOCAL_VALIDATION_PASS_COMMERCIAL_NO_GO",
+  "local_validation": {
+    "production_validate_status": "PASS_LOCAL_ONLY",
+    "production_validate_root": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/production-validate/20260625T000549Z",
+    "production_config_status": "ok",
+    "wallet_launch_status": "pass",
+    "smoke_payment_flow_status": "pass"
+  },
+  "commercial_validation": {
+    "verdict": "NO_GO",
+    "score": 1,
+    "p0_blockers": 16,
+    "p1_blockers": 7,
+    "p2_blockers": 1,
+    "blocker_summary": [
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "missing legal approval gate/reference"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "missing AML approval gate/reference"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "missing privacy approval gate/reference"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "missing APPI approval gate/reference"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "JPYC contract gate failed (chain/contract/ref/decimals mismatch)"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "confirmation policy gate failed"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "backscan policy gate failed"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "WALLET_ADAPTER_TYPE=mock is not allowed"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "APP_SECRET is weak/default"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "SERVICE_INGEST_SECRET is weak/default"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "METRICS_SECRET is weak/default"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "CORS_ALLOW_ORIGINS must not be empty"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "settlement_unresolved_review_policy must be block in commercial mode"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "release gate requires explicit --release-id, --evidence-dir, and --manifest"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "missing_release_manifest"
+      },
+      {
+        "severity": "P0",
+        "code": "unknown",
+        "message": "latest evidence auto-selection is forbidden for real-money release gates"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "APP_ENV is not production"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "COMMERCIAL_GO_MODE is not enabled"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "customer policy URLs are not fully configured with public HTTPS URLs"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "EXT-002 wallet/device evidence is not pass"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "EXT-001 real JPYC evidence is not pass"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "EXT-003 TLS evidence is not pass"
+      },
+      {
+        "severity": "P1",
+        "code": "unknown",
+        "message": "EXT-004 non-crypto staff drill is not pass"
+      },
+      {
+        "severity": "P2",
+        "code": "unknown",
+        "message": "POC-001..003 KPI evidence not fully pass"
+      }
+    ]
+  },
+  "protected_data_touched": false
+}

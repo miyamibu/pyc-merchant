@@ -1,0 +1,127 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "command_log_root": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs",
+  "runs": [
+    {
+      "id": "npm-run-check",
+      "command": "npm run check",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:21Z",
+      "ended_at": "2026-06-25T00:05:22Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-check.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-check.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-test",
+      "command": "npm test",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:22Z",
+      "ended_at": "2026-06-25T00:05:35Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-test.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-test.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-test-smoke",
+      "command": "npm run test:smoke",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:35Z",
+      "ended_at": "2026-06-25T00:05:36Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-test-smoke.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-test-smoke.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-test-audit-chain",
+      "command": "npm run test:audit-chain",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:36Z",
+      "ended_at": "2026-06-25T00:05:37Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-test-audit-chain.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-test-audit-chain.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-deploy-check",
+      "command": "npm run deploy:check",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:37Z",
+      "ended_at": "2026-06-25T00:05:38Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-deploy-check.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-deploy-check.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-audit-high",
+      "command": "npm audit --audit-level=high",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:38Z",
+      "ended_at": "2026-06-25T00:05:38Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-audit-high.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-audit-high.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-story-tracker-verify",
+      "command": "npm run story:tracker:verify",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:38Z",
+      "ended_at": "2026-06-25T00:05:38Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-story-tracker-verify.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-story-tracker-verify.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-story-retest",
+      "command": "npm run story:retest",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:38Z",
+      "ended_at": "2026-06-25T00:05:48Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-story-retest.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-story-retest.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-commercial-validate-safe",
+      "command": "npm run commercial:validate:safe",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:48Z",
+      "ended_at": "2026-06-25T00:05:48Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-commercial-validate-safe.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-commercial-validate-safe.stderr.log",
+      "interpretation": "pass"
+    },
+    {
+      "id": "npm-run-commercial-gate",
+      "command": "npm run commercial:gate",
+      "exit_code": 10,
+      "started_at": "2026-06-25T00:05:48Z",
+      "ended_at": "2026-06-25T00:05:48Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-commercial-gate.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-commercial-gate.stderr.log",
+      "interpretation": "expected fail-closed for non-GO release state"
+    },
+    {
+      "id": "npm-run-limited-gate",
+      "command": "npm run limited:gate",
+      "exit_code": 10,
+      "started_at": "2026-06-25T00:05:48Z",
+      "ended_at": "2026-06-25T00:05:49Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-limited-gate.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-limited-gate.stderr.log",
+      "interpretation": "expected fail-closed for non-GO release state"
+    },
+    {
+      "id": "npm-run-production-validate",
+      "command": "PRODUCTION_EVIDENCE_ROOT=artifacts/work/goal-closure/... npm run production:validate",
+      "exit_code": 0,
+      "started_at": "2026-06-25T00:05:49Z",
+      "ended_at": "2026-06-25T00:07:17Z",
+      "stdout": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-production-validate.stdout.log",
+      "stderr": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/command-runs/npm-run-production-validate.stderr.log",
+      "interpretation": "pass"
+    }
+  ]
+}

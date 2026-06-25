@@ -1,0 +1,70 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "invalidation_rules": [
+    {
+      "evidence": "local validator results",
+      "invalidated_by": [
+        "source code change",
+        "package-lock change",
+        "Node/npm baseline mismatch not resolved",
+        "dirty worktree content change"
+      ]
+    },
+    {
+      "evidence": "story retest manifests",
+      "invalidated_by": [
+        "UI/API behavior change",
+        "test script change",
+        "server configuration change",
+        "new canonical workbook schema"
+      ]
+    },
+    {
+      "evidence": "EXT-001 real payment",
+      "invalidated_by": [
+        "non-real payment",
+        "missing chain hash",
+        "wrong token contract",
+        "unapproved contract",
+        "manual or fabricated transfer evidence"
+      ]
+    },
+    {
+      "evidence": "EXT-002 wallet/device launch",
+      "invalidated_by": [
+        "simulator-only proof",
+        "mock wallet adapter",
+        "missing device identity",
+        "missing wallet app proof"
+      ]
+    },
+    {
+      "evidence": "EXT-003 public TLS",
+      "invalidated_by": [
+        "non-public host",
+        "expired/untrusted TLS",
+        "missing issuer/expiry",
+        "local-only URL"
+      ]
+    },
+    {
+      "evidence": "EXT-004 staff drill",
+      "invalidated_by": [
+        "single-operator shortcut",
+        "missing timestamps",
+        "missing audit trail",
+        "unresolved review/refund evidence"
+      ]
+    },
+    {
+      "evidence": "approvals",
+      "invalidated_by": [
+        "unsigned approval",
+        "missing approver",
+        "approval reference not tied to release fingerprint",
+        "changed policy or asset identity after approval"
+      ]
+    }
+  ]
+}

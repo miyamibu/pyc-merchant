@@ -1,0 +1,44 @@
+{
+  "status": "DRAFT_NOT_SIGNED_NOT_RELEASEABLE",
+  "failure_handling": "Do not pass this file to a real-money release gate until all null, placeholder, draft, and unsigned fields are replaced with real approved values.",
+  "release_id": "01KVY31WWH28VKS1DN1QE3CZ7C",
+  "mode": "commercial",
+  "commit": "53d9bbb6c4ff0ccd0cb0b24b7580295070cca715",
+  "source_hash": "41f233b234b47ab08b6fd42fae53e775d5d3342452aa8b71a2ffe57d8b51e5cc",
+  "lockfile_hash": "08e910a2ea7175f997f33ad359e7c35f1ec61e7750ff131b4c9be5e04a3990d9",
+  "migration_hash": "ac2679f5524fab952cd2dd8d276d5b2f4e7fd0f4eb3a794de85859dd50450a3d",
+  "runtime": {
+    "required_node": "24.17.0",
+    "observed_local_node": "v25.8.1",
+    "observed_local_npm": "11.11.0"
+  },
+  "base_image_digest": null,
+  "app_image_digest": null,
+  "env_hash": null,
+  "db_snapshot_hash": null,
+  "backup_hash": null,
+  "audit_root": null,
+  "issued_at": "2026-06-25T00:30:00Z",
+  "expires_at": null,
+  "revocation_status": "draft",
+  "signatures": [],
+  "evidence": {
+    "commercial_validation": "artifacts/commercial-validate/20260625T002242Z/commercial-go-validation.json",
+    "story_ui_retest": "output/playwright/story-ui-retest-20260625T000539Z/manifest.json",
+    "story_api_retest": "output/story-api-retest/20260625T000546Z/manifest.json",
+    "canonical_workbook": "artifacts/story-tracker/jpyc-feature-story-status.xlsx",
+    "goal_closure_report": "docs/goal-closure/goal-closure-20260625T000500Z/FINAL_CLOSURE_REPORT.md"
+  },
+  "known_blockers": [
+    "signed release owner decision missing",
+    "base_image_digest missing",
+    "app_image_digest missing",
+    "env_hash missing",
+    "db_snapshot_hash missing",
+    "backup_hash missing",
+    "audit_root missing",
+    "revocation_status is draft, not valid",
+    "signatures empty",
+    "external EXT/POC evidence not pass"
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "status": "PENDING",
+  "approvals": [
+    {
+      "approval_name": "legal",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "AML",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "privacy",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "APPI",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "JPYC token contract",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "confirmation policy",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "backscan policy",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "policy URL content",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "asset identity",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    },
+    {
+      "approval_name": "release owner signoff",
+      "status": "PENDING",
+      "approver": null,
+      "approved_at": null,
+      "reference_id": null,
+      "evidence_path": null,
+      "signature": null,
+      "notes": "Current commercial validation blocks this approval or requires explicit owner input."
+    }
+  ]
+}

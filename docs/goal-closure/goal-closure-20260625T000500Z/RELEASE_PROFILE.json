@@ -1,0 +1,25 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "selected_profile": null,
+  "candidate_profiles": [
+    {
+      "id": "commercial",
+      "gate_command": "npm run commercial:gate",
+      "required_machine_verdict": "COMMERCIAL_GO_10",
+      "current_status": "FAIL_CLOSED"
+    },
+    {
+      "id": "limited",
+      "gate_command": "npm run limited:gate",
+      "required_machine_verdicts": [
+        "READY_FOR_LIMITED_PILOT",
+        "COMMERCIAL_GO",
+        "COMMERCIAL_GO_10"
+      ],
+      "current_status": "FAIL_CLOSED"
+    }
+  ],
+  "selection_status": "BLOCKED_RELEASE_PROFILE_AMBIGUITY",
+  "owner_input_required": "Select exactly one target profile and provide signed release decision metadata."
+}

@@ -1,0 +1,28 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "official_verdict": "NO_GO",
+  "official_verdict_basis": "artifacts/work/goal-closure/goal-closure-20260625T000500Z/commercial-validate/20260625T000548Z/commercial-go-validation.json",
+  "official_verdict_scope": "current machine verdict only; not a signed human release decision",
+  "technical_eligibility": "BLOCKED",
+  "signoff_status": "PENDING",
+  "commercial_gate": {
+    "status": "FAIL_CLOSED",
+    "exit_code": 10
+  },
+  "limited_gate": {
+    "status": "FAIL_CLOSED",
+    "exit_code": 10
+  },
+  "may_claim_commercial_go": false,
+  "may_claim_limited_go": false,
+  "may_deploy_or_release": false,
+  "required_next_inputs": [
+    "single target release profile",
+    "approval registry completed and signed",
+    "real EXT-001..004 evidence",
+    "paid POC-001..003 KPI evidence",
+    "production-safe config and public policy URLs",
+    "clean or explicitly approved release candidate snapshot"
+  ]
+}

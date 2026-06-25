@@ -1,0 +1,17 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "workbook_path": "artifacts/story-tracker/jpyc-feature-story-status.xlsx",
+  "changed_this_run": true,
+  "sha256_current": "431b89669f67b9c07f2f6fdc798494f828a894b7617eb2909ecdf387676b95b1",
+  "validation_command": "npm run story:tracker:verify",
+  "validation_status": "PASS",
+  "alignment_status": "UPDATED_AND_SCHEMA_VALID",
+  "backup_path": "artifacts/story-tracker/backups/jpyc-feature-story-status.before-goal-closure-20260625T000500Z.xlsx",
+  "update_method": "Targeted XML string replacement for existing evidence run identifiers only; workbook dimensions and layout were preserved.",
+  "side_run_evidence_reflected": [
+    "output/playwright/story-ui-retest-20260625T000539Z/manifest.json",
+    "output/story-api-retest/20260625T000546Z/manifest.json",
+    "artifacts/work/goal-closure/goal-closure-20260625T000500Z/commercial-validate/20260625T000548Z/commercial-go-validation.json"
+  ]
+}

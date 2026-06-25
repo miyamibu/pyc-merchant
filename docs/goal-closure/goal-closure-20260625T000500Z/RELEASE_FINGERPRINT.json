@@ -1,0 +1,45 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "status": "UNSIGNED_DIRTY_LOCAL_SNAPSHOT",
+  "git": {
+    "branch": "main",
+    "head_commit": "53d9bbb6c4ff0ccd0cb0b24b7580295070cca715",
+    "head_tree": "0ff1b3ba0fa8250d7e1e4f9b5dababc27d2d1af7",
+    "dirty_diff_sha256": "7ad8a18e1a4ec4d055b18ff7bb6a69bfe4b7b7de8b451fd0c098093eca6f1836",
+    "dirty_worktree": true
+  },
+  "runtime": {
+    "node": "v25.8.1",
+    "npm": "11.11.0",
+    "repo_baseline_in_readme": "Node.js 24.17.0"
+  },
+  "package": {
+    "package_json_sha256": "b14089355a45b8e7ff247e5f9ad2f75b6fd1532d65304133692aa0c4f5c5fe2c",
+    "package_lock_sha256": "08e910a2ea7175f997f33ad359e7c35f1ec61e7750ff131b4c9be5e04a3990d9"
+  },
+  "contract_hashes": {
+    "src/server.mjs": "41f233b234b47ab08b6fd42fae53e775d5d3342452aa8b71a2ffe57d8b51e5cc",
+    "docs/31-db-schema.md": "ac2679f5524fab952cd2dd8d276d5b2f4e7fd0f4eb3a794de85859dd50450a3d",
+    "docs/21-chain-and-token-spec.md": "adb31b0716b913271d76c7b7e9b18a84cda1abf17a4c9f06504df588b85f107f",
+    "docs/90-production-validation-plan.md": "f08fae26db1ed1c505667d6b7595cfe95b166d2ea6d1c4b68219720c50250c55",
+    "docs/contracts/settlement-export-v1.schema.json": "e9d346f7c92969259eadcd9461cab499ac670fc64476a6360ac5986201302128",
+    "artifacts/story-tracker/jpyc-feature-story-status.xlsx": "431b89669f67b9c07f2f6fdc798494f828a894b7617eb2909ecdf387676b95b1",
+    "artifacts/work/goal-closure/goal-closure-20260625T000500Z/production-validate/20260625T000549Z/validate-production-config.json": "ac62d3a134a5ba612e7a66f8fb36882862e7b0d09a207b0287fc9654baf2162b",
+    "artifacts/work/goal-closure/goal-closure-20260625T000500Z/commercial-validate/20260625T000548Z/commercial-go-validation.json": "6f44874587c52696a17b65332d6051679121146cec9a6d97eb8381ccc57a78cf"
+  },
+  "deployment": {
+    "container_image_digest": null,
+    "build_id": null,
+    "deployment_id": null,
+    "public_fqdn": null,
+    "tls_certificate_fingerprint": null
+  },
+  "chain_asset": {
+    "chain_id_expected": 137,
+    "approved_token_contract": null,
+    "approval_reference": null,
+    "token_decimals_expected": 6,
+    "status": "BLOCKED_APPROVAL_AND_RPC_PROOF_MISSING"
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "release_id": "goal-closure-20260625T000500Z",
+  "generated_at": "2026-06-25T00:10:00Z",
+  "source_of_truth": "current local repository snapshot",
+  "discovery_gate": {
+    "status": "BLOCKED_RELEASE_PROFILE_AMBIGUITY",
+    "reason": "Commercial and Limited release profiles are both in scope, but no single signed target profile was selected.",
+    "checks": {
+      "target_release_profile_unique": {
+        "status": "BLOCKED",
+        "detail": "The controlling prompt names Commercial / Limited release closure; current package exposes both commercial:gate and limited:gate. Owner must select the release profile before signed closure."
+      },
+      "gate_graph_found": {
+        "status": "PASS",
+        "sources": [
+          "package.json",
+          "scripts/production-validation/validate-commercial-go.mjs",
+          "scripts/production-validation/commercial-gate.mjs",
+          "scripts/production-validation/limited-gate.mjs"
+        ]
+      },
+      "exact_commands_found": {
+        "status": "PASS",
+        "sources": [
+          "package.json"
+        ]
+      },
+      "ext_poc_mapping_found": {
+        "status": "PASS",
+        "sources": [
+          "docs/production/evidence/README.md",
+          "docs/production/evidence/templates",
+          "scripts/production-validation/validate-commercial-evidence.mjs"
+        ]
+      },
+      "verdict_enum_found": {
+        "status": "PASS",
+        "values": [
+          "NO_GO",
+          "COMMERCIAL_GO_10",
+          "COMMERCIAL_GO",
+          "CONDITIONAL_NO_GO_FOR_COMMERCIAL",
+          "READY_FOR_LIMITED_PILOT"
+        ]
+      },
+      "canonical_workbook_found": {
+        "status": "PASS",
+        "path": "artifacts/story-tracker/jpyc-feature-story-status.xlsx",
+        "sha256": "431b89669f67b9c07f2f6fdc798494f828a894b7617eb2909ecdf387676b95b1"
+      },
+      "asset_approval_mechanism_found": {
+        "status": "PASS",
+        "detail": "APPROVED_JPYC_TOKEN_CONTRACT and JPYC_CONTRACT_APPROVAL_REF are required; current commercial validation blocks because approval/ref are absent."
+      },
+      "evidence_schema_found": {
+        "status": "PASS_WITH_LIMITATION",
+        "detail": "EXT/POC templates and validators exist; signed external evidence is absent or pending."
+      },
+      "approval_schema_found": {
+        "status": "PARTIAL",
+        "detail": "Approval gates are enforced through env/reference checks; no prior machine-readable approval registry with signatures was found, so this run emits APPROVAL_REGISTRY.json with pending approvals."
+      }
+    }
+  },
+  "current_contracts": [
+    {
+      "id": "settlement-export-v1",
+      "source": [
+        "docs/contracts/settlement-export-v1.md",
+        "docs/contracts/settlement-export-v1.schema.json",
+        "tests/accounting/settlement-export-contract.test.mjs"
+      ],
+      "status": "present",
+      "impact_this_run": "not changed"
+    },
+    {
+      "id": "commercial-go-validation",
+      "source": [
+        "scripts/production-validation/validate-commercial-go.mjs"
+      ],
+      "command": "npm run commercial:validate:safe",
+      "current_verdict": "NO_GO",
+      "current_score": 1
+    },
+    {
+      "id": "limited-release-gate",
+      "source": [
+        "scripts/production-validation/limited-gate.mjs"
+      ],
+      "command": "npm run limited:gate",
+      "current_exit_code": 10
+    },
+    {
+      "id": "story-tracker",
+      "source": [
+        "artifacts/story-tracker/jpyc-feature-story-status.xlsx",
+        "scripts/verify-story-tracker.mjs"
+      ],
+      "command": "npm run story:tracker:verify",
+      "status": "schema validated; latest side-run evidence not written into workbook in this run"
+    }
+  ],
+  "protected_boundaries": {
+    "no_env_secret_dump": true,
+    "no_production_db_mutation": true,
+    "no_dns_tls_secret_manager_transfer_wallet_signing_git_push": true,
+    "no_external_evidence_original_modified": true
+  }
+}
