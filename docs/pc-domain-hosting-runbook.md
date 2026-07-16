@@ -94,6 +94,9 @@
 - `scripts/deploy/preflight-pc-hosting.sh`
 - `scripts/deploy/check-public-host.sh`
 - README / deployment / operations / QR docs の導線整理
+- `src/public-endpoint-security.mjs` による公開HTTPS検証（DNS解決先の固定、内部・予約IP拒否、TLS検証、同一ホスト以外のリダイレクト拒否）
+
+`check-public-host.sh` は公開入口トークンと署名付き決済URLを必須引数として受け取り、この検証を通してから `readyz`、固定入口、署名付き決済URLを確認する。引数を省略した検査は成功扱いしない。DNSが未登録、証明書が不一致、または解決先が内部・予約IPの場合はfail-closedとなる。
 
 ### ユーザーが外部でやること
 - 独自ドメインの購入

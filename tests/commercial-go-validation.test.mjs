@@ -90,3 +90,59 @@ test("real-money release gates reject latest evidence auto-selection and conditi
   assert.ok(report.blockers.P0.some((row) => String(row).includes("forbids conditional waivers")));
   assert.ok(report.blockers.P0.some((row) => String(row).includes("--release-id")));
 });
+
+test("commercial policy gate requires both public URLs and published versions", async () => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "jpyc-policy-gate-"));
+  const sourcePath = path.join(fixtureRoot, "mobile-policy.js");
+  const runValidation = async (label) => {
+    const outputDir = path.join(fixtureRoot, label);
+    const result = await runNode("scripts/production-validation/validate-commercial-go.mjs", [
+      "--policy-url-source",
+      sourcePath,
+      "--output-dir",
+      outputDir,
+    ], {
+      APP_ENV: "development",
+      COMMERCIAL_GO_MODE: "false",
+      DB_PATH: path.join(fixtureRoot, "missing.db"),
+    });
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    return JSON.parse(fs.readFileSync(path.join(outputDir, "commercial-go-validation.json"), "utf8"));
+  };
+
+  fs.writeFileSync(sourcePath, `
+const POLICY_URLS = {
+  terms: "https://policies.merchant.jp/terms",
+  privacy: "https://policies.merchant.jp/privacy",
+  refund: "https://policies.merchant.jp/refund",
+};
+const POLICY_VERSIONS = {
+  terms_version: "draft-v1",
+  privacy_version: "2026-07-15",
+  refund_policy_version: "2026-07-15",
+};
+`, "utf8");
+
+  const draft = await runValidation("draft");
+  assert.equal(draft.gates.policy_urls_gate, false);
+  assert.deepEqual(draft.policy_urls.missing_keys, []);
+  assert.deepEqual(draft.policy_urls.missing_version_keys, ["terms_version"]);
+
+  fs.writeFileSync(sourcePath, `
+const POLICY_URLS = {
+  terms: "https://policies.merchant.jp/terms",
+  privacy: "https://policies.merchant.jp/privacy",
+  refund: "https://policies.merchant.jp/refund",
+};
+const POLICY_VERSIONS = {
+  terms_version: "2026-07-15",
+  privacy_version: "2026-07-15",
+  refund_policy_version: "2026-07-15",
+};
+`, "utf8");
+
+  const published = await runValidation("published");
+  assert.equal(published.gates.policy_urls_gate, true);
+  assert.deepEqual(published.policy_urls.missing_keys, []);
+  assert.deepEqual(published.policy_urls.missing_version_keys, []);
+});

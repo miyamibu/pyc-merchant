@@ -13,6 +13,9 @@ test("settlement export contract docs and schema exist", () => {
     "docs/37-provider-rail-semantics.md",
     "docs/contracts/settlement-export-v1.md",
     "docs/contracts/settlement-export-v1.schema.json",
+    "docs/35-settlement-export-contract-v2.md",
+    "docs/contracts/settlement-export-v2.md",
+    "docs/contracts/settlement-export-v2.schema.json",
   ]) {
     assert.equal(fs.existsSync(path.join(ROOT, relativePath)), true, `${relativePath} should exist`);
   }
@@ -48,6 +51,37 @@ test("settlement export schema pins canonical enums and export privacy exclusion
     "disputed",
   ]);
   assert.deepEqual(schema.properties.export_excluded_private_data.enum, [1]);
+  for (const v2OnlyField of [
+    "refund_reference_status",
+    "refund_reference_count",
+    "refund_requested_amount_jpyc_base",
+    "refund_reserved_amount_jpyc_base",
+    "refund_succeeded_amount_jpyc_base",
+    "refund_references",
+  ]) {
+    assert.equal(schema.required.includes(v2OnlyField), false, `${v2OnlyField} must not change Settlement Export Contract v1`);
+    assert.equal(schema.properties[v2OnlyField], undefined, `${v2OnlyField} belongs to Settlement Export Contract v2`);
+  }
+});
+
+test("Settlement Export Contract v2 pins invoice-scoped refund manifest and primary-row attribution", () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "docs/contracts/settlement-export-v2.schema.json"), "utf8")
+  );
+  assert.equal(schema.properties.contract_version.const, "settlement_export_v2");
+  assert.equal(schema.properties.export_version.const, "v2");
+  assert.ok(schema.required.includes("refund_manifest"));
+  assert.ok(schema.required.includes("refund_totals"));
+  assert.deepEqual(schema.$defs.row.properties.refund_attribution.enum, [
+    "none",
+    "invoice_primary",
+    "invoice_manifest_only",
+  ]);
+  assert.equal(schema.$defs.refundManifestEntry.allOf[1].properties.attribution.const, "invoice_primary_row");
+  assert.equal(
+    schema.$defs.metadata.properties.hash_scope.properties.version.const,
+    "settlement_export_v2_canonical_payload_without_content_hashes"
+  );
 });
 
 test("buildDailyAccountingSummary aggregates cancelled rows alongside other accounting statuses", () => {
@@ -102,9 +136,14 @@ test("buildDailyAccountingSummary aggregates cancelled rows alongside other acco
 
 test("settlement export docs state provider accepted/captured is not paid", () => {
   const contractDoc = fs.readFileSync(path.join(ROOT, "docs/35-settlement-export-contract-v1.md"), "utf8");
+  const v2ContractDoc = fs.readFileSync(path.join(ROOT, "docs/35-settlement-export-contract-v2.md"), "utf8");
   assert.match(contractDoc, /Provider accepted\/captured is not `paid`\./);
   assert.match(contractDoc, /derived from `invoice \+ payment evidence \+ reconciliation`/);
   assert.match(contractDoc, /Provider raw payload must not be exported\./);
+  assert.doesNotMatch(contractDoc, /refund_manifest|refund_references/);
+  assert.match(v2ContractDoc, /Every refund case linked to an invoice is frozen once in the top-level `refund_manifest`/);
+  assert.match(v2ContractDoc, /`failed` and `verification_failed` remain reserved/);
+  assert.match(v2ContractDoc, /legacy_export_missing/);
 });
 
 test("settlement export HTTP contract separates read-only GET from snapshot POST", () => {
@@ -120,7 +159,13 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(serverSource, /app\.get\("\/api\/v1\/settlement-exports\/:id\/download"/);
   assert.match(serverSource, /Idempotency-Key/);
   assert.match(serverSource, /content_hashes/);
-  assert.match(serverSource, /buildSettlementExportSnapshotCsv\(rows, \{ bom: true \}\)/);
+  assert.match(serverSource, /SETTLEMENT_EXPORT_V2_CANONICAL_HASH_SCOPE/);
+  assert.match(serverSource, /refund_references_json/);
+  assert.match(serverSource, /settlement_id = \? AND store_id = \?/);
+  assert.match(serverSource, /buildSettlementExportV1SnapshotCsv\(rows, \{ bom: true \}\)/);
+  assert.match(serverSource, /buildSettlementExportV2SnapshotCsv\(rows, \{ bom: true \}\)/);
+  assert.match(serverSource, /resolveSettlementExportContractVersion/);
+  assert.match(serverSource, /legacy_export_missing/);
 
   const dailyGet = serverSource.match(/app\.get\("\/api\/v1\/settlements\/daily:export"[\s\S]*?\n\}\);/);
   const monthlyGet = serverSource.match(/app\.get\("\/api\/v1\/settlements\/monthly:export"[\s\S]*?\n\}\);/);

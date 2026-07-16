@@ -32,6 +32,11 @@
   }
 }
 ```
+- `Idempotency-Key` を要求する非同期更新APIは、業務処理開始前にキーを原子的にclaimする。
+  - 同じactor / endpoint / key / payloadが処理中の場合は `409 IDEMPOTENCY_IN_PROGRESS` と `Retry-After: 1` を返し、重複処理へ入らない。
+  - 同じキーでpayloadが異なる場合は従来どおり `409 IDEMPOTENCY_CONFLICT` とする。
+  - 完了後の同じpayloadは、保存済みstatus/bodyをそのままreplayする。
+  - 非同期ロジックが例外終了した場合も、同じキーで業務処理を自動再実行せず、保存した `500 INTERNAL_ERROR` をreplayしてfail-closedとする。
 
 ## Core endpoints
 ### `POST /api/v1/invoices`
@@ -98,6 +103,12 @@
   - 端末単位停止 / 再開
 - 新規 invoice / reissue のみを止め、既存 invoice の照会・review・audit・reconcile は継続する。
 
+### `POST /api/v1/refunds/:refundId/verify`
+- on-chain RPC確認はDB transaction外で行う。
+- RPC完了後の短いimmediate transaction内で、開始時のrefund status / `updated_at` / tx hash / log indexが変わっていないことを再確認し、duplicate tx検査、条件付き更新、`refund.verified_onchain` 監査を一体で確定する。
+- 別key/別actorの並行確認が先に同じ成功証跡を確定していた場合は、現行の成功結果を `200` で返し、監査ログを追加しない。
+- 並行中に異なるtx証跡または状態へ変化していた場合は `409 REFUND_VERIFICATION_CONFLICT` とし、遅い側は状態更新も監査追加も行わない。
+
 ### `GET /api/v1/public/invoices/:invoiceId`
 - 役割: 公開決済ページが表示とウォレット起動に必要な情報を取得する。
 - 主なレスポンス項目:
@@ -112,6 +123,18 @@
 - `customer_payment_mode` を返し、tap rail 提示中は wallet ボタンを無効化する。
 - 署名なし・署名不正の直接参照は拒否する。
 - rate limit 超過時は `429 RATE_LIMITED` を返す。
+
+### `POST /api/v1/public/invoices/:invoiceId/consent`
+- 役割: 顧客が同意した公開済み規約3点の版を、invoiceに紐づく監査証跡として記録する。
+- 事前条件:
+  - invoice固有の `sig` / `exp` / `nonce` が有効であること。
+  - `public/mobile.js` の `POLICY_URLS` 3点がcredentialなしの公開HTTPS URLであること。
+  - `POLICY_URLS` は単一ラベル名、`localhost` / `.local` / `.test` / `.invalid` / `.example` / `.arpa`、`example.com|org|net` とそのサブドメイン、およびIPv4/IPv6リテラルを許可しない。
+  - `POLICY_VERSIONS` 3点が空でなく、`draft` / `pending` / `placeholder` / `example` を含まない公開版であること。
+  - リクエストJSONは `terms_version` / `privacy_version` / `refund_policy_version` の3キーだけを含み、公開設定値と完全一致すること。
+- 設定が未公開の場合は `503 POLICY_CONFIGURATION_NOT_READY`、送信キーまたは版が一致しない場合は `409 POLICY_VERSION_MISMATCH` を返す。どちらの場合も `customer_policy_consent` 監査ログは作成しない。
+- 全条件を満たした場合だけ `200 { ok: true, recorded_at }` を返し、公開版3点と同意時刻を監査ログへ記録する。
+- 公開エンドポイントの運用前検証（`scripts/deploy/healthcheck.sh` と `scripts/deploy/check-public-host.sh`）は、HTTPS/443以外を拒否し、全A/AAAA解決結果を検査して内部・予約・IPv4埋め込み・NAT64/6to4/Teredo等をfail-closedで拒否する。接続時は検査済みアドレスへlookupを固定し、同一originのHTTPSリダイレクトだけを許可する。`check-public-host.sh` は公開入口トークンと署名付き決済URLを必須とし、readyzのJSON内容も検証する。これは外部DNS・TLS・配信先が実際に公開されていることの代替ではなく、公開後に外部証跡として実行する。
 
 ### `GET /healthz`
 - 役割: liveness check。
@@ -182,8 +205,18 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
 - `review_required`: copy fallback を維持しつつ、review 状態を表示する
 - `expired`: 期限切れ案内と再発行導線を優先する
 
+## Public payment evidence timestamps
+
+`GET /api/v1/public/invoices/:invoiceId` は、支払い証跡の時刻を次のように分離して返す。
+
+- `confirmed_at`: 必要確認数を満たし、請求の `paid_tx_hash` と一致した `payment_events` をサーバー台帳へ記録した時刻（`payment_events.created_at`）。画面の「サーバーで確認済み」「支払い確認日時」はこの値を使う。
+- `chain_recorded_at`: 同じ支払いイベントがブロックへ記録された時刻（`payment_events.block_timestamp`）。オンチェーン時刻であり、サーバー確認時刻とは扱わない。
+- 支払いが未確定、対応する確定イベントがない、または各時刻が不正な場合、該当フィールドは `null` とする。
+- 外部入力の `observed_at` はサーバー確認時刻の根拠には使わない。
+
 ## Validation
 - `tests/server-integration.test.mjs` が public invoice API のレスポンス項目と EIP-681 payload を検証する
+- `tests/backend-p0-safety.test.mjs` が `confirmed_at` と `chain_recorded_at` の意味を分離して検証する
 - `tests/wallet-adapter.test.mjs` が URI 生成、deeplink template 展開、copy fallback を検証する
 - `tests/frontend-security.test.mjs` が mobile UI の launch order と copy fallback の存在を検証する
 
@@ -196,13 +229,12 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
 ## Terminal Fixed QR Endpoints
 - `GET /t/:publicEntryToken`
   - terminal 固定 QR の公開入口。
-  - current invoice がある場合は、その invoice の signed `/pay?ref=...` へ redirect。
-  - ただし current invoice で tap rail が提示中なら redirect せず、`/terminal-entry.html?token=...` へ留める。
-  - current invoice がない場合は `/terminal-entry.html?token=...` へ redirect。
+  - current invoice の有無やrail状態にかかわらず、常に`/terminal-entry.html?token=...`へredirectする。
+  - 利用者は入口画面で店舗・金額・会計番号を確認し、明示ボタンを押した場合のみinvoice固有のsigned `/pay?ref=...`へ進む。
 - `GET /api/v1/public/terminal-entry/:publicEntryToken`
   - fixed QR waiting page が poll する公開 API。
   - `status=waiting|ready|blocked|tap_presented` を返す。
-  - `ready` の場合は invoice 固有 `pay_url` を返し、waiting page は一度だけ redirect する。
+  - `ready` の場合はinvoice固有`pay_url`を返す。入口画面は自動redirectせず、遷移直前に最新状態と会計内容を再照合する。
 
 ## Terminal Session Response
 - `POST /api/v1/terminal-sessions`
@@ -220,3 +252,16 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
 - `POST /api/v1/invoices/:invoiceId/reissue`
   - 旧 invoice の lineage を維持しつつ、新しい invoice を作成する。
   - current invoice pointer は同一 transaction 内で新 invoice へ swap する。
+
+## Settlement Export endpoints and versioning
+
+- `POST /api/v1/settlement-exports` と新規の `POST /api/v1/settlements/daily:close` は `settlement_export_v2` snapshotを作成し、レスポンスで `contract_version` を明示する。
+- `GET /api/v1/settlement-exports/:id` は保存時の契約版を読み、`contract_version` を返す。保存済みv1を読取時にv2へ合成しない。
+- `GET /api/v1/settlement-exports/:id/download` は保存時の契約版でserialiseし、`x-settlement-export-contract-version` を返す。
+  - v1は既存JSON形状とBOM付きCSV header/bytesを維持する。
+  - v2は `refund_manifest` / `refund_totals` と行の `refund_attribution` を含み、保存済みcanonical JSON/CSV hashと一致しない場合は `409 SETTLEMENT_EXPORT_HASH_MISMATCH` とする。
+- v2の返金はinvoice単位で一度だけmanifest集計し、決定的に選んだprimary payment-session行だけを `invoice_primary` として金額・参照を帰属する。兄弟行は `invoice_manifest_only` とし、返金額を重複計上しない。
+- 同一 `created_at` の行順はinvoice / payment-session / rail / provider / row idで決定し、同じsnapshotの再downloadは同じbytes/hashを返す。
+- 不正な返金基準額は黙って0にせず、返金作成・settlement export・daily closeを `409 REFUND_LEDGER_INTEGRITY_ERROR` で停止する。
+- 過去のsettlementに紐づくexportがない場合、repeat closeは別exportを推測せず `export_binding_status: "legacy_export_missing"`、`export_id: null`、`contract_version: null` を返す。
+- v1の契約は `docs/contracts/settlement-export-v1.md`、v2は `docs/contracts/settlement-export-v2.md` と対応schemaをsource of truthとする。

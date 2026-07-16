@@ -61,6 +61,22 @@ function isTxHash(value) {
   return /^0x[0-9a-f]{64}$/i.test(String(value || "").trim());
 }
 
+function normalizeEvidenceDomain(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/\.+$/, "");
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw.includes("://") ? raw : `https://${raw}`);
+    return parsed.hostname.toLowerCase().replace(/\.+$/, "");
+  } catch (_error) {
+    return raw.split("/")[0].replace(/\.+$/, "");
+  }
+}
+
+function parseEvidenceDate(value) {
+  const timestamp = Date.parse(String(value || "").trim());
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
 function findLatestEvidenceDir(rootDir) {
   if (!fs.existsSync(rootDir)) return null;
   const dirs = fs
@@ -141,13 +157,37 @@ function evaluateExt003(evidence) {
   if (!evidence.file) errors.push("missing_file");
   if (evidence.status !== "pass") errors.push(`status_${evidence.status}`);
   const domain = ensureField(errors, evidence.fields, "domain", "domain");
+  const normalizedDomain = normalizeEvidenceDomain(domain);
   if (domain && (/example\.com/i.test(domain) || /placeholder/i.test(domain))) errors.push("placeholder_domain");
   ensureField(errors, evidence.fields, "tls_issuer", "tls_issuer");
-  ensureField(errors, evidence.fields, "tls_expiry", "tls_expiry");
-  ensureField(errors, evidence.fields, "healthz_result", "healthz_result");
-  ensureField(errors, evidence.fields, "readyz_result", "readyz_result");
-  ensureField(errors, evidence.fields, "pay_ref_result", "pay_ref_result");
-  ensureField(errors, evidence.fields, "https_redirect_result", "https_redirect_result");
+  const tlsExpiry = ensureField(errors, evidence.fields, "tls_expiry", "tls_expiry");
+  if (tlsExpiry) {
+    const expiryTimestamp = parseEvidenceDate(tlsExpiry);
+    if (expiryTimestamp == null) errors.push("invalid_tls_expiry");
+    else if (expiryTimestamp <= Date.now()) errors.push("expired_tls_certificate");
+  }
+  const tlsSan = ensureField(errors, evidence.fields, "tls_san", "tls_san");
+  if (tlsSan && normalizedDomain) {
+    const sanDomains = String(tlsSan)
+      .split(/[\s,;]+/)
+      .map(normalizeEvidenceDomain)
+      .filter(Boolean);
+    if (!sanDomains.includes(normalizedDomain) && !sanDomains.includes(`*.${normalizedDomain.split(".").slice(1).join(".")}`)) {
+      errors.push("tls_san_mismatch");
+    }
+  }
+  for (const [key, label] of [
+    ["healthz_result", "healthz"],
+    ["readyz_result", "readyz"],
+    ["pay_ref_result", "pay_ref"],
+    ["https_redirect_result", "https_redirect"],
+  ]) {
+    const result = ensureField(errors, evidence.fields, key, key);
+    if (result && parseStatus(result) !== "pass") errors.push(`${label}_${parseStatus(result)}`);
+  }
+  ensureField(errors, evidence.fields, "screenshot_ref", "screenshot_ref");
+  ensureField(errors, evidence.fields, "tester", "tester");
+  ensureField(errors, evidence.fields, "checked_at", "checked_at");
   return { ok: errors.length === 0, errors };
 }
 

@@ -32,6 +32,12 @@ const REFUND_CANDIDATE_REASONS = new Set([
   "CHAIN_INCONSISTENT",
   "ADDRESS_MISMATCH",
 ]);
+const REFUND_VERIFY_RETRYABLE_STATUSES = new Set([
+  "recorded",
+  "pending_verification",
+  "verification_failed",
+  "failed",
+]);
 const ADDRESS_POOL_WARN_THRESHOLD = 5;
 const WORKER_STALE_WARN_SEC = 300;
 const OPS_AUTO_REFRESH_INTERVAL_MS = 60_000;
@@ -137,16 +143,27 @@ function getOperatorActionPolicy(status) {
 
 const state = {
   token: "",
+  sessionEpoch: 0,
+  requestControllers: new Set(),
   terminalId: "",
   storeId: "",
   sessionId: "",
   role: "",
+  staffName: "",
+  staffCode: "",
+  effectivePermissions: new Set(),
+  permissionsKnown: false,
+  storeTimezone: "Asia/Tokyo",
+  sessionExpiresAt: "",
+  sessionExpiryTimer: null,
   supportedWallets: [],
   fixedQrUrl: "",
   fixedQrToken: "",
   invoiceId: "",
   invoiceStatus: "",
   currentInvoice: null,
+  invoiceRequestSequence: 0,
+  latestInvoiceRequestId: "",
   diagnosticsEnabled: false,
   invoiceDiagnostics: null,
   diagnosticsUpdatedAt: "",
@@ -166,19 +183,53 @@ const state = {
   reviewRows: [],
   selectedReviewId: "",
   selectedReviewDetail: null,
+  reviewListSequence: 0,
+  reviewListFilter: "",
+  reviewDetailSequence: 0,
+  reviewDetailRequestId: "",
   autoRefreshTimer: null,
+  opsReviewReadState: "unavailable",
+  opsSettlementReadState: "unavailable",
+  opsReviewBusinessDate: "",
+  opsSnapshotSequence: 0,
+  opsSnapshotBusinessDate: "",
   pendingDangerAction: "",
-  pendingRefundExecute: false,
+  invoiceOperationsInFlight: new Set(),
+  invoiceOperationKeys: new Map(),
+  pendingRefundExecute: "",
+  pendingRefundExecuteTimer: null,
   pendingSettlementClose: "",
+  settlementCloseInFlight: false,
+  settlementOperationKeys: new Map(),
+  refundRequestInFlight: false,
+  refundRequestSignature: "",
+  refundRequestIdempotencyKey: "",
+  refundRequestCompletedSignature: "",
+  refundRequestOperations: new Map(),
+  refundOperationsInFlight: new Set(),
+  refundOperationTargetsInFlight: new Set(),
+  refundOperationKeys: new Map(),
+  refundReadSequence: 0,
+  refundReadRequestId: "",
+  currentRefund: null,
+  logoutInFlight: false,
+  logoutRetryToken: "",
+  logoutIdempotencyKey: "",
 };
 
 const el = {
   terminalCode: document.getElementById("terminalCode"),
+  staffName: document.getElementById("staffName"),
   staffPin: document.getElementById("staffPin"),
   staffPinConfirm: document.getElementById("staffPinConfirm"),
   loginFormPanel: document.getElementById("loginFormPanel"),
   staffPinConfirmLabel: document.getElementById("staffPinConfirmLabel"),
   loginBtn: document.getElementById("loginBtn"),
+  logoutBtn: document.getElementById("logoutBtn"),
+  sessionRolePill: document.getElementById("sessionRolePill"),
+  sessionIdentityText: document.getElementById("sessionIdentityText"),
+  sessionRoleText: document.getElementById("sessionRoleText"),
+  sessionPermissionText: document.getElementById("sessionPermissionText"),
   sessionText: document.getElementById("sessionText"),
   networkText: document.getElementById("networkText"),
   connectionStatusPanel: document.getElementById("connectionStatusPanel"),
@@ -284,30 +335,87 @@ const el = {
   verifyRefundBtn: document.getElementById("verifyRefundBtn"),
   executeRefundHint: document.getElementById("executeRefundHint"),
   refundDraftHint: document.getElementById("refundDraftHint"),
+  refundEligibleHint: document.getElementById("refundEligibleHint"),
   refundStepRequestBadge: document.getElementById("refundStepRequestBadge"),
   refundStepApproveBadge: document.getElementById("refundStepApproveBadge"),
   refundStepEvidenceBadge: document.getElementById("refundStepEvidenceBadge"),
   businessDateInput: document.getElementById("businessDateInput"),
   businessMonthInput: document.getElementById("businessMonthInput"),
   closeSettlementBtn: document.getElementById("closeSettlementBtn"),
+  businessTimezoneText: document.getElementById("businessTimezoneText"),
   settlementConfirmPanel: document.getElementById("settlementConfirmPanel"),
   exportAuditCsvBtn: document.getElementById("exportAuditCsvBtn"),
   exportMonthlyCsvBtn: document.getElementById("exportMonthlyCsvBtn"),
+  openAuditLogBtn: document.getElementById("openAuditLogBtn"),
+  auditLogPanel: document.getElementById("auditLogPanel"),
+  auditLogList: document.getElementById("auditLogList"),
   closeSettlementHint: document.getElementById("closeSettlementHint"),
   toastHost: document.getElementById("toastHost"),
-  adminSections: Array.from(document.querySelectorAll("[data-admin-only='true']")),
+  permissionNodes: Array.from(document.querySelectorAll("[data-permission], [data-permission-any]")),
 };
 
+function safeTimeZone(value) {
+  const candidate = String(value || "").trim() || "Asia/Tokyo";
+  try {
+    new Intl.DateTimeFormat("ja-JP", { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch (_error) {
+    return "Asia/Tokyo";
+  }
+}
+
 function nowIsoDate() {
-  return new Date().toISOString().slice(0, 10);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: safeTimeZone(state.storeTimezone),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
 }
 
 function idempotencyKey(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
-function isAdminRole(role) {
-  return role === "admin" || role === "manager";
+function getStableOperationKey(store, kind, signature) {
+  const operationSignature = `${kind}:${String(signature || "")}`;
+  if (!store.has(operationSignature)) store.set(operationSignature, idempotencyKey(kind));
+  return store.get(operationSignature);
+}
+
+function invalidateResourceRequests() {
+  state.invoiceRequestSequence += 1;
+  state.latestInvoiceRequestId = "";
+  state.reviewListSequence += 1;
+  state.reviewListFilter = "";
+  state.reviewDetailSequence += 1;
+  state.reviewDetailRequestId = "";
+  state.opsSnapshotSequence += 1;
+  state.opsSnapshotBusinessDate = "";
+  state.refundReadSequence += 1;
+  state.refundReadRequestId = "";
+}
+
+function hasPermission(permission) {
+  return state.permissionsKnown && state.effectivePermissions.has(permission);
+}
+
+function hasAnyPermission(permissions) {
+  return permissions.some((permission) => hasPermission(permission));
+}
+
+function requireUiPermission(permission, actionLabel) {
+  if (!state.token) {
+    showToast("先にログインしてください", true);
+    return false;
+  }
+  if (!hasPermission(permission)) {
+    showToast(`${actionLabel}の実効権限がありません`, true);
+    return false;
+  }
+  return true;
 }
 
 function setNetworkStatus(message) {
@@ -323,7 +431,7 @@ function formatDateTime(value) {
   if (!value) return "-";
   const dt = new Date(value);
   if (Number.isNaN(dt.getTime())) return String(value);
-  return dt.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", hour12: false });
+  return dt.toLocaleString("ja-JP", { timeZone: safeTimeZone(state.storeTimezone), hour12: false });
 }
 
 function formatJpy(value) {
@@ -488,10 +596,20 @@ function renderAmountPresetButtons() {
 
 function setHelperLink(linkEl, href, label) {
   if (typeof href === "string" && href.trim()) {
-    linkEl.href = href.trim();
-    linkEl.textContent = label;
-    linkEl.classList.remove("hidden");
-    return;
+    try {
+      const destination = new URL(href.trim(), window.location.origin);
+      const allowed = !destination.username
+        && !destination.password
+        && (destination.protocol === "https:" || destination.origin === window.location.origin);
+      if (allowed) {
+        linkEl.href = destination.href;
+        linkEl.textContent = label;
+        linkEl.classList.remove("hidden");
+        return;
+      }
+    } catch (_error) {
+      // Invalid or unsafe helper URLs remain hidden.
+    }
   }
   linkEl.classList.add("hidden");
   linkEl.removeAttribute("href");
@@ -907,49 +1025,94 @@ function computeReviewSuggestion(review) {
 }
 
 async function loadOpsSnapshot() {
-  if (!isAdminRole(state.role)) return;
+  const sessionGeneration = captureSessionGeneration();
+  const canReadReviews = hasPermission("review.read");
+  const canReadSettlement = hasPermission("settlement.close");
+  const canReadMonitor = hasPermission("monitor.read");
+  if (!hasAnyPermission(["review.read", "settlement.close", "monitor.read"])) return;
   const businessDate = /^\d{4}-\d{2}-\d{2}$/.test(String(el.businessDateInput.value || "").trim())
     ? String(el.businessDateInput.value || "").trim()
     : nowIsoDate();
+  const snapshotSequence = state.opsSnapshotSequence + 1;
+  state.opsSnapshotSequence = snapshotSequence;
+  state.opsSnapshotBusinessDate = businessDate;
+  state.opsReviewReadState = canReadReviews ? "loading" : "not_permitted";
+  state.opsSettlementReadState = canReadSettlement ? "loading" : "not_permitted";
+  state.opsReviewBusinessDate = businessDate;
   el.opsSnapshotState.textContent = "運用サマリーを更新中です。";
   try {
     const [reviewsResult, settlementResult, monitorResult] = await Promise.allSettled([
-      requestJson("/api/v1/reviews"),
-      requestJson(`/api/v1/settlements/daily-status?business_date=${encodeURIComponent(businessDate)}`),
-      requestJson("/api/v1/chain-monitor/status"),
+      canReadReviews ? requestJson("/api/v1/reviews") : Promise.resolve(null),
+      canReadSettlement
+        ? requestJson(`/api/v1/settlements/daily-status?business_date=${encodeURIComponent(businessDate)}`)
+        : Promise.resolve(null),
+      canReadMonitor ? requestJson("/api/v1/chain-monitor/status") : Promise.resolve(null),
     ]);
 
-    const reviews = reviewsResult.status === "fulfilled" && Array.isArray(reviewsResult.value.reviews)
+    if (
+      !isSessionGenerationCurrent(sessionGeneration)
+      || snapshotSequence !== state.opsSnapshotSequence
+      || state.opsSnapshotBusinessDate !== businessDate
+      || String(el.businessDateInput.value || "").trim() !== businessDate
+    ) return { status: "stale" };
+    const ignoredResult = [reviewsResult, settlementResult, monitorResult].find(
+      (result) => result.status === "rejected" && isIgnoredRequestError(result.reason)
+    );
+    if (ignoredResult) return { status: "stale" };
+
+    const reviewsAvailable = Boolean(
+      canReadReviews && reviewsResult.status === "fulfilled" && Array.isArray(reviewsResult.value?.reviews)
+    );
+    state.opsReviewReadState = reviewsAvailable ? "ok" : canReadReviews ? "failed" : "not_permitted";
+    const reviews = reviewsAvailable
       ? [...reviewsResult.value.reviews]
       : [];
     const sortedReviews = reviews.sort(compareReviewsByPriority);
     const activeReviews = sortedReviews.filter((row) => ["open", "in_progress"].includes(String(row.status || "")));
-    const openReviewCount = activeReviews.length;
+    const openReviewCount = reviewsAvailable ? activeReviews.length : null;
     const priorityReview = activeReviews[0] || null;
-    const refundCandidateCount = activeReviews.filter((row) => isRefundCandidateReason(row.reason_type)).length;
+    const refundCandidateCount = reviewsAvailable
+      ? activeReviews.filter((row) => isRefundCandidateReason(row.reason_type)).length
+      : null;
 
-    const monitor = monitorResult.status === "fulfilled" ? monitorResult.value : null;
+    const monitor = canReadMonitor && monitorResult.status === "fulfilled" ? monitorResult.value : null;
     const pendingDead = monitor ? Number(monitor.pending_dead_letter_count || 0) : null;
     const abandonedDead = monitor ? Number(monitor.abandoned_dead_letter_count || 0) : null;
     const unmatchedCount = monitor ? Number(monitor.unmatched_event_count || 0) : null;
     const failoverCount = monitor ? Number(monitor.failover_count || 0) : null;
     const deadLabel =
-      pendingDead == null || abandonedDead == null
+      !canReadMonitor
+        ? "権限対象外"
+        : pendingDead == null || abandonedDead == null
         ? "取得失敗"
         : `${pendingDead + abandonedDead}件`;
 
-    const settlementClosed = settlementResult.status === "fulfilled" ? settlementResult.value.closed === true : null;
-    const settlementReviewCount = settlementResult.status === "fulfilled"
+    const settlementClosed = canReadSettlement && settlementResult.status === "fulfilled"
+      ? settlementResult.value?.closed === true
+      : null;
+    const settlementAvailable = Boolean(canReadSettlement && settlementResult.status === "fulfilled");
+    state.opsSettlementReadState = settlementAvailable
+      ? "ok"
+      : canReadSettlement
+        ? "failed"
+        : "not_permitted";
+    const settlementReviewCount = canReadSettlement && settlementResult.status === "fulfilled"
       ? Number(settlementResult.value?.settlement?.review_count || 0)
       : null;
 
-    renderOpsWarningsList(monitor ? buildMonitorWarnings(monitor) : ["監視状態を取得できませんでした"]);
+    renderOpsWarningsList(
+      monitor
+        ? buildMonitorWarnings(monitor)
+        : [canReadMonitor ? "監視状態を取得できませんでした" : "監視状態は現在の実効権限の対象外です"]
+    );
 
     const addressPoolCount = monitor != null ? Number(monitor.address_pool_available_count ?? -1) : null;
     const monitorStateRows = Array.isArray(monitor?.state) ? monitor.state : [];
     const workerStaleSec = monitor ? detectWorkerStaleSec(monitorStateRows) : null;
     let workerStatusText;
-    if (!monitor) {
+    if (!canReadMonitor) {
+      workerStatusText = "権限対象外";
+    } else if (!monitor) {
       workerStatusText = "取得失敗";
     } else if (monitorStateRows.length === 0) {
       workerStatusText = "状態不明";
@@ -964,7 +1127,17 @@ async function loadOpsSnapshot() {
     let recommendedAction = "通常運用";
     const checklist = [];
 
-    if (abandonedDead != null && abandonedDead > 0) {
+    if (!reviewsAvailable) {
+      recommendedAction = canReadReviews ? "レビュー再取得" : "レビュー確認権限なし";
+      checklist.push(
+        canReadReviews
+          ? "未解決レビュー件数を取得できないため、日次締めは実行できません。通信・権限状態を確認して再取得してください。"
+          : "未解決レビューを確認する実効権限がないため、日次締めは実行できません。権限を確認してください。"
+      );
+    } else if (canReadSettlement && !settlementAvailable) {
+      recommendedAction = "締め状態再取得";
+      checklist.push("現在の日次締め状態を取得できないため、日次締めは実行できません。通信・権限状態を確認してください。");
+    } else if (abandonedDead != null && abandonedDead > 0) {
       recommendedAction = "dead-letter最優先";
       checklist.push(`abandoned dead-letter ${abandonedDead}件を最優先で確認します。`);
     } else if (pendingDead != null && pendingDead > 0) {
@@ -1009,15 +1182,23 @@ async function loadOpsSnapshot() {
     }
 
     el.opsAddressPoolCount.textContent =
-      addressPoolCount != null && addressPoolCount >= 0
+      !canReadMonitor
+        ? "権限対象外"
+        : addressPoolCount != null && addressPoolCount >= 0
         ? `${addressPoolCount}件${addressPoolCount <= ADDRESS_POOL_WARN_THRESHOLD ? "（要補充）" : ""}`
         : "取得失敗";
     el.opsWorkerStatus.textContent = workerStatusText || "-";
 
-    el.opsOpenReviewCount.textContent = `${openReviewCount}件`;
+    el.opsOpenReviewCount.textContent = !canReadReviews
+      ? "権限対象外"
+      : reviewsAvailable
+        ? `${openReviewCount}件`
+        : "取得失敗";
     el.opsDeadLetterCount.textContent = deadLabel;
     el.opsSettlementStatus.textContent =
-      settlementClosed == null
+      !canReadSettlement
+        ? "権限対象外"
+        : settlementClosed == null
         ? "取得失敗"
         : settlementClosed
           ? settlementReviewCount && settlementReviewCount > 0
@@ -1025,14 +1206,33 @@ async function loadOpsSnapshot() {
             : "完了"
           : "未実施";
     el.opsRecommendedAction.textContent = recommendedAction;
-    el.opsPriorityReview.textContent = priorityReview
-      ? `${reviewReasonLabel(priorityReview.reason_type)} / ${shortId(priorityReview.id)}`
-      : "なし";
-    el.opsRefundCandidateCount.textContent = `${refundCandidateCount}件`;
+    el.opsPriorityReview.textContent = !canReadReviews
+      ? "権限対象外"
+      : !reviewsAvailable
+        ? "取得失敗"
+        : priorityReview
+          ? `${reviewReasonLabel(priorityReview.reason_type)} / ${shortId(priorityReview.id)}`
+          : "なし";
+    el.opsRefundCandidateCount.textContent = !canReadReviews
+      ? "権限対象外"
+      : reviewsAvailable
+        ? `${refundCandidateCount}件`
+        : "取得失敗";
     el.opsSnapshotState.textContent =
-      "小規模店舗の現場で、いま止まりやすい項目を review / refund / settlement / monitor で優先表示しています。";
+      reviewsAvailable && (!canReadSettlement || settlementAvailable)
+        ? "サーバーが返した実効権限の範囲で review / settlement / monitor を集約しています。"
+        : "レビュー件数または日次締め状態を確認できていません。日次締めは安全のため停止しています。";
     setChecklist(el.opsSnapshotChecklist, checklist);
-  } catch (_error) {
+    return { status: reviewsAvailable && (!canReadSettlement || settlementAvailable) ? "ok" : "close_preflight_failed" };
+  } catch (error) {
+    if (
+      isIgnoredRequestError(error)
+      || !isSessionGenerationCurrent(sessionGeneration)
+      || snapshotSequence !== state.opsSnapshotSequence
+      || state.opsSnapshotBusinessDate !== businessDate
+    ) return { status: "stale" };
+    state.opsReviewReadState = canReadReviews ? "failed" : "not_permitted";
+    state.opsSettlementReadState = canReadSettlement ? "failed" : "not_permitted";
     el.opsOpenReviewCount.textContent = "-";
     el.opsDeadLetterCount.textContent = "-";
     el.opsSettlementStatus.textContent = "-";
@@ -1044,13 +1244,14 @@ async function loadOpsSnapshot() {
     el.opsSnapshotState.textContent = "運用サマリーの取得に失敗しました。";
     renderOpsWarningsList(["監視状態を取得できませんでした"]);
     setChecklist(el.opsSnapshotChecklist, ["ネットワークまたは権限状態を確認してから再取得してください。"]);
+    return { status: "failed" };
   }
 }
 
 function startOpsAutoRefresh() {
   if (state.autoRefreshTimer !== null) return;
   state.autoRefreshTimer = setInterval(() => {
-    if (isAdminRole(state.role)) void loadOpsSnapshot();
+    if (hasAnyPermission(["review.read", "settlement.close", "monitor.read"])) void loadOpsSnapshot();
   }, OPS_AUTO_REFRESH_INTERVAL_MS);
 }
 
@@ -1160,95 +1361,461 @@ function renderDiagnostics() {
   el.diagnosticsDumpText.textContent = lines.join("\n");
 }
 
-function showToast(message, isError = false) {
-  const toast = document.createElement("div");
-  toast.textContent = message;
-  toast.className = `toast ${isError ? "toast-error" : "toast-info"}`;
-  el.toastHost.appendChild(toast);
-  setTimeout(() => {
-    toast.remove();
+function removeToast(toast) {
+  if (!toast) return;
+  if (toast.dismissTimer) clearTimeout(toast.dismissTimer);
+  toast.remove();
+}
+
+function scheduleToastRemoval(toast) {
+  if (toast.dismissTimer) clearTimeout(toast.dismissTimer);
+  toast.dismissTimer = setTimeout(() => {
+    removeToast(toast);
   }, 5000);
+}
+
+function showToast(message, isError = false) {
+  const normalizedMessage = String(message || "").trim();
+  if (!normalizedMessage) return;
+  const existingToasts = Array.from(el.toastHost.children);
+  const duplicate = existingToasts.find((toast) => toast.dataset.toastMessage === normalizedMessage);
+  if (duplicate) {
+    if (!isError) {
+      for (const toast of existingToasts) {
+        if (toast !== duplicate && toast.dataset.toastKind === "success") removeToast(toast);
+      }
+    }
+    duplicate.className = `toast ${isError ? "toast-error" : "toast-info"}`;
+    duplicate.dataset.toastKind = isError ? "error" : "success";
+    el.toastHost.appendChild(duplicate);
+    scheduleToastRemoval(duplicate);
+    return;
+  }
+  if (!isError) {
+    for (const toast of existingToasts) {
+      if (toast.dataset.toastKind === "success") removeToast(toast);
+    }
+  }
+  const toast = document.createElement("div");
+  toast.textContent = normalizedMessage;
+  toast.className = `toast ${isError ? "toast-error" : "toast-info"}`;
+  toast.dataset.toastMessage = normalizedMessage;
+  toast.dataset.toastKind = isError ? "error" : "success";
+  el.toastHost.appendChild(toast);
+  while (el.toastHost.children.length > 2) {
+    removeToast(el.toastHost.firstElementChild);
+  }
+  scheduleToastRemoval(toast);
 }
 
 function setLoggedInUi(loggedIn) {
   if (el.loginFormPanel) el.loginFormPanel.classList.toggle("collapsed-after-login", loggedIn);
   if (el.staffPinConfirmLabel) el.staffPinConfirmLabel.classList.toggle("hidden", loggedIn);
+  if (el.logoutBtn) {
+    el.logoutBtn.classList.toggle("hidden", !loggedIn);
+    if (loggedIn) el.logoutBtn.textContent = "担当者を交代（ログアウト）";
+  }
+  if (el.sessionRolePill) {
+    el.sessionRolePill.textContent = loggedIn ? formatRole(state.role) : "未ログイン";
+    el.sessionRolePill.className = `role-pill ${loggedIn && state.role !== "staff" && state.role !== "operator" ? "role-admin" : "role-staff"}`;
+  }
 }
 
 function updateRefundStepState(statusText = "") {
   const hasRefundId = Boolean(String(el.refundIdInput?.value || "").trim());
+  const currentSignature = buildRefundRequestSignature();
+  const storedRequest = state.refundRequestOperations.get(currentSignature);
+  const alreadyCreated = Boolean(currentSignature && (storedRequest?.completed || state.refundRequestCompletedSignature === currentSignature));
+  const refundStatus = String(state.currentRefund?.status || "");
+  const operationInFlight = (kind) => [...state.refundOperationsInFlight].some((entry) => entry.startsWith(`${kind}:`));
+  const currentRefundId = String(el.refundIdInput?.value || "").trim();
+  const currentRefundBusy = Boolean(currentRefundId && state.refundOperationTargetsInFlight.has(currentRefundId));
   if (el.refundStepRequestBadge) el.refundStepRequestBadge.textContent = hasRefundId ? "作成済み" : "入力";
-  if (el.refundStepApproveBadge) el.refundStepApproveBadge.textContent = hasRefundId ? "承認待ち" : "返金ID待ち";
-  if (el.refundStepEvidenceBadge) el.refundStepEvidenceBadge.textContent = statusText || (hasRefundId ? "証跡入力" : "返金ID待ち");
-  if (el.approveRefundBtn) el.approveRefundBtn.disabled = !hasRefundId;
-  if (el.executeRefundBtn) el.executeRefundBtn.disabled = !hasRefundId;
-  if (el.verifyRefundBtn) el.verifyRefundBtn.disabled = !hasRefundId;
+  if (el.refundStepApproveBadge) {
+    el.refundStepApproveBadge.textContent = refundStatus === "approved" ? "承認済み" : hasRefundId ? "承認待ち" : "返金ID待ち";
+  }
+  if (el.refundStepEvidenceBadge) {
+    el.refundStepEvidenceBadge.textContent = statusText || refundStatus || (hasRefundId ? "証跡入力" : "返金ID待ち");
+  }
+  if (el.requestRefundBtn) {
+    el.requestRefundBtn.disabled = !hasPermission("refund.request") || state.refundRequestInFlight || alreadyCreated;
+  }
+  if (el.approveRefundBtn) {
+    el.approveRefundBtn.disabled = !hasRefundId || !hasPermission("refund.approve") || currentRefundBusy || operationInFlight("refund-approve");
+  }
+  if (el.executeRefundBtn) {
+    el.executeRefundBtn.disabled = !hasRefundId || !hasPermission("refund.execute") || currentRefundBusy || operationInFlight("refund-execute");
+  }
+  if (el.verifyRefundBtn) {
+    el.verifyRefundBtn.disabled = !hasRefundId || !hasPermission("refund.execute") || currentRefundBusy || operationInFlight("refund-verify");
+  }
+}
+
+function stopSessionExpiryTimer() {
+  if (state.sessionExpiryTimer === null) return;
+  clearInterval(state.sessionExpiryTimer);
+  state.sessionExpiryTimer = null;
+}
+
+function renderSessionExpiry() {
+  if (!state.sessionExpiresAt) {
+    el.sessionExpiryText.textContent = "-";
+    return;
+  }
+  const remainingMs = new Date(state.sessionExpiresAt).getTime() - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    resetSessionUi("セッション期限切れ。再ログインしてください");
+    return;
+  }
+  const remainingMinutes = Math.max(1, Math.ceil(remainingMs / 60000));
+  el.sessionExpiryText.textContent = `${formatDateTime(state.sessionExpiresAt)}（残り約${remainingMinutes}分）`;
+}
+
+function startSessionExpiryTimer() {
+  stopSessionExpiryTimer();
+  renderSessionExpiry();
+  if (!state.token || !state.sessionExpiresAt) return;
+  state.sessionExpiryTimer = setInterval(renderSessionExpiry, 30000);
+}
+
+function setAuditLogRows(rows) {
+  el.auditLogList.replaceChildren();
+  const source = Array.isArray(rows) && rows.length > 0 ? rows : [null];
+  for (const row of source) {
+    const item = document.createElement("li");
+    item.textContent = row
+      ? `${formatDateTime(row.created_at)} / ${row.action || "-"} / ${row.target_type || "-"} ${shortId(row.target_id || "-")}`
+      : "表示できる操作履歴はありません。";
+    el.auditLogList.appendChild(item);
+  }
+}
+
+function resetSessionUi(reason = "未ログイン", options = {}) {
+  const logoutRetryToken = String(options.logoutRetryToken || "");
+  const logoutIdempotencyKey = String(options.logoutIdempotencyKey || "");
+  advanceSessionEpoch();
+  invalidateResourceRequests();
+  stopSessionExpiryTimer();
+  closeSse(reason);
+  stopFallbackPolling();
+  stopOpsAutoRefresh();
+  state.token = "";
+  state.terminalId = "";
+  state.storeId = "";
+  state.sessionId = "";
+  state.role = "";
+  state.staffName = "";
+  state.staffCode = "";
+  state.effectivePermissions = new Set();
+  state.permissionsKnown = false;
+  state.storeTimezone = "Asia/Tokyo";
+  state.sessionExpiresAt = "";
+  state.diagnosticsEnabled = false;
+  state.invoiceDiagnostics = null;
+  state.diagnosticsUpdatedAt = "";
+  state.supportedWallets = [];
+  state.fixedQrUrl = "";
+  state.fixedQrToken = "";
+  state.reviewRows = [];
+  state.selectedReviewId = "";
+  state.selectedReviewDetail = null;
+  state.opsReviewReadState = "unavailable";
+  state.opsSettlementReadState = "unavailable";
+  state.opsReviewBusinessDate = "";
+  state.pendingDangerAction = "";
+  state.invoiceOperationsInFlight = new Set();
+  state.invoiceOperationKeys = new Map();
+  clearPendingRefundExecute();
+  state.pendingSettlementClose = "";
+  state.settlementCloseInFlight = false;
+  state.settlementOperationKeys = new Map();
+  state.refundRequestInFlight = false;
+  state.refundRequestSignature = "";
+  state.refundRequestIdempotencyKey = "";
+  state.refundRequestCompletedSignature = "";
+  state.refundRequestOperations = new Map();
+  state.refundOperationsInFlight = new Set();
+  state.refundOperationTargetsInFlight = new Set();
+  state.refundOperationKeys = new Map();
+  state.currentRefund = null;
+  state.logoutInFlight = false;
+  state.logoutRetryToken = logoutRetryToken;
+  state.logoutIdempotencyKey = logoutIdempotencyKey;
+
+  clearInvoiceView();
+  el.staffPin.value = "";
+  el.staffPinConfirm.value = "";
+  el.staffName.value = "";
+  el.amountInput.value = "";
+  el.sessionIdentityText.textContent = "未ログイン";
+  el.sessionRoleText.textContent = "-";
+  el.sessionText.textContent = reason;
+  el.sessionExpiryText.textContent = "-";
+  el.sessionPermissionText.textContent = "ログイン後、サーバーが返した実効権限に応じて操作を表示します。";
+  el.businessTimezoneText.textContent = state.storeTimezone;
+  el.businessDateInput.value = nowIsoDate();
+  el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+  el.reviewsTableBody.replaceChildren();
+  renderReviewSummary([]);
+  renderReviewDetail(null);
+  el.reviewIdInput.value = "";
+  el.reviewNote.value = "";
+  setReviewListState("empty", "再ログイン後に確認待ち一覧を読み込めます。");
+  el.refundReviewCaseId.value = "";
+  el.refundAmount.value = "";
+  el.refundAddress.value = "";
+  el.refundChainId.value = "";
+  el.refundIdInput.value = "";
+  el.refundTxHashInput.value = "";
+  el.refundExecutedWalletInput.value = "";
+  el.refundEvidenceNotePathInput.value = "";
+  el.refundCustomerNoteInput.value = "";
+  el.refundEligibleHint.textContent = "レビューを選択すると、サーバーが返した返金可能額を表示します。";
+  el.executeRefundHint.classList.add("hidden");
+  el.executeRefundHint.textContent = "";
+  el.settlementConfirmPanel.classList.add("hidden");
+  el.closeSettlementHint.classList.add("hidden");
+  el.closeSettlementHint.textContent = "";
+  el.auditLogPanel.classList.add("hidden");
+  setAuditLogRows([]);
+  el.opsOpenReviewCount.textContent = "-";
+  el.opsDeadLetterCount.textContent = "-";
+  el.opsSettlementStatus.textContent = "-";
+  el.opsRecommendedAction.textContent = "-";
+  el.opsPriorityReview.textContent = "-";
+  el.opsRefundCandidateCount.textContent = "-";
+  el.opsAddressPoolCount.textContent = "-";
+  el.opsWorkerStatus.textContent = "-";
+  el.opsSnapshotState.textContent = "再ログイン後に実効権限の範囲で運用サマリーを表示します。";
+  setChecklist(el.opsSnapshotChecklist, ["担当者を交代する場合は、次のスタッフでログインしてください。"]);
+  renderOpsWarningsList(["ログイン後に運用状態を確認します"]);
+  setLoggedInUi(false);
+  if (logoutRetryToken) {
+    if (el.loginFormPanel) el.loginFormPanel.classList.add("collapsed-after-login");
+    if (el.staffPinConfirmLabel) el.staffPinConfirmLabel.classList.add("hidden");
+    el.loginBtn.disabled = true;
+    el.logoutBtn.classList.remove("hidden");
+    el.logoutBtn.textContent = "ログアウトを再試行";
+    el.logoutBtn.disabled = false;
+    el.sessionRolePill.textContent = "ログアウト確認待ち";
+    el.sessionRolePill.className = "role-pill role-admin";
+    el.sessionIdentityText.textContent = "機密情報を非表示にしました";
+    el.sessionText.textContent = reason;
+    el.sessionPermissionText.textContent =
+      "サーバー側のログアウト完了を確認できていません。同じセッションでログアウトを再試行するまで新規操作とログインを停止しています。";
+    window.setTimeout(() => el.logoutBtn?.focus(), 0);
+  } else {
+    el.loginBtn.disabled = false;
+    el.logoutBtn.textContent = "担当者を交代（ログアウト）";
+    window.setTimeout(() => el.staffName?.focus(), 0);
+  }
+  applyPermissionVisibility();
+  updateRefundStepState();
+  setNetworkStatus("未接続");
+}
+
+function syncInvoiceOperationControls() {
+  const canCreate = hasPermission("invoice.create");
+  const busy = state.invoiceOperationsInFlight.size > 0;
+  if (el.createInvoiceBtn) el.createInvoiceBtn.disabled = !canCreate || busy;
+  if (el.cancelInvoiceBtn) el.cancelInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
+  if (el.expireInvoiceBtn) el.expireInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
+  if (el.reissueInvoiceBtn) el.reissueInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
+  if (state.currentInvoice) renderProviderControls(state.currentInvoice);
+}
+
+function beginInvoiceOperation(kind, signature, { stable = true } = {}) {
+  if (state.invoiceOperationsInFlight.size > 0) return null;
+  const operationSignature = `${kind}:${String(signature || "")}`;
+  state.invoiceOperationsInFlight.add(operationSignature);
+  syncInvoiceOperationControls();
+  return {
+    operationSignature,
+    idempotencyKey: stable
+      ? getStableOperationKey(state.invoiceOperationKeys, kind, signature)
+      : idempotencyKey(kind),
+  };
+}
+
+function endInvoiceOperation(operation) {
+  if (operation?.operationSignature) state.invoiceOperationsInFlight.delete(operation.operationSignature);
+  syncInvoiceOperationControls();
 }
 
 function confirmDangerInvoiceAction(actionPath, label) {
+  if (!requireUiPermission("invoice.create", label)) return;
   if (!state.invoiceId) {
     showToast("対象の請求がありません", true);
     return;
   }
-  if (state.pendingDangerAction !== actionPath) {
-    state.pendingDangerAction = actionPath;
+  const targetInvoiceId = state.invoiceId;
+  const actionSignature = `${targetInvoiceId}:${actionPath}`;
+  if (state.pendingDangerAction !== actionSignature) {
+    state.pendingDangerAction = actionSignature;
     showToast(`${label}するには、同じボタンをもう一度押してください`, true);
     window.setTimeout(() => {
-      if (state.pendingDangerAction === actionPath) state.pendingDangerAction = "";
+      if (state.pendingDangerAction === actionSignature) state.pendingDangerAction = "";
     }, 5000);
     return;
   }
   state.pendingDangerAction = "";
-  void postInvoiceAction(actionPath, `${label}しました`);
+  void postInvoiceAction(actionPath, `${label}しました`, targetInvoiceId);
 }
 
 function parseErrorMessage(data, fallback = "リクエストに失敗しました") {
   return data?.error?.message || fallback;
 }
 
-function authHeaders() {
-  if (!state.token) return {};
-  return { authorization: `Bearer ${state.token}` };
-}
-
-async function requestJson(path, options = {}) {
-  const headers = {
-    ...(options.headers || {}),
-    ...authHeaders(),
-  };
-  const response = await fetch(path, { ...options, headers });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = parseErrorMessage(payload);
-    const error = new Error(message);
-    error.status = response.status;
-    error.payload = payload;
-    throw error;
+function advanceSessionEpoch() {
+  state.sessionEpoch += 1;
+  for (const controller of state.requestControllers) {
+    controller.abort();
   }
-  return payload;
+  state.requestControllers.clear();
 }
 
-async function requestText(path, options = {}) {
+function captureSessionGeneration() {
+  return { epoch: state.sessionEpoch, token: state.token };
+}
+
+function isSessionGenerationCurrent(generation) {
+  return Boolean(
+    generation?.token && generation.epoch === state.sessionEpoch && generation.token === state.token
+  );
+}
+
+function createIgnoredRequestError() {
+  const error = new Error("旧セッションの応答を破棄しました");
+  error.name = "AbortError";
+  error.code = "STALE_SESSION_RESPONSE";
+  error.ignored = true;
+  return error;
+}
+
+function isIgnoredRequestError(error) {
+  return Boolean(error?.ignored || error?.code === "STALE_SESSION_RESPONSE" || error?.name === "AbortError");
+}
+
+function createRequestContext(policy = {}) {
+  const authToken = policy.authToken === undefined ? state.token : String(policy.authToken || "");
+  const bindToSession = policy.bindToSession === undefined
+    ? Boolean(authToken && authToken === state.token)
+    : policy.bindToSession === true;
+  const context = {
+    authToken,
+    bindToSession,
+    epoch: state.sessionEpoch,
+    resetOn401: policy.resetOn401 === undefined ? bindToSession : policy.resetOn401 === true,
+    controller: bindToSession ? new AbortController() : null,
+  };
+  if (context.controller) state.requestControllers.add(context.controller);
+  return context;
+}
+
+function assertRequestContextCurrent(context) {
+  if (!context.bindToSession) return;
+  if (
+    context.controller?.signal.aborted ||
+    context.epoch !== state.sessionEpoch ||
+    context.authToken !== state.token
+  ) {
+    throw createIgnoredRequestError();
+  }
+}
+
+function releaseRequestContext(context) {
+  if (context.controller) state.requestControllers.delete(context.controller);
+}
+
+function authHeaders(authToken = state.token) {
+  if (!authToken) return {};
+  return { authorization: `Bearer ${authToken}` };
+}
+
+function createHttpError(response, payload, fallback, context) {
+  assertRequestContextCurrent(context);
+  if (response.status === 401 && context.resetOn401 && state.token === context.authToken) {
+    resetSessionUi("セッションが無効または期限切れです");
+  }
+  const serverMessage = parseErrorMessage(payload, fallback);
+  const message = response.status === 403
+    ? `この操作の権限がありません。${serverMessage ? ` ${serverMessage}` : ""}`
+    : response.status === 401
+      ? `認証できませんでした。${serverMessage ? ` ${serverMessage}` : ""}`
+      : serverMessage;
+  const error = new Error(message);
+  error.status = response.status;
+  error.code = payload?.error?.code || "";
+  error.payload = payload;
+  return error;
+}
+
+async function requestJson(path, options = {}, policy = {}) {
+  const context = createRequestContext(policy);
   const headers = {
     ...(options.headers || {}),
-    ...authHeaders(),
+    ...authHeaders(context.authToken),
   };
-  const response = await fetch(path, { ...options, headers });
-  const body = await response.text();
-  if (!response.ok) {
-    let payload = {};
-    try {
-      payload = JSON.parse(body);
-    } catch (_error) {
-      payload = {};
+  const fetchOptions = { ...options, headers };
+  if (context.controller) fetchOptions.signal = context.controller.signal;
+  try {
+    const response = await fetch(path, fetchOptions);
+    assertRequestContextCurrent(context);
+    const payload = await response.json().catch(() => ({}));
+    assertRequestContextCurrent(context);
+    if (!response.ok) {
+      throw createHttpError(response, payload, "リクエストに失敗しました", context);
     }
-    const message = parseErrorMessage(payload, body || "リクエストに失敗しました");
-    const error = new Error(message);
-    error.status = response.status;
-    error.payload = payload;
+    return payload;
+  } catch (error) {
+    if (
+      isIgnoredRequestError(error) ||
+      (context.bindToSession &&
+        (context.controller?.signal.aborted || context.epoch !== state.sessionEpoch || context.authToken !== state.token))
+    ) {
+      throw createIgnoredRequestError();
+    }
     throw error;
+  } finally {
+    releaseRequestContext(context);
   }
-  return { body, headers: response.headers };
+}
+
+async function requestText(path, options = {}, policy = {}) {
+  const context = createRequestContext(policy);
+  const headers = {
+    ...(options.headers || {}),
+    ...authHeaders(context.authToken),
+  };
+  const fetchOptions = { ...options, headers };
+  if (context.controller) fetchOptions.signal = context.controller.signal;
+  try {
+    const response = await fetch(path, fetchOptions);
+    assertRequestContextCurrent(context);
+    const body = await response.text();
+    assertRequestContextCurrent(context);
+    if (!response.ok) {
+      let payload = {};
+      try {
+        payload = JSON.parse(body);
+      } catch (_error) {
+        payload = {};
+      }
+      throw createHttpError(response, payload, body || "リクエストに失敗しました", context);
+    }
+    return { body, headers: response.headers };
+  } catch (error) {
+    if (
+      isIgnoredRequestError(error) ||
+      (context.bindToSession &&
+        (context.controller?.signal.aborted || context.epoch !== state.sessionEpoch || context.authToken !== state.token))
+    ) {
+      throw createIgnoredRequestError();
+    }
+    throw error;
+  } finally {
+    releaseRequestContext(context);
+  }
 }
 
 function setInvoiceStatusPill(statusRaw) {
@@ -1398,11 +1965,12 @@ function startFallbackPollingIfNeeded() {
 
 function renderProviderControls(invoice) {
   const providerSummary = invoice?.provider_summary || null;
+  const canControlProvider = hasPermission("invoice.create") && state.invoiceOperationsInFlight.size === 0;
   if (!providerSummary?.available) {
     el.providerOperatorStateText.textContent = "QR案内";
     el.providerStatusText.textContent = "店頭端末未提示";
     el.providerControlHint.textContent = "端末入口QRを入口として案内できます。タッチ決済を使う場合だけ明示的に提示を開始します。";
-    el.presentTapBtn.disabled = !state.invoiceId || invoice?.status !== "issued";
+    el.presentTapBtn.disabled = !canControlProvider || !state.invoiceId || invoice?.status !== "issued";
     el.resumeQrBtn.disabled = true;
     return;
   }
@@ -1417,8 +1985,8 @@ function renderProviderControls(invoice) {
   el.providerControlHint.textContent = providerSummary.qr_available
     ? "QR案内に戻っています。必要なら改めて tap を提示できます。"
     : (providerSummary.operator_state?.body || "タッチ案内中は端末入口QR導線を止め、同じ会計の二重導線を防ぎます。");
-  el.presentTapBtn.disabled = providerSummary.can_present !== true;
-  el.resumeQrBtn.disabled = providerSummary.can_cancel_presentation !== true;
+  el.presentTapBtn.disabled = !canControlProvider || providerSummary.can_present !== true;
+  el.resumeQrBtn.disabled = !canControlProvider || providerSummary.can_cancel_presentation !== true;
 }
 
 function renderAmountCompare(invoice) {
@@ -1449,6 +2017,8 @@ function renderAmountCompare(invoice) {
 
 function renderInvoice(invoice) {
   const previousInvoiceId = state.invoiceId;
+  const nextInvoiceId = String(invoice?.invoice_id || "");
+  if (previousInvoiceId && previousInvoiceId !== nextInvoiceId) state.pendingDangerAction = "";
   state.currentInvoice = invoice;
   state.invoiceDiagnostics = invoice.diagnostics || null;
   state.invoiceId = invoice.invoice_id || "";
@@ -1488,6 +2058,9 @@ function renderInvoice(invoice) {
 }
 
 function clearInvoiceView() {
+  state.invoiceRequestSequence += 1;
+  state.latestInvoiceRequestId = "";
+  state.pendingDangerAction = "";
   state.invoiceId = "";
   state.invoiceStatus = "";
   state.currentInvoice = null;
@@ -1520,16 +2093,34 @@ function clearInvoiceView() {
 }
 
 async function loadInvoice(invoiceId, options = {}) {
-  if (!invoiceId) return;
+  const requestedInvoiceId = String(invoiceId || "").trim();
+  if (!requestedInvoiceId) return { status: "skipped" };
+  const requestSequence = state.invoiceRequestSequence + 1;
+  state.invoiceRequestSequence = requestSequence;
+  state.latestInvoiceRequestId = requestedInvoiceId;
   try {
-    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(invoiceId)}`);
+    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(requestedInvoiceId)}`);
+    if (
+      requestSequence !== state.invoiceRequestSequence
+      || state.latestInvoiceRequestId !== requestedInvoiceId
+    ) return { status: "stale" };
+    if (String(data?.invoice_id || "") !== requestedInvoiceId) {
+      throw new Error("請求IDが一致しない応答を受け取ったため破棄しました");
+    }
     state.lastInvoiceRefreshAt = nowIso();
     renderInvoice(data);
     if (!options.silent) {
       showToast(`請求状態を更新しました（${el.invoiceStatusPill.textContent}）`);
     }
+    return { status: "ok", invoice: data };
   } catch (error) {
+    if (
+      isIgnoredRequestError(error)
+      || requestSequence !== state.invoiceRequestSequence
+      || state.latestInvoiceRequestId !== requestedInvoiceId
+    ) return { status: "stale" };
     if (!options.silent) showToast(String(error.message || error), true);
+    return { status: "failed", error };
   }
 }
 
@@ -1579,11 +2170,15 @@ function handleResetAmountPresets() {
 }
 
 async function fetchSseToken(invoiceId) {
+  const sessionGeneration = captureSessionGeneration();
   const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(invoiceId)}/sse-token`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
   });
+  if (!isSessionGenerationCurrent(sessionGeneration) || state.invoiceId !== invoiceId) {
+    throw createIgnoredRequestError();
+  }
   state.sseToken = data.token;
   return data.token;
 }
@@ -1591,42 +2186,56 @@ async function fetchSseToken(invoiceId) {
 async function connectTerminalStream() {
   if (!state.token || !state.terminalId || !state.invoiceId) return;
   closeSse();
+  const sessionGeneration = captureSessionGeneration();
+  const terminalId = state.terminalId;
+  const invoiceId = state.invoiceId;
   let sseToken = "";
   setSseStatus("connecting", "SSE token を取得中");
   try {
-    sseToken = await fetchSseToken(state.invoiceId);
+    sseToken = await fetchSseToken(invoiceId);
   } catch (error) {
+    if (isIgnoredRequestError(error) || !isSessionGenerationCurrent(sessionGeneration)) return;
     setNetworkStatus("再接続中（トークン取得失敗）");
     setSseStatus("reconnecting", "トークン取得失敗");
     startFallbackPollingIfNeeded();
     scheduleSseReconnect();
     return;
   }
+  if (!isSessionGenerationCurrent(sessionGeneration) || state.invoiceId !== invoiceId) return;
 
   const streamUrl =
-    `/api/v1/streams/terminals/${encodeURIComponent(state.terminalId)}` +
-    `?invoice_id=${encodeURIComponent(state.invoiceId)}&sse_token=${encodeURIComponent(sseToken)}`;
+    `/api/v1/streams/terminals/${encodeURIComponent(terminalId)}` +
+    `?invoice_id=${encodeURIComponent(invoiceId)}&sse_token=${encodeURIComponent(sseToken)}`;
 
-  state.sse = new EventSource(streamUrl);
+  const stream = new EventSource(streamUrl);
+  state.sse = stream;
+  const isCurrentStream = () =>
+    isSessionGenerationCurrent(sessionGeneration) && state.invoiceId === invoiceId && state.sse === stream;
 
-  state.sse.addEventListener("open", () => {
+  stream.addEventListener("open", () => {
+    if (!isCurrentStream()) {
+      stream.close();
+      return;
+    }
     setNetworkStatus("リアルタイム接続中");
     setSseStatus("open", "SSE 接続済み");
     state.lastStreamEventAt = nowIso();
-    if (state.invoiceId) {
-      void loadInvoice(state.invoiceId, { silent: true });
-    }
+    void loadInvoice(invoiceId, { silent: true });
     startFallbackPollingIfNeeded();
   });
 
   const refreshFromStream = (event) => {
+    if (!isCurrentStream()) {
+      stream.close();
+      return;
+    }
     try {
       const payload = JSON.parse(event.data || "{}");
       const updatedInvoiceId = payload.invoiceId || payload.invoice_id;
       if (!updatedInvoiceId) return;
       state.lastStreamEventAt = nowIso();
       renderDiagnostics();
-      if (!state.invoiceId || state.invoiceId === updatedInvoiceId) {
+      if (state.invoiceId === updatedInvoiceId) {
         void loadInvoice(updatedInvoiceId, { silent: true });
       }
     } catch (_error) {
@@ -1634,16 +2243,24 @@ async function connectTerminalStream() {
     }
   };
 
-  state.sse.addEventListener("snapshot", refreshFromStream);
-  state.sse.addEventListener("invoice.updated", refreshFromStream);
-  state.sse.addEventListener("status_changed", refreshFromStream);
-  state.sse.addEventListener("heartbeat", () => {
+  stream.addEventListener("snapshot", refreshFromStream);
+  stream.addEventListener("invoice.updated", refreshFromStream);
+  stream.addEventListener("status_changed", refreshFromStream);
+  stream.addEventListener("heartbeat", () => {
+    if (!isCurrentStream()) {
+      stream.close();
+      return;
+    }
     setNetworkStatus("リアルタイム接続中");
     setSseStatus("open", "heartbeat");
     state.lastStreamEventAt = nowIso();
     renderDiagnostics();
   });
-  state.sse.addEventListener("error", () => {
+  stream.addEventListener("error", () => {
+    if (!isCurrentStream()) {
+      stream.close();
+      return;
+    }
     setNetworkStatus("再接続中（自動更新中）");
     setSseStatus("reconnecting", "自動再接続待ち");
     startFallbackPollingIfNeeded();
@@ -1652,17 +2269,31 @@ async function connectTerminalStream() {
 }
 
 function formatRole(role) {
-  if (role === "admin") return "管理者";
-  if (role === "manager") return "マネージャー";
-  return "スタッフ";
+  const labels = {
+    admin: "管理者",
+    manager: "マネージャー",
+    accounting: "経理担当",
+    operator: "オペレーター",
+    staff: "スタッフ",
+  };
+  return labels[role] || role || "-";
 }
 
-function applyAdminVisibility() {
-  const visible = isAdminRole(state.role);
-  for (const section of el.adminSections) {
-    section.classList.toggle("hidden", !visible);
-    section.setAttribute("aria-hidden", visible ? "false" : "true");
+function applyPermissionVisibility() {
+  for (const node of el.permissionNodes) {
+    const requiredPermission = String(node.dataset.permission || "").trim();
+    const anyPermissions = String(node.dataset.permissionAny || "").trim().split(/\s+/).filter(Boolean);
+    const visible = Boolean(
+      state.token &&
+      state.permissionsKnown &&
+      (requiredPermission ? hasPermission(requiredPermission) : hasAnyPermission(anyPermissions))
+    );
+    node.classList.toggle("hidden", !visible);
+    node.setAttribute("aria-hidden", visible ? "false" : "true");
+    if ("disabled" in node) node.disabled = !visible;
   }
+  syncInvoiceOperationControls();
+  updateRefundStepState();
 }
 
 function setReviewListState(kind, message) {
@@ -1738,9 +2369,11 @@ function applyRefundDraftFromReview(review, suggestion, events) {
   if (suggestion.suggestedRefundAmount != null) {
     el.refundAmount.value = String(suggestion.suggestedRefundAmount);
     hintParts.push(`返金候補 ${formatJpyc(suggestion.suggestedRefundAmount)}`);
+    el.refundEligibleHint.textContent = `レビューから算出した返金候補: ${formatJpyc(suggestion.suggestedRefundAmount)}。申請時はサーバーが返金可能上限を再検証します。`;
   } else {
     el.refundAmount.value = "";
     hintParts.push("返金候補額なし");
+    el.refundEligibleHint.textContent = "このレビューには自動算出できる返金候補額がありません。明細を確認して入力してください。";
   }
 
   const chainCandidate = String(
@@ -1771,6 +2404,7 @@ function applyRefundDraftFromReview(review, suggestion, events) {
     hintParts.length > 0
       ? `返金フォーム下書き: ${hintParts.join(" / ")}`
       : "返金フォームの下書き候補はありません。必要な項目を手入力してください。";
+  handleRefundDraftChanged();
 }
 
 function renderReviewDetail(detail = null) {
@@ -1793,6 +2427,7 @@ function renderReviewDetail(detail = null) {
     el.reviewRelatedInvoices.textContent = "レビューを選ぶと、同じ会計で再発行された関連請求をここへ表示します。";
     el.refundDraftHint.textContent =
       "レビューを選択すると、返金候補額・支払い元アドレス・チェーンIDを返金フォームへ下書きします。";
+    el.refundEligibleHint.textContent = "レビューを選択すると、サーバーが返した返金可能額を表示します。";
     return;
   }
 
@@ -1858,22 +2493,41 @@ function renderReviewDetail(detail = null) {
 function highlightSelectedReviewRow() {
   const rows = Array.from(el.reviewsTableBody.querySelectorAll("tr"));
   for (const row of rows) {
-    row.classList.toggle("is-selected", row.dataset.reviewId === state.selectedReviewId);
+    const selected = row.dataset.reviewId === state.selectedReviewId;
+    row.classList.toggle("is-selected", selected);
+    row.setAttribute("aria-selected", selected ? "true" : "false");
   }
 }
 
 async function selectReview(reviewId) {
   const nextId = String(reviewId || "").trim();
-  if (!nextId || !isAdminRole(state.role)) return;
+  if (!nextId || !hasPermission("review.read")) return;
+  const requestSequence = state.reviewDetailSequence + 1;
+  state.reviewDetailSequence = requestSequence;
+  state.reviewDetailRequestId = nextId;
   state.selectedReviewId = nextId;
   highlightSelectedReviewRow();
   el.reviewIdInput.value = nextId;
   try {
     const data = await requestJson(`/api/v1/reviews/${encodeURIComponent(nextId)}`);
+    if (
+      requestSequence !== state.reviewDetailSequence
+      || state.reviewDetailRequestId !== nextId
+      || state.selectedReviewId !== nextId
+    ) return { status: "stale" };
+    if (String(data?.review?.id || "") !== nextId) throw new Error("レビューIDが一致しない応答を破棄しました");
     renderReviewDetail(data);
+    return { status: "ok", detail: data };
   } catch (error) {
+    if (
+      isIgnoredRequestError(error)
+      || requestSequence !== state.reviewDetailSequence
+      || state.reviewDetailRequestId !== nextId
+      || state.selectedReviewId !== nextId
+    ) return { status: "stale" };
     renderReviewDetail(null);
     showToast(String(error.message || error), true);
+    return { status: "failed", error };
   }
 }
 
@@ -1882,6 +2536,8 @@ function createReviewRow(row) {
   tr.className = "clickable-row";
   tr.dataset.reviewId = row.id;
   tr.tabIndex = 0;
+  tr.setAttribute("aria-selected", "false");
+  tr.setAttribute("aria-label", `レビュー ${shortId(row.id)}、${reviewReasonLabel(row.reason_type)}、${reviewStatusLabel(row.status)}。Enter または Space で詳細を表示`);
   const priority = reviewPriorityMeta(row);
 
   const cells = [
@@ -1920,11 +2576,16 @@ function createReviewRow(row) {
 }
 
 async function handleLogin() {
+  if (state.logoutRetryToken) {
+    showToast("ログアウト完了を確認するまで、新しい担当者ではログインできません", true);
+    return;
+  }
   const terminalCode = String(el.terminalCode.value || "").trim();
+  const staffName = String(el.staffName.value || "").trim();
   const staffPin = String(el.staffPin.value || "").trim();
   const staffPinConfirm = String(el.staffPinConfirm.value || "").trim();
-  if (!terminalCode || !staffPin) {
-    showToast("端末コードとスタッフPINを入力してください", true);
+  if (!terminalCode || !staffName || !staffPin) {
+    showToast("端末コード、スタッフ名、スタッフPINを入力してください", true);
     return;
   }
   if (staffPinConfirm && staffPin !== staffPinConfirm) {
@@ -1933,61 +2594,143 @@ async function handleLogin() {
   }
 
   el.loginBtn.disabled = true;
+  const loginEpoch = state.sessionEpoch;
   try {
     const data = await requestJson("/api/v1/terminal-sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ terminalCode, staffPin }),
+      body: JSON.stringify({ terminalCode, staffPin, staffName }),
     });
+    if (loginEpoch !== state.sessionEpoch || state.logoutRetryToken) return;
+    advanceSessionEpoch();
     state.token = data.token;
-    state.terminalId = data.terminalId;
-    state.storeId = data.storeId;
-    state.sessionId = data.sessionId;
+    state.terminalId = data.terminalId || data.terminal_id || "";
+    state.storeId = data.storeId || data.store_id || "";
+    state.sessionId = data.sessionId || data.session_id || "";
     state.role = String(data.role || "staff");
+    state.staffName = String(data.staff_name || data.staffName || staffName);
+    state.staffCode = String(data.staff_code || data.staffCode || "");
+    const permissions = Array.isArray(data.effective_permissions)
+      ? data.effective_permissions
+      : Array.isArray(data.permissions)
+        ? data.permissions
+        : [];
+    state.permissionsKnown = Array.isArray(data.effective_permissions) || Array.isArray(data.permissions);
+    state.effectivePermissions = new Set(permissions.map((permission) => String(permission || "").trim()).filter(Boolean));
+    state.storeTimezone = safeTimeZone(data.store_timezone || data.storeTimezone || data.timezone || "Asia/Tokyo");
+    const explicitExpiry = data.session_expires_at || data.sessionExpiresAt || data.expires_at || "";
+    const startedAtMs = new Date(data.started_at || Date.now()).getTime();
+    const ttlMs = Number(data.session_ttl_sec) * 1000;
+    state.sessionExpiresAt = explicitExpiry || (Number.isFinite(startedAtMs) && Number.isFinite(ttlMs)
+      ? new Date(startedAtMs + ttlMs).toISOString()
+      : "");
     state.diagnosticsEnabled = data.diagnostic_mode_enabled === true;
     state.supportedWallets = Array.isArray(data.supported_wallets) ? data.supported_wallets : [];
     state.fixedQrUrl = typeof data.fixed_qr_url === "string" ? data.fixed_qr_url : "";
     state.fixedQrToken = typeof data.public_entry_token === "string" ? data.public_entry_token : "";
+    el.staffPin.value = "";
+    el.staffPinConfirm.value = "";
+    const authenticatedGeneration = captureSessionGeneration();
 
     setLoggedInUi(true);
-    el.sessionText.textContent = `${state.sessionId}（${formatRole(state.role)}）`;
-    el.sessionExpiryText.textContent = `${data.session_ttl_sec} 秒`;
+    el.sessionIdentityText.textContent = state.staffCode ? `${state.staffName}（${state.staffCode}）` : state.staffName;
+    el.sessionRoleText.textContent = formatRole(state.role);
+    el.sessionText.textContent = state.sessionId;
+    el.sessionPermissionText.textContent = state.permissionsKnown
+      ? `実効権限 ${state.effectivePermissions.size}件（許可された操作のみ表示）`
+      : "実効権限を確認できないため、管理・返金・締め・監査・監視操作を非表示にしています。";
+    el.businessTimezoneText.textContent = state.storeTimezone;
+    el.businessDateInput.value = nowIsoDate();
+    el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+    startSessionExpiryTimer();
     setNetworkStatus("認証済み");
     renderCustomerFacingQr();
-    applyAdminVisibility();
+    applyPermissionVisibility();
     renderDiagnostics();
     renderOperatorGuide();
     if (data.current_invoice?.invoice_id) {
       await loadInvoice(data.current_invoice.invoice_id, { silent: true });
+      if (!isSessionGenerationCurrent(authenticatedGeneration)) return;
     } else {
       clearInvoiceView();
     }
-    if (isAdminRole(state.role)) {
+    if (hasAnyPermission(["review.read", "settlement.close", "monitor.read"])) {
       await loadOpsSnapshot();
+      if (!isSessionGenerationCurrent(authenticatedGeneration)) return;
       startOpsAutoRefresh();
-      void loadReviews();
-    } else {
-      await loadOpsWarnings();
-      setReviewListState("empty", "管理者権限でログインすると確認待ち一覧を表示できます。");
     }
+    if (hasPermission("review.read")) void loadReviews();
+    else setReviewListState("empty", "確認待ち一覧は現在の実効権限の対象外です。");
+    if (hasPermission("monitor.read")) {
+      await loadOpsWarnings();
+      if (!isSessionGenerationCurrent(authenticatedGeneration)) return;
+    }
+    else renderOpsWarningsList(["監視状態は現在の実効権限の対象外です"]);
     showToast("ログインしました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
   } finally {
-    el.loginBtn.disabled = false;
+    el.loginBtn.disabled = Boolean(state.logoutRetryToken);
+  }
+}
+
+function enterLogoutRetryState(token, logoutIdempotencyKey, reason) {
+  resetSessionUi(reason, {
+    logoutRetryToken: token,
+    logoutIdempotencyKey,
+  });
+}
+
+async function handleLogout() {
+  if (state.logoutInFlight) return;
+  const logoutToken = state.logoutRetryToken || state.token;
+  if (!logoutToken) {
+    resetSessionUi("未ログイン");
+    return;
+  }
+  const logoutIdempotencyKey = state.logoutIdempotencyKey || idempotencyKey("terminal-logout");
+  state.logoutIdempotencyKey = logoutIdempotencyKey;
+  state.logoutInFlight = true;
+  el.logoutBtn.disabled = true;
+  try {
+    await requestJson("/api/v1/terminal-sessions/current", {
+      method: "DELETE",
+      headers: { "idempotency-key": logoutIdempotencyKey },
+    }, {
+      authToken: logoutToken,
+      bindToSession: false,
+      resetOn401: false,
+    });
+    resetSessionUi("担当者交代待ち");
+    showToast("ログアウトしました。次の担当者でログインしてください");
+  } catch (error) {
+    if (error.status === 401) {
+      resetSessionUi("担当者交代待ち");
+      showToast("サーバー側のセッションは終了済みです。次の担当者でログインしてください");
+      return;
+    }
+    enterLogoutRetryState(
+      logoutToken,
+      logoutIdempotencyKey,
+      "ログアウト完了を確認できません。通信復旧後に同じボタンで再試行してください"
+    );
+    showToast("ログアウト完了を確認できません。機密情報を隠し、再試行だけを許可しています", true);
+  } finally {
+    state.logoutInFlight = false;
+    if (state.logoutRetryToken) el.logoutBtn.disabled = false;
   }
 }
 
 async function handleCreateInvoice() {
-  if (!state.token) {
-    showToast("先にログインしてください", true);
-    return;
-  }
+  if (!requireUiPermission("invoice.create", "請求作成")) return;
   const amount = Number(el.amountInput.value);
   if (!Number.isInteger(amount) || amount <= 0) {
     el.amountInputError.textContent = "金額は1円以上の整数で入力してください。";
     return;
   }
+  const operation = beginInvoiceOperation("invoice-create", String(amount), { stable: false });
+  if (!operation) return;
   el.amountInputError.textContent = "";
   el.createInvoiceBtn.disabled = true;
   el.createInvoiceBtn.classList.add("loading");
@@ -1996,13 +2739,14 @@ async function handleCreateInvoice() {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("invoice"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: JSON.stringify({ amount_jpy: amount }),
     });
     showToast("請求を作成しました");
     await loadInvoice(data.invoice_id);
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     if (error?.payload?.error?.code === "TERMINAL_ACTIVE_INVOICE_EXISTS") {
       const activeInvoice = error.payload?.error?.details?.active_invoice;
       if (activeInvoice?.invoice_id) {
@@ -2018,67 +2762,83 @@ async function handleCreateInvoice() {
     }
   } finally {
     el.createInvoiceBtn.classList.remove("loading");
-    el.createInvoiceBtn.disabled = false;
+    endInvoiceOperation(operation);
   }
 }
 
-async function postInvoiceAction(actionPath, actionLabel) {
-  if (!state.invoiceId) {
+async function postInvoiceAction(actionPath, actionLabel, invoiceId = state.invoiceId) {
+  if (!requireUiPermission("invoice.create", actionLabel)) return;
+  const targetInvoiceId = String(invoiceId || "").trim();
+  if (!targetInvoiceId) {
     showToast("対象の請求がありません", true);
     return;
   }
+  const operation = beginInvoiceOperation(`invoice-${actionPath}`, targetInvoiceId);
+  if (!operation) return;
   try {
-    await requestJson(`/api/v1/invoices/${encodeURIComponent(state.invoiceId)}/${actionPath}`, {
+    await requestJson(`/api/v1/invoices/${encodeURIComponent(targetInvoiceId)}/${actionPath}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey(`invoice-${actionPath}`),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: "{}",
     });
     showToast(actionLabel);
-    await loadInvoice(state.invoiceId, { silent: true });
+    await loadInvoice(targetInvoiceId, { silent: true });
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
+  } finally {
+    endInvoiceOperation(operation);
   }
 }
 
 async function handleReissueInvoice() {
-  if (!state.invoiceId) {
+  if (!requireUiPermission("invoice.create", "QR再発行")) return;
+  const targetInvoiceId = String(state.invoiceId || "").trim();
+  if (!targetInvoiceId) {
     showToast("再発行対象の請求がありません", true);
     return;
   }
+  const operation = beginInvoiceOperation("invoice-reissue", targetInvoiceId);
+  if (!operation) return;
   el.reissueInvoiceBtn.disabled = true;
   try {
-    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(state.invoiceId)}/reissue`, {
+    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(targetInvoiceId)}/reissue`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("invoice-reissue"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: "{}",
     });
     showToast("QRを再発行しました");
     await loadInvoice(data.invoice_id, { silent: true });
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
   } finally {
-    el.reissueInvoiceBtn.disabled = false;
+    endInvoiceOperation(operation);
   }
 }
 
 async function handlePresentTap() {
-  if (!state.invoiceId) {
+  if (!requireUiPermission("invoice.create", "タッチ決済の提示")) return;
+  const targetInvoiceId = String(state.invoiceId || "").trim();
+  if (!targetInvoiceId) {
     showToast("tap 提示対象の請求がありません", true);
     return;
   }
+  const operation = beginInvoiceOperation("provider-present", targetInvoiceId);
+  if (!operation) return;
   el.presentTapBtn.disabled = true;
   try {
-    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(state.invoiceId)}/provider-sessions:present`, {
+    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(targetInvoiceId)}/provider-sessions:present`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("provider-present"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: "{}",
     });
@@ -2087,10 +2847,12 @@ async function handlePresentTap() {
     } else {
       showToast("タッチ決済を提示しました");
     }
-    await loadInvoice(data.invoice_id || state.invoiceId, { silent: true });
+    await loadInvoice(data.invoice_id || targetInvoiceId, { silent: true });
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
   } finally {
+    endInvoiceOperation(operation);
     if (state.currentInvoice) {
       renderProviderControls(state.currentInvoice);
     } else {
@@ -2100,25 +2862,31 @@ async function handlePresentTap() {
 }
 
 async function handleResumeQr() {
-  if (!state.invoiceId) {
+  if (!requireUiPermission("invoice.create", "QR案内へ戻す操作")) return;
+  const targetInvoiceId = String(state.invoiceId || "").trim();
+  if (!targetInvoiceId) {
     showToast("QRへ戻す対象の請求がありません", true);
     return;
   }
+  const operation = beginInvoiceOperation("provider-cancel", targetInvoiceId);
+  if (!operation) return;
   el.resumeQrBtn.disabled = true;
   try {
-    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(state.invoiceId)}/provider-sessions:cancel`, {
+    const data = await requestJson(`/api/v1/invoices/${encodeURIComponent(targetInvoiceId)}/provider-sessions:cancel`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("provider-cancel"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: "{}",
     });
     showToast("QR案内へ戻しました");
-    await loadInvoice(data.invoice_id || state.invoiceId, { silent: true });
+    await loadInvoice(data.invoice_id || targetInvoiceId, { silent: true });
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
   } finally {
+    endInvoiceOperation(operation);
     if (state.currentInvoice) {
       renderProviderControls(state.currentInvoice);
     } else {
@@ -2128,15 +2896,25 @@ async function handleResumeQr() {
 }
 
 async function loadReviews() {
-  if (!isAdminRole(state.role)) return;
+  if (!hasPermission("review.read")) return;
+  const requestSequence = state.reviewListSequence + 1;
+  state.reviewListSequence = requestSequence;
+  const status = String(el.reviewStatusFilter.value || "");
+  state.reviewListFilter = status;
+  state.reviewDetailSequence += 1;
+  state.reviewDetailRequestId = "";
   setReviewListState("loading", "確認待ち支払いを読み込み中です...");
   el.reviewsTableBody.innerHTML = "";
 
-  const status = String(el.reviewStatusFilter.value || "");
   const query = status ? `?status=${encodeURIComponent(status)}` : "";
 
   try {
     const data = await requestJson(`/api/v1/reviews${query}`);
+    if (
+      requestSequence !== state.reviewListSequence
+      || state.reviewListFilter !== status
+      || String(el.reviewStatusFilter.value || "") !== status
+    ) return { status: "stale" };
     const rows = Array.isArray(data.reviews) ? [...data.reviews].sort(compareReviewsByPriority) : [];
     state.reviewRows = rows;
     renderReviewSummary(rows);
@@ -2144,7 +2922,7 @@ async function loadReviews() {
       state.selectedReviewId = "";
       renderReviewDetail(null);
       setReviewListState("empty", "確認待ちの支払いはありません。");
-      return;
+      return { status: "ok", rows };
     }
     const activeRows = rows.filter((row) => ["open", "in_progress"].includes(String(row.status || "")));
     const topReview = activeRows[0] || null;
@@ -2161,17 +2939,26 @@ async function loadReviews() {
     if (nextSelection) {
       await selectReview(nextSelection);
     }
+    if (requestSequence !== state.reviewListSequence || state.reviewListFilter !== status) return { status: "stale" };
     highlightSelectedReviewRow();
+    return { status: "ok", rows };
   } catch (error) {
+    if (
+      isIgnoredRequestError(error)
+      || requestSequence !== state.reviewListSequence
+      || state.reviewListFilter !== status
+    ) return { status: "stale" };
     state.selectedReviewId = "";
     renderReviewDetail(null);
     renderReviewSummary([]);
     setReviewListState("error", "読み込みに失敗しました。もう一度お試しください。");
     showToast(String(error.message || error), true);
+    return { status: "failed", error };
   }
 }
 
 async function handleUpdateReview() {
+  if (!requireUiPermission("review.update", "レビュー更新")) return;
   const reviewId = String(el.reviewIdInput.value || "").trim();
   if (!reviewId) {
     showToast("レビューIDを入力してください", true);
@@ -2193,7 +2980,170 @@ async function handleUpdateReview() {
     await loadReviews();
     await loadOpsSnapshot();
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
+  }
+}
+
+function normalizeDecimalSignature(value) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(\d+)(?:\.(\d+))?$/);
+  if (!match) return raw;
+  const whole = match[1].replace(/^0+(?=\d)/, "");
+  const fraction = String(match[2] || "").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
+function buildRefundRequestSignature() {
+  return JSON.stringify({
+    review_case_id: String(el.refundReviewCaseId?.value || "").trim(),
+    refund_amount_jpyc: normalizeDecimalSignature(el.refundAmount?.value),
+    refund_to_address: String(el.refundAddress?.value || "").trim().toLowerCase(),
+    refund_chain_id: String(el.refundChainId?.value || "").trim(),
+  });
+}
+
+function clearPendingRefundExecute() {
+  state.pendingRefundExecute = "";
+  if (state.pendingRefundExecuteTimer) {
+    clearTimeout(state.pendingRefundExecuteTimer);
+    state.pendingRefundExecuteTimer = null;
+  }
+}
+
+function buildRefundExecuteSignature() {
+  return JSON.stringify({
+    refund_id: String(el.refundIdInput?.value || "").trim(),
+    refund_tx_hash: String(el.refundTxHashInput?.value || "").trim().toLowerCase(),
+    executed_wallet: String(el.refundExecutedWalletInput?.value || "").trim().toLowerCase(),
+    evidence_note_path: String(el.refundEvidenceNotePathInput?.value || "").trim(),
+    customer_note: String(el.refundCustomerNoteInput?.value || "").trim(),
+  });
+}
+
+function beginRefundOperation(kind, signature, refundId) {
+  const targetRefundId = String(refundId || "").trim();
+  if (!targetRefundId || state.refundOperationTargetsInFlight.has(targetRefundId)) return null;
+  const operationSignature = `${kind}:${String(signature || "")}`;
+  if (state.refundOperationsInFlight.has(operationSignature)) return null;
+  state.refundOperationsInFlight.add(operationSignature);
+  state.refundOperationTargetsInFlight.add(targetRefundId);
+  syncRefundOperationInputs();
+  updateRefundStepState();
+  return {
+    operationSignature,
+    targetRefundId,
+    idempotencyKey: getStableOperationKey(state.refundOperationKeys, kind, signature),
+  };
+}
+
+function endRefundOperation(operation) {
+  if (operation?.operationSignature) state.refundOperationsInFlight.delete(operation.operationSignature);
+  if (operation?.targetRefundId) state.refundOperationTargetsInFlight.delete(operation.targetRefundId);
+  syncRefundOperationInputs();
+  updateRefundStepState();
+}
+
+function releaseRefundVerifyKeyAfterResult(operation, result) {
+  if (!operation?.operationSignature) return;
+  if (REFUND_VERIFY_RETRYABLE_STATUSES.has(String(result?.status || ""))) {
+    state.refundOperationKeys.delete(operation.operationSignature);
+  }
+}
+
+function releaseRefundVerifyKeyAfterError(operation, error) {
+  if (!operation?.operationSignature || !Number.isInteger(error?.status)) return;
+  if (error?.code === "IDEMPOTENCY_IN_PROGRESS") return;
+  state.refundOperationKeys.delete(operation.operationSignature);
+}
+
+function syncRefundOperationInputs() {
+  const busy = state.refundOperationsInFlight.size > 0;
+  for (const input of [
+    el.refundIdInput,
+    el.refundTxHashInput,
+    el.refundExecutedWalletInput,
+    el.refundEvidenceNotePathInput,
+    el.refundCustomerNoteInput,
+  ]) {
+    if (input) input.disabled = busy || state.refundRequestInFlight;
+  }
+}
+
+function handleRefundDraftChanged() {
+  const nextSignature = buildRefundRequestSignature();
+  const stored = state.refundRequestOperations.get(nextSignature);
+  state.refundRequestSignature = nextSignature;
+  state.refundRequestIdempotencyKey = stored?.idempotencyKey || "";
+  state.refundRequestCompletedSignature = stored?.completed ? nextSignature : "";
+  clearPendingRefundExecute();
+  updateRefundStepState();
+}
+
+function setRefundRequestBusy(busy) {
+  state.refundRequestInFlight = busy;
+  for (const input of [
+    el.refundReviewCaseId,
+    el.refundAmount,
+    el.refundAddress,
+    el.refundChainId,
+    el.refundEvidenceNotePathInput,
+    el.refundCustomerNoteInput,
+  ]) {
+    if (input) input.disabled = busy;
+  }
+  syncRefundOperationInputs();
+  updateRefundStepState();
+}
+
+function renderRefundRecord(refund) {
+  if (!refund) return;
+  state.currentRefund = refund;
+  const refundId = String(refund.refund_request_id || refund.refund_case_id || refund.id || "");
+  if (refundId && String(el.refundIdInput.value || "").trim() !== refundId) {
+    clearPendingRefundExecute();
+    state.refundReadSequence += 1;
+    state.refundReadRequestId = "";
+    el.refundIdInput.value = refundId;
+  }
+  const status = String(refund.status || "");
+  const eligibleDisplay = refund.eligible_refund_amount_jpyc ?? refund.remaining_refund_amount_jpyc;
+  if (eligibleDisplay != null) {
+    el.refundEligibleHint.textContent = `サーバー確認済みの返金可能額: ${formatJpyc(eligibleDisplay)}`;
+  } else if (refund.eligible_refund_amount_jpyc_base != null) {
+    el.refundEligibleHint.textContent = `サーバー確認済みの返金可能額（最小単位）: ${refund.eligible_refund_amount_jpyc_base}`;
+  }
+  updateRefundStepState(status || "証跡入力");
+}
+
+async function readBackRefund(refundId) {
+  const requestedRefundId = String(refundId || "").trim();
+  if (!requestedRefundId || !hasPermission("refund.view")) return null;
+  const requestSequence = state.refundReadSequence + 1;
+  state.refundReadSequence = requestSequence;
+  state.refundReadRequestId = requestedRefundId;
+  const data = await requestJson(`/api/v1/refunds/${encodeURIComponent(requestedRefundId)}`);
+  if (
+    requestSequence !== state.refundReadSequence
+    || state.refundReadRequestId !== requestedRefundId
+    || String(el.refundIdInput?.value || "").trim() !== requestedRefundId
+  ) return null;
+  const responseRefundId = String(data?.refund_request_id || data?.refund_case_id || data?.id || "");
+  if (responseRefundId !== requestedRefundId) throw new Error("返金IDが一致しない応答を破棄しました");
+  renderRefundRecord(data);
+  return data;
+}
+
+async function tryReadBackRefund(refundId, completedLabel) {
+  if (!hasPermission("refund.view")) return true;
+  try {
+    await readBackRefund(refundId);
+    return true;
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return false;
+    el.executeRefundHint.classList.remove("hidden");
+    el.executeRefundHint.textContent = `${completedLabel}は完了しましたが、最新状態の再取得に失敗しました。返金IDから再確認してください。`;
+    return false;
   }
 }
 
@@ -2202,6 +3152,8 @@ function isHexTxHash(value) {
 }
 
 async function handleRequestRefund() {
+  if (!requireUiPermission("refund.request", "返金申請")) return;
+  if (state.refundRequestInFlight) return;
   const reviewCaseId = String(el.refundReviewCaseId.value || "").trim();
   const refundAmount = Number(el.refundAmount.value);
   const refundToAddress = String(el.refundAddress.value || "").trim();
@@ -2216,12 +3168,35 @@ async function handleRequestRefund() {
     showToast("返金先アドレスは 0x から始まる40桁hexで入力してください", true);
     return;
   }
+  const requestSignature = buildRefundRequestSignature();
+  let requestOperation = state.refundRequestOperations.get(requestSignature);
+  if (!requestOperation) {
+    requestOperation = {
+      idempotencyKey: idempotencyKey("refund-request"),
+      completed: false,
+      refundId: "",
+      result: null,
+    };
+    state.refundRequestOperations.set(requestSignature, requestOperation);
+  }
+  state.refundRequestSignature = requestSignature;
+  state.refundRequestIdempotencyKey = requestOperation.idempotencyKey;
+  if (requestOperation.completed) {
+    state.refundRequestCompletedSignature = requestSignature;
+    if (requestOperation.result) renderRefundRecord(requestOperation.result);
+    if (requestOperation.refundId && hasPermission("refund.view")) {
+      await tryReadBackRefund(requestOperation.refundId, "返金申請の作成");
+    }
+    showToast("この入力内容の返金申請は作成済みです。同じ返金IDと状態を表示しました");
+    return;
+  }
+  setRefundRequestBusy(true);
   try {
     const data = await requestJson("/api/v1/refunds", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("refund-request"),
+        "idempotency-key": requestOperation.idempotencyKey,
       },
       body: JSON.stringify({
         review_case_id: reviewCaseId,
@@ -2232,37 +3207,55 @@ async function handleRequestRefund() {
         customer_note: customerNote || null,
       }),
     });
-    el.refundIdInput.value = data.refund_request_id || "";
-    updateRefundStepState("承認待ち");
+    state.refundRequestCompletedSignature = requestSignature;
+    requestOperation.completed = true;
+    requestOperation.result = data;
+    renderRefundRecord(data);
+    const refundId = String(data.refund_request_id || data.refund_case_id || data.id || "");
+    requestOperation.refundId = refundId;
+    if (refundId) await tryReadBackRefund(refundId, "返金申請の作成");
     showToast("返金申請を作成しました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
+  } finally {
+    setRefundRequestBusy(false);
   }
 }
 
 async function handleApproveRefund() {
+  if (!requireUiPermission("refund.approve", "返金承認")) return;
   const refundId = String(el.refundIdInput.value || "").trim();
   if (!refundId) {
     showToast("返金IDを入力してください", true);
     return;
   }
+  const operation = beginRefundOperation("refund-approve", refundId, refundId);
+  if (!operation) return;
   try {
-    await requestJson(`/api/v1/refunds/${encodeURIComponent(refundId)}/approve`, {
+    const data = await requestJson(`/api/v1/refunds/${encodeURIComponent(refundId)}/approve`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("refund-approve"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: "{}",
     });
-    updateRefundStepState("外部実行待ち");
+    if (String(el.refundIdInput.value || "").trim() === refundId) {
+      renderRefundRecord(data);
+      await tryReadBackRefund(refundId, "返金申請の承認");
+    }
     showToast("返金申請を承認しました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
+  } finally {
+    endRefundOperation(operation);
   }
 }
 
 async function handleExecuteRefund() {
+  if (!requireUiPermission("refund.execute", "返金記録の保存")) return;
   const refundId = String(el.refundIdInput.value || "").trim();
   if (!refundId) {
     showToast("返金IDを入力してください", true);
@@ -2280,24 +3273,29 @@ async function handleExecuteRefund() {
     showToast("返金に使った店舗ウォレットは 0x から始まる40桁hexで入力してください", true);
     return;
   }
-  if (!state.pendingRefundExecute) {
-    state.pendingRefundExecute = true;
+  const executeSignature = buildRefundExecuteSignature();
+  if (state.pendingRefundExecute !== executeSignature) {
+    clearPendingRefundExecute();
+    state.pendingRefundExecute = executeSignature;
     el.executeRefundHint.classList.remove("hidden");
     el.executeRefundHint.textContent =
       `外部ウォレットで返金を実行済みであることを確認してください。返金記録 ${shortId(txHash)} を保存するには同じボタンをもう一度押してください。`;
     showToast("返金記録の保存はもう一度押すと実行します", true);
-    window.setTimeout(() => {
-      state.pendingRefundExecute = false;
+    state.pendingRefundExecuteTimer = window.setTimeout(() => {
+      if (state.pendingRefundExecute === executeSignature) state.pendingRefundExecute = "";
+      state.pendingRefundExecuteTimer = null;
     }, 8000);
     return;
   }
-  state.pendingRefundExecute = false;
+  clearPendingRefundExecute();
+  const operation = beginRefundOperation("refund-execute", executeSignature, refundId);
+  if (!operation) return;
   try {
     const data = await requestJson(`/api/v1/refunds/${encodeURIComponent(refundId)}/execute`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("refund-execute"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: JSON.stringify({
         executor_type: "manual",
@@ -2307,8 +3305,17 @@ async function handleExecuteRefund() {
         customer_note: customerNote || null,
       }),
     });
+    const targetStillCurrent = buildRefundExecuteSignature() === executeSignature;
+    if (!targetStillCurrent) {
+      showToast(`返金 ${shortId(refundId)} の記録保存は完了しました。現在の入力表示は上書きしません`);
+      return;
+    }
+    renderRefundRecord(data);
+    const readBackOk = await tryReadBackRefund(refundId, "返金記録の保存");
     el.executeRefundHint.classList.remove("hidden");
-    if (data.status === "recorded") {
+    if (!readBackOk) {
+      updateRefundStepState(String(data.status || "証跡入力"));
+    } else if (data.status === "recorded") {
       el.executeRefundHint.textContent = "返金記録を保存しました。検証待ちです。";
       updateRefundStepState("検証待ち");
     } else {
@@ -2317,13 +3324,17 @@ async function handleExecuteRefund() {
     }
     showToast("返金記録を保存しました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     el.executeRefundHint.classList.remove("hidden");
     el.executeRefundHint.textContent = String(error.message || error);
     showToast(String(error.message || error), true);
+  } finally {
+    endRefundOperation(operation);
   }
 }
 
 async function handleVerifyRefund() {
+  if (!requireUiPermission("refund.execute", "返金検証")) return;
   const refundId = String(el.refundIdInput.value || "").trim();
   if (!refundId) {
     showToast("返金IDを入力してください", true);
@@ -2339,31 +3350,81 @@ async function handleVerifyRefund() {
     payload.refund_tx_hash = txHash;
   }
 
+  const verifySignature = JSON.stringify({ refund_id: refundId, refund_tx_hash: txHash });
+  const operation = beginRefundOperation("refund-verify", verifySignature, refundId);
+  if (!operation) return;
   try {
     const data = await requestJson(`/api/v1/refunds/${encodeURIComponent(refundId)}/verify`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("refund-verify"),
+        "idempotency-key": operation.idempotencyKey,
       },
       body: JSON.stringify(payload),
     });
+    releaseRefundVerifyKeyAfterResult(operation, data);
+    const targetStillCurrent = String(el.refundIdInput.value || "").trim() === refundId
+      && String(el.refundTxHashInput.value || "").trim().toLowerCase() === txHash;
+    if (!targetStillCurrent) {
+      showToast(`返金 ${shortId(refundId)} の検証は完了しました。現在の入力表示は上書きしません`);
+      return;
+    }
+    renderRefundRecord(data);
+    const readBackOk = await tryReadBackRefund(refundId, "返金検証");
     el.executeRefundHint.classList.remove("hidden");
-    el.executeRefundHint.textContent =
-      data.status === "succeeded" ? "返金のオンチェーン検証が完了しました。" : `返金状態: ${data.status}`;
+    if (readBackOk) {
+      el.executeRefundHint.textContent =
+        data.status === "succeeded" ? "返金のオンチェーン検証が完了しました。" : `返金状態: ${data.status}`;
+    }
     updateRefundStepState(data.status === "succeeded" ? "検証済み" : String(data.status || "証跡入力"));
     showToast("返金検証を実行しました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    releaseRefundVerifyKeyAfterError(operation, error);
     el.executeRefundHint.classList.remove("hidden");
     el.executeRefundHint.textContent = String(error.message || error);
     showToast(String(error.message || error), true);
+  } finally {
+    endRefundOperation(operation);
   }
 }
 
 async function handleCloseSettlement() {
+  if (!requireUiPermission("settlement.close", "日次締め")) return;
+  if (state.settlementCloseInFlight) return;
+  const sessionGeneration = captureSessionGeneration();
   const businessDate = String(el.businessDateInput.value || "").trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) {
     showToast("対象営業日は YYYY-MM-DD 形式で入力してください", true);
+    return;
+  }
+  if (
+    state.opsReviewReadState !== "ok" ||
+    state.opsSettlementReadState !== "ok" ||
+    state.opsReviewBusinessDate !== businessDate ||
+    !hasPermission("review.read")
+  ) {
+    await loadOpsSnapshot();
+    if (!isSessionGenerationCurrent(sessionGeneration)) return;
+  }
+  if (String(el.businessDateInput.value || "").trim() !== businessDate) {
+    state.pendingSettlementClose = "";
+    if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
+    showToast("対象営業日が変更されたため、日次締めの確認をやり直してください", true);
+    return;
+  }
+  if (
+    state.opsReviewReadState !== "ok" ||
+    state.opsSettlementReadState !== "ok" ||
+    state.opsReviewBusinessDate !== businessDate ||
+    !hasPermission("review.read")
+  ) {
+    state.pendingSettlementClose = "";
+    if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
+    el.closeSettlementHint.classList.remove("hidden");
+    el.closeSettlementHint.textContent =
+      "未解決レビュー件数または現在の日次締め状態を確認できないため、日次締めを停止しました。通信状態と review.read の実効権限を確認して運用サマリーを再取得してください。";
+    showToast("締め前提の運用状態が不明なため、日次締めは実行できません", true);
     return;
   }
   if (state.pendingSettlementClose !== businessDate) {
@@ -2372,7 +3433,7 @@ async function handleCloseSettlement() {
     const refundCandidates = el.opsRefundCandidateCount?.textContent || "-";
     el.closeSettlementHint.classList.remove("hidden");
     el.closeSettlementHint.textContent =
-      `${businessDate} の日次締めを確認中です。未解決レビュー ${openReviews} 件、返金候補 ${refundCandidates} 件、操作履歴を確認し、同じボタンをもう一度押すと実行します。`;
+      `${businessDate}（${state.storeTimezone}）の日次締めを確認中です。未解決レビュー ${openReviews}、返金候補 ${refundCandidates}、操作履歴を確認し、同じボタンをもう一度押すと実行します。`;
     if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.remove("hidden");
     showToast("日次締めはもう一度押すと実行します", true);
     window.setTimeout(() => {
@@ -2382,12 +3443,16 @@ async function handleCloseSettlement() {
   }
   state.pendingSettlementClose = "";
   if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
+  state.settlementCloseInFlight = true;
+  el.closeSettlementBtn.disabled = true;
+  el.businessDateInput.disabled = true;
+  const closeKey = getStableOperationKey(state.settlementOperationKeys, "settlement-close", businessDate);
   try {
     const data = await requestJson("/api/v1/settlements/daily:close", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "idempotency-key": idempotencyKey("settlement-close"),
+        "idempotency-key": closeKey,
       },
       body: JSON.stringify({ business_date: businessDate }),
     });
@@ -2401,13 +3466,19 @@ async function handleCloseSettlement() {
     await loadOpsSnapshot();
     showToast("日次締めを実行しました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     el.closeSettlementHint.classList.remove("hidden");
     el.closeSettlementHint.textContent = String(error.message || error);
     showToast(String(error.message || error), true);
+  } finally {
+    state.settlementCloseInFlight = false;
+    el.businessDateInput.disabled = false;
+    el.closeSettlementBtn.disabled = !hasPermission("settlement.close");
   }
 }
 
 async function handleExportAuditCsv() {
+  if (!requireUiPermission("audit.export", "監査CSV出力")) return;
   try {
     const { body, headers } = await requestText("/api/v1/audit-logs/export?format=csv&limit=1000");
     const nameHint = headers.get("content-disposition");
@@ -2424,11 +3495,30 @@ async function handleExportAuditCsv() {
     URL.revokeObjectURL(objectUrl);
     showToast("CSVを出力しました");
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
   }
 }
 
+async function handleOpenAuditLog() {
+  if (!requireUiPermission("audit.read", "操作履歴の表示")) return;
+  el.openAuditLogBtn.disabled = true;
+  try {
+    const data = await requestJson("/api/v1/audit-logs?limit=50");
+    setAuditLogRows(data.audit_logs);
+    el.auditLogPanel.classList.remove("hidden");
+    showToast("認証済みの操作履歴を表示しました");
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    el.auditLogPanel.classList.add("hidden");
+    showToast(String(error.message || error), true);
+  } finally {
+    el.openAuditLogBtn.disabled = !hasPermission("audit.read");
+  }
+}
+
 async function handleExportMonthlyCsv() {
+  if (!requireUiPermission("settlement.export", "月次CSV出力")) return;
   const yearMonth = String(el.businessMonthInput.value || "").trim();
   if (!/^\d{4}-\d{2}$/.test(yearMonth)) {
     showToast("対象月は YYYY-MM 形式で入力してください", true);
@@ -2452,15 +3542,21 @@ async function handleExportMonthlyCsv() {
     URL.revokeObjectURL(objectUrl);
     showToast(`${yearMonth} の月次CSVを出力しました`);
   } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
   }
 }
 
 async function loadOpsWarnings() {
+  if (!hasPermission("monitor.read")) {
+    renderOpsWarningsList(["監視状態は現在の実効権限の対象外です"]);
+    return;
+  }
   try {
     const monitor = await requestJson("/api/v1/chain-monitor/status");
     renderOpsWarningsList(buildMonitorWarnings(monitor));
-  } catch (_error) {
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
     renderOpsWarningsList(["監視状態を取得できませんでした"]);
   }
 }
@@ -2484,6 +3580,7 @@ function loadTerminalSettings() {
 
 function bindEvents() {
   el.loginBtn.addEventListener("click", () => void handleLogin());
+  el.logoutBtn.addEventListener("click", () => void handleLogout());
   el.amountPresetList.addEventListener("click", (event) => {
     const actionButton = event.target.closest("[data-preset-action]");
     if (!actionButton) return;
@@ -2508,12 +3605,14 @@ function bindEvents() {
   el.cancelInvoiceBtn.addEventListener("click", () => confirmDangerInvoiceAction("cancel", "請求を無効化"));
   el.expireInvoiceBtn.addEventListener("click", () => confirmDangerInvoiceAction("expire", "請求を期限切れに"));
   el.refreshBtn.addEventListener("click", () => {
+    if (!requireUiPermission("invoice.read", "請求の最新状態取得")) return;
     if (!state.invoiceId) return;
     void loadInvoice(state.invoiceId);
   });
   if (el.connectionRefreshBtn) {
     el.connectionRefreshBtn.addEventListener("click", () => {
       if (state.invoiceId) {
+        if (!requireUiPermission("invoice.read", "請求の最新状態取得")) return;
         void loadInvoice(state.invoiceId);
         return;
       }
@@ -2529,7 +3628,35 @@ function bindEvents() {
   el.updateReviewBtn.addEventListener("click", () => void handleUpdateReview());
 
   el.requestRefundBtn.addEventListener("click", () => void handleRequestRefund());
-  el.refundIdInput.addEventListener("input", () => updateRefundStepState());
+  for (const input of [
+    el.refundReviewCaseId,
+    el.refundAmount,
+    el.refundAddress,
+    el.refundChainId,
+    el.refundEvidenceNotePathInput,
+    el.refundCustomerNoteInput,
+  ]) {
+    input.addEventListener("input", handleRefundDraftChanged);
+  }
+  el.refundIdInput.addEventListener("input", () => {
+    clearPendingRefundExecute();
+    state.refundReadSequence += 1;
+    state.refundReadRequestId = "";
+    state.currentRefund = null;
+    updateRefundStepState();
+  });
+  for (const input of [el.refundTxHashInput, el.refundExecutedWalletInput]) {
+    input.addEventListener("input", clearPendingRefundExecute);
+  }
+  el.refundIdInput.addEventListener("change", () => {
+    const refundId = String(el.refundIdInput.value || "").trim();
+    if (refundId && hasPermission("refund.view")) {
+      void readBackRefund(refundId).catch((error) => {
+        if (isIgnoredRequestError(error)) return;
+        showToast(String(error.message || error), true);
+      });
+    }
+  });
   el.approveRefundBtn.addEventListener("click", () => void handleApproveRefund());
   el.executeRefundBtn.addEventListener("click", () => void handleExecuteRefund());
   el.verifyRefundBtn.addEventListener("click", () => void handleVerifyRefund());
@@ -2537,10 +3664,13 @@ function bindEvents() {
   el.closeSettlementBtn.addEventListener("click", () => void handleCloseSettlement());
   el.exportAuditCsvBtn.addEventListener("click", () => void handleExportAuditCsv());
   el.exportMonthlyCsvBtn.addEventListener("click", () => void handleExportMonthlyCsv());
+  el.openAuditLogBtn.addEventListener("click", () => void handleOpenAuditLog());
   el.saveSettingsBtn.addEventListener("click", saveTerminalSettings);
   el.refreshOpsSnapshotBtn.addEventListener("click", () => void loadOpsSnapshot());
   el.businessDateInput.addEventListener("change", () => {
-    if (!isAdminRole(state.role)) return;
+    state.pendingSettlementClose = "";
+    if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
+    if (!hasPermission("settlement.close")) return;
     void loadOpsSnapshot();
   });
 
@@ -2548,6 +3678,7 @@ function bindEvents() {
     closeSse();
     stopFallbackPolling();
     stopOpsAutoRefresh();
+    stopSessionExpiryTimer();
   });
 }
 
@@ -2559,7 +3690,7 @@ function init() {
   setLoggedInUi(false);
   loadTerminalSettings();
   bindEvents();
-  applyAdminVisibility();
+  applyPermissionVisibility();
   renderReviewSummary([]);
   setReviewListState("empty", "ログイン後に確認待ち一覧を読み込めます。");
   renderReviewDetail(null);
@@ -2573,6 +3704,7 @@ function init() {
   setChecklist(el.opsSnapshotChecklist, ["小規模現場向けに、必要な運用項目だけをコンパクトに表示します。"]);
   el.businessDateInput.value = nowIsoDate();
   el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+  el.businessTimezoneText.textContent = state.storeTimezone;
   setNetworkStatus("未接続");
   updateRefundStepState();
   renderDiagnostics();

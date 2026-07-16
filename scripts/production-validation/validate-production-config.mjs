@@ -2,6 +2,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { buildWalletLaunchPayload } from "../../src/wallet-adapter.mjs";
+import {
+  fetchPinnedPublicHttps,
+  validatePublicHttpsUrl,
+} from "../../src/public-endpoint-security.mjs";
 
 function parseArgs(argv) {
   const args = new Map();
@@ -68,27 +72,43 @@ async function rpcRequest(url, method, params, timeoutMs = 5000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+    const body = JSON.stringify({
         jsonrpc: "2.0",
         id: `${method}-${Date.now()}`,
         method,
         params,
-      }),
-      signal: controller.signal,
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(`http_${response.status}`);
-    }
+      });
+    const response = url.startsWith("https:")
+      ? await fetchPinnedPublicHttps(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+          timeoutMs,
+        })
+      : await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+          signal: controller.signal,
+          redirect: "error",
+        }).then(async (raw) => ({ status: raw.status, body: await raw.text() }));
+    const payload = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
+    if (response.status < 200 || response.status >= 300) throw new Error(`http_${response.status}`);
     if (payload.error) {
       throw new Error(payload.error.message || "rpc_error");
     }
     return payload.result;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+function sanitizeRpcUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}/[redacted]`;
+  } catch {
+    return "[invalid-rpc-url]";
   }
 }
 
@@ -123,11 +143,32 @@ async function main() {
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean);
+    const trustProxy = boolFlag(env.TRUST_PROXY);
+    const trustProxyHops = String(env.TRUST_PROXY_HOPS || "").trim();
+    const trustProxyCidrs = String(env.TRUST_PROXY_CIDRS || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
 
     record("app_env", appEnv === expectedAppEnv, {
       expected: expectedAppEnv,
       actual: appEnv,
     });
+
+    if (productionChecks && !allowEmpty) {
+      ensure(String(env.APP_BIND_HOST || "").trim(), "APP_BIND_HOST must be explicit for production", {});
+      record("app_bind_host_explicit", true, { value: String(env.APP_BIND_HOST).trim() });
+      ensure(trustProxy && (/^\d+$/.test(trustProxyHops) || trustProxyCidrs.length > 0),
+        "production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS",
+        { trust_proxy_hops: trustProxyHops || null, trust_proxy_cidrs: trustProxyCidrs });
+      record("trusted_proxy_boundary", true, {
+        hops: trustProxyHops || null,
+        cidrs: trustProxyCidrs,
+      });
+    } else {
+      record("app_bind_host_explicit", true, { skipped: true, reason: "allow-empty" });
+      record("trusted_proxy_boundary", true, { skipped: true, reason: "allow-empty" });
+    }
 
     ensure(chainId === "137", "CHAIN_ID must be 137", { actual: chainId });
     record("chain_id_polygon", true, { value: chainId });
@@ -242,12 +283,19 @@ async function main() {
         ensure(rpcUrls.length > 0, "RPC_URLS must not be empty", {});
       const rpcChecks = [];
         for (const rpcUrl of rpcUrls) {
+          const rpcUrlValidation = validatePublicHttpsUrl(rpcUrl);
+          if (productionChecks) {
+            ensure(rpcUrlValidation.ok, "production RPC_URLS must be public HTTPS endpoints on port 443", {
+              rpc_url: sanitizeRpcUrl(rpcUrl),
+              errors: rpcUrlValidation.errors,
+            });
+          }
           const chainIdHex = String(await rpcRequest(rpcUrl, "eth_chainId", []));
           const rpcChainId = chainIdHex.startsWith("0x") ? BigInt(chainIdHex).toString() : chainIdHex;
           const blockHex = String(await rpcRequest(rpcUrl, "eth_blockNumber", []));
           const latestBlock = blockHex.startsWith("0x") ? Number(BigInt(blockHex)) : Number(blockHex);
-          rpcChecks.push({ rpc_url: rpcUrl, chain_id: rpcChainId, latest_block: latestBlock });
-          ensure(rpcChainId === "137", "RPC chainId drift detected", { rpc_url: rpcUrl, chain_id: rpcChainId });
+          rpcChecks.push({ rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId, latest_block: latestBlock });
+          ensure(rpcChainId === "137", "RPC chainId drift detected", { rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId });
         }
         record("rpc_reachability", true, { providers: rpcChecks });
       }

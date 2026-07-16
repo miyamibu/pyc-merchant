@@ -16,6 +16,7 @@
 - `refund_to_address` は EVM address 形式必須。
 - `refund_chain_id` は invoice chain と一致必須。
 - 適格額を超える申請は `OVER_REFUND` で拒否。
+- 承認済み以降の同一 review / 金額 / 返金先 / chain の申請は既存返金へ収束し、別の返金行を作らない。
 - 監査ログに request_id / idempotency_key を残す。
 
 ## Executor Abstraction

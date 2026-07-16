@@ -45,6 +45,7 @@ function buildServerEnv(targetBaseUrl) {
   const env = { ...process.env };
   env.APP_PORT = env.APP_PORT || (url.port || "4173");
   env.APP_HOST = env.APP_HOST || targetBaseUrl;
+  env.APP_BIND_HOST = env.APP_BIND_HOST || (["localhost", "127.0.0.1", "::1"].includes(url.hostname) ? url.hostname : "127.0.0.1");
   env.DB_PATH = env.DB_PATH || path.join(mkdtempSync(path.join(tmpdir(), "jpyc-smoke-")), "app.db");
   env.APP_SECRET = env.APP_SECRET || crypto.randomBytes(32).toString("hex");
   env.SERVICE_INGEST_SECRET = env.SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET;

@@ -210,11 +210,11 @@ async function run() {
     const signedEntryInvoice = parsePaymentUrl(invoiceForEntry.data.payment_url);
     const signedQuery = `sig=${encodeURIComponent(signedEntryInvoice.sig)}&exp=${encodeURIComponent(signedEntryInvoice.exp)}&nonce=${encodeURIComponent(signedEntryInvoice.nonce)}`;
     await request("public invoice signed read", ["US-001", "US-002", "US-007"], `/api/v1/public/invoices/${encodeURIComponent(signedEntryInvoice.invoiceId)}?${signedQuery}`, {}, [200]);
-    await request("public consent audit", ["US-002"], `/api/v1/public/invoices/${encodeURIComponent(signedEntryInvoice.invoiceId)}/consent?${signedQuery}`, {
+    await request("public consent fails closed before policy publication", ["US-002"], `/api/v1/public/invoices/${encodeURIComponent(signedEntryInvoice.invoiceId)}/consent?${signedQuery}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ terms_version: "story-retest", privacy_version: "story-retest", refund_policy_version: "story-retest" }),
-    });
+    }, [503]);
     await request("public payment simulation expected disabled", ["US-003"], `/api/v1/public/invoices/${encodeURIComponent(signedEntryInvoice.invoiceId)}/pay?${signedQuery}`, {
       method: "POST",
       headers: { "content-type": "application/json" },

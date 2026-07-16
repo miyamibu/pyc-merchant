@@ -52,6 +52,11 @@ import {
   RECEIVABLE_STATUS_VALUES,
   buildDailyAccountingSummary,
 } from "./settlement-export.mjs";
+import {
+  evaluatePolicyPublicationSource,
+  unavailablePolicyPublication,
+  validatePolicyVersionSubmission,
+} from "./policy-publication.mjs";
 import { validateCommercialEvidence } from "../scripts/production-validation/validate-commercial-evidence.mjs";
 
 const CWD = process.cwd();
@@ -61,6 +66,7 @@ const DEFAULTS = {
   APP_PORT: "4173",
   PORT: "",
   APP_HOST: "http://localhost:4173",
+  APP_BIND_HOST: "",
   PAY_BASE_URL: "",
   PUBLIC_BASE_URL: "",
   APP_SECRET: "__REPLACE_WITH_LONG_RANDOM_SECRET__",
@@ -94,6 +100,8 @@ const DEFAULTS = {
   LOGIN_RATE_LIMIT_WINDOW_MS: "600000",
   LOGIN_RATE_LIMIT_MAX: "10",
   TRUST_PROXY: "true",
+  TRUST_PROXY_HOPS: "",
+  TRUST_PROXY_CIDRS: "",
   WALLET_ADAPTER_TYPE: "mock",
   ENABLE_REOWN: "false",
   REOWN_PROJECT_ID: "",
@@ -215,6 +223,7 @@ const APP_ENV = String(ENV.APP_ENV || ENV.NODE_ENV || DEFAULTS.APP_ENV).trim().t
 const IS_PRODUCTION = APP_ENV === "production";
 const PORT = Number(ENV.APP_PORT || ENV.PORT || DEFAULTS.APP_PORT);
 const APP_HOST = ENV.APP_HOST || ENV.PAY_BASE_URL || ENV.PUBLIC_BASE_URL || DEFAULTS.APP_HOST;
+const APP_BIND_HOST = String(ENV.APP_BIND_HOST || DEFAULTS.APP_BIND_HOST || "").trim();
 const APP_SECRET = ENV.APP_SECRET || DEFAULTS.APP_SECRET;
 const DB_PATH = path.resolve(CWD, ENV.DB_PATH || DEFAULTS.DB_PATH);
 const CHAIN_ID = String(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID).trim();
@@ -248,6 +257,21 @@ const PUBLIC_RATE_LIMIT_MAX = Number(ENV.PUBLIC_RATE_LIMIT_MAX || DEFAULTS.PUBLI
 const LOGIN_RATE_LIMIT_WINDOW_MS = Number(ENV.LOGIN_RATE_LIMIT_WINDOW_MS || DEFAULTS.LOGIN_RATE_LIMIT_WINDOW_MS);
 const LOGIN_RATE_LIMIT_MAX = Number(ENV.LOGIN_RATE_LIMIT_MAX || DEFAULTS.LOGIN_RATE_LIMIT_MAX);
 const TRUST_PROXY = parseFlag(ENV.TRUST_PROXY ?? DEFAULTS.TRUST_PROXY, true);
+const TRUST_PROXY_HOPS_RAW = String(ENV.TRUST_PROXY_HOPS ?? DEFAULTS.TRUST_PROXY_HOPS ?? "").trim();
+const TRUST_PROXY_HOPS = TRUST_PROXY_HOPS_RAW === "" ? null : Number(TRUST_PROXY_HOPS_RAW);
+const TRUST_PROXY_CIDRS = String(ENV.TRUST_PROXY_CIDRS ?? DEFAULTS.TRUST_PROXY_CIDRS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const TRUST_PROXY_CONFIGURED = TRUST_PROXY && (
+  (Number.isInteger(TRUST_PROXY_HOPS) && TRUST_PROXY_HOPS >= 1)
+  || TRUST_PROXY_CIDRS.length > 0
+);
+const EXPRESS_TRUST_PROXY = !TRUST_PROXY
+  ? false
+  : (Number.isInteger(TRUST_PROXY_HOPS) && TRUST_PROXY_HOPS >= 1
+      ? TRUST_PROXY_HOPS
+      : TRUST_PROXY_CIDRS.length > 0 ? TRUST_PROXY_CIDRS : false);
 const ENABLE_PUBLIC_PAYMENT_SIMULATION = parseFlag(
   ENV.ENABLE_PUBLIC_PAYMENT_SIMULATION ?? DEFAULTS.ENABLE_PUBLIC_PAYMENT_SIMULATION,
   false
@@ -515,6 +539,10 @@ if (IS_PRODUCTION) {
   }
   if (CORS_ALLOW_ORIGINS.some((origin) => origin === "*" || origin.includes("*"))) {
     console.error("FATAL: CORS_ALLOW_ORIGINS wildcard is not allowed in production.");
+    process.exit(1);
+  }
+  if (!TRUST_PROXY_CONFIGURED) {
+    console.error("FATAL: production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS.");
     process.exit(1);
   }
   if (REQUIRED_CONFIRMATIONS < 1 || REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
@@ -1659,6 +1687,39 @@ function computeTtlRemainingSec(expiresAt, nowMs = Date.now()) {
   return Math.floor((expiryMs - nowMs) / 1000);
 }
 
+function findInvoicePaymentEvidenceTimestamps(invoice) {
+  const unavailable = { confirmedAt: null, chainRecordedAt: null };
+  if (!invoice?.paid_tx_hash || !["paid", "settled"].includes(String(invoice.status || ""))) return unavailable;
+  const event = db
+    .prepare(
+      `SELECT created_at, block_timestamp
+       FROM payment_events
+       WHERE invoice_id = ?
+         AND lower(tx_hash) = lower(?)
+         AND confirmations >= ?
+         AND chain_id = ?
+         AND lower(token_contract) = lower(?)
+         AND lower(COALESCE(to_address, '')) = lower(?)
+       ORDER BY confirmations DESC, block_number DESC, created_at DESC
+       LIMIT 1`
+    )
+    .get(
+      invoice.id,
+      invoice.paid_tx_hash,
+      REQUIRED_CONFIRMATIONS,
+      String(invoice.chain_id || ""),
+      String(invoice.token_contract || ""),
+      String(invoice.recipient_address || "")
+    );
+  const confirmedAt = event?.created_at && Number.isFinite(new Date(event.created_at).getTime())
+    ? event.created_at
+    : null;
+  const chainRecordedAt = event?.block_timestamp && Number.isFinite(new Date(event.block_timestamp).getTime())
+    ? event.block_timestamp
+    : null;
+  return { confirmedAt, chainRecordedAt };
+}
+
 function getReissueRootInvoiceId(invoice) {
   return String(invoice?.reissue_root_invoice_id || invoice?.reissued_from_invoice_id || invoice?.id || "");
 }
@@ -2100,7 +2161,10 @@ function buildSettlementExportCsv(rows) {
   return lines.join("\n");
 }
 
-const SETTLEMENT_EXPORT_SNAPSHOT_HEADERS = [
+const SETTLEMENT_EXPORT_CONTRACT_V1 = "settlement_export_v1";
+const SETTLEMENT_EXPORT_CONTRACT_V2 = "settlement_export_v2";
+
+const SETTLEMENT_EXPORT_V1_SNAPSHOT_HEADERS = [
   "export_run_id",
   "export_version",
   "business_date",
@@ -2131,16 +2195,70 @@ const SETTLEMENT_EXPORT_SNAPSHOT_HEADERS = [
   "created_at",
 ];
 
-function buildSettlementExportSnapshotCsv(rows, { bom = false } = {}) {
-  const lines = [SETTLEMENT_EXPORT_SNAPSHOT_HEADERS.join(",")];
+const SETTLEMENT_EXPORT_V2_SNAPSHOT_HEADERS = [
+  "export_run_id",
+  "export_version",
+  "business_date",
+  "store_id",
+  "terminal_id",
+  "operator_id",
+  "invoice_id",
+  "checkout_session_id",
+  "payment_session_id",
+  "rail_type",
+  "provider_code",
+  "invoice_amount_jpyc_base",
+  "invoice_status",
+  "accounting_status",
+  "cash_recognition_status",
+  "receivable_status",
+  "onchain_cash_amount_jpyc_base",
+  "provider_receivable_amount_jpyc_base",
+  "exception_amount_jpyc_base",
+  "refund_amount_jpyc_base",
+  "refund_attribution",
+  "refund_reference_status",
+  "refund_reference_count",
+  "refund_requested_amount_jpyc_base",
+  "refund_reserved_amount_jpyc_base",
+  "refund_succeeded_amount_jpyc_base",
+  "refund_references_json",
+  "void_amount_jpyc_base",
+  "provider_payment_ref",
+  "provider_settlement_ref",
+  "onchain_transfer_ref",
+  "evidence_hash",
+  "payload_schema_version",
+  "export_excluded_private_data",
+  "created_at",
+];
+
+function buildSettlementExportV1SnapshotCsv(rows, { bom = false } = {}) {
+  const lines = [SETTLEMENT_EXPORT_V1_SNAPSHOT_HEADERS.join(",")];
   for (const row of rows) {
-    lines.push(SETTLEMENT_EXPORT_SNAPSHOT_HEADERS.map((header) => escapeCsvCell(row[header])).join(","));
+    lines.push(SETTLEMENT_EXPORT_V1_SNAPSHOT_HEADERS.map((header) => escapeCsvCell(row[header])).join(","));
   }
   const csv = lines.join("\n");
   return bom ? `\uFEFF${csv}` : csv;
 }
 
-function buildSettlementExportSnapshotJsonPayload({ exportRow, metadata, rows }) {
+function buildSettlementExportV2SnapshotCsv(rows, { bom = false } = {}) {
+  const lines = [SETTLEMENT_EXPORT_V2_SNAPSHOT_HEADERS.join(",")];
+  for (const row of rows) {
+    lines.push(
+      SETTLEMENT_EXPORT_V2_SNAPSHOT_HEADERS.map((header) => {
+        if (header === "refund_references_json") {
+          return escapeCsvCell(JSON.stringify(Array.isArray(row.refund_references) ? row.refund_references : []));
+        }
+        return escapeCsvCell(row[header]);
+      }).join(",")
+    );
+  }
+  const csv = lines.join("\n");
+  return bom ? `\uFEFF${csv}` : csv;
+}
+
+function buildSettlementExportV1SnapshotJsonPayload({ exportRow, metadata, rows }) {
   return {
     export_id: exportRow.id,
     export_run_id: metadata?.export_run_id || null,
@@ -2152,6 +2270,165 @@ function buildSettlementExportSnapshotJsonPayload({ exportRow, metadata, rows })
     metadata,
     rows,
   };
+}
+
+const SETTLEMENT_EXPORT_V2_CANONICAL_HASH_SCOPE = "settlement_export_v2_canonical_payload_without_content_hashes";
+const SETTLEMENT_EXPORT_V2_REFUND_ANNOTATION_FIELDS = [
+  "refund_attribution",
+  "refund_reference_status",
+  "refund_reference_count",
+  "refund_requested_amount_jpyc_base",
+  "refund_reserved_amount_jpyc_base",
+  "refund_succeeded_amount_jpyc_base",
+  "refund_references",
+];
+const SETTLEMENT_EXPORT_V2_CANONICAL_JSON_ROW_FIELDS = [
+  "id",
+  "export_run_id",
+  "export_version",
+  "business_date",
+  "store_id",
+  "terminal_id",
+  "operator_id",
+  "invoice_id",
+  "checkout_session_id",
+  "payment_session_id",
+  "rail_type",
+  "provider_code",
+  "invoice_amount_jpyc_base",
+  "invoice_status",
+  "accounting_status",
+  "cash_recognition_status",
+  "receivable_status",
+  "onchain_cash_amount_jpyc_base",
+  "provider_receivable_amount_jpyc_base",
+  "exception_amount_jpyc_base",
+  "refund_amount_jpyc_base",
+  "refund_attribution",
+  "refund_reference_status",
+  "refund_reference_count",
+  "refund_requested_amount_jpyc_base",
+  "refund_reserved_amount_jpyc_base",
+  "refund_succeeded_amount_jpyc_base",
+  "refund_references",
+  "void_amount_jpyc_base",
+  "provider_payment_ref",
+  "provider_settlement_ref",
+  "onchain_transfer_ref",
+  "evidence_hash",
+  "payload_schema_version",
+  "export_excluded_private_data",
+  "created_at",
+];
+
+function buildSettlementExportV2RowAnnotations(rows) {
+  return Object.fromEntries(
+    rows.map((row) => [
+      row.id,
+      Object.fromEntries(SETTLEMENT_EXPORT_V2_REFUND_ANNOTATION_FIELDS.map((field) => [field, row[field]])),
+    ])
+  );
+}
+
+function applySettlementExportV2RowAnnotations(rows, metadata) {
+  const annotations = metadata?._row_annotations && typeof metadata._row_annotations === "object"
+    ? metadata._row_annotations
+    : {};
+  return rows.map((row) => {
+    const annotation = annotations[row.id];
+    if (!annotation || typeof annotation !== "object") {
+      const error = new Error(`Settlement Export v2 row annotation is missing for ${row.id}`);
+      error.code = "SETTLEMENT_EXPORT_V2_INTEGRITY_ERROR";
+      throw error;
+    }
+    return { ...row, ...annotation };
+  });
+}
+
+function publicSettlementExportV2Metadata(metadata) {
+  const {
+    _row_annotations: _annotations,
+    _refund_manifest: _refundManifest,
+    _refund_totals: _refundTotals,
+    ...publicMetadata
+  } = metadata || {};
+  return publicMetadata;
+}
+
+function canonicalSettlementExportV2Metadata(metadata) {
+  const {
+    content_hash: _contentHash,
+    content_hashes: _contentHashes,
+    ...canonicalMetadata
+  } = publicSettlementExportV2Metadata(metadata);
+  return canonicalMetadata;
+}
+
+function canonicalSettlementExportV2Rows(rows) {
+  return rows.map((row) => Object.fromEntries(
+    SETTLEMENT_EXPORT_V2_CANONICAL_JSON_ROW_FIELDS.map((field) => [field, row[field] ?? null])
+  ));
+}
+
+function buildSettlementExportV2SnapshotJsonPayload({ exportRow, metadata, rows }) {
+  return {
+    export_id: exportRow.id,
+    export_run_id: metadata?.export_run_id || null,
+    contract_version: SETTLEMENT_EXPORT_CONTRACT_V2,
+    export_version: "v2",
+    business_date: exportRow.business_date,
+    format: exportRow.format,
+    generated_at: exportRow.generated_at,
+    output_path: exportRow.output_path,
+    refund_manifest: Array.isArray(metadata?._refund_manifest) ? metadata._refund_manifest : [],
+    refund_totals: metadata?._refund_totals || null,
+    metadata: canonicalSettlementExportV2Metadata(metadata),
+    rows: canonicalSettlementExportV2Rows(rows),
+  };
+}
+
+function resolveSettlementExportContractVersion(metadata) {
+  const explicit = String(metadata?.contract_version || "").trim();
+  const exportVersion = String(metadata?.export_version || "").trim();
+  if (!explicit && (!exportVersion || exportVersion === "v1")) return SETTLEMENT_EXPORT_CONTRACT_V1;
+  if (explicit === SETTLEMENT_EXPORT_CONTRACT_V1 && (!exportVersion || exportVersion === "v1")) {
+    return SETTLEMENT_EXPORT_CONTRACT_V1;
+  }
+  if (explicit === SETTLEMENT_EXPORT_CONTRACT_V2 && exportVersion === "v2") {
+    return SETTLEMENT_EXPORT_CONTRACT_V2;
+  }
+  return null;
+}
+
+function compareSettlementExportV2Rows(left, right) {
+  for (const field of ["invoice_id", "payment_session_id", "rail_type", "provider_code", "id"]) {
+    const leftValue = String(left?.[field] || "");
+    const rightValue = String(right?.[field] || "");
+    if (leftValue < rightValue) return -1;
+    if (leftValue > rightValue) return 1;
+  }
+  return 0;
+}
+
+function loadSettlementExportRows(exportRunId, contractVersion) {
+  if (!exportRunId) return [];
+  if (contractVersion === SETTLEMENT_EXPORT_CONTRACT_V1) {
+    return db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId);
+  }
+  if (contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2) {
+    return db
+      .prepare(
+        `SELECT * FROM settlement_export_rows
+         WHERE export_run_id = ?
+         ORDER BY COALESCE(invoice_id, '') ASC,
+                  COALESCE(payment_session_id, '') ASC,
+                  rail_type ASC,
+                  provider_code ASC,
+                  id ASC`
+      )
+      .all(exportRunId);
+  }
+  return [];
 }
 
 function invoiceNo() {
@@ -3255,43 +3532,15 @@ function detectLatestEvidenceDirectory(rootDir = COMMERCIAL_EVIDENCE_ROOT) {
   return candidates[0] || null;
 }
 
-function isCommercialHttpsUrl(value) {
-  try {
-    const parsed = new URL(String(value || ""));
-    if (parsed.protocol !== "https:") return false;
-    const host = parsed.hostname.toLowerCase();
-    if (!host || host === "localhost" || host.endsWith(".local") || host.endsWith(".example.com")) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function evaluatePolicyUrlsGate({ sourcePath = path.join(CWD, "public/mobile.js") } = {}) {
-  const requiredKeys = ["terms", "privacy", "refund"];
   try {
     const content = fs.readFileSync(sourcePath, "utf8");
-    const values = {};
-    for (const key of requiredKeys) {
-      const match = content.match(new RegExp(`${key}\\s*:\\s*["'\`]([^"'\`]+)["'\`]`));
-      values[key] = match?.[1] || "";
-    }
-    const missing_keys = requiredKeys.filter((key) => !isCommercialHttpsUrl(values[key]));
-    return {
-      ok: missing_keys.length === 0,
-      source_path: sourcePath,
-      values,
-      missing_keys,
-      errors: missing_keys.map((key) => `POLICY_URLS.${key} must be a production https URL`),
-    };
+    return evaluatePolicyPublicationSource(content, { sourcePath });
   } catch (error) {
-    return {
-      ok: false,
-      source_path: sourcePath,
-      values: {},
-      missing_keys: requiredKeys,
-      errors: [error?.message || "policy url source could not be read"],
-    };
+    return unavailablePolicyPublication({
+      sourcePath,
+      message: error?.message || "policy url source could not be read",
+    });
   }
 }
 
@@ -3339,7 +3588,10 @@ function evaluateDangerousFlagsGate() {
   if (INSECURE_SECRETS.has(SERVICE_INGEST_SECRET) || SERVICE_INGEST_SECRET.length < 32) blockers.push("SERVICE_INGEST_SECRET is weak");
   if (INSECURE_SECRETS.has(METRICS_SECRET) || METRICS_SECRET.length < 32) blockers.push("METRICS_SECRET is weak");
   if (CORS_ALLOW_ORIGINS.some((origin) => origin === "*" || origin.includes("*"))) blockers.push("CORS_ALLOW_ORIGINS wildcard is not allowed");
-  if (!TRUST_PROXY) blockers.push("TRUST_PROXY must be true");
+  if (!TRUST_PROXY) blockers.push("TRUST_PROXY must be enabled");
+  if (APP_ENV === "production" && !TRUST_PROXY_CONFIGURED) {
+    blockers.push("production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS");
+  }
   if (!Number.isFinite(SESSION_TTL_SEC) || SESSION_TTL_SEC <= 0) blockers.push("SESSION_TTL_SEC must be positive");
   if (!Number.isFinite(SSE_TOKEN_MAX_TTL_SEC) || SSE_TOKEN_MAX_TTL_SEC < 60 || SSE_TOKEN_MAX_TTL_SEC > 900) {
     blockers.push("SSE_TOKEN_MAX_TTL_SEC must be between 60 and 900");
@@ -3894,11 +4146,26 @@ function verifySseToken(token, expected) {
 
 function redactUrlForLogs(urlValue) {
   const raw = String(urlValue || "");
-  if (!raw.includes("?")) return raw;
+  const redactPathTokens = (pathname) => String(pathname || "")
+    .replace(/^(\/t\/)[^/?#]+/i, "$1[REDACTED]")
+    .replace(/^(\/api\/v1\/public\/terminal-entry\/)[^/?#]+/i, "$1[REDACTED]");
+  const sensitiveQueryKeys = new Set([
+    "token",
+    "sse_token",
+    "ref",
+    "sig",
+    "signature",
+    "nonce",
+    "access_token",
+    "refresh_token",
+    "api_key",
+    "secret",
+  ]);
   try {
     const parsed = new URL(raw, APP_HOST);
-    for (const key of ["token", "sse_token"]) {
-      if (parsed.searchParams.has(key)) {
+    parsed.pathname = redactPathTokens(parsed.pathname);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (sensitiveQueryKeys.has(String(key).toLowerCase())) {
         parsed.searchParams.set(key, "[REDACTED]");
       }
     }
@@ -3907,7 +4174,11 @@ function redactUrlForLogs(urlValue) {
     }
     return parsed.toString();
   } catch (_error) {
-    return raw.replace(/([?&](?:token|sse_token)=)[^&]+/gi, "$1[REDACTED]");
+    return redactPathTokens(raw)
+      .replace(
+        /([?&](?:token|sse_token|ref|sig|signature|nonce|access_token|refresh_token|api_key|secret)=)[^&#]+/gi,
+        "$1[REDACTED]"
+      );
   }
 }
 
@@ -4059,6 +4330,35 @@ function hasPermission(session, permission) {
   return permissions.has(permission);
 }
 
+function projectStaffUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    staff_name: row.staff_name,
+    role: row.role,
+    status: row.status,
+    permissions_override: row.permissions_override || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function projectTerminalSession(row) {
+  if (!row) return null;
+  return {
+    id: row.id || row.session_id,
+    terminal_id: row.terminal_id || null,
+    terminal_code: row.terminal_code || null,
+    staff_user_id: row.staff_user_id || null,
+    staff_name: row.staff_name || null,
+    role: row.role || null,
+    started_at: row.started_at || null,
+    ended_at: row.ended_at || null,
+    revoked_at: row.revoked_at || null,
+    ended_reason: row.ended_reason || null,
+  };
+}
+
 function requirePermission(permission) {
   return (req, res, next) => {
     if (!req.session) return jsonError(res, 401, "UNAUTHORIZED", "Session required");
@@ -4138,6 +4438,145 @@ function isTransitionAllowed(from, to) {
   return transitions[from] && transitions[from].has(to);
 }
 
+const AUDIT_OMITTED_FIELD_NAMES = new Set([
+  "authorization",
+  "bearer_token",
+  "access_token",
+  "refresh_token",
+  "session_token",
+  "sse_token",
+  "token",
+  "token_hash",
+  "pin",
+  "staff_pin",
+  "new_pin",
+  "pin_hash",
+  "public_entry_token",
+  "fixed_qr_url",
+  "fixed_qr_payload",
+  "payment_url",
+  "pay_url",
+  "private_key",
+  "secret_key",
+  "signing_key",
+  "client_secret",
+  "api_key",
+  "password",
+  "passphrase",
+  "mnemonic",
+  "seed",
+  "seed_phrase",
+  "recovery_phrase",
+  "keystore",
+  "credential",
+  "credentials",
+]);
+
+const AUDIT_SECRET_FIELD_NAME_PATTERNS = [
+  /(?:^|_)private_key(?:$|_)/,
+  /(?:^|_)secret_key(?:$|_)/,
+  /(?:^|_)signing_key(?:$|_)/,
+  /(?:^|_)client_secret(?:$|_)/,
+  /(?:^|_)api_key(?:$|_)/,
+  /(?:^|_)password(?:$|_)/,
+  /(?:^|_)passphrase(?:$|_)/,
+  /(?:^|_)mnemonic(?:$|_)/,
+  /(?:^|_)seed(?:_phrase)?(?:$|_)/,
+  /(?:^|_)recovery_phrase(?:$|_)/,
+  /(?:^|_)keystore(?:$|_)/,
+  /(?:^|_)credentials?(?:$|_)/,
+];
+
+function normalizeAuditFieldName(value) {
+  return String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .toLowerCase();
+}
+
+function isSignedPaymentReference(value) {
+  const raw = String(value || "");
+  return /\/pay\?[^\s"'<>]*(?:ref|sig|nonce)=/i.test(raw)
+    || /\/(?:mobile\.html|api\/v1\/public\/invoices\/[^?\s"'<>]+)\?[^\s"'<>]*(?:sig|nonce)=/i.test(raw)
+    || /(?:%2f)?pay%3f[^\s"'<>]*(?:ref|sig|nonce)(?:=|%3d)/i.test(raw)
+    || /[?&](?:sse_token|access_token|refresh_token)=/i.test(raw)
+    || /\/t\/[A-Za-z0-9_-]{12,}/.test(raw);
+}
+
+function isSecretAuditFieldName(normalizedKey) {
+  return AUDIT_OMITTED_FIELD_NAMES.has(normalizedKey)
+    || AUDIT_SECRET_FIELD_NAME_PATTERNS.some((pattern) => pattern.test(normalizedKey));
+}
+
+function containsExplicitSecretAssignment(value) {
+  const raw = String(value || "");
+  return /(?:^|[\s?&,{])(?:private[_-]?key|secret[_-]?key|signing[_-]?key|client[_-]?secret|api[_-]?key|password|passphrase|mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*(?:=|:)\s*[^\s,;}]+/i.test(raw)
+    || /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(raw);
+}
+
+function sanitizeAuditState(value, seen = new WeakSet()) {
+  if (value == null) return value;
+  if (typeof value === "string") {
+    if (/\bbearer\s+[^\s,;]+/i.test(value)) return "[REDACTED_BEARER_TOKEN]";
+    if (isSignedPaymentReference(value)) return "[REDACTED_SIGNED_URL]";
+    if (containsExplicitSecretAssignment(value)) return "[REDACTED_SECRET]";
+    return value;
+  }
+  if (typeof value !== "object") return value;
+  if (seen.has(value)) return "[REDACTED_CIRCULAR_REFERENCE]";
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const sanitized = value.map((item) => sanitizeAuditState(item, seen));
+    seen.delete(value);
+    return sanitized;
+  }
+  const sanitized = {};
+  for (const [key, nested] of Object.entries(value)) {
+    const normalizedKey = normalizeAuditFieldName(key);
+    if (isSecretAuditFieldName(normalizedKey)) continue;
+    if (normalizedKey === "qr_payload" && isSignedPaymentReference(nested)) continue;
+    sanitized[key] = sanitizeAuditState(nested, seen);
+  }
+  seen.delete(value);
+  return sanitized;
+}
+
+function sanitizeAuditMetadataValue(value) {
+  if (value == null || value === "") return null;
+  const sanitized = sanitizeAuditState(String(value));
+  return typeof sanitized === "string" ? sanitized : "[REDACTED_AUDIT_METADATA]";
+}
+
+function sanitizeStoredAuditState(value, context) {
+  if (value == null || value === "") return null;
+  try {
+    return JSON.stringify(sanitizeAuditState(JSON.parse(value)));
+  } catch (error) {
+    console.warn(
+      JSON.stringify({
+        ts: nowIso(),
+        level: "warn",
+        type: "audit.response_state_parse_failed",
+        context,
+        message: String(error.message || error),
+      })
+    );
+    return JSON.stringify("[REDACTED_UNPARSEABLE_AUDIT_STATE]");
+  }
+}
+
+function sanitizeAuditLogRowForResponse(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    target_id: sanitizeAuditMetadataValue(row.target_id),
+    request_id: sanitizeAuditMetadataValue(row.request_id),
+    idempotency_key: sanitizeAuditMetadataValue(row.idempotency_key),
+    before_state: sanitizeStoredAuditState(row.before_state, `audit:${row.id}:before_state`),
+    after_state: sanitizeStoredAuditState(row.after_state, `audit:${row.id}:after_state`),
+  };
+}
+
 function audit({
   actorType,
   actorId,
@@ -4151,6 +4590,11 @@ function audit({
   ip
 }) {
   const createdAt = nowIso();
+  const sanitizedTargetId = sanitizeAuditMetadataValue(targetId);
+  const sanitizedRequestId = sanitizeAuditMetadataValue(requestId);
+  const sanitizedIdempotencyKey = sanitizeAuditMetadataValue(idempotencyKey);
+  const sanitizedBeforeState = sanitizeAuditState(beforeState);
+  const sanitizedAfterState = sanitizeAuditState(afterState);
   const latest = db.prepare(`SELECT entry_hash FROM audit_logs ORDER BY rowid DESC LIMIT 1`).get();
   const prevHash = latest?.entry_hash || null;
   const entryHash = computeAuditEntryHash(prevHash, {
@@ -4158,11 +4602,11 @@ function audit({
     actorId,
     action,
     targetType,
-    targetId,
-    requestId,
-    idempotencyKey,
-    beforeState,
-    afterState,
+    targetId: sanitizedTargetId,
+    requestId: sanitizedRequestId,
+    idempotencyKey: sanitizedIdempotencyKey,
+    beforeState: sanitizedBeforeState,
+    afterState: sanitizedAfterState,
     ip,
     createdAt
   });
@@ -4176,11 +4620,11 @@ function audit({
     actorId,
     action,
     targetType,
-    targetId,
-    requestId || null,
-    idempotencyKey || null,
-    beforeState ? JSON.stringify(beforeState) : null,
-    afterState ? JSON.stringify(afterState) : null,
+    sanitizedTargetId,
+    sanitizedRequestId,
+    sanitizedIdempotencyKey,
+    sanitizedBeforeState == null ? null : JSON.stringify(sanitizedBeforeState),
+    sanitizedAfterState == null ? null : JSON.stringify(sanitizedAfterState),
     prevHash,
     entryHash,
     ip || null,
@@ -4189,10 +4633,82 @@ function audit({
 }
 
 const RESOLVED_REFUND_STATUSES = new Set(["succeeded", "verified", "cancelled", "rejected"]);
+const REFUND_RESERVATION_RELEASED_STATUSES = new Set(["cancelled", "rejected"]);
 
 function isUnresolvedRefundStatus(status) {
   const value = String(status || "").trim();
   return !RESOLVED_REFUND_STATUSES.has(value);
+}
+
+function refundLedgerIntegrityError(refundId) {
+  const error = new Error(`Invalid refund amount in ledger row ${String(refundId || "unknown")}`);
+  error.code = "REFUND_LEDGER_INTEGRITY_ERROR";
+  error.refundId = String(refundId || "unknown");
+  return error;
+}
+
+function refundLedgerIntegrityApiResult(error) {
+  return {
+    status: 409,
+    body: {
+      error: {
+        code: "REFUND_LEDGER_INTEGRITY_ERROR",
+        message: "Refund ledger amount is invalid; operation stopped for accounting safety",
+        details: { refund_id: error?.refundId || null },
+      },
+    },
+  };
+}
+
+function parseRefundAmountBaseStrict(refund) {
+  const raw = String(refund?.refund_amount_jpyc_base ?? "").trim();
+  if (!/^\d+$/.test(raw)) throw refundLedgerIntegrityError(refund?.id);
+  let amount;
+  try {
+    amount = BigInt(raw);
+  } catch (_error) {
+    throw refundLedgerIntegrityError(refund?.id);
+  }
+  if (amount < 0n || amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw refundLedgerIntegrityError(refund?.id);
+  }
+  return amount;
+}
+
+function computeReservedRefundAmountBase({ invoiceId, reviewCaseId }) {
+  const rows = db
+    .prepare(
+      `SELECT id, status, refund_amount_jpyc_base
+       FROM refund_requests
+       WHERE invoice_id = ? OR review_case_id = ?`
+    )
+    .all(String(invoiceId || ""), String(reviewCaseId || ""));
+  return rows.reduce((total, row) => {
+    const amount = parseRefundAmountBaseStrict(row);
+    if (REFUND_RESERVATION_RELEASED_STATUSES.has(String(row.status || "").trim())) return total;
+    return amount > 0n ? total + amount : total;
+  }, 0n).toString();
+}
+
+function findActiveRefundBySemantic({ reviewCaseId, refundAmountBase, refundToAddress, refundChainId }) {
+  return db
+    .prepare(
+      `SELECT *
+       FROM refund_requests
+       WHERE review_case_id = ?
+         AND refund_amount_jpyc_base = ?
+         AND lower(refund_to_address) = lower(?)
+         AND refund_chain_id = ?
+         AND status IN ('approved', 'recorded', 'pending_verification', 'verification_failed', 'failed', 'succeeded', 'verified')
+       ORDER BY rowid ASC
+       LIMIT 1`
+    )
+    .get(
+      String(reviewCaseId || ""),
+      String(refundAmountBase || ""),
+      String(refundToAddress || ""),
+      String(refundChainId || "")
+    );
 }
 
 function refundAuditLogRefs(refundId) {
@@ -4324,9 +4840,36 @@ function idempotent(req, res, endpoint, actorId, logicFn) {
     return res.status(existing.status_code).json(parsedResponse);
   }
 
-  let result;
+  let outcome;
   try {
-    result = logicFn();
+    const execute = db.transaction(() => {
+      const concurrentExisting = db
+        .prepare(
+          `SELECT status_code, response_json, request_hash
+           FROM idempotency_records
+           WHERE actor_id = ? AND endpoint = ? AND idempotency_key = ? AND expires_at > ?`
+        )
+        .get(actorId, endpoint, key, nowIso());
+      if (concurrentExisting) {
+        return {
+          kind: concurrentExisting.request_hash === requestHash ? "replay" : "conflict",
+          existing: concurrentExisting,
+        };
+      }
+
+      const result = logicFn() || {};
+      const statusCode = result.status ?? 200;
+      const responseBody = result.body ?? {};
+      const createdAt = nowIso();
+      const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
+      db.prepare(
+        `INSERT INTO idempotency_records
+        (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(uuid(), actorId, endpoint, key, requestHash, statusCode, JSON.stringify(responseBody), createdAt, expiresAt);
+      return { kind: "created", statusCode, responseBody };
+    });
+    outcome = execute.immediate();
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -4342,17 +4885,42 @@ function idempotent(req, res, endpoint, actorId, logicFn) {
     return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
   }
 
-  const statusCode = result.status ?? 200;
-  const responseBody = result.body ?? {};
+  if (outcome.kind === "conflict") {
+    return jsonError(res, 409, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different payload");
+  }
+  if (outcome.kind === "replay") {
+    const parsedResponse = parseJsonWithWarning(outcome.existing.response_json, "idempotency.concurrent_response_json", null);
+    if (!parsedResponse || typeof parsedResponse !== "object") {
+      return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+    }
+    return res.status(outcome.existing.status_code).json(parsedResponse);
+  }
+  return res.status(outcome.statusCode).json(outcome.responseBody);
+}
+
+const IDEMPOTENCY_PENDING_STATUS_CODE = 0;
+const IDEMPOTENCY_PENDING_RESPONSE_JSON = JSON.stringify({ _idempotency_state: "pending" });
+
+function finalizeAsyncIdempotencyClaim(claimId, statusCode, responseBody) {
   const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
-
-  db.prepare(
-    `INSERT INTO idempotency_records
-    (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(uuid(), actorId, endpoint, key, requestHash, statusCode, JSON.stringify(responseBody), nowIso(), expiresAt);
-
-  return res.status(statusCode).json(responseBody);
+  const responseJson = JSON.stringify(responseBody);
+  const updated = db.prepare(
+    `UPDATE idempotency_records
+     SET status_code = ?, response_json = ?, expires_at = ?
+     WHERE id = ? AND status_code = ? AND response_json = ?`
+  ).run(
+    statusCode,
+    responseJson,
+    expiresAt,
+    claimId,
+    IDEMPOTENCY_PENDING_STATUS_CODE,
+    IDEMPOTENCY_PENDING_RESPONSE_JSON
+  );
+  if (updated.changes !== 1) {
+    const error = new Error("Async idempotency claim could not be finalized");
+    error.code = "IDEMPOTENCY_CLAIM_FINALIZE_FAILED";
+    throw error;
+  }
 }
 
 async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
@@ -4363,25 +4931,78 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
 
   cleanupIdempotencyRecords();
   const requestHash = hashJson(req.body);
-  const existing = db
-    .prepare(
-      `SELECT status_code, response_json, request_hash
-       FROM idempotency_records
-       WHERE actor_id = ? AND endpoint = ? AND idempotency_key = ? AND expires_at > ?`
-    )
-    .get(actorId, endpoint, key, nowIso());
+  let claim;
+  try {
+    const executeClaim = db.transaction(() => {
+      const existing = db
+        .prepare(
+          `SELECT id, status_code, response_json, request_hash
+           FROM idempotency_records
+           WHERE actor_id = ? AND endpoint = ? AND idempotency_key = ? AND expires_at > ?`
+        )
+        .get(actorId, endpoint, key, nowIso());
+      if (existing) return { kind: "existing", record: existing };
 
-  if (existing) {
+      const claimId = uuid();
+      const createdAt = nowIso();
+      const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
+      db.prepare(
+        `INSERT INTO idempotency_records
+        (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        claimId,
+        actorId,
+        endpoint,
+        key,
+        requestHash,
+        IDEMPOTENCY_PENDING_STATUS_CODE,
+        IDEMPOTENCY_PENDING_RESPONSE_JSON,
+        createdAt,
+        expiresAt
+      );
+      return { kind: "claimed", claimId };
+    });
+    claim = executeClaim.immediate();
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        ts: nowIso(),
+        level: "error",
+        type: "idempotency_async.claim_failed",
+        endpoint,
+        request_id: requestIdFromReq(req),
+        actor_id: actorId,
+        message: String(error.message || error),
+      })
+    );
+    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+  }
+
+  if (claim.kind === "existing") {
+    const existing = claim.record;
     if (existing.request_hash !== requestHash) {
       return jsonError(res, 409, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different payload");
     }
+    if (
+      existing.status_code === IDEMPOTENCY_PENDING_STATUS_CODE
+      && existing.response_json === IDEMPOTENCY_PENDING_RESPONSE_JSON
+    ) {
+      res.setHeader("retry-after", "1");
+      return jsonError(res, 409, "IDEMPOTENCY_IN_PROGRESS", "A request with this idempotency key is still in progress", {
+        retryable: true,
+      });
+    }
     const parsedResponse = parseJsonWithWarning(existing.response_json, "idempotency_async.response_json", null);
-    return res.status(existing.status_code).json(parsedResponse || {});
+    if (!parsedResponse || typeof parsedResponse !== "object") {
+      return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+    }
+    return res.status(existing.status_code).json(parsedResponse);
   }
 
   let result;
   try {
-    result = await logicFn();
+    result = (await logicFn()) || {};
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -4394,17 +5015,43 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
         message: String(error.message || error),
       })
     );
-    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+    const responseBody = { error: { code: "INTERNAL_ERROR", message: "Unexpected server error", details: {} } };
+    try {
+      finalizeAsyncIdempotencyClaim(claim.claimId, 500, responseBody);
+    } catch (finalizeError) {
+      console.error(
+        JSON.stringify({
+          ts: nowIso(),
+          level: "error",
+          type: "idempotency_async.finalize_failed",
+          endpoint,
+          request_id: requestIdFromReq(req),
+          actor_id: actorId,
+          message: String(finalizeError.message || finalizeError),
+        })
+      );
+    }
+    return res.status(500).json(responseBody);
   }
 
   const statusCode = result.status ?? 200;
   const responseBody = result.body ?? {};
-  const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
-  db.prepare(
-    `INSERT INTO idempotency_records
-    (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(uuid(), actorId, endpoint, key, requestHash, statusCode, JSON.stringify(responseBody), nowIso(), expiresAt);
+  try {
+    finalizeAsyncIdempotencyClaim(claim.claimId, statusCode, responseBody);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        ts: nowIso(),
+        level: "error",
+        type: "idempotency_async.finalize_failed",
+        endpoint,
+        request_id: requestIdFromReq(req),
+        actor_id: actorId,
+        message: String(error.message || error),
+      })
+    );
+    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+  }
 
   return res.status(statusCode).json(responseBody);
 }
@@ -4673,6 +5320,92 @@ function findLatestRefundRequest(invoiceId) {
     .get(invoiceId) || null;
 }
 
+function findRefundRequests(invoiceId) {
+  return db
+    .prepare(`SELECT * FROM refund_requests WHERE invoice_id = ? ORDER BY created_at ASC, id ASC`)
+    .all(invoiceId);
+}
+
+function buildSettlementRefundSummary(refunds) {
+  const references = (Array.isArray(refunds) ? refunds : []).map((refund) => {
+    const amount = parseRefundAmountBaseStrict(refund);
+    return {
+      refund_id: refund.id,
+      review_case_id: refund.review_case_id || null,
+      status: String(refund.status || ""),
+      refund_amount_jpyc_base: Number(amount),
+      refund_tx_hash: refund.refund_tx_hash || null,
+      refund_tx_log_index: refund.refund_tx_log_index ?? null,
+      verified_at: refund.verified_at || null,
+      audit_log_refs: refundAuditLogRefs(refund.id).map((row) => row.id),
+    };
+  });
+  const requestedAmount = references.reduce((sum, row) => sum + BigInt(String(row.refund_amount_jpyc_base || 0)), 0n);
+  const reservedAmount = references.reduce((sum, row) => {
+    if (REFUND_RESERVATION_RELEASED_STATUSES.has(row.status)) return sum;
+    return sum + BigInt(String(row.refund_amount_jpyc_base || 0));
+  }, 0n);
+  const succeededAmount = references.reduce((sum, row) => {
+    if (!["succeeded", "verified"].includes(row.status) || !row.refund_tx_hash) return sum;
+    return sum + BigInt(String(row.refund_amount_jpyc_base || 0));
+  }, 0n);
+  return {
+    refund_reference_status: "complete",
+    refund_reference_count: references.length,
+    refund_requested_amount_jpyc_base: Number(requestedAmount),
+    refund_reserved_amount_jpyc_base: Number(reservedAmount),
+    refund_succeeded_amount_jpyc_base: Number(succeededAmount),
+    refund_references: references,
+  };
+}
+
+function emptySettlementRefundSummary(referenceStatus) {
+  return {
+    refund_reference_status: referenceStatus,
+    refund_reference_count: 0,
+    refund_requested_amount_jpyc_base: 0,
+    refund_reserved_amount_jpyc_base: 0,
+    refund_succeeded_amount_jpyc_base: 0,
+    refund_references: [],
+  };
+}
+
+function compareSettlementPaymentSessions(left, right) {
+  const railRank = (session) => String(session?.rail_type || "") === PAYMENT_RAIL_TYPES.WALLET_DIRECT ? 0 : 1;
+  const rankDifference = railRank(left) - railRank(right);
+  if (rankDifference !== 0) return rankDifference;
+  for (const field of ["provider_code", "id"]) {
+    const leftValue = String(left?.[field] || "");
+    const rightValue = String(right?.[field] || "");
+    if (leftValue < rightValue) return -1;
+    if (leftValue > rightValue) return 1;
+  }
+  return 0;
+}
+
+function buildSettlementRefundTotals(refundManifest) {
+  const totals = (Array.isArray(refundManifest) ? refundManifest : []).reduce(
+    (result, entry) => ({
+      invoiceCount: result.invoiceCount + 1,
+      referenceCount: result.referenceCount + BigInt(String(entry.refund_reference_count || 0)),
+      requested: result.requested + BigInt(String(entry.refund_requested_amount_jpyc_base || 0)),
+      reserved: result.reserved + BigInt(String(entry.refund_reserved_amount_jpyc_base || 0)),
+      succeeded: result.succeeded + BigInt(String(entry.refund_succeeded_amount_jpyc_base || 0)),
+    }),
+    { invoiceCount: 0, referenceCount: 0n, requested: 0n, reserved: 0n, succeeded: 0n }
+  );
+  for (const value of [totals.referenceCount, totals.requested, totals.reserved, totals.succeeded]) {
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw refundLedgerIntegrityError("aggregate");
+  }
+  return {
+    invoice_count: totals.invoiceCount,
+    refund_reference_count: Number(totals.referenceCount),
+    refund_requested_amount_jpyc_base: Number(totals.requested),
+    refund_reserved_amount_jpyc_base: Number(totals.reserved),
+    refund_succeeded_amount_jpyc_base: Number(totals.succeeded),
+  };
+}
+
 function determineProviderTransition(invoice, { eventType, txHash = null, amountMatches = true }) {
   if (!amountMatches) return { nextStatus: "review_required", reason: "provider_amount_mismatch" };
   if (eventType === "captured" && txHash) {
@@ -4734,8 +5467,8 @@ function findLatestProviderAllocationForPayment(providerPaymentId, invoiceId = n
     .get(providerPaymentId) || null;
 }
 
-function shouldIncludeSettlementSnapshotRow({ invoice, paymentSession, providerSession, refund }) {
-  if (refund) return true;
+function shouldIncludeSettlementSnapshotRow({ invoice, paymentSession, providerSession, hasRefunds }) {
+  if (hasRefunds) return true;
   if (providerSession || String(paymentSession?.rail_type) === PAYMENT_RAIL_TYPES.PROVIDER_EXTERNAL) return true;
   return ["paid", "review_required", "cancelled"].includes(String(invoice.status));
 }
@@ -4752,15 +5485,17 @@ function buildSettlementExportRow({
   providerSession,
   providerAllocation,
   review,
-  refund,
+  refundSummary,
+  refundAttribution,
+  hasRefunds,
   exportRunId,
   businessDate,
+  createdAt,
 }) {
-  if (!shouldIncludeSettlementSnapshotRow({ invoice, paymentSession, providerSession, refund })) return null;
+  if (!shouldIncludeSettlementSnapshotRow({ invoice, paymentSession, providerSession, hasRefunds })) return null;
   const invoiceAmountBase = toIntegerAmount(invoice.amount_jpyc_base, 0);
   const paidAmountBase = toIntegerAmount(invoice.paid_amount_jpyc_base, 0);
   const providerAmountBase = toIntegerAmount(providerSession?.provider_amount_jpyc_base, invoiceAmountBase);
-  const refundAmountBase = toIntegerAmount(refund?.refund_amount_jpyc_base, 0);
   const allocationAmountBase = toIntegerAmount(providerAllocation?.allocated_amount_jpyc_base, providerAmountBase);
 
   let accountingStatus = "cancelled";
@@ -4772,10 +5507,10 @@ function buildSettlementExportRow({
   let voidAmount = 0;
   let refundAmount = 0;
 
-  if (refund?.status === "succeeded" && refund.refund_tx_hash) {
+  if (refundSummary.refund_succeeded_amount_jpyc_base > 0) {
     accountingStatus = "refunded_onchain";
     cashRecognitionStatus = "none";
-    refundAmount = refundAmountBase;
+    refundAmount = refundSummary.refund_succeeded_amount_jpyc_base;
   } else if (providerSession?.provider_status === "refund_accepted") {
     accountingStatus = "provider_refunded";
     refundAmount = providerAmountBase;
@@ -4831,14 +5566,15 @@ function buildSettlementExportRow({
     onchain_transfer_ref: onchainTransferRef,
     invoice_status: invoice.status,
     review_status: review?.status || null,
-    refund_status: refund?.status || null,
+    refund_references: refundSummary.refund_references,
+    refund_attribution: refundAttribution,
     accounting_status: accountingStatus,
   });
 
   return {
     id: uuid(),
     export_run_id: exportRunId,
-    export_version: "v1",
+    export_version: "v2",
     business_date: businessDate,
     store_id: invoice.store_id || null,
     terminal_id: invoice.terminal_id || null,
@@ -4857,14 +5593,16 @@ function buildSettlementExportRow({
     provider_receivable_amount_jpyc_base: providerReceivableAmount,
     exception_amount_jpyc_base: exceptionAmount,
     refund_amount_jpyc_base: refundAmount,
+    refund_attribution: refundAttribution,
+    ...refundSummary,
     void_amount_jpyc_base: voidAmount,
     provider_payment_ref: providerPaymentRef,
     provider_settlement_ref: providerSettlementRef,
     onchain_transfer_ref: onchainTransferRef,
     evidence_hash: evidenceHash,
-    payload_schema_version: "settlement_export_v1",
+    payload_schema_version: SETTLEMENT_EXPORT_CONTRACT_V2,
     export_excluded_private_data: 1,
-    created_at: nowIso(),
+    created_at: createdAt,
   };
 }
 
@@ -4883,7 +5621,7 @@ function createSettlementExportSnapshot({
   db.prepare(
     `INSERT INTO settlement_export_runs
      (id, export_version, business_date, store_id, terminal_id, status, exported_at, created_by, created_at)
-     VALUES (?, 'v1', ?, ?, ?, 'created', ?, ?, ?)`
+     VALUES (?, 'v2', ?, ?, ?, 'created', ?, ?, ?)`
   ).run(runId, businessDate, store.id, terminalId || null, createdAt, actorId || null, createdAt);
 
   audit({
@@ -4894,75 +5632,115 @@ function createSettlementExportSnapshot({
     targetId: runId,
     requestId,
     idempotencyKey,
-    afterState: { business_date: businessDate, export_version: "v1", store_id: store.id },
+    afterState: {
+      business_date: businessDate,
+      contract_version: SETTLEMENT_EXPORT_CONTRACT_V2,
+      export_version: "v2",
+      store_id: store.id,
+    },
     ip,
   });
 
   const invoices = buildSettlementExportBaseInvoices(store.id, range);
   const rows = [];
+  const refundManifest = [];
   for (const invoice of invoices) {
     const review = findLatestReviewCase(invoice.id);
-    const refund = findLatestRefundRequest(invoice.id);
-    const sessions = getPaymentSessionsForInvoice(invoice);
-    for (const paymentSession of sessions) {
+    const refunds = findRefundRequests(invoice.id);
+    const hasRefunds = refunds.length > 0;
+    const invoiceRefundSummary = buildSettlementRefundSummary(refunds);
+    const sessions = [...getPaymentSessionsForInvoice(invoice)].sort(compareSettlementPaymentSessions);
+    let primaryRow = null;
+    for (const [sessionIndex, paymentSession] of sessions.entries()) {
       const providerSession = paymentSession.id
         ? db.prepare(`SELECT * FROM provider_payment_sessions WHERE payment_session_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1`).get(paymentSession.id) || null
         : null;
       const providerAllocation = providerSession
         ? findLatestProviderAllocationForPayment(providerSession.provider_payment_id, invoice.id)
         : null;
+      const isRefundPrimary = hasRefunds && sessionIndex === 0;
+      const refundAttribution = isRefundPrimary
+        ? "invoice_primary"
+        : (hasRefunds ? "invoice_manifest_only" : "none");
+      const rowRefundSummary = isRefundPrimary
+        ? invoiceRefundSummary
+        : emptySettlementRefundSummary(hasRefunds ? "invoice_manifest_only" : "none");
       const row = buildSettlementExportRow({
         invoice,
         paymentSession,
         providerSession,
         providerAllocation,
         review,
-        refund,
+        refundSummary: rowRefundSummary,
+        refundAttribution,
+        hasRefunds,
         exportRunId: runId,
         businessDate,
+        createdAt,
       });
       if (!row) continue;
       rows.push(row);
-      db.prepare(
-        `INSERT INTO settlement_export_rows
-         (id, export_run_id, export_version, business_date, store_id, terminal_id, operator_id, invoice_id, checkout_session_id,
-          payment_session_id, rail_type, provider_code, invoice_amount_jpyc_base, invoice_status, accounting_status,
-          cash_recognition_status, receivable_status, onchain_cash_amount_jpyc_base, provider_receivable_amount_jpyc_base,
-          exception_amount_jpyc_base, refund_amount_jpyc_base, void_amount_jpyc_base, provider_payment_ref, provider_settlement_ref,
-          onchain_transfer_ref, evidence_hash, payload_schema_version, export_excluded_private_data, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        row.id,
-        row.export_run_id,
-        row.export_version,
-        row.business_date,
-        row.store_id,
-        row.terminal_id,
-        row.operator_id,
-        row.invoice_id,
-        row.checkout_session_id,
-        row.payment_session_id,
-        row.rail_type,
-        row.provider_code,
-        row.invoice_amount_jpyc_base,
-        row.invoice_status,
-        row.accounting_status,
-        row.cash_recognition_status,
-        row.receivable_status,
-        row.onchain_cash_amount_jpyc_base,
-        row.provider_receivable_amount_jpyc_base,
-        row.exception_amount_jpyc_base,
-        row.refund_amount_jpyc_base,
-        row.void_amount_jpyc_base,
-        row.provider_payment_ref,
-        row.provider_settlement_ref,
-        row.onchain_transfer_ref,
-        row.evidence_hash,
-        row.payload_schema_version,
-        row.export_excluded_private_data,
-        row.created_at
-      );
+      if (isRefundPrimary) primaryRow = row;
     }
+    if (hasRefunds && primaryRow) {
+      refundManifest.push({
+        invoice_id: invoice.id,
+        primary_export_row_id: primaryRow.id,
+        primary_payment_session_id: primaryRow.payment_session_id || null,
+        attribution: "invoice_primary_row",
+        ...invoiceRefundSummary,
+      });
+    }
+  }
+
+  rows.sort(compareSettlementExportV2Rows);
+  refundManifest.sort((left, right) => {
+    const leftValue = String(left.invoice_id || "");
+    const rightValue = String(right.invoice_id || "");
+    if (leftValue < rightValue) return -1;
+    if (leftValue > rightValue) return 1;
+    return 0;
+  });
+  for (const row of rows) {
+    db.prepare(
+      `INSERT INTO settlement_export_rows
+       (id, export_run_id, export_version, business_date, store_id, terminal_id, operator_id, invoice_id, checkout_session_id,
+        payment_session_id, rail_type, provider_code, invoice_amount_jpyc_base, invoice_status, accounting_status,
+        cash_recognition_status, receivable_status, onchain_cash_amount_jpyc_base, provider_receivable_amount_jpyc_base,
+        exception_amount_jpyc_base, refund_amount_jpyc_base, void_amount_jpyc_base, provider_payment_ref, provider_settlement_ref,
+        onchain_transfer_ref, evidence_hash, payload_schema_version, export_excluded_private_data, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      row.id,
+      row.export_run_id,
+      row.export_version,
+      row.business_date,
+      row.store_id,
+      row.terminal_id,
+      row.operator_id,
+      row.invoice_id,
+      row.checkout_session_id,
+      row.payment_session_id,
+      row.rail_type,
+      row.provider_code,
+      row.invoice_amount_jpyc_base,
+      row.invoice_status,
+      row.accounting_status,
+      row.cash_recognition_status,
+      row.receivable_status,
+      row.onchain_cash_amount_jpyc_base,
+      row.provider_receivable_amount_jpyc_base,
+      row.exception_amount_jpyc_base,
+      row.refund_amount_jpyc_base,
+      row.void_amount_jpyc_base,
+      row.provider_payment_ref,
+      row.provider_settlement_ref,
+      row.onchain_transfer_ref,
+      row.evidence_hash,
+      row.payload_schema_version,
+      row.export_excluded_private_data,
+      row.created_at
+    );
   }
 
   db.prepare(`UPDATE settlement_export_runs SET status = 'completed' WHERE id = ?`).run(runId);
@@ -4982,6 +5760,85 @@ function createSettlementExportSnapshot({
     exportRunId: runId,
     rows,
     accountingSummary: buildDailyAccountingSummary(rows),
+    refundManifest,
+    refundTotals: buildSettlementRefundTotals(refundManifest),
+  };
+}
+
+function persistSettlementExportArtifact({
+  settlementId = null,
+  businessDate,
+  format,
+  store,
+  actorId,
+  range,
+  snapshot,
+}) {
+  const exportId = uuid();
+  const generatedAt = nowIso();
+  const outputPath = `api://settlement-exports/${exportId}.${format}`;
+  const metadata = {
+    export_run_id: snapshot.exportRunId,
+    contract_version: SETTLEMENT_EXPORT_CONTRACT_V2,
+    export_version: "v2",
+    export_scope: "daily",
+    totals: buildDailyAccountingSummary(snapshot.rows),
+    timezone: store.timezone || "Asia/Tokyo",
+    period_start_utc: range.fromUtc,
+    period_end_utc: range.toUtc,
+    row_count: snapshot.rows.length,
+    hash_scope: {
+      version: SETTLEMENT_EXPORT_V2_CANONICAL_HASH_SCOPE,
+      json: "SHA-256 of UTF-8 JSON.stringify(Settlement Export v2 canonical payload), excluding content_hash/content_hashes and internal storage annotations",
+      csv: "SHA-256 of UTF-8 BOM CSV download bytes",
+    },
+    _row_annotations: buildSettlementExportV2RowAnnotations(snapshot.rows),
+    _refund_manifest: snapshot.refundManifest,
+    _refund_totals: snapshot.refundTotals,
+  };
+  const exportRowForPayload = {
+    id: exportId,
+    business_date: businessDate,
+    format,
+    generated_at: generatedAt,
+    output_path: outputPath,
+  };
+  const decoratedRows = applySettlementExportV2RowAnnotations(snapshot.rows, metadata);
+  const jsonPayload = buildSettlementExportV2SnapshotJsonPayload({
+    exportRow: exportRowForPayload,
+    metadata,
+    rows: decoratedRows,
+  });
+  const jsonDownload = JSON.stringify(jsonPayload);
+  const csvDownload = buildSettlementExportV2SnapshotCsv(decoratedRows, { bom: true });
+  metadata.content_hashes = {
+    json: sha256(jsonDownload),
+    csv: sha256(csvDownload),
+  };
+  metadata.content_hash = metadata.content_hashes[format];
+  db.prepare(
+    `INSERT INTO settlement_exports
+     (id, merchant_id, store_id, settlement_id, business_date, format, output_path, generated_by, generated_at, metadata_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    exportId,
+    store.merchant_id || "merchant-001",
+    store.id,
+    settlementId || null,
+    businessDate,
+    format,
+    outputPath,
+    actorId,
+    generatedAt,
+    JSON.stringify(metadata)
+  );
+  return {
+    exportId,
+    exportRunId: snapshot.exportRunId,
+    generatedAt,
+    outputPath,
+    metadata,
+    rows: decoratedRows,
   };
 }
 
@@ -6059,23 +6916,28 @@ expirySweepTimer.unref();
 
 const app = express();
 app.disable("x-powered-by");
-app.set("trust proxy", TRUST_PROXY);
+app.set("trust proxy", EXPRESS_TRUST_PROXY);
+
+const securityDirectives = {
+  defaultSrc: ["'self'"],
+  scriptSrc: ["'self'"],
+  styleSrc: ["'self'"],
+  imgSrc: ["'self'", "data:"],
+  connectSrc: ["'self'"],
+  fontSrc: ["'self'", "data:"],
+  objectSrc: ["'none'"],
+  frameAncestors: ["'none'"],
+  baseUri: ["'self'"],
+  // 開発用LAN HTTP確認では相対リソースまでHTTPS化するとSafariの実機確認が成立しない。
+  // 公開HTTPSの本番環境では昇格を維持し、混在コンテンツを防ぐ。
+  upgradeInsecureRequests: IS_PRODUCTION ? [] : null,
+};
 
 app.use(
   helmet({
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'"],
-        imgSrc: ["'self'", "data:"],
-        connectSrc: ["'self'"],
-        fontSrc: ["'self'", "data:"],
-        objectSrc: ["'none'"],
-        frameAncestors: ["'none'"],
-        baseUri: ["'self'"]
-      }
+      directives: securityDirectives,
     }
   })
 );
@@ -6177,14 +7039,12 @@ app.get("/pay", (req, res) => {
 });
 
 app.get("/t/:publicEntryToken", (req, res) => {
-  const entry = buildPublicTerminalEntryState(req.params.publicEntryToken);
-  if (!entry) {
+  const publicEntryToken = String(req.params.publicEntryToken || "").trim();
+  const terminal = getTerminalByPublicEntryToken(publicEntryToken);
+  if (!terminal) {
     return jsonError(res, 404, "NOT_FOUND", "Terminal entry not found");
   }
-  if (entry.status === "ready" && entry.pay_url) {
-    return res.redirect(entry.pay_url);
-  }
-  return res.redirect(`/terminal-entry.html?token=${encodeURIComponent(req.params.publicEntryToken)}`);
+  return res.redirect(`/terminal-entry.html?token=${encodeURIComponent(publicEntryToken)}`);
 });
 
 app.get("/healthz", (_req, res) => {
@@ -6400,14 +7260,12 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
   const candidateRows = staffName
     ? db.prepare(`SELECT * FROM staff_users WHERE store_id = ? AND status = 'active' AND staff_name = ?`).all(terminal.store_id, String(staffName))
     : db.prepare(`SELECT * FROM staff_users WHERE store_id = ? AND status = 'active'`).all(terminal.store_id);
-  const staff = candidateRows.find((row) => verifyPin(String(staffPin), row.pin_hash));
-  if (!staff) {
-    const failure = registerPinFailure(terminalCode);
-    return jsonError(res, 401, "UNAUTHORIZED", "Invalid staff PIN", {
-      failed_attempts: failure.failedAttempts,
-      locked_until: failure.lockedUntil
-    });
+  const matchingStaff = candidateRows.filter((row) => verifyPin(String(staffPin), row.pin_hash));
+  if (matchingStaff.length !== 1) {
+    if (matchingStaff.length === 0) registerPinFailure(terminalCode);
+    return jsonError(res, 401, "UNAUTHORIZED", "Invalid staff credentials");
   }
+  const staff = matchingStaff[0];
   clearPinFailures(terminalCode);
   if (!staff.pin_hash.startsWith("$2")) {
     db.prepare(`UPDATE staff_users SET pin_hash = ?, updated_at = ? WHERE id = ?`).run(hashPin(staffPin), nowIso(), staff.id);
@@ -6417,6 +7275,7 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
   const tokenHash = sha256(rawToken);
   const sid = uuid();
   const ts = nowIso();
+  const expiresAt = new Date(new Date(ts).getTime() + SESSION_TTL_SEC * 1000).toISOString();
   db.prepare(
     `INSERT INTO terminal_sessions (id, terminal_id, staff_user_id, token_hash, started_at)
      VALUES (?, ?, ?, ?, ?)`
@@ -6446,12 +7305,15 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
     token: rawToken,
     terminalId: terminal.id,
     storeId: terminal.store_id,
+    staff_name: staff.staff_name,
     role: staff.role,
+    effective_permissions: [...getPermissionsForSession(staff)].sort(),
     ...publicEntry,
     current_invoice: summarizeInvoiceForTerminalState(currentInvoiceContext.currentInvoice),
     terminal_invariant_broken: currentInvoiceContext.invariantBroken === true,
     supported_wallets: getSupportedWallets(ENV),
     started_at: ts,
+    expires_at: expiresAt,
     session_ttl_sec: SESSION_TTL_SEC,
     diagnostic_mode_enabled: DIAGNOSTIC_MODE_ENABLED,
   });
@@ -6567,7 +7429,7 @@ app.get("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
        ORDER BY created_at DESC`
     )
     .all(req.session.store_id);
-  return res.json({ staff: rows });
+  return res.json({ staff: rows.map(projectStaffUser) });
 });
 
 app.post("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
@@ -6599,7 +7461,7 @@ app.post("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
       ts,
       ts
     );
-    const created = db.prepare(`SELECT id, staff_name, role, status, permissions_override, created_at, updated_at FROM staff_users WHERE id = ?`).get(id);
+    const created = db.prepare(`SELECT * FROM staff_users WHERE id = ?`).get(id);
     audit({
       actorType: "admin",
       actorId,
@@ -6608,10 +7470,10 @@ app.post("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
       targetId: id,
       requestId,
       idempotencyKey: idemKey,
-      afterState: created,
+      afterState: projectStaffUser(created),
       ip: req.ip
     });
-    return { status: 201, body: { staff: created } };
+    return { status: 201, body: { staff: projectStaffUser(created) } };
   });
 });
 
@@ -6652,7 +7514,7 @@ app.patch("/api/v1/staff/:staffId", requirePermission("staff.manage"), (req, res
       afterState: after,
       ip: req.ip
     });
-    return { status: 200, body: { staff: after } };
+    return { status: 200, body: { staff: projectStaffUser(after) } };
   });
 });
 
@@ -6846,7 +7708,7 @@ app.get("/api/v1/terminal-sessions", requirePermission("session.read"), (req, re
        LIMIT ? OFFSET ?`
     )
     .all(...args, limit, offset);
-  return res.json({ sessions: rows, page: { limit, offset, returned: rows.length } });
+  return res.json({ sessions: rows.map(projectTerminalSession), page: { limit, offset, returned: rows.length } });
 });
 
 app.post("/api/v1/terminal-sessions/:sessionId/revoke", requirePermission("session.revoke"), (req, res) => {
@@ -8159,14 +9021,52 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "refund_chain_id must match invoice chain_id" } } };
     }
 
+    const existingSemanticRefund = findActiveRefundBySemantic({
+      reviewCaseId: review_case_id,
+      refundAmountBase: parsedRefundBase.value,
+      refundToAddress: refund_to_address,
+      refundChainId: refund_chain_id,
+    });
+    if (existingSemanticRefund) {
+      audit({
+        actorType: "admin",
+        actorId,
+        action: "refund.request_deduplicated",
+        targetType: "refund",
+        targetId: existingSemanticRefund.id,
+        requestId,
+        idempotencyKey: idemKey,
+        afterState: existingSemanticRefund,
+        ip: req.ip,
+      });
+      const deduplicated = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(existingSemanticRefund.id);
+      return { status: 200, body: buildRefundEvidenceResponse(deduplicated) };
+    }
+
     const eligibleBase = computeRefundEligibilityBase(review, review);
-    if (compareBaseUnits(parsedRefundBase.value, eligibleBase) > 0) {
+    let reservedBase;
+    try {
+      reservedBase = computeReservedRefundAmountBase({
+        invoiceId: review.invoice_id,
+        reviewCaseId: review_case_id,
+      });
+    } catch (error) {
+      if (error?.code === "REFUND_LEDGER_INTEGRITY_ERROR") return refundLedgerIntegrityApiResult(error);
+      throw error;
+    }
+    const requestedPlusReservedBase = (BigInt(reservedBase) + BigInt(parsedRefundBase.value)).toString();
+    if (compareBaseUnits(requestedPlusReservedBase, eligibleBase) > 0) {
+      const remainingBase = BigInt(eligibleBase) > BigInt(reservedBase)
+        ? (BigInt(eligibleBase) - BigInt(reservedBase)).toString()
+        : "0";
       recordSuspiciousActivity({
         storeId: req.session.store_id,
         invoiceId: review.invoice_id,
         reason: "abnormal_refund_request_over_limit",
         payload: {
           requested_base: parsedRefundBase.value,
+          reserved_base: reservedBase,
+          requested_plus_reserved_base: requestedPlusReservedBase,
           eligible_base: eligibleBase,
           review_case_id,
         },
@@ -8176,8 +9076,12 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
         body: {
           error: {
             code: "OVER_REFUND",
-            message: "requested refund exceeds eligible amount",
-            details: { eligible_refund_amount_jpyc_base: eligibleBase },
+            message: "requested refund exceeds remaining eligible amount",
+            details: {
+              eligible_refund_amount_jpyc_base: eligibleBase,
+              reserved_refund_amount_jpyc_base: reservedBase,
+              remaining_refund_amount_jpyc_base: remainingBase,
+            },
           },
         },
       };
@@ -8459,71 +9363,132 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
       return { status: 400, body: { error: verified.error } };
     }
 
-    if (verified.refundTxHash) {
-      const existingHash = db
-        .prepare(
-          `SELECT id
-           FROM refund_requests
-           WHERE refund_tx_hash = ?
-             AND COALESCE(refund_tx_log_index, -1) = COALESCE(?, -1)
-             AND id != ?`
-        )
-        .get(verified.refundTxHash, verified.refundTxLogIndex ?? null, refund.id);
-      if (existingHash) {
-        return { status: 409, body: { error: { code: "DUPLICATE_REFUND_TX_HASH", message: "refund_tx_hash/log_index already used by another request" } } };
-      }
-    }
-
-    const ts = nowIso();
-    db.prepare(
-      `UPDATE refund_requests
-       SET status = ?,
-           refund_tx_hash = ?,
-           refund_tx_log_index = ?,
-           failure_reason = ?,
-           from_address = COALESCE(?, from_address),
-           to_address = COALESCE(?, to_address),
-           chain_id = COALESCE(?, chain_id),
-           token_contract = COALESCE(?, token_contract),
-           block_number = ?,
-           block_timestamp = ?,
-           detected_at = ?,
-           verified_at = ?,
-           last_attempted_at = ?,
-           updated_at = ?
-       WHERE id = ?`
-    ).run(
-      verified.status,
-      verified.refundTxHash || refund.refund_tx_hash || null,
-      verified.refundTxLogIndex ?? refund.refund_tx_log_index ?? null,
-      verified.failureReason || null,
-      verified.fromAddress || null,
-      verified.toAddress || null,
-      verified.chainId || null,
-      verified.tokenContract || null,
-      verified.blockNumber ?? null,
-      verified.blockTimestamp || null,
-      verified.detectedAt || ts,
-      verified.verifiedAt || null,
-      ts,
-      ts,
-      refund.id
-    );
-    const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
-    audit({
-      actorType: "admin",
-      actorId,
-      action: "refund.verified_onchain",
-      targetType: "refund",
-      targetId: refund.id,
-      requestId,
-      idempotencyKey: idemKey,
-      beforeState: refund,
-      afterState: after,
-      ip: req.ip,
+    const finalTxHash = verified.refundTxHash || refund.refund_tx_hash || null;
+    const finalTxLogIndex = verified.refundTxLogIndex ?? refund.refund_tx_log_index ?? null;
+    const normalizeEvidenceHash = (value) => String(value || "").trim().toLowerCase();
+    const normalizeEvidenceLogIndex = (value) => (value == null ? -1 : Number(value));
+    const conflictResult = (current) => ({
+      status: 409,
+      body: {
+        error: {
+          code: "REFUND_VERIFICATION_CONFLICT",
+          message: "Refund state or transaction evidence changed while verification was in progress",
+          details: {
+            refund_id: refund.id,
+            current_status: current?.status || null,
+          },
+        },
+      },
     });
-    const afterAudit = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
-    return { status: 200, body: buildRefundEvidenceResponse(afterAudit) };
+
+    const finalizeVerification = db.transaction(() => {
+      const current = db
+        .prepare(
+          `SELECT rr.* FROM refund_requests rr
+           JOIN invoices i ON i.id = rr.invoice_id
+           WHERE rr.id = ? AND i.store_id = ?`
+        )
+        .get(refund.id, req.session.store_id);
+      if (!current) {
+        return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
+      }
+
+      const currentEvidenceMatchesResult = normalizeEvidenceHash(current.refund_tx_hash) === normalizeEvidenceHash(finalTxHash)
+        && normalizeEvidenceLogIndex(current.refund_tx_log_index) === normalizeEvidenceLogIndex(finalTxLogIndex);
+      const alreadySameSuccess = ["succeeded", "verified"].includes(String(current.status))
+        && verified.status === "succeeded"
+        && currentEvidenceMatchesResult;
+      const snapshotStillCurrent = String(current.status) === String(refund.status)
+        && String(current.updated_at || "") === String(refund.updated_at || "")
+        && normalizeEvidenceHash(current.refund_tx_hash) === normalizeEvidenceHash(refund.refund_tx_hash)
+        && normalizeEvidenceLogIndex(current.refund_tx_log_index) === normalizeEvidenceLogIndex(refund.refund_tx_log_index);
+
+      if (!snapshotStillCurrent) {
+        if (alreadySameSuccess) {
+          return { status: 200, body: buildRefundEvidenceResponse(current) };
+        }
+        return conflictResult(current);
+      }
+      if (!["recorded", "pending_verification", "verification_failed", "failed"].includes(String(current.status))) {
+        return { status: 409, body: { error: { code: "INVALID_STATE_TRANSITION", message: "Refund is not awaiting verification" } } };
+      }
+
+      if (finalTxHash) {
+        const existingHash = db
+          .prepare(
+            `SELECT id
+             FROM refund_requests
+             WHERE refund_tx_hash = ?
+               AND COALESCE(refund_tx_log_index, -1) = COALESCE(?, -1)
+               AND id != ?`
+          )
+          .get(finalTxHash, finalTxLogIndex, refund.id);
+        if (existingHash) {
+          return { status: 409, body: { error: { code: "DUPLICATE_REFUND_TX_HASH", message: "refund_tx_hash/log_index already used by another request" } } };
+        }
+      }
+
+      const ts = nowIso();
+      const updated = db.prepare(
+        `UPDATE refund_requests
+         SET status = ?,
+             refund_tx_hash = ?,
+             refund_tx_log_index = ?,
+             failure_reason = ?,
+             from_address = COALESCE(?, from_address),
+             to_address = COALESCE(?, to_address),
+             chain_id = COALESCE(?, chain_id),
+             token_contract = COALESCE(?, token_contract),
+             block_number = ?,
+             block_timestamp = ?,
+             detected_at = ?,
+             verified_at = ?,
+             last_attempted_at = ?,
+             updated_at = ?
+         WHERE id = ?
+           AND status = ?
+           AND updated_at = ?
+           AND COALESCE(refund_tx_hash, '') = COALESCE(?, '')
+           AND COALESCE(refund_tx_log_index, -1) = COALESCE(?, -1)`
+      ).run(
+        verified.status,
+        finalTxHash,
+        finalTxLogIndex,
+        verified.failureReason || null,
+        verified.fromAddress || null,
+        verified.toAddress || null,
+        verified.chainId || null,
+        verified.tokenContract || null,
+        verified.blockNumber ?? null,
+        verified.blockTimestamp || null,
+        verified.detectedAt || ts,
+        verified.verifiedAt || null,
+        ts,
+        ts,
+        refund.id,
+        refund.status,
+        refund.updated_at,
+        refund.refund_tx_hash || null,
+        refund.refund_tx_log_index ?? null
+      );
+      if (updated.changes !== 1) return conflictResult(current);
+
+      const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
+      audit({
+        actorType: "admin",
+        actorId,
+        action: "refund.verified_onchain",
+        targetType: "refund",
+        targetId: refund.id,
+        requestId,
+        idempotencyKey: idemKey,
+        beforeState: current,
+        afterState: after,
+        ip: req.ip,
+      });
+      return { status: 200, body: buildRefundEvidenceResponse(after) };
+    });
+    return finalizeVerification.immediate();
   });
 });
 
@@ -8561,7 +9526,8 @@ app.get("/api/v1/audit-logs", requirePermission("audit.read"), (req, res) => {
   } else {
     rows = db.prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(limit, offset);
   }
-  res.json({ audit_logs: rows, page: { limit, offset, returned: rows.length } });
+  const sanitizedRows = rows.map(sanitizeAuditLogRowForResponse);
+  res.json({ audit_logs: sanitizedRows, page: { limit, offset, returned: sanitizedRows.length } });
 });
 
 app.get("/api/v1/audit-logs/verify-chain", requirePermission("audit.read"), (_req, res) => {
@@ -8586,6 +9552,7 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
     );
   }
   const rows = db.prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?`).all(limit);
+  const sanitizedRows = rows.map(sanitizeAuditLogRowForResponse);
   audit({
     actorType: "admin",
     actorId: req.session.staff_user_id,
@@ -8627,17 +9594,17 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
     };
     const escapeCell = (value) => `"${sanitizeCsvCell(value).replace(/"/g, '""')}"`;
     const lines = [headers.join(",")];
-    for (const row of rows) {
+    for (const row of sanitizedRows) {
       lines.push(headers.map((header) => escapeCell(row[header])).join(","));
     }
     res.setHeader("content-type", "text/csv; charset=utf-8");
     return res.send(lines.join("\n"));
   }
   return res.json({
-    audit_logs: rows,
+    audit_logs: sanitizedRows,
     exported_at: nowIso(),
     format: "json",
-    count: rows.length,
+    count: sanitizedRows.length,
     meta: {
       requested_limit: requestedLimit,
       applied_limit: limit,
@@ -8717,20 +9684,41 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
       };
     }
 
-    const result = db.transaction(() => {
+    let result;
+    try {
+      result = db.transaction(() => {
       const existing = db.prepare(`SELECT * FROM settlements WHERE store_id = ? AND business_date = ?`).get(req.session.store_id, businessDate);
       if (existing) {
-        const latestExportRun = db
+        const boundExport = db
           .prepare(
-            `SELECT id FROM settlement_export_runs
-             WHERE business_date = ? AND store_id = ?
-             ORDER BY created_at DESC
+            `SELECT * FROM settlement_exports
+             WHERE settlement_id = ? AND store_id = ?
+             ORDER BY generated_at ASC
              LIMIT 1`
           )
-          .get(businessDate, req.session.store_id);
-        const existingSnapshotRows = latestExportRun
-          ? db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(latestExportRun.id)
+          .get(existing.id, req.session.store_id);
+        const boundMetadata = boundExport
+          ? parseJsonWithWarning(boundExport.metadata_json, "settlement.close.bound_export_metadata", {})
+          : {};
+        const contractVersion = boundExport ? resolveSettlementExportContractVersion(boundMetadata) : null;
+        if (boundExport && !contractVersion) {
+          return {
+            status: 409,
+            body: {
+              error: {
+                code: "UNSUPPORTED_SETTLEMENT_EXPORT_CONTRACT",
+                message: "Bound settlement export contract version is unsupported",
+              },
+            },
+          };
+        }
+        const boundExportRunId = boundMetadata?.export_run_id || null;
+        const storedSnapshotRows = boundExport
+          ? loadSettlementExportRows(boundExportRunId, contractVersion)
           : [];
+        const existingSnapshotRows = contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2
+          ? applySettlementExportV2RowAnnotations(storedSnapshotRows, boundMetadata)
+          : storedSnapshotRows;
         return {
           status: 200,
           body: {
@@ -8747,8 +9735,15 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
             unresolved_review_policy: existing.unresolved_review_policy || resolveSettlementUnresolvedReviewPolicy(store),
             unresolved_review_reason: existing.unresolved_review_note || null,
             export_reference: `settlement-${businessDate}.csv`,
-            export_run_id: latestExportRun?.id || null,
-            accounting_summary: buildDailyAccountingSummary(existingSnapshotRows),
+            export_id: boundExport?.id || null,
+            export_run_id: boundExportRunId,
+            contract_version: contractVersion,
+            export_binding_status: boundExport ? "bound" : "legacy_export_missing",
+            accounting_summary: boundExport ? buildDailyAccountingSummary(existingSnapshotRows) : null,
+            refund_manifest: contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2 ? boundMetadata._refund_manifest || [] : null,
+            refund_totals: contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2 ? boundMetadata._refund_totals || null : null,
+            content_hash: boundMetadata?.content_hash || null,
+            content_hashes: boundMetadata?.content_hashes || null,
             already_closed: true,
             warning: Number(existing.review_count || 0) > 0 ? "UNRESOLVED_REVIEWS" : null,
             review_count: Number(existing.review_count || 0),
@@ -8926,6 +9921,15 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
         ip: req.ip,
         range,
       });
+      const artifact = persistSettlementExportArtifact({
+        settlementId,
+        businessDate,
+        format: "csv",
+        store,
+        actorId,
+        range,
+        snapshot,
+      });
 
       return {
         status: 200,
@@ -8937,15 +9941,26 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
           unresolved_review_policy: unresolvedPolicy,
           unresolved_review_reason: unresolvedReviewReason || null,
           export_reference: `settlement-${businessDate}.csv`,
-          export_run_id: snapshot.exportRunId,
-          accounting_summary: snapshot.accountingSummary,
+          export_id: artifact.exportId,
+          export_run_id: artifact.exportRunId,
+          contract_version: SETTLEMENT_EXPORT_CONTRACT_V2,
+          export_binding_status: "bound",
+          accounting_summary: artifact.metadata.totals,
+          refund_manifest: artifact.metadata._refund_manifest,
+          refund_totals: artifact.metadata._refund_totals,
+          content_hash: artifact.metadata.content_hash,
+          content_hashes: artifact.metadata.content_hashes,
           already_closed: false,
           warning: reviewInvoices.length > 0 ? "UNRESOLVED_REVIEWS" : null,
           review_count: reviewInvoices.length,
           review_invoice_ids: reviewInvoiceIds
         }
       };
-    })();
+      })();
+    } catch (error) {
+      if (error?.code === "REFUND_LEDGER_INTEGRITY_ERROR") return refundLedgerIntegrityApiResult(error);
+      throw error;
+    }
 
     return result;
   });
@@ -9143,79 +10158,50 @@ app.post("/api/v1/settlement-exports", requirePermission("settlement.export"), (
       };
     }
 
-    const result = db.transaction(() => {
-      const snapshot = createSettlementExportSnapshot({
-        businessDate,
-        store,
-        terminalId: null,
-        actorId,
-        requestId: requestIdFromReq(req),
-        idempotencyKey: req.header("Idempotency-Key"),
-        ip: req.ip,
-        range,
-      });
-      const exportId = uuid();
-      const generatedAt = nowIso();
-      const exportPath = `api://settlement-exports/${exportId}.${format}`;
-      const exportRowForPayload = {
-        id: exportId,
-        business_date: businessDate,
-        format,
-        generated_at: generatedAt,
-        output_path: exportPath,
-      };
-      const metadata = {
-        export_run_id: snapshot.exportRunId,
-        export_version: "v1",
-        export_scope: "daily",
-        totals: buildDailyAccountingSummary(snapshot.rows),
-        timezone: store.timezone || "Asia/Tokyo",
-        period_start_utc: range.fromUtc,
-        period_end_utc: range.toUtc,
-        row_count: snapshot.rows.length,
-      };
-      const jsonPayload = buildSettlementExportSnapshotJsonPayload({
-        exportRow: exportRowForPayload,
-        metadata,
-        rows: snapshot.rows,
-      });
-      const csvPayload = buildSettlementExportSnapshotCsv(snapshot.rows, { bom: true });
-      metadata.content_hashes = {
-        json: sha256(JSON.stringify(jsonPayload)),
-        csv: sha256(csvPayload),
-      };
-      metadata.content_hash = metadata.content_hashes[format];
-      db.prepare(
-        `INSERT INTO settlement_exports
-         (id, merchant_id, store_id, business_date, format, output_path, generated_by, generated_at, metadata_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        exportId,
-        store.merchant_id || "merchant-001",
-        store.id,
-        businessDate,
-        format,
-        exportPath,
-        actorId,
-        generatedAt,
-        JSON.stringify(metadata)
-      );
-      return {
-        status: 201,
-        body: {
-          export_id: exportId,
-          export_run_id: snapshot.exportRunId,
-          business_date: businessDate,
+    let result;
+    try {
+      result = db.transaction(() => {
+        const snapshot = createSettlementExportSnapshot({
+          businessDate,
+          store,
+          terminalId: null,
+          actorId,
+          requestId: requestIdFromReq(req),
+          idempotencyKey: req.header("Idempotency-Key"),
+          ip: req.ip,
+          range,
+        });
+        const artifact = persistSettlementExportArtifact({
+          businessDate,
           format,
-          generated_at: generatedAt,
-          output_path: exportPath,
-          accounting_summary: metadata.totals,
-          row_count: snapshot.rows.length,
-          content_hash: metadata.content_hash,
-          content_hashes: metadata.content_hashes,
-        },
-      };
-    })();
+          store,
+          actorId,
+          range,
+          snapshot,
+        });
+        return {
+          status: 201,
+          body: {
+            export_id: artifact.exportId,
+            export_run_id: artifact.exportRunId,
+            contract_version: SETTLEMENT_EXPORT_CONTRACT_V2,
+            business_date: businessDate,
+            format,
+            generated_at: artifact.generatedAt,
+            output_path: artifact.outputPath,
+            accounting_summary: artifact.metadata.totals,
+            refund_manifest: artifact.metadata._refund_manifest,
+            refund_totals: artifact.metadata._refund_totals,
+            row_count: artifact.rows.length,
+            content_hash: artifact.metadata.content_hash,
+            content_hashes: artifact.metadata.content_hashes,
+          },
+        };
+      })();
+    } catch (error) {
+      if (error?.code === "REFUND_LEDGER_INTEGRITY_ERROR") return refundLedgerIntegrityApiResult(error);
+      throw error;
+    }
 
     return result;
   });
@@ -9227,22 +10213,35 @@ app.get("/api/v1/settlement-exports/:id", requirePermission("settlement.export")
     .get(String(req.params.id || ""), req.session.store_id);
   if (!exportRow) return jsonError(res, 404, "NOT_FOUND", "Settlement export not found");
   const metadata = parseJsonWithWarning(exportRow.metadata_json, "settlement_exports.metadata_json", {});
+  const contractVersion = resolveSettlementExportContractVersion(metadata);
+  if (!contractVersion) {
+    return jsonError(res, 409, "UNSUPPORTED_SETTLEMENT_EXPORT_CONTRACT", "Settlement export contract version is unsupported");
+  }
   const exportRunId = metadata?.export_run_id || null;
-  const rows = exportRunId
-    ? db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId)
-    : [];
-  return res.json({
+  const storedRows = loadSettlementExportRows(exportRunId, contractVersion);
+  const rows = contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2
+    ? applySettlementExportV2RowAnnotations(storedRows, metadata)
+    : storedRows;
+  const responseBody = {
     export_id: exportRow.id,
     export_run_id: exportRunId,
+    contract_version: contractVersion,
     business_date: exportRow.business_date,
     format: exportRow.format,
     generated_at: exportRow.generated_at,
     output_path: exportRow.output_path,
     content_hash: metadata?.content_hash || null,
     content_hashes: metadata?.content_hashes || null,
-    metadata,
+    metadata: contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2
+      ? publicSettlementExportV2Metadata(metadata)
+      : metadata,
     rows,
-  });
+  };
+  if (contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2) {
+    responseBody.refund_manifest = metadata._refund_manifest || [];
+    responseBody.refund_totals = metadata._refund_totals || null;
+  }
+  return res.json(responseBody);
 });
 
 app.get("/api/v1/settlement-exports/:id/download", requirePermission("settlement.export"), (req, res) => {
@@ -9251,26 +10250,55 @@ app.get("/api/v1/settlement-exports/:id/download", requirePermission("settlement
     .get(String(req.params.id || ""), req.session.store_id);
   if (!exportRow) return jsonError(res, 404, "NOT_FOUND", "Settlement export not found");
   const metadata = parseJsonWithWarning(exportRow.metadata_json, "settlement_exports.metadata_json", {});
+  const contractVersion = resolveSettlementExportContractVersion(metadata);
+  if (!contractVersion) {
+    return jsonError(res, 409, "UNSUPPORTED_SETTLEMENT_EXPORT_CONTRACT", "Settlement export contract version is unsupported");
+  }
   const exportRunId = metadata?.export_run_id || null;
-  const rows = exportRunId
-    ? db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId)
-    : [];
+  const storedRows = loadSettlementExportRows(exportRunId, contractVersion);
+  const rows = contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2
+    ? applySettlementExportV2RowAnnotations(storedRows, metadata)
+    : storedRows;
   const format = String(req.query.format || exportRow.format || "json").trim().toLowerCase();
   if (!["json", "csv"].includes(format)) {
     return jsonError(res, 400, "VALIDATION_ERROR", "format must be json or csv");
   }
   const filename = `settlement-export-${exportRow.business_date}-${exportRow.id}.${format}`;
   res.setHeader("content-disposition", `attachment; filename="${filename}"`);
-  if (format === "csv") {
-    res.setHeader("content-type", "text/csv; charset=utf-8");
-    return res.send(buildSettlementExportSnapshotCsv(rows, { bom: true }));
+  res.setHeader("x-settlement-export-contract-version", contractVersion);
+  if (contractVersion === SETTLEMENT_EXPORT_CONTRACT_V1) {
+    if (format === "csv") {
+      res.setHeader("content-type", "text/csv; charset=utf-8");
+      return res.send(buildSettlementExportV1SnapshotCsv(rows, { bom: true }));
+    }
+    const payload = buildSettlementExportV1SnapshotJsonPayload({ exportRow, metadata, rows });
+    return res.json({
+      ...payload,
+      content_hash: metadata?.content_hashes?.json || metadata?.content_hash || null,
+      content_hashes: metadata?.content_hashes || null,
+    });
   }
-  const payload = buildSettlementExportSnapshotJsonPayload({ exportRow, metadata, rows });
-  return res.json({
-    ...payload,
-    content_hash: metadata?.content_hashes?.json || metadata?.content_hash || null,
-    content_hashes: metadata?.content_hashes || null,
-  });
+  if (format === "csv") {
+    const csvDownload = buildSettlementExportV2SnapshotCsv(rows, { bom: true });
+    const actualHash = sha256(csvDownload);
+    const expectedHash = metadata?.content_hashes?.csv || null;
+    if (metadata?.hash_scope?.version !== SETTLEMENT_EXPORT_V2_CANONICAL_HASH_SCOPE || expectedHash !== actualHash) {
+      return jsonError(res, 409, "SETTLEMENT_EXPORT_HASH_MISMATCH", "stored CSV hash does not match frozen snapshot bytes");
+    }
+    res.setHeader("content-type", "text/csv; charset=utf-8");
+    res.setHeader("x-content-sha256", actualHash);
+    return res.send(csvDownload);
+  }
+  const payload = buildSettlementExportV2SnapshotJsonPayload({ exportRow, metadata, rows });
+  const jsonDownload = JSON.stringify(payload);
+  const actualHash = sha256(jsonDownload);
+  const expectedHash = metadata?.content_hashes?.json || null;
+  if (metadata?.hash_scope?.version !== SETTLEMENT_EXPORT_V2_CANONICAL_HASH_SCOPE || expectedHash !== actualHash) {
+    return jsonError(res, 409, "SETTLEMENT_EXPORT_HASH_MISMATCH", "stored JSON hash does not match frozen snapshot bytes");
+  }
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.setHeader("x-content-sha256", actualHash);
+  return res.send(jsonDownload);
 });
 
 app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
@@ -9419,6 +10447,8 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);
   const walletPayload = buildInvoiceWalletPayload(invoice, store);
   const providerSummary = buildProviderSummary(invoice);
+  const paymentEvidenceTimestamps = findInvoicePaymentEvidenceTimestamps(invoice);
+  const serverNow = nowIso();
   res.json({
     invoice_id: invoice.id,
     invoice_no: invoice.invoice_no,
@@ -9426,9 +10456,15 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
     amount_jpyc: invoice.amount_jpyc,
     amount_jpyc_base: invoice.amount_jpyc_base,
     status: invoice.status,
+    status_version: invoice.updated_at,
     issued_at: invoice.created_at,
     created_at: invoice.created_at,
+    server_now: serverNow,
     expires_at: invoice.expires_at,
+    ttl_remaining_sec: computeTtlRemainingSec(invoice.expires_at, new Date(serverNow).getTime()),
+    paid_tx_hash: invoice.paid_tx_hash || null,
+    confirmed_at: paymentEvidenceTimestamps.confirmedAt,
+    chain_recorded_at: paymentEvidenceTimestamps.chainRecordedAt,
     chain_id: invoice.chain_id,
     token_contract: invoice.token_contract,
     recipient_address: invoice.recipient_address,
@@ -9525,10 +10561,25 @@ app.post("/api/v1/public/invoices/:invoiceId/consent", (req, res) => {
   if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
   const invoice = db.prepare(`SELECT id, status FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
+  const policyGate = evaluatePolicyUrlsGate();
+  if (!policyGate.ok) {
+    return jsonError(res, 503, "POLICY_CONFIGURATION_NOT_READY", "Published customer policy configuration is not ready", {
+      missing_keys: policyGate.missing_keys,
+      missing_version_keys: policyGate.missing_version_keys,
+    });
+  }
   const body = req.body || {};
-  const termsVersion = String(body.terms_version || "").slice(0, 64);
-  const privacyVersion = String(body.privacy_version || "").slice(0, 64);
-  const refundPolicyVersion = String(body.refund_policy_version || "").slice(0, 64);
+  const versionSubmission = validatePolicyVersionSubmission(policyGate.versions, body);
+  if (!versionSubmission.ok) {
+    return jsonError(res, 409, "POLICY_VERSION_MISMATCH", "Submitted policy versions do not match the published versions", {
+      missing_keys: versionSubmission.missing_keys,
+      mismatch_keys: versionSubmission.mismatch_keys,
+      unexpected_keys: versionSubmission.unexpected_keys,
+    });
+  }
+  const termsVersion = policyGate.versions.terms_version;
+  const privacyVersion = policyGate.versions.privacy_version;
+  const refundPolicyVersion = policyGate.versions.refund_policy_version;
   const consentedAt = nowIso();
   audit({
     actorType: "customer_anonymous",
@@ -9559,7 +10610,7 @@ app.use((error, req, res, next) => {
       level: "error",
       type: "http.error",
       request_id: requestIdFromReq(req),
-      path: req.originalUrl || req.path,
+      path: redactUrlForLogs(req.originalUrl || req.path),
       method: req.method,
       message: String(error.message || error)
     })
@@ -9571,10 +10622,14 @@ let serverInstance = null;
 let shutdownStarted = false;
 export function startServer() {
   if (serverInstance) return serverInstance;
-  serverInstance = app.listen(PORT, () => {
+  const onListening = () => {
     console.log(`JPYC production server started on ${APP_HOST} (port ${PORT})`);
+    console.log(`Bind host: ${APP_BIND_HOST || "runtime default"}`);
     console.log(`DB path: ${DB_PATH}`);
-  });
+  };
+  serverInstance = APP_BIND_HOST
+    ? app.listen(PORT, APP_BIND_HOST, onListening)
+    : app.listen(PORT, onListening);
   return serverInstance;
 }
 

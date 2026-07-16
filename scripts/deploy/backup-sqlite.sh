@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -10,6 +11,7 @@ TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 TARGET_PATH="${BACKUP_DIR}/app-${TIMESTAMP}.sqlite3"
 
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
 node - "$DB_PATH" "$TARGET_PATH" <<'NODE'
 const Database = require("better-sqlite3");
@@ -22,6 +24,7 @@ const db = new Database(sourcePath, { fileMustExist: true });
 (async () => {
   await db.backup(targetPath);
   db.close();
+  require("node:fs").chmodSync(targetPath, 0o600);
   process.stdout.write(`${targetPath}\n`);
 })().catch((error) => {
   try {

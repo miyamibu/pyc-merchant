@@ -11,6 +11,7 @@ pnpm-debug.log*
 runtime/
 artifacts/
 deliverables/
+output/
 .codex/
 docs/production/evidence/*
 !docs/production/evidence/.gitkeep

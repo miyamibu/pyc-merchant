@@ -368,6 +368,7 @@ label {
   color: #516076;
   background: #d6dde9;
   border-color: #bcc7d9;
+  transition: none;
 }
 
 .btn:not(:disabled):hover {
@@ -591,6 +592,40 @@ label {
 .primary-action-stack {
   display: grid;
   gap: var(--space-2);
+}
+
+.mobile-surface .btn-compact {
+  min-height: var(--tap-target-min);
+}
+
+.mobile-surface a.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mobile-surface .consent-checkbox-row {
+  min-height: var(--tap-target-min);
+  align-items: flex-start;
+  flex-wrap: nowrap;
+}
+
+.mobile-surface .consent-checkbox-row #consentCheckbox {
+  width: 24px;
+  height: 24px;
+  margin: 10px 0;
+  flex: 0 0 24px;
+}
+
+.mobile-surface .consent-checkbox-row .consent-checkbox-label {
+  min-height: var(--tap-target-min);
+  padding: 10px 0;
+  flex: 1 1 auto;
+}
+
+.mobile-inline-error {
+  padding: var(--space-3);
+  text-align: left;
 }
 
 .btn-xl {
@@ -946,20 +981,25 @@ tbody tr:last-child td {
 .toast-host {
   position: fixed;
   right: max(16px, env(safe-area-inset-right));
-  bottom: max(16px, env(safe-area-inset-bottom));
+  top: max(16px, env(safe-area-inset-top));
   display: grid;
   gap: var(--space-2);
   z-index: 1000;
+  pointer-events: none;
+  max-width: calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right));
 }
 
 .toast {
-  min-width: 240px;
+  width: min(360px, calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right)));
+  min-width: 0;
   max-width: 360px;
   border-radius: var(--radius-sm);
   padding: 10px 12px;
   box-shadow: var(--shadow-pop);
   font-size: var(--font-size-sm);
   font-weight: 700;
+  pointer-events: none;
+  overflow-wrap: anywhere;
 }
 
 .toast-info {
@@ -1852,6 +1892,14 @@ tbody tr:last-child td {
 
   .row > * {
     flex: 1 1 100%;
+  }
+
+  .mobile-surface .consent-checkbox-row > * {
+    flex: 0 0 auto;
+  }
+
+  .mobile-surface .consent-checkbox-row .consent-checkbox-label {
+    flex: 1 1 auto;
   }
 
   .mobile-surface .btn {

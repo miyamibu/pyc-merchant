@@ -167,7 +167,15 @@ test("provider presentation suppresses fixed QR until staff explicitly resumes Q
     redirect: "manual",
   });
   assert.equal(fixedEntryAfterResume.status, 302);
-  assert.equal(fixedEntryAfterResume.headers.get("location"), created.data.payment_url);
+  assert.match(String(fixedEntryAfterResume.headers.get("location") || ""), /\/terminal-entry\.html\?token=/);
+
+  const publicEntryAfterResume = await apiRequest(
+    ctx.started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(ctx.admin.publicEntryToken)}`
+  );
+  assert.equal(publicEntryAfterResume.status, 200);
+  assert.equal(publicEntryAfterResume.data.status, "ready");
+  assert.equal(publicEntryAfterResume.data.pay_url, created.data.payment_url);
 });
 
 test("provider authorized updates provider_summary and terminal SSE refreshes", async (t) => {

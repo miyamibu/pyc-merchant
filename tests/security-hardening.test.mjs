@@ -296,11 +296,13 @@ test("negative permission, public exposure, and rate-limit guards stay enforced"
   assert.equal(wrongSig3.status, 429);
 });
 
-test("consent endpoint: requires valid signed URL, records audit, and rate-limits", async (t) => {
+test("consent endpoint: requires a valid signature and fails closed without published policy configuration", async (t) => {
   const env = baseServerEnv();
   const started = await startServerProcess(CWD, env);
+  const db = new Database(env.DB_PATH);
 
   t.after(async () => {
+    db.close();
     await stopServerProcess(started.proc);
   });
 
@@ -323,14 +325,19 @@ test("consent endpoint: requires valid signed URL, records audit, and rate-limit
 
   const consentUrl = `/api/v1/public/invoices/${encodeURIComponent(parsed.invoiceId)}/consent?sig=${encodeURIComponent(parsed.sig)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(parsed.nonce)}`;
 
-  const ok = await apiRequest(started.baseUrl, consentUrl, {
+  const blocked = await apiRequest(started.baseUrl, consentUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: consentBody,
   });
-  assert.equal(ok.status, 200);
-  assert.equal(ok.data.ok, true);
-  assert.ok(ok.data.recorded_at, "recorded_at must be present");
+  assert.equal(blocked.status, 503);
+  assert.equal(blocked.data.error.code, "POLICY_CONFIGURATION_NOT_READY");
+  assert.deepEqual(blocked.data.error.details.missing_keys, ["terms", "privacy", "refund"]);
+  assert.deepEqual(blocked.data.error.details.missing_version_keys, ["terms_version", "privacy_version", "refund_policy_version"]);
+  const consentAuditCount = db
+    .prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'customer_policy_consent' AND target_id = ?`)
+    .get(parsed.invoiceId).count;
+  assert.equal(consentAuditCount, 0, "blocked consent must not create audit evidence");
 
   const badSig = await apiRequest(
     started.baseUrl,

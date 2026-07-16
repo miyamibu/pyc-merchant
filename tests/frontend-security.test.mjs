@@ -38,6 +38,11 @@ test("SR-09 no runtime CDN QR script, no inline scripts, and no inline style att
   assert.doesNotMatch(server, new RegExp(`styleSrc:\\s*\\[[^\\]]*${inlineDirectivePattern.source}`, "i"));
 });
 
+test("development LAN UI does not force HTTPS upgrades while production keeps CSP upgrade protection", () => {
+  const server = read("src/server.mjs");
+  assert.match(server, /upgradeInsecureRequests:\s*IS_PRODUCTION\s*\?\s*\[\]\s*:\s*null/);
+});
+
 test("SR-10 mobile polling includes issued and unknown-status safe handling", () => {
   const mobileJs = read("public/mobile.js");
   assert.match(mobileJs, /issued/);
@@ -53,7 +58,8 @@ test("SR-10 mobile polling includes issued and unknown-status safe handling", ()
 test("SR-10 terminal SSE reconnect refreshes current invoice snapshot", () => {
   const terminalJs = read("public/terminal.js");
   assert.match(terminalJs, /addEventListener\("open"/);
-  assert.match(terminalJs, /if\s*\(state\.invoiceId\)\s*\{\s*void loadInvoice\(state\.invoiceId/);
+  assert.match(terminalJs, /void loadInvoice\(invoiceId, \{ silent: true \}\)/);
+  assert.match(terminalJs, /requestSequence !== state\.invoiceRequestSequence/);
   assert.match(terminalJs, /FALLBACK_POLL_INTERVAL_MS/);
   assert.match(terminalJs, /\/api\/v1\/invoices\/\$\{encodeURIComponent\(invoiceId\)\}\/sse-token/);
   assert.match(terminalJs, /sse_token=\$\{encodeURIComponent\(sseToken\)\}/);
@@ -169,11 +175,12 @@ test("terminal staff/admin IA and review empty/loading/error placeholders are pr
   assert.match(terminalJs, /TERMINAL_ACTIVE_INVOICE_EXISTS/);
   assert.match(terminalJs, /normalizeAmountPresetList/);
   assert.match(terminalJs, /DEFAULT_AMOUNT_PRESETS/);
-  assert.match(terminalEntryHtml, /JPYCお支払い準備中/);
-  assert.match(terminalEntryHtml, /JPYCお支払い準備中/);
+  assert.match(terminalEntryHtml, /JPYCお支払い案内/);
   assert.match(terminalEntryJs, /public\/terminal-entry/);
   assert.match(terminalEntryJs, /会計がまだ立っていない/);
   assert.match(terminalEntryJs, /店頭端末でお支払いをご案内しています/);
+  assert.match(terminalEntryHtml, /id="openInvoiceBtn"[^>]*>この会計を開く</);
+  assert.match(terminalEntryJs, /async function handleOpenInvoice/);
   assert.match(terminalEntryJs, /window\.location\.replace/);
   assert.match(server, /DIAGNOSTIC_MODE_ENABLED/);
   assert.match(server, /buildInvoiceDiagnostics/);
@@ -247,6 +254,10 @@ test("consent gate: server.mjs exposes /consent endpoint with sig verification a
   assert.match(server, /\/api\/v1\/public\/invoices\/:invoiceId\/consent/);
   assert.match(server, /isPublicRateLimited.*public:consent/);
   assert.match(server, /verifySig\(invoiceId/);
+  assert.match(server, /evaluatePolicyUrlsGate\(\)/);
+  assert.match(server, /POLICY_CONFIGURATION_NOT_READY/);
+  assert.match(server, /validatePolicyVersionSubmission/);
+  assert.match(server, /POLICY_VERSION_MISMATCH/);
   assert.match(server, /customer_policy_consent/);
   assert.match(server, /terms_version/);
   assert.match(server, /privacy_version/);

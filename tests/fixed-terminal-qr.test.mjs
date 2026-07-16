@@ -66,7 +66,7 @@ test("fixed terminal QR waits, resolves to the current invoice once, and blocks 
     redirect: "manual",
   });
   assert.equal(directEntry.status, 302);
-  assert.equal(directEntry.headers.get("location"), created.data.payment_url);
+  assert.match(String(directEntry.headers.get("location") || ""), /\/terminal-entry\.html\?token=/);
 
   const parsed = parsePaymentUrl(created.data.payment_url);
   assert.equal(parsed.invoiceId, created.data.invoice_id);
@@ -149,7 +149,14 @@ test("reissue swaps the terminal current invoice pointer and late payment on the
     redirect: "manual",
   });
   assert.equal(entryAfterReissue.status, 302);
-  assert.equal(entryAfterReissue.headers.get("location"), reissued.data.payment_url);
+  assert.match(String(entryAfterReissue.headers.get("location") || ""), /\/terminal-entry\.html\?token=/);
+  const entryStateAfterReissue = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}`
+  );
+  assert.equal(entryStateAfterReissue.status, 200);
+  assert.equal(entryStateAfterReissue.data.status, "ready");
+  assert.equal(entryStateAfterReissue.data.pay_url, reissued.data.payment_url);
 
   const oldInvoice = await getInvoice(started.baseUrl, admin.token, original.data.invoice_id);
   assert.equal(oldInvoice.status, 200);

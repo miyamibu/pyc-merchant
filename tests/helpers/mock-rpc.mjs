@@ -19,6 +19,7 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
   const receipts = new Map();
   const blocks = new Map();
   let latestBlock = 1;
+  let beforeRespond = null;
 
   function registerTransfer({
     txHash,
@@ -81,53 +82,56 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
     }
     const body = Buffer.concat(chunks).toString("utf8");
     const payload = body ? JSON.parse(body) : {};
-    const respond = (id, result) => {
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
-    };
-    const method = payload.method;
-    const id = payload.id ?? 1;
-
-    if (method === "eth_chainId") {
-      return respond(id, toHex(chainId));
-    }
-    if (method === "eth_getTransactionReceipt") {
-      const txHash = String(payload.params?.[0] || "").toLowerCase();
-      return respond(id, receipts.get(txHash) || null);
-    }
-    if (method === "eth_blockNumber") {
-      return respond(id, toHex(latestBlock));
-    }
-    if (method === "eth_getBlockByNumber") {
-      const raw = String(payload.params?.[0] || "0x1");
-      const blockNumber = Number(BigInt(raw));
-      const block = blocks.get(blockNumber);
-      if (!block) {
-        return respond(id, null);
+    const handlePayload = async (item) => {
+      const method = item?.method;
+      const id = item?.id ?? 1;
+      if (beforeRespond) await beforeRespond({ method, payload: item });
+      if (method === "eth_chainId") {
+        return { jsonrpc: "2.0", id, result: toHex(chainId) };
       }
-      return respond(id, {
-        number: toHex(block.number),
-        hash: fakeHash("c", block.number),
-        parentHash: fakeHash("d", Math.max(block.number - 1, 0)),
-        timestamp: toHex(block.timestamp),
-        nonce: "0x0000000000000000",
-        difficulty: "0x0",
-        gasLimit: "0x0",
-        gasUsed: "0x0",
-        miner: "0x0000000000000000000000000000000000000000",
-        extraData: "0x",
-        baseFeePerGas: "0x0",
-        transactions: [],
-      });
-    }
-
+      if (method === "eth_getTransactionReceipt") {
+        const txHash = String(item.params?.[0] || "").toLowerCase();
+        return { jsonrpc: "2.0", id, result: receipts.get(txHash) || null };
+      }
+      if (method === "eth_blockNumber") {
+        return { jsonrpc: "2.0", id, result: toHex(latestBlock) };
+      }
+      if (method === "eth_getBlockByNumber") {
+        const raw = String(item.params?.[0] || "0x1");
+        const blockNumber = Number(BigInt(raw));
+        const block = blocks.get(blockNumber);
+        if (!block) return { jsonrpc: "2.0", id, result: null };
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            number: toHex(block.number),
+            hash: fakeHash("c", block.number),
+            parentHash: fakeHash("d", Math.max(block.number - 1, 0)),
+            timestamp: toHex(block.timestamp),
+            nonce: "0x0000000000000000",
+            difficulty: "0x0",
+            gasLimit: "0x0",
+            gasUsed: "0x0",
+            miner: "0x0000000000000000000000000000000000000000",
+            extraData: "0x",
+            baseFeePerGas: "0x0",
+            transactions: [],
+          },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `Method not implemented: ${method}` },
+      };
+    };
+    const responsePayload = Array.isArray(payload)
+      ? await Promise.all(payload.map((item) => handlePayload(item)))
+      : await handlePayload(payload);
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32601, message: `Method not implemented: ${method}` },
-    }));
+    res.end(JSON.stringify(responsePayload));
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -139,6 +143,9 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
     registerTransfer,
     setLatestBlock(blockNumber) {
       latestBlock = Math.max(latestBlock, Number(blockNumber));
+    },
+    setBeforeRespond(handler) {
+      beforeRespond = typeof handler === "function" ? handler : null;
     },
     stop() {
       return new Promise((resolve) => server.close(resolve));

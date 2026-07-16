@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -17,8 +18,15 @@ if [[ -z "$BACKUP_FILE" ]]; then
 fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/jpyc-restore-drill-XXXXXX")"
+chmod 700 "$TMP_DIR"
+cleanup_restore_drill() {
+  rm -f "$RESTORE_PATH" 2>/dev/null || true
+  rmdir "$TMP_DIR" 2>/dev/null || true
+}
+trap cleanup_restore_drill EXIT
 RESTORE_PATH="$TMP_DIR/restored-app.db"
 cp "$BACKUP_FILE" "$RESTORE_PATH"
+chmod 600 "$RESTORE_PATH"
 
 node - "$RESTORE_PATH" <<'NODE'
 const Database = require("better-sqlite3");
@@ -41,5 +49,4 @@ NODE
 
 DB_PATH="$RESTORE_PATH" node scripts/verify-audit-chain.mjs
 
-echo "restore_drill_temp_dir=$TMP_DIR"
-echo "restore_drill_db=$RESTORE_PATH"
+echo "restore drill passed; temporary decrypted database was removed"

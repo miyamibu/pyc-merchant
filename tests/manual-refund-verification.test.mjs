@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import {
   apiRequest,
   authHeaders,
@@ -102,15 +103,67 @@ async function executeRefund(baseUrl, token, refundId, txHash, idemPrefix) {
   });
 }
 
-async function verifyRefund(baseUrl, token, refundId, idemKey) {
+async function verifyRefund(baseUrl, token, refundId, idemKey, refundTxHash = null) {
   return apiRequest(baseUrl, `/api/v1/refunds/${encodeURIComponent(refundId)}/verify`, {
     method: "POST",
     headers: authHeaders(token, {
       "content-type": "application/json",
       "idempotency-key": idemKey,
     }),
-    body: "{}",
+    body: JSON.stringify(refundTxHash ? { refund_tx_hash: refundTxHash } : {}),
   });
+}
+
+function holdNextReceiptResponse(rpc, txHash) {
+  let markEntered;
+  const entered = new Promise((resolve) => {
+    markEntered = resolve;
+  });
+  let releaseResponse;
+  const releasePromise = new Promise((resolve) => {
+    releaseResponse = resolve;
+  });
+  let held = false;
+  rpc.setBeforeRespond(async ({ method, payload }) => {
+    if (
+      !held
+      && method === "eth_getTransactionReceipt"
+      && String(payload.params?.[0] || "").toLowerCase() === txHash.toLowerCase()
+    ) {
+      held = true;
+      markEntered();
+      await releasePromise;
+    }
+  });
+  return {
+    entered,
+    release() {
+      releaseResponse();
+      rpc.setBeforeRespond(null);
+    },
+  };
+}
+
+async function waitForReceiptHold(hold) {
+  await Promise.race([
+    hold.entered,
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error("refund verification did not reach RPC")), 3000)),
+  ]);
+}
+
+async function waitForPendingIdempotencyClaim(db, idempotencyKey) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const row = db
+      .prepare(`SELECT status_code FROM idempotency_records WHERE idempotency_key = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(idempotencyKey);
+    if (row?.status_code === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`pending idempotency claim was not observed for ${idempotencyKey}`);
 }
 
 test("manual ingest verifies receipts on-chain before applying payment decisions", async (t) => {
@@ -327,7 +380,9 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     JPYC_BASE_UNIT_SCALE: "1000000",
   });
   const started = await startServerProcess(CWD, env);
+  const testDb = new Database(env.DB_PATH, { readonly: true });
   t.after(async () => {
+    testDb.close();
     await stopServerProcess(started.proc);
     await rpc.stop();
   });
@@ -394,6 +449,154 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     assert.equal(verify.data.status, "succeeded");
     assert.equal(verifyReplay.status, 200);
     assert.equal(verifyReplay.data.status, "succeeded");
+  });
+
+  await t.test("semantic duplicate refund requests converge across idempotency keys", async () => {
+    const scenario = await createRefundScenario("refund-semantic-duplicate", 2210, 2410, 200, "0x4747474747474747474747474747474747474747");
+    const duplicate = await requestRefund(
+      started.baseUrl,
+      admin.token,
+      scenario.invoice.review_case_id,
+      200,
+      scenario.refundToAddress,
+      env.CHAIN_ID,
+      "refund-semantic-duplicate-second"
+    );
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.data.refund_request_id, scenario.refundId);
+    const audit = await apiRequest(
+      started.baseUrl,
+      `/api/v1/audit-logs?target_type=refund&target_id=${encodeURIComponent(scenario.refundId)}&limit=200`,
+      { headers: authHeaders(admin.token) }
+    );
+    assert.equal(audit.status, 200);
+    assert.equal(
+      audit.data.audit_logs.filter((row) => row.action === "refund.request_deduplicated").length,
+      1
+    );
+  });
+
+  await t.test("parallel refund verification claims one key and converges across another actor and key", async () => {
+    const scenario = await createRefundScenario("refund-parallel", 2250, 2450, 200, "0x4545454545454545454545454545454545454545");
+    const refundTx = randomTxHash("refund-parallel");
+    const execute = await executeRefund(started.baseUrl, admin.token, scenario.refundId, refundTx, "refund-parallel-execute");
+    assert.equal(execute.status, 200);
+    assert.equal(execute.data.status, "recorded");
+    rpc.registerTransfer({
+      txHash: refundTx,
+      tokenContract,
+      fromAddress: scenario.invoice.chain.recipient_address,
+      toAddress: scenario.refundToAddress,
+      amountBase: scenario.refundAmountBase,
+      blockNumber: 605,
+    });
+    rpc.setLatestBlock(607);
+
+    const hold = holdNextReceiptResponse(rpc, refundTx);
+    const idem = `refund-parallel-verify-${Date.now()}`;
+    const firstRequest = verifyRefund(started.baseUrl, admin.token, scenario.refundId, idem);
+    await waitForReceiptHold(hold);
+
+    let competingRequest;
+    try {
+      const sameKey = await verifyRefund(started.baseUrl, admin.token, scenario.refundId, idem);
+      assert.equal(sameKey.status, 409);
+      assert.equal(sameKey.data.error.code, "IDEMPOTENCY_IN_PROGRESS");
+      assert.equal(sameKey.headers.get("retry-after"), "1");
+
+      const competingIdem = `refund-parallel-competing-${Date.now()}`;
+      competingRequest = verifyRefund(
+        started.baseUrl,
+        approver.token,
+        scenario.refundId,
+        competingIdem
+      );
+      await waitForPendingIdempotencyClaim(testDb, competingIdem);
+    } finally {
+      hold.release();
+    }
+
+    const [first, competing] = await Promise.all([firstRequest, competingRequest]);
+    const parallelDebug = JSON.stringify({ first, competing, logs: started.logs.slice(-12) });
+    assert.equal(first.status, 200, parallelDebug);
+    assert.equal(first.data.status, "succeeded");
+    assert.equal(competing.status, 200);
+    assert.equal(competing.data.status, "succeeded");
+    assert.equal(first.data.refund_tx_hash, competing.data.refund_tx_hash);
+
+    const replay = await verifyRefund(started.baseUrl, admin.token, scenario.refundId, idem);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(replay.data, first.data);
+
+    const audit = await apiRequest(
+      started.baseUrl,
+      `/api/v1/audit-logs?target_type=refund&target_id=${encodeURIComponent(scenario.refundId)}&limit=200`,
+      { headers: authHeaders(admin.token) }
+    );
+    assert.equal(audit.status, 200);
+    const verificationAudits = audit.data.audit_logs.filter((row) => row.action === "refund.verified_onchain");
+    assert.equal(verificationAudits.length, 1, "refund verification transition must be audited exactly once");
+  });
+
+  await t.test("parallel refund verification rejects conflicting transaction evidence and audits once", async () => {
+    const scenario = await createRefundScenario("refund-conflict", 2275, 2475, 200, "0x4646464646464646464646464646464646464646");
+    const originalRefundTx = randomTxHash("refund-conflict-original");
+    const competingRefundTx = randomTxHash("refund-conflict-competing");
+    const execute = await executeRefund(started.baseUrl, admin.token, scenario.refundId, originalRefundTx, "refund-conflict-execute");
+    assert.equal(execute.status, 200);
+    assert.equal(execute.data.status, "recorded");
+    for (const [txHash, blockNumber] of [[originalRefundTx, 608], [competingRefundTx, 609]]) {
+      rpc.registerTransfer({
+        txHash,
+        tokenContract,
+        fromAddress: scenario.invoice.chain.recipient_address,
+        toAddress: scenario.refundToAddress,
+        amountBase: scenario.refundAmountBase,
+        blockNumber,
+      });
+    }
+    rpc.setLatestBlock(611);
+
+    const hold = holdNextReceiptResponse(rpc, originalRefundTx);
+    const originalIdem = `refund-conflict-original-${Date.now()}`;
+    const originalRequest = verifyRefund(started.baseUrl, admin.token, scenario.refundId, originalIdem);
+    await waitForReceiptHold(hold);
+
+    let competingRequest;
+    try {
+      const competingIdem = `refund-conflict-competing-${Date.now()}`;
+      competingRequest = verifyRefund(
+        started.baseUrl,
+        approver.token,
+        scenario.refundId,
+        competingIdem,
+        competingRefundTx
+      );
+      await waitForPendingIdempotencyClaim(testDb, competingIdem);
+    } finally {
+      hold.release();
+    }
+
+    const [original, competing] = await Promise.all([originalRequest, competingRequest]);
+    const accepted = [original, competing].find((response) => response.status === 200);
+    const conflicted = [original, competing].find((response) => response.status === 409);
+    assert.ok(accepted, JSON.stringify({ original, competing, logs: started.logs.slice(-12) }));
+    assert.equal(accepted.data.status, "succeeded");
+    assert.ok([originalRefundTx, competingRefundTx].includes(accepted.data.refund_tx_hash));
+    assert.ok(conflicted, "one verification must fail closed");
+    assert.equal(conflicted.data.error.code, "REFUND_VERIFICATION_CONFLICT");
+    const conflictReplay = await verifyRefund(started.baseUrl, admin.token, scenario.refundId, originalIdem);
+    assert.equal(conflictReplay.status, original.status);
+    assert.deepEqual(conflictReplay.data, original.data);
+
+    const audit = await apiRequest(
+      started.baseUrl,
+      `/api/v1/audit-logs?target_type=refund&target_id=${encodeURIComponent(scenario.refundId)}&limit=200`,
+      { headers: authHeaders(admin.token) }
+    );
+    assert.equal(audit.status, 200);
+    const verificationAudits = audit.data.audit_logs.filter((row) => row.action === "refund.verified_onchain");
+    assert.equal(verificationAudits.length, 1, "only the accepted refund evidence may create a verification audit");
   });
 
   await t.test("mismatched refund transfer does not succeed", async () => {

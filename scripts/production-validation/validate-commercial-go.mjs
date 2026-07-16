@@ -4,6 +4,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { scaleToDecimals } from "../../src/amounts.mjs";
+import {
+  evaluatePolicyPublicationSource,
+  unavailablePolicyPublication,
+} from "../../src/policy-publication.mjs";
 import { validateCommercialEvidence } from "./validate-commercial-evidence.mjs";
 import { renderCommercialScorecard } from "./validate-commercial-scorecard.mjs";
 
@@ -79,58 +83,14 @@ function isStrongSecret(value) {
   return true;
 }
 
-function isPublicHttpsUrl(value) {
-  const raw = String(value || "").trim();
-  if (!raw || isPlaceholderLike(raw)) return false;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "https:") return false;
-    if (/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname)) return false;
-    return true;
-  } catch (_error) {
-    return false;
-  }
-}
-
 function evaluatePolicyUrls({ sourcePath }) {
   const resolvedPath = path.resolve(process.cwd(), sourcePath || "public/mobile.js");
   if (!fs.existsSync(resolvedPath)) {
-    return {
-      ok: false,
-      source_path: resolvedPath,
-      values: { terms: "", privacy: "", refund: "" },
-      missing_keys: ["terms", "privacy", "refund"],
-      errors: ["missing_policy_urls_source_file"],
-    };
+    return unavailablePolicyPublication({ sourcePath: resolvedPath, message: "missing_policy_urls_source_file" });
   }
 
   const content = fs.readFileSync(resolvedPath, "utf8");
-  const blockMatch = content.match(/const\s+POLICY_URLS\s*=\s*\{([\s\S]*?)\};/m);
-  if (!blockMatch) {
-    return {
-      ok: false,
-      source_path: resolvedPath,
-      values: { terms: "", privacy: "", refund: "" },
-      missing_keys: ["terms", "privacy", "refund"],
-      errors: ["missing_policy_urls_block"],
-    };
-  }
-
-  const values = { terms: "", privacy: "", refund: "" };
-  const pairRegex = /\b(terms|privacy|refund)\s*:\s*["']([^"']*)["']/g;
-  for (const match of blockMatch[1].matchAll(pairRegex)) {
-    values[match[1]] = String(match[2] || "").trim();
-  }
-
-  const missingKeys = Object.keys(values).filter((key) => !isPublicHttpsUrl(values[key]));
-  const errors = missingKeys.map((key) => `invalid_or_missing_${key}_policy_url`);
-  return {
-    ok: missingKeys.length === 0,
-    source_path: resolvedPath,
-    values,
-    missing_keys: missingKeys,
-    errors,
-  };
+  return evaluatePolicyPublicationSource(content, { sourcePath: resolvedPath });
 }
 
 function utcTimestamp() {
@@ -229,6 +189,22 @@ function loadReleaseManifest(manifestPath) {
   if (String(manifest.base_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_base_image_digest_null");
   if (!Array.isArray(manifest.signatures) || manifest.signatures.length === 0) blockers.push("manifest_missing_signatures");
   if (String(manifest.revocation_status || "").trim().toLowerCase() !== "valid") blockers.push("manifest_revocation_not_valid");
+  const currentCommit = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  }).stdout?.trim() || "";
+  const currentTree = spawnSync("git", ["status", "--porcelain"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  }).stdout?.trim() || "";
+  if (currentCommit && String(manifest.commit || "").trim() !== currentCommit) blockers.push("manifest_commit_mismatch_current_HEAD");
+  if (currentTree) blockers.push("manifest_requires_clean_worktree");
+  const issuedAt = Date.parse(String(manifest.issued_at || ""));
+  const expiresAt = Date.parse(String(manifest.expires_at || ""));
+  if (!Number.isFinite(issuedAt)) blockers.push("manifest_issued_at_invalid");
+  if (!Number.isFinite(expiresAt)) blockers.push("manifest_expires_at_invalid");
+  if (Number.isFinite(issuedAt) && issuedAt > Date.now() + 60_000) blockers.push("manifest_issued_at_in_future");
+  if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) blockers.push("manifest_expired");
   return { ok: blockers.length === 0, path: resolved, manifest, blockers };
 }
 
@@ -288,6 +264,10 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const evidenceDir = String(env.COMMERCIAL_EVIDENCE_DIR || "").trim();
   const manifestPath = String(env.RELEASE_MANIFEST || "").trim();
   const releaseManifest = loadReleaseManifest(manifestPath);
+  if (releaseManifest.manifest && releaseId && String(releaseManifest.manifest.release_id || "").trim() !== releaseId) {
+    releaseManifest.blockers.push("manifest_release_id_mismatch_selected_release");
+    releaseManifest.ok = false;
+  }
   const explicitReleaseSelectionGate = validateReleaseId(releaseId) && Boolean(evidenceDir) && Boolean(manifestPath);
   const chainId = String(env.CHAIN_ID || "").trim();
   const tokenContract = String(env.TOKEN_CONTRACT || "").trim().toLowerCase();
@@ -330,6 +310,19 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const refundPolicyGate = boolFlag(env.REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR, true);
   const policyUrls = evaluatePolicyUrls({ sourcePath: policyUrlSource || env.POLICY_URL_SOURCE || "public/mobile.js" });
   const dangerousFlags = evaluateDangerousFlags(env);
+  const bindHost = String(env.APP_BIND_HOST || "").trim();
+  const trustProxy = boolFlag(env.TRUST_PROXY, false);
+  const trustProxyHops = String(env.TRUST_PROXY_HOPS || "").trim();
+  const trustProxyCidrs = String(env.TRUST_PROXY_CIDRS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const proxyBoundaryBlockers = [];
+  if (appEnv === "production" && !bindHost) proxyBoundaryBlockers.push("APP_BIND_HOST must be explicit in production");
+  if (appEnv === "production" && !trustProxy) proxyBoundaryBlockers.push("TRUST_PROXY must be enabled in production");
+  if (appEnv === "production" && trustProxy && !/^\d+$/.test(trustProxyHops) && trustProxyCidrs.length === 0) {
+    proxyBoundaryBlockers.push("production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS");
+  }
   const auditChain = runAuditChainVerification(env);
   const evidence = validateCommercialEvidence({ evidenceRoot, evidenceDir: evidenceDir || null });
   const signedConditionalWaiverRef = String(env.SIGNED_CONDITIONAL_GO_WAIVER_REF || "").trim();
@@ -368,6 +361,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.confirmation_policy_gate) blockers.P0.push("confirmation policy gate failed");
   if (!gates.backscan_policy_gate) blockers.P0.push("backscan policy gate failed");
   if (!gates.dangerous_flags_gate) blockers.P0.push(...dangerousFlags.blockers);
+  blockers.P0.push(...proxyBoundaryBlockers);
   if (!gates.audit_chain_gate) blockers.P0.push(`audit hash-chain verification failed: ${auditChain.message || auditChain.status}`);
   if (!gates.refund_policy_gate) blockers.P0.push("REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR must be true");
   if (!gates.settlement_policy_gate) blockers.P0.push("settlement_unresolved_review_policy must be block in commercial mode");
@@ -378,7 +372,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
 
   if (!gates.production_env_gate) blockers.P1.push("APP_ENV is not production");
   if (!gates.commercial_go_mode_gate) blockers.P1.push("COMMERCIAL_GO_MODE is not enabled");
-  if (!gates.policy_urls_gate) blockers.P1.push("customer policy URLs are not fully configured with public HTTPS URLs");
+  if (!gates.policy_urls_gate) blockers.P1.push("customer policy URLs and published versions are not fully configured");
   if (!gates.wallet_evidence_gate) blockers.P1.push("EXT-002 wallet/device evidence is not pass");
   if (!gates.real_payment_evidence_gate) blockers.P1.push("EXT-001 real JPYC evidence is not pass");
   if (!gates.tls_evidence_gate) blockers.P1.push("EXT-003 TLS evidence is not pass");
@@ -482,6 +476,9 @@ function renderSummaryMarkdown(report, paths) {
   lines.push(`- gate: ${report.gates?.policy_urls_gate ? "pass" : "fail"}`);
   if ((report.policy_urls?.missing_keys || []).length > 0) {
     lines.push(`- missing or invalid: ${report.policy_urls.missing_keys.join(", ")}`);
+  }
+  if ((report.policy_urls?.missing_version_keys || []).length > 0) {
+    lines.push(`- missing or invalid versions: ${report.policy_urls.missing_version_keys.join(", ")}`);
   }
   lines.push("");
   lines.push("## External evidence");

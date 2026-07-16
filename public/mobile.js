@@ -21,8 +21,11 @@ const INVOICE_STATUS_ALIASES = Object.freeze({
 });
 
 const POLL_INTERVAL_MS = 5000;
+const REMAINING_ANNOUNCEMENT_THRESHOLDS_SEC = [300, 120, 60, 30, 10, 0];
 const FINAL_STATUSES = new Set(["paid", "settled", "review_required", "expired", "cancelled"]);
 const WAITING_STATUSES = new Set(["issued", "open", "payment_detected", "confirming"]);
+const PAYMENT_ACTION_STATUSES = new Set(["issued", "open"]);
+const WALLET_LAUNCH_PROTOCOLS = new Set(["https:", "ethereum:", "hashport:", "wallet:", "wc:"]);
 
 const STATUS_COPY = {
   issued: { label: "支払い待ち", pill: "s-blue", title: "送金をお待ちしています" },
@@ -41,11 +44,25 @@ const state = {
   pollTimer: null,
   remainingTimer: null,
   pollInFlight: false,
-  announcedMinute: "",
+  announcedRemainingThreshold: null,
+  lastAnnouncementInvoiceId: "",
   manualRiskVisible: false,
   addressExpanded: false,
   manualActionHint: "",
   consented: false,
+  consentRecordStatus: "idle",
+  consentRecordError: "",
+  consentSequence: 0,
+  consentController: null,
+  lastRefreshSucceeded: false,
+  lastRefreshInvoiceId: "",
+  refreshSequence: 0,
+  refreshController: null,
+  refreshInProgress: false,
+  serverClockOffsetMs: null,
+  launchInProgress: false,
+  blockingWarning: "",
+  transientError: "",
 };
 
 const el = {
@@ -74,6 +91,8 @@ const el = {
   walletSupportText: document.getElementById("walletSupportText"),
   walletHelpLink: document.getElementById("walletHelpLink"),
   walletPayBtn: document.getElementById("walletPayBtn"),
+  paymentGateHint: document.getElementById("paymentGateHint"),
+  goToConsentBtn: document.getElementById("goToConsentBtn"),
   showMethodsBtn: document.getElementById("showMethodsBtn"),
   copyInfoBtn: document.getElementById("copyInfoBtn"),
   networkText: document.getElementById("networkText"),
@@ -93,32 +112,52 @@ const el = {
   manualRiskText: document.getElementById("manualRiskText"),
   toggleAddressBtn: document.getElementById("toggleAddressBtn"),
   receiptCard: document.getElementById("receiptCard"),
+  receiptTitle: document.getElementById("receiptTitle"),
   receiptStatusBadge: document.getElementById("receiptStatusBadge"),
   receiptStoreName: document.getElementById("receiptStoreName"),
   receiptAmount: document.getElementById("receiptAmount"),
   receiptInvoiceId: document.getElementById("receiptInvoiceId"),
   receiptTxHash: document.getElementById("receiptTxHash"),
+  receiptChainRecordedAt: document.getElementById("receiptChainRecordedAt"),
+  receiptConfirmedAt: document.getElementById("receiptConfirmedAt"),
+  receiptEvidenceNotice: document.getElementById("receiptEvidenceNotice"),
   copyReceiptBtn: document.getElementById("copyReceiptBtn"),
   consentGateSection: document.getElementById("consentGateSection"),
   consentCheckbox: document.getElementById("consentCheckbox"),
   consentLiveStatus: document.getElementById("consentLiveStatus"),
+  consentRecordError: document.getElementById("consentRecordError"),
+  retryConsentBtn: document.getElementById("retryConsentBtn"),
   consentTermsLink: document.getElementById("consentTermsLink"),
   consentPrivacyLink: document.getElementById("consentPrivacyLink"),
   consentRefundLink: document.getElementById("consentRefundLink"),
 };
 
 function announce(message) {
-  el.liveStatus.textContent = message || "";
+  const next = message || "";
+  if (el.liveStatus.textContent !== next) el.liveStatus.textContent = next;
 }
 
-function showError(message) {
+function renderErrorBanner() {
+  const message = state.blockingWarning || state.transientError;
   if (!message) {
     el.errorBanner.classList.add("hidden");
     el.errorBannerText.textContent = "";
+    el.closeErrorBannerBtn.classList.remove("hidden");
     return;
   }
   el.errorBanner.classList.remove("hidden");
-  el.errorBannerText.textContent = message;
+  if (el.errorBannerText.textContent !== message) el.errorBannerText.textContent = message;
+  el.closeErrorBannerBtn.classList.toggle("hidden", Boolean(state.blockingWarning));
+}
+
+function showError(message) {
+  state.transientError = String(message || "");
+  renderErrorBanner();
+}
+
+function setBlockingWarning(message) {
+  state.blockingWarning = String(message || "");
+  renderErrorBanner();
 }
 
 function toNumber(value) {
@@ -158,19 +197,34 @@ function formatDateTime(value) {
 }
 
 function renderChipGroup(host, values, fallback = "案内準備中") {
-  host.innerHTML = "";
   const items = Array.isArray(values) && values.length > 0 ? values : [fallback];
-  for (const value of items) {
+  const nextValues = items.map((value) => String(value || fallback));
+  const currentValues = Array.from(host.children).map((node) => node.textContent || "");
+  if (JSON.stringify(currentValues) === JSON.stringify(nextValues)) return;
+  host.innerHTML = "";
+  for (const value of nextValues) {
     const chip = document.createElement("span");
     chip.className = "chip";
-    chip.textContent = String(value || fallback);
+    chip.textContent = value;
     host.appendChild(chip);
   }
 }
 
 function setHelperLink(linkEl, href, label) {
-  if (typeof href === "string" && href.trim()) {
-    linkEl.href = href.trim();
+  const raw = typeof href === "string" ? href.trim() : "";
+  let safeHref = "";
+  if (raw) {
+    try {
+      const parsed = new URL(raw, window.location.origin);
+      if (!parsed.username && !parsed.password && (parsed.protocol === "https:" || parsed.origin === window.location.origin)) {
+        safeHref = parsed.href;
+      }
+    } catch {
+      safeHref = "";
+    }
+  }
+  if (safeHref) {
+    linkEl.href = safeHref;
     linkEl.textContent = label;
     linkEl.classList.remove("hidden");
     return;
@@ -185,13 +239,79 @@ function middleEllipsis(value, head = 10, tail = 8) {
   return `${text.slice(0, head)}…${text.slice(-tail)}`;
 }
 
+function serverAwareNowMs() {
+  if (!Number.isFinite(state.serverClockOffsetMs)) return null;
+  return Date.now() + state.serverClockOffsetMs;
+}
+
+function updateServerClock(response, requestStartedAtMs, serverNowValue) {
+  const payloadServerNowMs = serverNowValue ? new Date(serverNowValue).getTime() : NaN;
+  const serverDate = response?.headers?.get?.("date");
+  const headerServerNowMs = serverDate ? new Date(serverDate).getTime() : NaN;
+  const serverNowMs = Number.isFinite(payloadServerNowMs) ? payloadServerNowMs : headerServerNowMs;
+  if (!Number.isFinite(serverNowMs)) {
+    state.serverClockOffsetMs = null;
+    return;
+  }
+  const safeLocalReferenceMs = Number.isFinite(requestStartedAtMs) ? requestStartedAtMs : Date.now();
+  state.serverClockOffsetMs = serverNowMs - safeLocalReferenceMs;
+}
+
+function remainingSeconds(expiresAt) {
+  const nowMs = serverAwareNowMs();
+  const expiryMs = new Date(expiresAt).getTime();
+  if (!Number.isFinite(nowMs) || !Number.isFinite(expiryMs)) return null;
+  return Math.floor((expiryMs - nowMs) / 1000);
+}
+
+function isPublicPolicyHostname(value) {
+  const host = String(value || "").trim().toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
+  if (!host || !host.includes(".")) return false;
+  if (host.includes(":") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return false;
+  if (
+    host === "localhost"
+    || host.endsWith(".localhost")
+    || host.endsWith(".local")
+    || host.endsWith(".test")
+    || host.endsWith(".invalid")
+    || host.endsWith(".example")
+    || host.endsWith(".arpa")
+  ) return false;
+  return ![
+    "example.com",
+    "example.org",
+    "example.net",
+  ].some((reservedHost) => host === reservedHost || host.endsWith(`.${reservedHost}`));
+}
+
+function isPublishedPolicyUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "https:"
+      && !parsed.username
+      && !parsed.password
+      && isPublicPolicyHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function policyLinksReady() {
+  const urlsReady = Object.values(POLICY_URLS).every(isPublishedPolicyUrl);
+  const versionsReady = Object.values(POLICY_VERSIONS).every((value) => {
+    const version = String(value || "").trim();
+    return Boolean(version) && !/(?:draft|pending|placeholder|example)/i.test(version);
+  });
+  return urlsReady && versionsReady;
+}
+
 function formatRemaining(expiresAt) {
   if (!expiresAt) return "期限情報を確認中です。";
-  const expiry = new Date(expiresAt).getTime();
-  if (!Number.isFinite(expiry)) return "期限情報を確認中です。";
-  const remainMs = expiry - Date.now();
-  if (remainMs <= 0) return "期限切れです。";
-  const totalSec = Math.floor(remainMs / 1000);
+  const totalSec = remainingSeconds(expiresAt);
+  if (totalSec == null) return "期限情報を再確認中です。";
+  if (totalSec <= 0) return "期限切れです。";
   const mins = Math.floor(totalSec / 60);
   const secs = totalSec % 60;
   return `残り ${String(mins)}分${String(secs).padStart(2, "0")}秒`;
@@ -205,6 +325,192 @@ function canonicalInvoiceStatus(status) {
   const raw = String(status || "").trim();
   if (!raw) return "";
   return INVOICE_STATUS_ALIASES[raw] || raw;
+}
+
+function validatePaymentDetails(invoice) {
+  const chainId = String(invoice?.chain_id || "").trim();
+  const tokenContract = String(invoice?.token_contract || "").trim();
+  const receiveAddress = String(invoice?.receive_address || "").trim();
+  const recipientAddress = String(invoice?.recipient_address || "").trim();
+  const amountJpyc = Number(invoice?.amount_jpyc);
+  const amountJpycBase = String(invoice?.amount_jpyc_base ?? "").trim();
+  const expectedAmountAtomic = String(invoice?.expected_amount_atomic ?? "").trim();
+  const tokenDecimalsRaw = invoice?.token_decimals;
+  const tokenDecimals = Number(tokenDecimalsRaw);
+  const evmAddressPattern = /^0x[0-9a-fA-F]{40}$/;
+
+  if (!/^\d+$/.test(chainId) || BigInt(chainId) <= 0n) return { ok: false, reason: "chain_id" };
+  if (!evmAddressPattern.test(tokenContract)) return { ok: false, reason: "token_contract" };
+  if (!evmAddressPattern.test(receiveAddress)) return { ok: false, reason: "receive_address" };
+  if (!recipientAddress || recipientAddress.toLowerCase() !== receiveAddress.toLowerCase()) {
+    return { ok: false, reason: "recipient_mismatch" };
+  }
+  if (!Number.isFinite(amountJpyc) || amountJpyc <= 0) return { ok: false, reason: "amount_jpyc" };
+  if (!/^[1-9]\d*$/.test(amountJpycBase)) return { ok: false, reason: "amount_jpyc_base" };
+  if (!/^[1-9]\d*$/.test(expectedAmountAtomic)) return { ok: false, reason: "expected_amount_atomic" };
+  if (tokenDecimalsRaw == null || String(tokenDecimalsRaw).trim() === ""
+    || !Number.isInteger(tokenDecimals) || tokenDecimals < 0 || tokenDecimals > 255) {
+    return { ok: false, reason: "token_decimals" };
+  }
+
+  const copyFallback = invoice?.copy_fallback;
+  if (!copyFallback
+    || String(copyFallback.copy_receive_address || "").toLowerCase() !== receiveAddress.toLowerCase()
+    || String(copyFallback.copy_amount || "") !== expectedAmountAtomic) {
+    return { ok: false, reason: "copy_fallback" };
+  }
+
+  try {
+    const paymentUri = new URL(String(invoice?.payment_uri || ""));
+    const match = paymentUri.pathname.match(/^([^@]+)@(\d+)\/transfer$/);
+    const keys = [...paymentUri.searchParams.keys()].sort();
+    const uriToken = String(match?.[1] || "");
+    const uriChainId = String(match?.[2] || "");
+    const uriAddress = String(paymentUri.searchParams.get("address") || "");
+    const uriAmount = String(paymentUri.searchParams.get("uint256") || "");
+    const exactKeys = keys.length === 2 && keys[0] === "address" && keys[1] === "uint256";
+    if (
+      paymentUri.protocol !== "ethereum:"
+      || !match
+      || !exactKeys
+      || paymentUri.searchParams.getAll("address").length !== 1
+      || paymentUri.searchParams.getAll("uint256").length !== 1
+      || uriToken.toLowerCase() !== tokenContract.toLowerCase()
+      || uriChainId !== chainId
+      || uriAddress.toLowerCase() !== receiveAddress.toLowerCase()
+      || uriAmount !== expectedAmountAtomic
+    ) return { ok: false, reason: "payment_uri" };
+  } catch {
+    return { ok: false, reason: "payment_uri" };
+  }
+
+  return { ok: true, reason: "" };
+}
+
+function evaluatePaymentActionGate(invoice = state.invoice) {
+  if (!invoice) {
+    return { allowed: false, code: "loading", message: "最新の請求状態を確認しています。", blockingMessage: "" };
+  }
+
+  const status = canonicalInvoiceStatus(invoice.status);
+  const customerMode = invoice?.customer_payment_mode || {};
+  if (state.refreshInProgress) {
+    return {
+      allowed: false,
+      code: "refresh_in_progress",
+      message: "最新の請求状態を再確認しています。",
+      blockingMessage: "再取得が完了するまで、送金・手動送金・コピー操作を停止しています。",
+    };
+  }
+  const refreshMatchesInvoice =
+    state.lastRefreshSucceeded
+    && String(state.lastRefreshInvoiceId || "") === String(invoice.invoice_id || "");
+  if (!refreshMatchesInvoice) {
+    return {
+      allowed: false,
+      code: "refresh_required",
+      message: "最新状態を取得できるまで支払い操作を停止しています。",
+      blockingMessage: "請求の最新状態を確認できないため、送金・手動送金・コピー操作を停止しています。再取得してください。",
+    };
+  }
+  if (!STATUS_COPY[status]) {
+    return {
+      allowed: false,
+      code: "unknown_status",
+      message: "請求状態を判定できないため支払えません。",
+      blockingMessage: "不明な請求状態です。送金せず、最新の状態を再取得してください。",
+    };
+  }
+  if (!PAYMENT_ACTION_STATUSES.has(status)) {
+    const message = ["payment_detected", "confirming"].includes(status)
+      ? "送金確認中です。二重送金せず、このままお待ちください。"
+      : "現在の状態では支払い操作は必要ありません。";
+    return { allowed: false, code: "status_not_payable", message, blockingMessage: "" };
+  }
+  if (customerMode.mode !== "wallet_qr") {
+    return {
+      allowed: false,
+      code: customerMode.mode ? "store_guidance" : "payment_mode_unknown",
+      message: customerMode.body || "支払い方式を確認できないため、店頭スタッフにご確認ください。",
+      blockingMessage: customerMode.mode ? "" : "支払い方式が不明なため、送金・手動送金・コピー操作を停止しています。",
+    };
+  }
+  const paymentDetails = validatePaymentDetails(invoice);
+  if (!paymentDetails.ok) {
+    return {
+      allowed: false,
+      code: "payment_details_invalid",
+      message: "支払い先・金額・ネットワーク情報の整合性を確認できません。",
+      blockingMessage: "支払い情報が不完全または不整合なため、送金・手動送金・コピー操作を停止しています。店舗スタッフにお声がけください。",
+    };
+  }
+  const remaining = remainingSeconds(invoice.expires_at);
+  if (remaining == null) {
+    return {
+      allowed: false,
+      code: "expiry_unknown",
+      message: "サーバー時刻と支払い期限を確認できるまで支払えません。",
+      blockingMessage: "支払い期限を安全に判定できません。送金せず、最新の状態を再取得してください。",
+    };
+  }
+  if (remaining <= 0) {
+    return {
+      allowed: false,
+      code: "expired",
+      message: "この請求は期限切れです。新しい請求を店舗スタッフに依頼してください。",
+      blockingMessage: "この請求は期限切れです。送金・手動送金・コピーは行わないでください。",
+    };
+  }
+  if (!policyLinksReady()) {
+    return {
+      allowed: false,
+      code: "policy_unavailable",
+      message: "利用規約・プライバシーポリシー・返金ポリシーの公開URLと承認版を確認できません。",
+      blockingMessage: "規約3点の公開URLまたは承認版を確認できないため、支払い操作を停止しています。店舗スタッフへお声がけください。",
+    };
+  }
+  if (!state.consented) {
+    return {
+      allowed: false,
+      code: "consent_required",
+      message: "利用規約・ポリシーを確認し、同意にチェックすると支払えます。",
+      blockingMessage: "",
+    };
+  }
+  if (state.consentRecordStatus !== "recorded") {
+    return {
+      allowed: false,
+      code: "consent_record_required",
+      message: "同意記録がサーバーへ保存されるまで支払い操作を停止しています。",
+      blockingMessage: state.consentRecordStatus === "failed"
+        ? "同意記録を保存できませんでした。再送が成功するまで支払い操作はできません。"
+        : "同意記録を保存しています。完了するまで支払い操作はできません。",
+    };
+  }
+  if (state.launchInProgress) {
+    return { allowed: false, code: "launch_in_progress", message: "ウォレットを開いています。連続で押さないでください。", blockingMessage: "" };
+  }
+  return { allowed: true, code: "ready", message: "最新状態と支払い期限を確認済みです。", blockingMessage: "" };
+}
+
+function applyPaymentActionGate(invoice = state.invoice) {
+  const gate = evaluatePaymentActionGate(invoice);
+  const walletAllowed = gate.allowed && state.consented;
+  for (const control of [el.walletPayBtn, el.showMethodsBtn, el.copyInfoBtn]) {
+    if (control) control.disabled = !walletAllowed;
+  }
+  el.copyAddressBtn.disabled = !walletAllowed;
+  el.copyAmountBtn.disabled = !walletAllowed;
+  el.copyInvoiceBtn.disabled = !walletAllowed;
+  if (el.paymentGateHint && el.paymentGateHint.textContent !== gate.message) {
+    el.paymentGateHint.textContent = gate.message;
+  }
+  if (el.goToConsentBtn) {
+    el.goToConsentBtn.classList.toggle("hidden", gate.code !== "consent_required");
+  }
+  if (!gate.allowed && gate.code !== "launch_in_progress") setMethodPanel(false, "");
+  setBlockingWarning(gate.blockingMessage);
+  return gate;
 }
 
 function startPolling(status) {
@@ -226,9 +532,11 @@ function startRemainingTimer(invoice) {
   if (!invoice?.expires_at || !WAITING_STATUSES.has(canonicalInvoiceStatus(invoice?.status))) return;
   state.remainingTimer = setInterval(() => {
     updateRemainingAnnouncement(invoice.expires_at);
-    if (formatRemaining(invoice.expires_at) === "期限切れです。") {
-      showError("この請求は期限切れです。送金せず、店舗スタッフに新しい請求を依頼してください。");
+    const gate = applyPaymentActionGate(invoice);
+    if (gate.code === "expired") {
       el.remainingText.classList.add("attention-pulse");
+    } else {
+      el.remainingText.classList.remove("attention-pulse");
     }
   }, 1000);
 }
@@ -255,48 +563,149 @@ function signedConsentPath() {
 }
 
 function initPolicyLinks() {
-  if (el.consentTermsLink) el.consentTermsLink.href = POLICY_URLS.terms || "#";
-  if (el.consentPrivacyLink) el.consentPrivacyLink.href = POLICY_URLS.privacy || "#";
-  if (el.consentRefundLink) el.consentRefundLink.href = POLICY_URLS.refund || "#";
+  for (const [link, url] of [
+    [el.consentTermsLink, POLICY_URLS.terms],
+    [el.consentPrivacyLink, POLICY_URLS.privacy],
+    [el.consentRefundLink, POLICY_URLS.refund],
+  ]) {
+    if (!link) continue;
+    const ready = isPublishedPolicyUrl(url);
+    link.classList.toggle("hidden", !ready);
+    if (ready) link.href = String(url).trim();
+    else link.removeAttribute("href");
+  }
 }
 
 async function recordConsent() {
   const path = signedConsentPath();
-  if (!path) return;
+  if (state.consentRecordStatus === "pending") return false;
+  if (!state.consented || !el.consentCheckbox?.checked) {
+    state.consentRecordStatus = "failed";
+    state.consentRecordError = "同意チェックが外れています。内容を確認し、再度チェックを入れてください。";
+    renderConsentRecordState();
+    applyPaymentActionGate(state.invoice);
+    return false;
+  }
+  if (!policyLinksReady()) {
+    state.consentRecordStatus = "failed";
+    state.consentRecordError = "規約3点の公開URLまたは承認版を確認できないため、同意を記録できません。";
+    renderConsentRecordState();
+    applyPaymentActionGate(state.invoice);
+    return false;
+  }
+  if (!path) {
+    state.consentRecordStatus = "failed";
+    state.consentRecordError = "同意記録の送信先を確認できません。支払いURLを再確認してください。";
+    renderConsentRecordState();
+    applyPaymentActionGate(state.invoice);
+    return false;
+  }
+  state.consentRecordStatus = "pending";
+  state.consentRecordError = "";
+  const consentSequence = state.consentSequence + 1;
+  state.consentSequence = consentSequence;
+  if (state.consentController) state.consentController.abort();
+  const controller = new AbortController();
+  state.consentController = controller;
+  renderConsentRecordState();
+  applyPaymentActionGate(state.invoice);
   try {
-    await fetch(path, {
+    const response = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(POLICY_VERSIONS),
+      signal: controller.signal,
     });
-  } catch (_) {
-    // best-effort audit; consent is gated locally, server failure does not block user
+    if (consentSequence !== state.consentSequence || !state.consented || !el.consentCheckbox?.checked) {
+      return false;
+    }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+    }
+    state.consentRecordStatus = "recorded";
+    state.consentRecordError = "";
+    state.lastRefreshSucceeded = false;
+    state.lastRefreshInvoiceId = "";
+    renderConsentRecordState();
+    applyPaymentActionGate(state.invoice);
+    const refreshResult = await loadInvoice({ silent: true, force: true });
+    return refreshResult?.ok === true;
+  } catch (error) {
+    if (error?.name === "AbortError" || consentSequence !== state.consentSequence) return false;
+    state.consentRecordStatus = "failed";
+    state.consentRecordError = `同意記録をサーバーへ送信できませんでした。再送が成功するまで支払い操作はできません。（${String(error.message || error)}）`;
+    renderConsentRecordState();
+    applyPaymentActionGate(state.invoice);
+    return false;
+  } finally {
+    if (consentSequence === state.consentSequence) state.consentController = null;
   }
 }
 
+function renderConsentRecordState() {
+  if (!el.consentRecordError || !el.retryConsentBtn) return;
+  const failed = state.consentRecordStatus === "failed";
+  el.consentRecordError.classList.toggle("hidden", !failed);
+  if (failed && el.consentRecordError.textContent !== state.consentRecordError) {
+    el.consentRecordError.textContent = state.consentRecordError;
+  }
+  if (!failed) el.consentRecordError.textContent = "";
+  el.retryConsentBtn.classList.toggle("hidden", !failed);
+  el.retryConsentBtn.disabled = state.consentRecordStatus === "pending" || !state.consented || !el.consentCheckbox?.checked;
+}
+
 function renderConsentGate(invoice) {
-  const needsConsent = WAITING_STATUSES.has(canonicalInvoiceStatus(invoice?.status));
+  const needsConsent = PAYMENT_ACTION_STATUSES.has(canonicalInvoiceStatus(invoice?.status));
   if (!el.consentGateSection) return;
   el.consentGateSection.classList.toggle("hidden", !needsConsent);
   if (!needsConsent) return;
-  if (el.consentCheckbox) el.consentCheckbox.checked = state.consented;
-  if (el.consentLiveStatus) {
-    el.consentLiveStatus.textContent = state.consented
-      ? "同意済みです。お支払い操作が可能です。"
-      : "利用規約・ポリシーをご確認のうえ、チェックを入れてください。";
+  const policiesReady = policyLinksReady();
+  if (el.consentCheckbox) {
+    el.consentCheckbox.disabled = !policiesReady;
+    el.consentCheckbox.checked = policiesReady && state.consented;
   }
+  if (el.consentLiveStatus) {
+    const message = !policiesReady
+      ? "規約3点の公開URLまたは承認版を確認できないため、支払い操作を停止しています。"
+      : state.consentRecordStatus === "recorded"
+        ? "同意記録を保存しました。お支払い操作が可能です。"
+        : state.consented
+          ? "同意記録をサーバーへ保存しています。"
+          : "利用規約・ポリシーをご確認のうえ、チェックを入れてください。";
+    if (el.consentLiveStatus.textContent !== message) el.consentLiveStatus.textContent = message;
+  }
+  renderConsentRecordState();
+}
+
+function focusConsentGate() {
+  if (!el.consentGateSection || !el.consentCheckbox) return;
+  const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+  el.consentGateSection.classList.add("attention-pulse");
+  el.consentGateSection.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "center" });
+  window.setTimeout(() => {
+    el.consentCheckbox.focus({ preventScroll: true });
+    el.consentGateSection.classList.remove("attention-pulse");
+  }, reduceMotion ? 0 : 300);
 }
 
 function buildWalletLaunchTarget(invoice) {
   if (!invoice) return null;
   const candidates = [
-    { type: "wallet_deeplink", url: invoice.wallet_deeplink },
     { type: "payment_uri", url: invoice.payment_uri },
+    { type: "wallet_deeplink", url: invoice.wallet_deeplink },
     { type: "wallet_url", url: invoice.wallet_url },
   ];
   for (const candidate of candidates) {
-    if (typeof candidate.url === "string" && candidate.url.trim()) {
-      return { type: candidate.type, url: candidate.url.trim() };
+    if (typeof candidate.url !== "string" || !candidate.url.trim()) continue;
+    const raw = candidate.url.trim();
+    try {
+      const parsed = new URL(raw);
+      if (WALLET_LAUNCH_PROTOCOLS.has(parsed.protocol) && !parsed.username && !parsed.password) {
+        return { type: candidate.type, url: raw };
+      }
+    } catch {
+      // Unsafe or malformed targets fall through to the copy guidance.
     }
   }
   return null;
@@ -415,7 +824,7 @@ function renderCustomerAction(invoice) {
     state.manualActionHint = customerMode.body || "";
     return;
   }
-  const status = canonicalInvoiceStatus(invoice?.status) || "issued";
+  const status = canonicalInvoiceStatus(invoice?.status);
   const hasLaunchTarget = Boolean(buildWalletLaunchTarget(invoice));
   const actionMap = {
     issued: {
@@ -514,7 +923,16 @@ function renderCustomerAction(invoice) {
     },
   };
 
-  const action = actionMap[status] || actionMap.issued;
+  const action = actionMap[status] || {
+    badge: "状態確認中",
+    title: "送金せず、最新状態の確認をお待ちください",
+    body: "請求状態を安全に判定できないため、すべての支払い操作を停止しています。",
+    items: [
+      "送金・再送金は行わないでください。",
+      "最新の状態が取得できるまでお待ちください。",
+      "長く変わらない場合は店舗スタッフへお声がけください。",
+    ],
+  };
   el.customerActionBadge.textContent = action.badge;
   el.customerActionTitle.textContent = action.title;
   el.customerActionBody.textContent = action.body;
@@ -529,14 +947,25 @@ function renderCustomerAction(invoice) {
 
 function updateRemainingAnnouncement(expiresAt) {
   const remaining = formatRemaining(expiresAt);
-  el.remainingText.textContent = remaining;
-  const minuteKey = remaining.replace(/秒$/, "");
-  if (minuteKey !== state.announcedMinute) {
-    state.announcedMinute = minuteKey;
-    if (minuteKey.includes("残り")) {
-      announce(`支払い期限 ${minuteKey}`);
+  if (el.remainingText.textContent !== remaining) el.remainingText.textContent = remaining;
+  const totalSec = remainingSeconds(expiresAt);
+  if (totalSec == null) return;
+  let threshold = null;
+  for (let index = REMAINING_ANNOUNCEMENT_THRESHOLDS_SEC.length - 1; index >= 0; index -= 1) {
+    const candidate = REMAINING_ANNOUNCEMENT_THRESHOLDS_SEC[index];
+    if (totalSec <= candidate) {
+      threshold = candidate;
+      break;
     }
   }
+  if (threshold == null || threshold === state.announcedRemainingThreshold) return;
+  state.announcedRemainingThreshold = threshold;
+  if (threshold === 0) {
+    announce("支払い期限に達しました。送金しないでください。");
+    return;
+  }
+  const label = threshold >= 60 ? `${Math.floor(threshold / 60)}分` : `${threshold}秒`;
+  announce(`支払い期限まで残り${label}以内です。`);
 }
 
 function renderPaymentConditions(invoice) {
@@ -578,17 +1007,42 @@ function renderPaymentVerification(invoice) {
   }
 }
 
+function getReceiptEvidence(invoice) {
+  const txHash = String(invoice?.paid_tx_hash || "").trim();
+  const chainRecordedAt = String(invoice?.chain_recorded_at || "").trim();
+  const confirmedAt = String(invoice?.confirmed_at || "").trim();
+  const confirmedAtMs = confirmedAt ? new Date(confirmedAt).getTime() : NaN;
+  return {
+    txHash,
+    chainRecordedAt,
+    confirmedAt,
+    complete: Boolean(txHash) && Number.isFinite(confirmedAtMs),
+  };
+}
+
 function renderReceiptCard(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status);
   const isPaid = status === "paid" || status === "settled";
   el.receiptCard.classList.toggle("hidden", !isPaid);
   if (!isPaid) return;
-  el.receiptStatusBadge.textContent = status === "settled" ? "確定済み" : "支払い確認済み";
+  const evidence = getReceiptEvidence(invoice);
+  el.receiptTitle.textContent = evidence.complete ? "お支払い確認書" : "お支払い状況メモ";
+  el.receiptStatusBadge.textContent = evidence.complete
+    ? status === "settled" ? "確定済み" : "支払い確認済み"
+    : "証跡確認中";
+  el.receiptStatusBadge.className = `status-pill ${evidence.complete ? "s-green" : "s-yellow"}`;
   el.receiptStoreName.textContent = invoice.store_name || "加盟店";
   el.receiptAmount.textContent =
     `${formatJpy(invoice.amount_jpy)} / ${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`;
   el.receiptInvoiceId.textContent = invoice.invoice_no || invoice.invoice_id || "-";
-  el.receiptTxHash.textContent = invoice.paid_tx_hash || "-";
+  el.receiptTxHash.textContent = evidence.txHash || "サーバー確認待ち";
+  el.receiptChainRecordedAt.textContent = evidence.chainRecordedAt ? formatDateTime(evidence.chainRecordedAt) : "チェーン時刻なし";
+  el.receiptConfirmedAt.textContent = evidence.complete ? formatDateTime(evidence.confirmedAt) : "サーバー確認待ち";
+  el.receiptEvidenceNotice.textContent = evidence.complete
+    ? "取引番号とサーバー台帳への記録日時を確認済みです。チェーン記録日時とは別に表示しています。"
+    : "請求状態は完了ですが、取引番号またはサーバー確認日時を取得できていないため、これは確認書ではありません。";
+  el.copyReceiptBtn.textContent = evidence.complete ? "確認書をコピー" : "状況メモをコピー";
+  el.copyReceiptBtn.setAttribute("aria-label", evidence.complete ? "お支払い確認書をコピー" : "証跡確認中のお支払い状況をコピー");
 }
 
 function renderStatus(invoice) {
@@ -599,17 +1053,26 @@ function renderStatus(invoice) {
     pill: "s-gray",
     title: "支払い状況を確認中です。",
   };
-  el.statusPill.textContent = meta.label;
-  el.statusPill.className = `status-pill ${meta.pill}`;
-  el.uxStateLabel.textContent = meta.title;
+  if (el.statusPill.textContent !== meta.label) el.statusPill.textContent = meta.label;
+  const statusClass = `status-pill ${meta.pill}`;
+  if (el.statusPill.className !== statusClass) el.statusPill.className = statusClass;
+  if (el.uxStateLabel.textContent !== meta.title) el.uxStateLabel.textContent = meta.title;
   if (unknownStatus) {
-    el.uxStateDetail.textContent = "不明な状態です。確認のため自動更新を継続しています。";
+    const detail = "不明な状態です。確認のため自動更新を継続しています。支払い操作は停止しています。";
+    if (el.uxStateDetail.textContent !== detail) el.uxStateDetail.textContent = detail;
     return;
   }
-  el.uxStateDetail.textContent = state.manualActionHint || "";
+  const detail = state.manualActionHint || "";
+  if (el.uxStateDetail.textContent !== detail) el.uxStateDetail.textContent = detail;
 }
 
 function renderInvoice(invoice) {
+  const nextInvoiceId = String(invoice?.invoice_id || "");
+  if (nextInvoiceId !== state.lastAnnouncementInvoiceId) {
+    state.lastAnnouncementInvoiceId = nextInvoiceId;
+    state.announcedRemainingThreshold = null;
+    state.manualRiskVisible = false;
+  }
   state.invoice = invoice;
   state.manualActionHint = buildPaymentMethodHint(invoice);
   const status = canonicalInvoiceStatus(invoice?.status);
@@ -637,15 +1100,7 @@ function renderInvoice(invoice) {
   el.invoiceText.textContent = invoice.invoice_no || invoice.invoice_id || "-";
   el.txHashText.textContent = invoice.paid_tx_hash || "-";
 
-  const customerMode = invoice?.customer_payment_mode || {};
-  const paymentActionAvailable = WAITING_STATUSES.has(status) && (!customerMode.mode || customerMode.mode === "wallet_qr");
-  const walletAllowed = paymentActionAvailable && state.consented;
-  el.walletPayBtn.disabled = !paymentActionAvailable;
-  el.showMethodsBtn.disabled = !paymentActionAvailable;
-  el.copyInfoBtn.disabled = !paymentActionAvailable;
-  el.copyAddressBtn.disabled = !walletAllowed;
-  el.copyAmountBtn.disabled = !walletAllowed;
-  el.copyInvoiceBtn.disabled = !walletAllowed;
+  applyPaymentActionGate(invoice);
   if (el.toggleAddressBtn) {
     el.toggleAddressBtn.disabled = !receiveAddress;
     el.toggleAddressBtn.textContent = state.addressExpanded ? "支払い先を短縮表示" : "支払い先を全文表示";
@@ -693,23 +1148,66 @@ function setMethodPanel(visible, message) {
   if (message) el.methodPanelText.textContent = message;
 }
 
+function explainPaymentGate(gate = evaluatePaymentActionGate()) {
+  if (gate.code === "consent_required") {
+    announceConsentRequired();
+    return;
+  }
+  if (gate.code === "store_guidance") {
+    setMethodPanel(true, gate.message);
+  }
+  if (gate.blockingMessage) showError("");
+  else showError(gate.message);
+  announce(gate.message);
+}
+
+function setLaunchInProgress(inProgress) {
+  state.launchInProgress = Boolean(inProgress);
+  applyPaymentActionGate(state.invoice);
+}
+
+async function refreshAfterBrowserRecovery() {
+  const result = await loadInvoice({ silent: true, force: true });
+  if (result?.ok) setLaunchInProgress(false);
+  return result;
+}
+
+async function getFreshPayableInvoiceForAction() {
+  const initialGate = applyPaymentActionGate();
+  if (!initialGate.allowed) {
+    explainPaymentGate(initialGate);
+    return null;
+  }
+  const refreshResult = await loadInvoice({ silent: true, force: true });
+  if (!refreshResult?.ok) return null;
+  const refreshedGate = applyPaymentActionGate(refreshResult.invoice);
+  if (!refreshedGate.allowed) {
+    explainPaymentGate(refreshedGate);
+    return null;
+  }
+  return refreshResult.invoice;
+}
+
 async function handleWalletPay() {
-  const invoice = state.invoice;
-  if (!invoice) {
-    showError("請求情報を読み込み中です。");
-    return;
-  }
-  if (invoice.customer_payment_mode?.mode && invoice.customer_payment_mode.mode !== "wallet_qr") {
-    setMethodPanel(true, invoice.customer_payment_mode.body || "この会計は店頭端末でご案内します。");
-    announce("店頭端末の案内をご確認ください");
-    return;
-  }
-  if (!WAITING_STATUSES.has(canonicalInvoiceStatus(invoice.status))) {
-    showError("現在の状態ではお支払いを開始できません。");
-    return;
-  }
   if (!state.consented) {
     announceConsentRequired();
+    return;
+  }
+  const initialGate = applyPaymentActionGate();
+  if (!initialGate.allowed) {
+    explainPaymentGate(initialGate);
+    return;
+  }
+
+  setLaunchInProgress(true);
+  const refreshResult = await loadInvoice({ silent: true, force: true });
+  setLaunchInProgress(false);
+  if (!refreshResult?.ok) return;
+
+  const invoice = refreshResult.invoice;
+  const refreshedGate = applyPaymentActionGate(invoice);
+  if (!refreshedGate.allowed) {
+    explainPaymentGate(refreshedGate);
     return;
   }
   const launchTarget = buildWalletLaunchTarget(invoice);
@@ -726,16 +1224,13 @@ async function handleWalletPay() {
       : "ウォレット起動URLを開きます。内容をご確認のうえ送金してください。";
   setMethodPanel(true, launchMessage);
   announce("ウォレットを開きます");
+  setLaunchInProgress(true);
   location.href = launchTarget.url;
 }
 
 function announceConsentRequired() {
   showError("利用規約・ポリシーをご確認のうえ、チェックを入れてください。");
-  if (el.consentGateSection) {
-    el.consentGateSection.classList.add("attention-pulse");
-    el.consentGateSection.scrollIntoView({ behavior: "smooth", block: "center" });
-    window.setTimeout(() => el.consentGateSection.classList.remove("attention-pulse"), 1400);
-  }
+  focusConsentGate();
   announce("同意が必要です");
 }
 
@@ -745,8 +1240,10 @@ async function handleCopyInfo() {
     announceConsentRequired();
     return;
   }
+  const invoice = await getFreshPayableInvoiceForAction();
+  if (!invoice) return;
   try {
-    await copyText(buildCopyPayload(state.invoice));
+    await copyText(buildCopyPayload(invoice));
     setMethodPanel(true, "支払い情報をコピーしました。ウォレットで内容を確認して送金してください。");
     announce("支払い情報をコピーしました");
   } catch (error) {
@@ -760,8 +1257,10 @@ async function handleCopyAddress() {
     announceConsentRequired();
     return;
   }
+  const invoice = await getFreshPayableInvoiceForAction();
+  if (!invoice) return;
   try {
-    await copyText(getCopyFallback(state.invoice).copy_receive_address || getReceiveAddress(state.invoice) || "");
+    await copyText(getCopyFallback(invoice).copy_receive_address || getReceiveAddress(invoice) || "");
     announce("支払い先をコピーしました");
   } catch (error) {
     showError(String(error.message || error));
@@ -774,8 +1273,10 @@ async function handleCopyAmount() {
     announceConsentRequired();
     return;
   }
+  const invoice = await getFreshPayableInvoiceForAction();
+  if (!invoice) return;
   try {
-    await copyText(`${toNumber(state.invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(state.invoice)}`);
+    await copyText(`${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`);
     announce("金額をコピーしました");
   } catch (error) {
     showError(String(error.message || error));
@@ -788,98 +1289,151 @@ async function handleCopyInvoice() {
     announceConsentRequired();
     return;
   }
+  const invoice = await getFreshPayableInvoiceForAction();
+  if (!invoice) return;
   try {
-    await copyText(state.invoice.invoice_no || state.invoice.invoice_id || "");
+    await copyText(invoice.invoice_no || invoice.invoice_id || "");
     announce("請求IDをコピーしました");
   } catch (error) {
     showError(String(error.message || error));
   }
 }
 
+async function handleShowMethods() {
+  if (!state.consented) {
+    announceConsentRequired();
+    return;
+  }
+  const invoice = await getFreshPayableInvoiceForAction();
+  if (!invoice) return;
+  const visible = el.methodPanel.classList.contains("hidden");
+  setMethodPanel(visible, visible ? buildManualPaymentInstructions(invoice, { includeHelp: true }) : "");
+  if (visible && !buildWalletLaunchTarget(invoice)) showManualRiskWarning(invoice);
+  announce(visible ? "支払い方法を表示しました" : "支払い方法を閉じました");
+}
+
 async function handleCopyReceipt() {
   const invoice = state.invoice;
   if (!invoice) return;
   try {
+    const evidence = getReceiptEvidence(invoice);
+    const copyTimestamp = formatDateTime(new Date().toISOString());
     const lines = [
-      "【お支払い確認書】",
+      evidence.complete ? "【お支払い確認書】" : "【お支払い状況メモ（証跡確認中）】",
       `店舗: ${invoice.store_name || "加盟店"}`,
       `金額: ${formatJpy(invoice.amount_jpy)} / ${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`,
       `請求ID: ${invoice.invoice_no || invoice.invoice_id || "-"}`,
-      `取引番号: ${invoice.paid_tx_hash || "-"}`,
-      `確認日時: ${formatDateTime(new Date().toISOString())}`,
+      `取引番号: ${evidence.txHash || "サーバー確認待ち"}`,
+      `チェーン記録日時: ${evidence.chainRecordedAt ? formatDateTime(evidence.chainRecordedAt) : "チェーン時刻なし"}`,
+      `サーバー確認日時: ${evidence.complete ? formatDateTime(evidence.confirmedAt) : "サーバー確認待ち"}`,
+      `コピー日時: ${copyTimestamp}`,
     ];
     await copyText(lines.join("\n"));
-    announce("お支払い確認書をコピーしました");
+    announce(evidence.complete ? "お支払い確認書をコピーしました" : "証跡確認中のお支払い状況をコピーしました");
   } catch (error) {
     showError(String(error.message || error));
   }
 }
 
 async function loadInvoice(options = {}) {
-  const { silent = false, fromPolling = false } = options;
-  if (state.pollInFlight && fromPolling) return;
+  const { silent = false, fromPolling = false, force = false } = options;
+  if (state.pollInFlight && fromPolling && !force) return { ok: false, skipped: true };
   const path = signedInvoicePath();
   if (!path) {
     stopPolling();
-    showError("このURLは無効です。署名付きの支払いURLをご確認ください。");
-    el.walletPayBtn.disabled = true;
-    return;
+    state.lastRefreshSucceeded = false;
+    state.lastRefreshInvoiceId = "";
+    applyPaymentActionGate(state.invoice);
+    setBlockingWarning("このURLは無効です。署名付きの支払いURLを確認するまで、すべての支払い操作を停止しています。");
+    return { ok: false, invalidPath: true };
   }
+  const requestSequence = state.refreshSequence + 1;
+  state.refreshSequence = requestSequence;
+  if (state.refreshController) state.refreshController.abort();
+  const controller = new AbortController();
+  state.refreshController = controller;
   state.pollInFlight = true;
+  state.refreshInProgress = true;
+  applyPaymentActionGate(state.invoice);
+  const requestStartedAtMs = Date.now();
   try {
-    const response = await fetch(path);
+    const response = await fetch(path, { signal: controller.signal, cache: "no-store" });
     const data = await response.json().catch(() => ({}));
+    if (requestSequence !== state.refreshSequence) return { ok: false, stale: true };
     if (!response.ok) {
       const message = data?.error?.message || "請求情報を取得できませんでした。";
       throw new Error(message);
     }
+    if (String(data.invoice_id || "") !== String(invoiceId || "")) {
+      throw new Error("請求IDが一致しない応答を受け取りました。");
+    }
+    updateServerClock(response, requestStartedAtMs, data.server_now);
+    state.lastRefreshSucceeded = true;
+    state.lastRefreshInvoiceId = String(data.invoice_id || "");
+    state.refreshInProgress = false;
     showError("");
     renderInvoice(data);
     if (!silent) announce(`現在の状態は ${el.statusPill.textContent} です`);
+    return { ok: true, invoice: data };
   } catch (error) {
-    showError(`請求情報の読み込みに失敗しました。${String(error.message || error)}`);
-    setMethodPanel(true, "読み込みに失敗しました。時間をおいて再度お試しください。");
+    if (error?.name === "AbortError" || requestSequence !== state.refreshSequence) {
+      return { ok: false, aborted: true };
+    }
+    state.lastRefreshSucceeded = false;
+    state.lastRefreshInvoiceId = "";
+    state.refreshInProgress = false;
+    applyPaymentActionGate(state.invoice);
+    setBlockingWarning("請求の最新状態を確認できないため、送金・手動送金・コピー操作を停止しています。再取得してください。");
+    state.transientError = `請求情報の読み込みに失敗しました。${String(error.message || error)}`;
+    renderErrorBanner();
+    setMethodPanel(false, "");
     if (!silent) announce("請求情報の取得に失敗しました");
+    return { ok: false, error };
   } finally {
-    state.pollInFlight = false;
+    if (requestSequence === state.refreshSequence) {
+      state.pollInFlight = false;
+      state.refreshInProgress = false;
+      state.refreshController = null;
+      applyPaymentActionGate(state.invoice);
+    }
   }
 }
 
 function handleConsentChange() {
-  state.consented = Boolean(el.consentCheckbox?.checked);
+  state.consented = policyLinksReady() && Boolean(el.consentCheckbox?.checked);
   if (state.consented) {
     void recordConsent();
+  } else {
+    state.consentSequence += 1;
+    if (state.consentController) state.consentController.abort();
+    state.consentController = null;
+    state.consentRecordStatus = "idle";
+    state.consentRecordError = "";
   }
   if (state.invoice) {
-    renderInvoice(state.invoice);
-  }
-  if (el.consentLiveStatus) {
-    el.consentLiveStatus.textContent = state.consented
-      ? "同意済みです。お支払い操作が可能です。"
-      : "利用規約・ポリシーをご確認のうえ、チェックを入れてください。";
+    renderConsentGate(state.invoice);
+    applyPaymentActionGate(state.invoice);
   }
 }
 
 function bindEvents() {
   if (el.consentCheckbox) el.consentCheckbox.addEventListener("change", handleConsentChange);
+  if (el.retryConsentBtn) el.retryConsentBtn.addEventListener("click", () => void recordConsent());
+  if (el.goToConsentBtn) el.goToConsentBtn.addEventListener("click", focusConsentGate);
   el.walletPayBtn.addEventListener("click", () => void handleWalletPay());
-  el.showMethodsBtn.addEventListener("click", () => {
-    if (!state.consented) {
-      announceConsentRequired();
-      return;
-    }
-    const visible = el.methodPanel.classList.contains("hidden");
-    setMethodPanel(visible, visible ? buildManualPaymentInstructions(state.invoice, { includeHelp: true }) : "");
-    if (visible && state.invoice && !buildWalletLaunchTarget(state.invoice)) showManualRiskWarning(state.invoice);
-    announce(visible ? "支払い方法を表示しました" : "支払い方法を閉じました");
-  });
+  el.showMethodsBtn.addEventListener("click", () => void handleShowMethods());
   el.copyInfoBtn.addEventListener("click", () => void handleCopyInfo());
   el.copyAddressBtn.addEventListener("click", () => void handleCopyAddress());
   el.copyAmountBtn.addEventListener("click", () => void handleCopyAmount());
   el.copyInvoiceBtn.addEventListener("click", () => void handleCopyInvoice());
   el.copyReceiptBtn.addEventListener("click", () => void handleCopyReceipt());
-  el.refreshBtn.addEventListener("click", () => void loadInvoice({ silent: false }));
-  el.closeErrorBannerBtn.addEventListener("click", () => showError(""));
+  el.refreshBtn.addEventListener("click", () => {
+    setLaunchInProgress(false);
+    void loadInvoice({ silent: false, force: true });
+  });
+  el.closeErrorBannerBtn.addEventListener("click", () => {
+    if (!state.blockingWarning) showError("");
+  });
   if (el.toggleAddressBtn) {
     el.toggleAddressBtn.addEventListener("click", () => {
       state.addressExpanded = !state.addressExpanded;
@@ -889,7 +1443,16 @@ function bindEvents() {
   window.addEventListener("beforeunload", () => {
     stopPolling();
     stopRemainingTimer();
+    if (state.refreshController) state.refreshController.abort();
+    if (state.consentController) state.consentController.abort();
   });
+  window.addEventListener("pageshow", () => {
+    void refreshAfterBrowserRecovery();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void refreshAfterBrowserRecovery();
+  });
+  window.addEventListener("online", () => void loadInvoice({ silent: true, force: true }));
 }
 
 bindEvents();
