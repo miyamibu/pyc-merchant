@@ -246,6 +246,7 @@ async function getInvoiceStatus(authorization, invoiceId) {
 async function main() {
   const autoServer = await ensureServer();
   const nonce = createNonce();
+  const approverName = `${SECOND_ADMIN_NAME} ${nonce}`;
   const summary = {};
   try {
     const health = await request("/healthz");
@@ -275,14 +276,14 @@ async function main() {
       "idempotency-key": `smoke-create-approver-${nonce}`
     },
     body: JSON.stringify({
-      staff_name: SECOND_ADMIN_NAME,
+      staff_name: approverName,
       role: "admin",
       pin: SECOND_ADMIN_PIN,
       status: "active"
     })
   });
   assert([201, 409].includes(createApprover.status) || createApprover.status === 200, "failed to prepare second approver account", createApprover);
-  const approverLogin = await loginAs(SECOND_ADMIN_PIN, SECOND_ADMIN_NAME);
+  const approverLogin = await loginAs(SECOND_ADMIN_PIN, approverName);
   approverAuthorization = approverLogin.authorization;
   summary.approver = {
     role: approverLogin.login.data.role,
