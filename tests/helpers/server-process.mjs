@@ -24,7 +24,7 @@ export function baseServerEnv(overrides = {}) {
     SERVICE_INGEST_SECRET: "b".repeat(48),
     METRICS_SECRET: "c".repeat(48),
     CHAIN_ID: "137",
-    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+    TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
     RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
     TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
@@ -46,7 +46,7 @@ export function baseServerEnv(overrides = {}) {
 export function productionServerEnv(overrides = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "jpyc-terminal-prod-test-"));
   const port = overrides.APP_PORT ? Number(overrides.APP_PORT) : randomPort();
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
   return {
     APP_ENV: "production",
     APP_PORT: String(port),
@@ -194,7 +194,7 @@ export async function createInvoice(baseUrl, token, amount, idem = `inv-${Date.n
       "content-type": "application/json",
       "idempotency-key": idem,
     }),
-    body: JSON.stringify({ amount_jpy: amount }),
+    body: JSON.stringify({ amount_jpy: amount, payment_chain_id: "137" }),
   });
 }
 

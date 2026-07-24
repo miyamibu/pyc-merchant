@@ -51,6 +51,21 @@ test("settlement export schema pins canonical enums and export privacy exclusion
     "disputed",
   ]);
   assert.deepEqual(schema.properties.export_excluded_private_data.enum, [1]);
+  assert.equal(schema.required.length, 40, "Settlement Export Contract v1 must retain exactly 40 required fields");
+  for (const field of [
+    "export_reference", "settlement_id", "settlement_export_run_id", "settlement_export_row_id",
+    "invoice_no", "checkout_session_id", "store_id", "terminal_id", "operator_id",
+    "chain_id", "network", "token_contract", "recipient_address", "payment_attempt_ids",
+    "primary_tx_hash", "primary_tx_log_index", "review_case_id", "review_reason_type",
+    "refund_request_id", "refund_tx_hash", "audit_log_refs", "external_sync_refs",
+    "source_ledger_snapshot_hash",
+  ]) {
+    assert.ok(schema.required.includes(field), `${field} must be required in v1`);
+    assert.ok(schema.properties[field], `${field} must be defined in v1`);
+  }
+  assert.deepEqual(schema.properties.chain_id.enum, ["1", "43114", "137"]);
+  assert.match(schema.properties.token_contract.pattern, /\[Ee\]7/);
+  assert.equal(schema.allOf.length, 5, "v1 must fail closed on five conditional traceability rules");
   for (const v2OnlyField of [
     "refund_reference_status",
     "refund_reference_count",
@@ -82,6 +97,19 @@ test("Settlement Export Contract v2 pins invoice-scoped refund manifest and prim
     schema.$defs.metadata.properties.hash_scope.properties.version.const,
     "settlement_export_v2_canonical_payload_without_content_hashes"
   );
+  const v1TraceFields = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "docs/contracts/settlement-export-v1.schema.json"), "utf8")
+  ).required.filter((field) => ![
+    "export_version", "business_date", "rail_type", "provider_code", "invoice_status",
+    "accounting_status", "cash_recognition_status", "receivable_status",
+    "onchain_cash_amount_jpyc_base", "provider_receivable_amount_jpyc_base",
+    "exception_amount_jpyc_base", "refund_amount_jpyc_base", "void_amount_jpyc_base",
+    "evidence_hash", "payload_schema_version", "export_excluded_private_data",
+  ].includes(field));
+  for (const field of v1TraceFields) {
+    assert.ok(schema.$defs.row.required.includes(field), `${field} must be additively required in v2 rows`);
+    assert.ok(schema.$defs.row.properties[field], `${field} must be defined in v2 rows`);
+  }
 });
 
 test("buildDailyAccountingSummary aggregates cancelled rows alongside other accounting statuses", () => {
@@ -166,6 +194,8 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(serverSource, /buildSettlementExportV2SnapshotCsv\(rows, \{ bom: true \}\)/);
   assert.match(serverSource, /resolveSettlementExportContractVersion/);
   assert.match(serverSource, /legacy_export_missing/);
+  assert.match(serverSource, /addColumnIfMissing\("settlement_export_rows", "payload_json"/);
+  assert.match(serverSource, /JSON\.stringify\(row\)/);
 
   const dailyGet = serverSource.match(/app\.get\("\/api\/v1\/settlements\/daily:export"[\s\S]*?\n\}\);/);
   const monthlyGet = serverSource.match(/app\.get\("\/api\/v1\/settlements\/monthly:export"[\s\S]*?\n\}\);/);

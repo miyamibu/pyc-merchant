@@ -11,6 +11,11 @@ import {
   parseDecimalToBaseUnits,
   scaleToDecimals,
 } from "./amounts.mjs";
+import {
+  OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
+  getSupportedPaymentChain,
+  validateOfficialJpycContract,
+} from "./jpyc-contract-policy.mjs";
 
 const CWD = process.cwd();
 const DEFAULTS = {
@@ -24,6 +29,9 @@ const DEFAULTS = {
   TOKEN_DECIMALS: "18",
   JPYC_BASE_UNIT_SCALE: "",
   RPC_URLS: "",
+  RPC_URLS_1: "",
+  RPC_URLS_43114: "",
+  RPC_URLS_137: "",
   MONITOR_POLL_INTERVAL_MS: "15000",
   MONITOR_BACKSCAN_BLOCKS: "12",
   MIN_MONITOR_BACKSCAN_BLOCKS: "12",
@@ -87,7 +95,8 @@ const TOKEN_DECIMALS = Number(ENV.TOKEN_DECIMALS || DEFAULTS.TOKEN_DECIMALS);
 const JPYC_BASE_UNIT_SCALE = String(ENV.JPYC_BASE_UNIT_SCALE || DEFAULTS.JPYC_BASE_UNIT_SCALE || "");
 const JPYC_DECIMALS = scaleToDecimals(JPYC_BASE_UNIT_SCALE);
 const CHAIN_ID_NUMERIC = Number(CHAIN_ID);
-const RPC_URLS = String(ENV.RPC_URLS || DEFAULTS.RPC_URLS)
+const PAYMENT_CHAIN = getSupportedPaymentChain(CHAIN_ID);
+const RPC_URLS = String(ENV[`RPC_URLS_${CHAIN_ID}`] || ENV.RPC_URLS || DEFAULTS.RPC_URLS)
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
@@ -104,7 +113,7 @@ const MONITOR_DEAD_LETTER_RETRY_INTERVAL_MS = Number(
 );
 const SERVICE_INGEST_ID = String(ENV.SERVICE_INGEST_ID || DEFAULTS.SERVICE_INGEST_ID);
 const SERVICE_INGEST_SECRET = String(ENV.SERVICE_INGEST_SECRET || DEFAULTS.SERVICE_INGEST_SECRET);
-const ACTIVE_TOKEN_CONTRACT = APPROVED_JPYC_TOKEN_CONTRACT || TOKEN_CONTRACT;
+const ACTIVE_TOKEN_CONTRACT = OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER;
 
 if (RPC_URLS.length === 0) {
   console.error("FATAL: RPC_URLS is empty. Set at least one RPC endpoint.");
@@ -122,13 +131,24 @@ if (!JPYC_BASE_UNIT_SCALE) {
   console.error("FATAL: JPYC_BASE_UNIT_SCALE is invalid.");
   process.exit(1);
 }
-if (!/^0x[0-9a-f]{40}$/.test(TOKEN_CONTRACT)) {
-  console.error("FATAL: TOKEN_CONTRACT must be a 0x-prefixed 40-hex EVM address.");
+if (!PAYMENT_CHAIN) {
+  console.error("FATAL: CHAIN_ID must be one of 1, 43114, or 137.");
   process.exit(1);
 }
-if (APPROVED_JPYC_TOKEN_CONTRACT && !/^0x[0-9a-f]{40}$/.test(APPROVED_JPYC_TOKEN_CONTRACT)) {
-  console.error("FATAL: APPROVED_JPYC_TOKEN_CONTRACT must be a 0x-prefixed 40-hex EVM address.");
+const tokenContractValidation = validateOfficialJpycContract(TOKEN_CONTRACT, "TOKEN_CONTRACT");
+if (!tokenContractValidation.ok) {
+  console.error(`FATAL: ${tokenContractValidation.code}: ${tokenContractValidation.message}`);
   process.exit(1);
+}
+if (APPROVED_JPYC_TOKEN_CONTRACT) {
+  const approvedContractValidation = validateOfficialJpycContract(
+    APPROVED_JPYC_TOKEN_CONTRACT,
+    "APPROVED_JPYC_TOKEN_CONTRACT"
+  );
+  if (!approvedContractValidation.ok) {
+    console.error(`FATAL: ${approvedContractValidation.code}: ${approvedContractValidation.message}`);
+    process.exit(1);
+  }
 }
 if (!Number.isFinite(REQUIRED_CONFIRMATIONS) || REQUIRED_CONFIRMATIONS < 0 || !Number.isInteger(REQUIRED_CONFIRMATIONS)) {
   console.error("FATAL: REQUIRED_CONFIRMATIONS must be a non-negative integer.");
@@ -167,7 +187,7 @@ if (IS_PRODUCTION && TOKEN_DECIMALS !== JPYC_DECIMALS) {
   process.exit(1);
 }
 if (IS_PRODUCTION) {
-  if (!APPROVED_JPYC_TOKEN_CONTRACT || TOKEN_CONTRACT !== APPROVED_JPYC_TOKEN_CONTRACT) {
+  if (TOKEN_CONTRACT !== APPROVED_JPYC_TOKEN_CONTRACT) {
     console.error("FATAL: TOKEN_CONTRACT must match APPROVED_JPYC_TOKEN_CONTRACT in production.");
     process.exit(1);
   }

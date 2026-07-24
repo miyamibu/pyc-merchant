@@ -89,13 +89,13 @@ test("production fatal guards reject unsafe startup configs", async (t) => {
     },
     {
       name: "wrong chain",
-      env: { CHAIN_ID: "1" },
-      pattern: /CHAIN_ID must be 137/i,
+      env: { CHAIN_ID: "10" },
+      pattern: /CHAIN_ID must be included in ENABLED_PAYMENT_CHAIN_IDS/i,
     },
     {
       name: "token mismatch",
       env: { TOKEN_CONTRACT: "0xcccccccccccccccccccccccccccccccccccccccc" },
-      pattern: /must match APPROVED_JPYC_TOKEN_CONTRACT/i,
+      pattern: /official funds-transfer JPYC contract/i,
     },
     {
       name: "confirmation below minimum",

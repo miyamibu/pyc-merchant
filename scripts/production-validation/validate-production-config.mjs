@@ -3,6 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { buildWalletLaunchPayload } from "../../src/wallet-adapter.mjs";
 import {
+  OFFICIAL_JPYC_CONTRACT_ADDRESS,
+  parseEnabledPaymentChainIds,
+  getSupportedPaymentChain,
+  validateOfficialJpycContract,
+} from "../../src/jpyc-contract-policy.mjs";
+import {
   fetchPinnedPublicHttps,
   validatePublicHttpsUrl,
 } from "../../src/public-endpoint-security.mjs";
@@ -137,9 +143,10 @@ async function main() {
       .map((value) => value.trim().replace(/\/$/, ""))
       .filter(Boolean);
     const chainId = String(env.CHAIN_ID || "137").trim();
+    const enabledChainIds = parseEnabledPaymentChainIds(env.ENABLED_PAYMENT_CHAIN_IDS || "1,43114,137");
     const tokenContract = normalizeAddress(env.TOKEN_CONTRACT);
     const approvedTokenContract = normalizeAddress(env.APPROVED_JPYC_TOKEN_CONTRACT);
-    const rpcUrls = String(env.RPC_URLS || "")
+    const rpcUrls = String(env[`RPC_URLS_${chainId}`] || env.RPC_URLS || "")
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean);
@@ -170,8 +177,17 @@ async function main() {
       record("trusted_proxy_boundary", true, { skipped: true, reason: "allow-empty" });
     }
 
-    ensure(chainId === "137", "CHAIN_ID must be 137", { actual: chainId });
-    record("chain_id_polygon", true, { value: chainId });
+    const paymentChain = getSupportedPaymentChain(chainId);
+    ensure(paymentChain && enabledChainIds.includes(chainId), "CHAIN_ID must be an enabled JPYC chain (1, 43114, or 137)", {
+      actual: chainId,
+      enabled_chain_ids: enabledChainIds,
+    });
+    record("payment_chain_enabled", true, { value: chainId, network: paymentChain.network });
+
+    ensure(validateOfficialJpycContract(tokenContract, "TOKEN_CONTRACT").ok, "TOKEN_CONTRACT must be the official funds-transfer JPYC contract", {
+      token_contract: tokenContract,
+      expected: OFFICIAL_JPYC_CONTRACT_ADDRESS,
+    });
 
     if (approvedTokenContract) {
       ensure(tokenContract === approvedTokenContract, "TOKEN_CONTRACT must match APPROVED_JPYC_TOKEN_CONTRACT", {
@@ -240,10 +256,10 @@ async function main() {
 
     const deeplinkPayload = buildWalletLaunchPayload({
       env,
-      chainId: "137",
-      network: "Polygon",
+      chainId,
+      network: paymentChain.network,
       tokenSymbol: "JPYC",
-      tokenContract: tokenContract || "0x1111111111111111111111111111111111111111",
+      tokenContract: tokenContract || OFFICIAL_JPYC_CONTRACT_ADDRESS,
       tokenDecimals: Number(env.TOKEN_DECIMALS || "18"),
       receiveAddress: String(env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222"),
       expectedAmountAtomic: "1000000",
@@ -251,10 +267,10 @@ async function main() {
       expiresAt: "2099-01-01T00:00:00.000Z",
       payUrl: publicBaseUrl || "https://pay.miyamibu.xyz/pay?ref=test",
     });
-    ensure(deeplinkPayload.network === "Polygon", "wallet payload network must resolve to Polygon", {
+    ensure(deeplinkPayload.network === paymentChain.network, "wallet payload network must match CHAIN_ID", {
       network: deeplinkPayload.network,
     });
-    record("wallet_payload_polygon", true, {
+    record("wallet_payload_chain", true, {
       network: deeplinkPayload.network,
       payment_uri: deeplinkPayload.payment_uri,
     });
@@ -295,7 +311,7 @@ async function main() {
           const blockHex = String(await rpcRequest(rpcUrl, "eth_blockNumber", []));
           const latestBlock = blockHex.startsWith("0x") ? Number(BigInt(blockHex)) : Number(blockHex);
           rpcChecks.push({ rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId, latest_block: latestBlock });
-          ensure(rpcChainId === "137", "RPC chainId drift detected", { rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId });
+          ensure(rpcChainId === chainId, "RPC chainId drift detected", { rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId, expected_chain_id: chainId });
         }
         record("rpc_reachability", true, { providers: rpcChecks });
       }

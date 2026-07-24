@@ -9,20 +9,23 @@ function read(filePath) {
   return fs.readFileSync(path.join(ROOT, filePath), "utf8");
 }
 
-// P0-UX-01: Payment conditions card shown before payment (MATIC, split, chain warnings)
-test("P0-UX-01 mobile shows payment conditions card with MATIC and refund warnings before payment", () => {
+// P0-UX-01: Payment conditions card shown before payment (dynamic gas token, split, chain warnings)
+test("P0-UX-01 mobile shows payment conditions card with chain-specific gas and refund warnings before payment", () => {
   const mobileHtml = read("public/mobile.html");
   const mobileJs = read("public/mobile.js");
 
   assert.match(mobileHtml, /id="paymentConditionsCard"/);
-  assert.match(mobileHtml, /MATIC/);
+  assert.match(mobileHtml, /選択されたネットワークのガス代/);
   assert.match(mobileHtml, /分割送金/);
   assert.match(mobileHtml, /返金対応外/);
 
   assert.match(mobileJs, /renderPaymentConditions/);
   assert.match(mobileJs, /paymentConditionsCard/);
   assert.match(mobileJs, /WAITING_STATUSES/);
-  assert.match(mobileJs, /MATIC/);
+  assert.match(mobileJs, /getNativeSymbol/);
+  assert.match(mobileJs, /ETH/);
+  assert.match(mobileJs, /AVAX/);
+  assert.match(mobileJs, /POL/);
 });
 
 // P0-UX-02: Receipt card shown after payment with tx hash and copy button
@@ -114,4 +117,17 @@ test("P0-OPS-05 server chain-monitor/status endpoint returns address_pool_availa
   const endpointBody = statusEndpointMatch[0];
   assert.match(endpointBody, /address_pool_available_count/);
   assert.match(endpointBody, /receive_addresses.*status.*available/);
+});
+
+test("terminal requires an enabled payment chain and displays the frozen invoice chain", () => {
+  const terminalHtml = read("public/terminal.html");
+  const terminalJs = read("public/terminal.js");
+
+  assert.match(terminalHtml, /id="paymentChainSelect"/);
+  assert.match(terminalHtml, /id="paymentChainHint"/);
+  assert.match(terminalHtml, /id="paymentChainText"/);
+  assert.match(terminalHtml, /id="paymentContractText"/);
+  assert.match(terminalJs, /\/api\/v1\/payment-chains/);
+  assert.match(terminalJs, /payment_chain_id: paymentChainId/);
+  assert.match(terminalJs, /paymentChainSelect\.disabled/);
 });

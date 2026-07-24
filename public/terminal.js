@@ -157,6 +157,7 @@ const state = {
   sessionExpiresAt: "",
   sessionExpiryTimer: null,
   supportedWallets: [],
+  paymentChains: [],
   fixedQrUrl: "",
   fixedQrToken: "",
   invoiceId: "",
@@ -242,6 +243,8 @@ const el = {
   opsWarnings: document.getElementById("opsWarnings"),
   amountInput: document.getElementById("amountInput"),
   amountInputError: document.getElementById("amountInputError"),
+  paymentChainSelect: document.getElementById("paymentChainSelect"),
+  paymentChainHint: document.getElementById("paymentChainHint"),
   amountPresetList: document.getElementById("amountPresetList"),
   presetAmountInput: document.getElementById("presetAmountInput"),
   addPresetBtn: document.getElementById("addPresetBtn"),
@@ -254,6 +257,8 @@ const el = {
   invoiceIdText: document.getElementById("invoiceIdText"),
   fixedQrUrlLink: document.getElementById("fixedQrUrlLink"),
   paymentUrlLink: document.getElementById("paymentUrlLink"),
+  paymentChainText: document.getElementById("paymentChainText"),
+  paymentContractText: document.getElementById("paymentContractText"),
   qrCanvas: document.getElementById("qrCanvas"),
   qrAccessibleText: document.getElementById("qrAccessibleText"),
   expiresAtText: document.getElementById("expiresAtText"),
@@ -1514,6 +1519,7 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
   state.invoiceDiagnostics = null;
   state.diagnosticsUpdatedAt = "";
   state.supportedWallets = [];
+  state.paymentChains = [];
   state.fixedQrUrl = "";
   state.fixedQrToken = "";
   state.reviewRows = [];
@@ -1547,6 +1553,7 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
   el.staffPinConfirm.value = "";
   el.staffName.value = "";
   el.amountInput.value = "";
+  renderPaymentChains([]);
   el.sessionIdentityText.textContent = "未ログイン";
   el.sessionRoleText.textContent = "-";
   el.sessionText.textContent = reason;
@@ -1617,7 +1624,9 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
 function syncInvoiceOperationControls() {
   const canCreate = hasPermission("invoice.create");
   const busy = state.invoiceOperationsInFlight.size > 0;
-  if (el.createInvoiceBtn) el.createInvoiceBtn.disabled = !canCreate || busy;
+  const hasPaymentChain = Boolean(el.paymentChainSelect?.value);
+  if (el.createInvoiceBtn) el.createInvoiceBtn.disabled = !canCreate || busy || !hasPaymentChain;
+  if (el.paymentChainSelect) el.paymentChainSelect.disabled = !canCreate || busy || state.paymentChains.length === 0;
   if (el.cancelInvoiceBtn) el.cancelInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
   if (el.expireInvoiceBtn) el.expireInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
   if (el.reissueInvoiceBtn) el.reissueInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
@@ -2033,6 +2042,10 @@ function renderInvoice(invoice) {
     el.paymentUrlLink.textContent = "-";
     el.paymentUrlLink.removeAttribute("href");
   }
+  const chainId = String(invoice?.chain?.chain_id || "");
+  const selectedChain = state.paymentChains.find((chain) => String(chain.chain_id) === chainId);
+  el.paymentChainText.textContent = selectedChain?.network || invoice?.wallet?.network || chainId || "-";
+  el.paymentContractText.textContent = invoice?.chain?.token_contract || selectedChain?.token_contract_display || "-";
   el.expiresAtText.textContent = invoice.expires_at || "-";
   el.amountText.textContent = `${invoice.amounts?.amount_jpyc_display ?? "-"} JPYC`;
   el.paidText.textContent = `${invoice.amounts?.paid_amount_jpyc_display ?? "-"} JPYC`;
@@ -2072,6 +2085,8 @@ function clearInvoiceView() {
   el.invoiceIdText.textContent = "-";
   el.paymentUrlLink.textContent = "-";
   el.paymentUrlLink.removeAttribute("href");
+  el.paymentChainText.textContent = "-";
+  el.paymentContractText.textContent = "-";
   el.expiresAtText.textContent = "-";
   el.amountText.textContent = "-";
   el.paidText.textContent = "-";
@@ -2648,6 +2663,10 @@ async function handleLogin() {
     applyPermissionVisibility();
     renderDiagnostics();
     renderOperatorGuide();
+    if (hasAnyPermission(["invoice.create", "invoice.read"])) {
+      await loadPaymentChains();
+      if (!isSessionGenerationCurrent(authenticatedGeneration)) return;
+    }
     if (data.current_invoice?.invoice_id) {
       await loadInvoice(data.current_invoice.invoice_id, { silent: true });
       if (!isSessionGenerationCurrent(authenticatedGeneration)) return;
@@ -2672,6 +2691,40 @@ async function handleLogin() {
     showToast(String(error.message || error), true);
   } finally {
     el.loginBtn.disabled = Boolean(state.logoutRetryToken);
+  }
+}
+
+function renderPaymentChains(chains = []) {
+  const previous = String(el.paymentChainSelect?.value || "");
+  state.paymentChains = Array.isArray(chains) ? chains : [];
+  if (!el.paymentChainSelect) return;
+  el.paymentChainSelect.replaceChildren();
+  for (const chain of state.paymentChains) {
+    const option = document.createElement("option");
+    option.value = String(chain.chain_id || "");
+    option.textContent = `${chain.short_name || chain.network || chain.chain_id}（Chain ID ${chain.chain_id}）`;
+    el.paymentChainSelect.appendChild(option);
+  }
+  const nextValue = state.paymentChains.some((chain) => String(chain.chain_id) === previous)
+    ? previous
+    : String(state.paymentChains[0]?.chain_id || "");
+  el.paymentChainSelect.value = nextValue;
+  el.paymentChainSelect.disabled = state.paymentChains.length === 0 || !hasPermission("invoice.create");
+  const selected = state.paymentChains.find((chain) => String(chain.chain_id) === nextValue);
+  el.paymentChainHint.textContent = selected
+    ? `${selected.network} / 公式JPYC ${selected.token_contract_display || selected.token_contract}`
+    : "利用可能な支払いチェーンを取得できません。請求作成を停止しています。";
+  syncInvoiceOperationControls();
+}
+
+async function loadPaymentChains() {
+  try {
+    const data = await requestJson("/api/v1/payment-chains");
+    renderPaymentChains(data.payment_chains || []);
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    renderPaymentChains([]);
+    showToast("支払いチェーンを確認できないため請求作成を停止しました", true);
   }
 }
 
@@ -2725,11 +2778,16 @@ async function handleLogout() {
 async function handleCreateInvoice() {
   if (!requireUiPermission("invoice.create", "請求作成")) return;
   const amount = Number(el.amountInput.value);
+  const paymentChainId = String(el.paymentChainSelect?.value || "").trim();
   if (!Number.isInteger(amount) || amount <= 0) {
     el.amountInputError.textContent = "金額は1円以上の整数で入力してください。";
     return;
   }
-  const operation = beginInvoiceOperation("invoice-create", String(amount), { stable: false });
+  if (!paymentChainId) {
+    el.amountInputError.textContent = "支払いチェーンを選択してください。";
+    return;
+  }
+  const operation = beginInvoiceOperation("invoice-create", `${amount}:${paymentChainId}`, { stable: false });
   if (!operation) return;
   el.amountInputError.textContent = "";
   el.createInvoiceBtn.disabled = true;
@@ -2741,7 +2799,7 @@ async function handleCreateInvoice() {
         "content-type": "application/json",
         "idempotency-key": operation.idempotencyKey,
       },
-      body: JSON.stringify({ amount_jpy: amount }),
+      body: JSON.stringify({ amount_jpy: amount, payment_chain_id: paymentChainId }),
     });
     showToast("請求を作成しました");
     await loadInvoice(data.invoice_id);
@@ -3595,6 +3653,7 @@ function bindEvents() {
   });
   el.addPresetBtn.addEventListener("click", handleAddAmountPreset);
   el.resetPresetBtn.addEventListener("click", handleResetAmountPresets);
+  el.paymentChainSelect.addEventListener("change", () => renderPaymentChains(state.paymentChains));
   el.presetAmountInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();

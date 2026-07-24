@@ -272,6 +272,16 @@ test("Settlement Export v1 compatibility and v2 refund integrity", async (t) => 
     assert.equal(primaryRows[0].rail_type, "wallet_direct");
     assert.equal(primaryRows[0].refund_amount_jpyc_base, 300000000);
     assert.equal(primaryRows[0].refund_reference_count, 1);
+    assert.equal(primaryRows[0].chain_id, "137");
+    assert.equal(primaryRows[0].network, "Polygon");
+    assert.equal(primaryRows[0].token_contract.toLowerCase(), env.TOKEN_CONTRACT.toLowerCase());
+    assert.equal(primaryRows[0].settlement_export_run_id, created.data.export_run_id);
+    assert.equal(primaryRows[0].settlement_export_row_id, primaryRows[0].id);
+    assert.equal(primaryRows[0].review_case_id, review.id);
+    assert.equal(primaryRows[0].refund_request_id, refund.data.refund_request_id);
+    assert.equal(primaryRows[0].refund_tx_hash, refundTxHash);
+    assert.ok(primaryRows[0].audit_log_refs.length > 0);
+    assert.ok(primaryRows[0].source_ledger_snapshot_hash);
     const siblingRows = invoiceRows.filter((row) => row.refund_attribution === "invoice_manifest_only");
     assert.equal(siblingRows.length, 1);
     assert.equal(siblingRows[0].refund_amount_jpyc_base, 0);
@@ -286,6 +296,10 @@ test("Settlement Export v1 compatibility and v2 refund integrity", async (t) => 
       .prepare(`SELECT COUNT(DISTINCT created_at) AS count FROM settlement_export_rows WHERE export_run_id = ? AND invoice_id = ?`)
       .get(created.data.export_run_id, invoice.data.invoice_id);
     assert.equal(timestampCount.count, 1);
+    const frozenPayloadCount = db
+      .prepare(`SELECT COUNT(*) AS count FROM settlement_export_rows WHERE export_run_id = ? AND payload_json IS NOT NULL`)
+      .get(created.data.export_run_id);
+    assert.equal(frozenPayloadCount.count, read.data.rows.length);
 
     const firstDownload = await fetch(
       `${started.baseUrl}/api/v1/settlement-exports/${created.data.export_id}/download?format=json`,

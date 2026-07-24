@@ -79,7 +79,7 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
     SERVICE_INGEST_SECRET: "t".repeat(48),
     METRICS_SECRET: "u".repeat(48),
     CHAIN_ID: "137",
-    TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+    TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
     RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
     TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
@@ -117,7 +117,7 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
           "content-type": "application/json",
           "idempotency-key": `sweep-inv-1-${Date.now()}`,
         },
-        body: JSON.stringify({ amount_jpy: 1000 }),
+        body: JSON.stringify({ amount_jpy: 1000, payment_chain_id: "137" }),
       });
       assert.equal(create1.status, 201);
 
@@ -128,7 +128,7 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
           "content-type": "application/json",
           "idempotency-key": `sweep-inv-2-${Date.now()}`,
         },
-        body: JSON.stringify({ amount_jpy: 1200 }),
+        body: JSON.stringify({ amount_jpy: 1200, payment_chain_id: "137" }),
       });
       assert.equal(create2.status, 409);
       assert.equal(create2.data.error.code, "TERMINAL_ACTIVE_INVOICE_EXISTS");

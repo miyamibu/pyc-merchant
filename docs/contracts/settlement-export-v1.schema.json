@@ -6,8 +6,31 @@
   "additionalProperties": false,
   "required": [
     "export_version",
+    "export_reference",
+    "settlement_id",
+    "settlement_export_run_id",
+    "settlement_export_row_id",
     "business_date",
     "invoice_id",
+    "invoice_no",
+    "checkout_session_id",
+    "store_id",
+    "terminal_id",
+    "operator_id",
+    "chain_id",
+    "network",
+    "token_contract",
+    "recipient_address",
+    "payment_attempt_ids",
+    "primary_tx_hash",
+    "primary_tx_log_index",
+    "review_case_id",
+    "review_reason_type",
+    "refund_request_id",
+    "refund_tx_hash",
+    "audit_log_refs",
+    "external_sync_refs",
+    "source_ledger_snapshot_hash",
     "rail_type",
     "provider_code",
     "invoice_status",
@@ -32,10 +55,36 @@
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
     },
+    "export_reference": { "type": "string", "minLength": 1 },
+    "settlement_id": { "type": ["string", "null"] },
+    "settlement_export_run_id": { "type": "string", "minLength": 1 },
+    "settlement_export_row_id": { "type": "string", "minLength": 1 },
     "invoice_id": {
       "type": "string",
       "minLength": 1
     },
+    "invoice_no": { "type": ["string", "null"] },
+    "checkout_session_id": { "type": ["string", "null"] },
+    "store_id": { "type": ["string", "null"] },
+    "terminal_id": { "type": ["string", "null"] },
+    "operator_id": { "type": ["string", "null"] },
+    "chain_id": { "type": "string", "enum": ["1", "43114", "137"] },
+    "network": { "type": "string", "enum": ["Ethereum Mainnet", "Avalanche C-Chain", "Polygon"] },
+    "token_contract": {
+      "type": "string",
+      "pattern": "^0x[Ee]7[Cc]3[Dd]8[Cc]9[Aa]439[Ff][Ee][Dd][Ee]00[Dd]2600032[Dd]5[Dd][Bb]0[Bb][Ee]71[Cc]3[Cc]29$"
+    },
+    "recipient_address": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+    "payment_attempt_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "primary_tx_hash": { "type": ["string", "null"] },
+    "primary_tx_log_index": { "type": ["integer", "null"] },
+    "review_case_id": { "type": ["string", "null"] },
+    "review_reason_type": { "type": ["string", "null"] },
+    "refund_request_id": { "type": ["string", "null"] },
+    "refund_tx_hash": { "type": ["string", "null"] },
+    "audit_log_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "external_sync_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "source_ledger_snapshot_hash": { "type": "string", "minLength": 1 },
     "rail_type": {
       "type": "string",
       "enum": ["wallet_direct", "provider_external"]
@@ -109,5 +158,44 @@
       "type": "integer",
       "enum": [1]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "accounting_status": { "const": "onchain_cash_confirmed" } }, "required": ["accounting_status"] },
+      "then": {
+        "anyOf": [
+          { "properties": { "primary_tx_hash": { "type": "string", "minLength": 1 } }, "required": ["primary_tx_hash"] },
+          { "properties": { "payment_attempt_ids": { "type": "array", "minItems": 1 } }, "required": ["payment_attempt_ids"] }
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "const": "exception_pending" } }, "required": ["accounting_status"] },
+      "then": {
+        "properties": {
+          "review_case_id": { "type": "string", "minLength": 1 },
+          "review_reason_type": { "type": "string", "minLength": 1 }
+        },
+        "required": ["review_case_id", "review_reason_type"]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "const": "refunded_onchain" } }, "required": ["accounting_status"] },
+      "then": {
+        "properties": {
+          "refund_request_id": { "type": "string", "minLength": 1 },
+          "refund_tx_hash": { "type": "string", "minLength": 1 }
+        },
+        "required": ["refund_request_id", "refund_tx_hash"]
+      }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "enum": ["provider_receivable", "provider_settlement_pending", "provider_settled_unallocated"] } }, "required": ["accounting_status"] },
+      "then": { "properties": { "external_sync_refs": { "type": "array", "minItems": 1 } }, "required": ["external_sync_refs"] }
+    },
+    {
+      "if": { "properties": { "accounting_status": { "enum": ["onchain_cash_confirmed", "exception_pending", "refunded_onchain", "provider_receivable", "provider_settlement_pending", "provider_settled_unallocated", "provider_refunded", "voided"] } }, "required": ["accounting_status"] },
+      "then": { "properties": { "audit_log_refs": { "type": "array", "minItems": 1 } }, "required": ["audit_log_refs"] }
+    }
+  ]
 }

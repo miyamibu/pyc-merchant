@@ -46,6 +46,10 @@ Define a stable accounting interface and frozen accounting snapshot for daily cl
 - `disputed`
 
 ## Snapshot rules
+- The machine-readable v1 row requires 40 fields. Optional business events are represented by nullable values or empty arrays, not by removing the field.
+- Every row preserves `export_reference`, settlement/export identities, invoice/checkout identities, store/terminal/operator identities, chain/token/recipient identities, payment attempt and primary transfer evidence, review/refund evidence, audit refs, external sync refs, and a source-ledger snapshot hash.
+- `chain_id` is limited to Ethereum `1`, Avalanche C-Chain `43114`, and Polygon `137`, using the official funds-transfer JPYC contract `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29`.
+- New export creation uses v2. Legacy v1 snapshot bytes remain immutable and are never synthesized again from the current ledger.
 - `GET` endpoints must not create settlement exports, export runs, export rows, audit entries, files, or other accounting side effects.
 - `POST /api/v1/settlements/daily:close` creates the daily close settlement export snapshot as part of the close operation.
 - `POST /api/v1/settlement-exports` creates an on-demand immutable settlement export snapshot and requires `Idempotency-Key`; same key and same payload must return the same response, while same key and different payload must conflict.

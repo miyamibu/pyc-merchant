@@ -42,8 +42,8 @@ test("validate-production-config passes for production-safe env with skip-rpc", 
       PAY_BASE_URL: "https://terminal.example.com",
       CORS_ALLOW_ORIGINS: "https://terminal.example.com",
       CHAIN_ID: "137",
-      TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
-      APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+      TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
+      APPROVED_JPYC_TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
       TOKEN_DECIMALS: "18",
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
       WALLET_DEEPLINK_TEMPLATE: "wallet://open?uri={{payment_uri_encoded}}",
@@ -52,7 +52,7 @@ test("validate-production-config passes for production-safe env with skip-rpc", 
   assert.equal(result.code, 0, result.stdout || result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, true);
-  assert.ok(payload.checks.some((row) => row.name === "chain_id_polygon" && row.ok === true));
+  assert.ok(payload.checks.some((row) => row.name === "payment_chain_enabled" && row.ok === true));
 });
 
 test("validate-production-config fails on chain drift", async () => {
@@ -67,9 +67,9 @@ test("validate-production-config fails on chain drift", async () => {
       APP_HOST: "https://terminal.example.com",
       PUBLIC_BASE_URL: "https://terminal.example.com",
       PAY_BASE_URL: "https://terminal.example.com",
-      CHAIN_ID: "1",
-      TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
-      APPROVED_JPYC_TOKEN_CONTRACT: "0x1111111111111111111111111111111111111111",
+      CHAIN_ID: "10",
+      TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
+      APPROVED_JPYC_TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
       TOKEN_DECIMALS: "18",
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
     }
@@ -77,7 +77,7 @@ test("validate-production-config fails on chain drift", async () => {
   assert.notEqual(result.code, 0);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, false);
-  assert.match(JSON.stringify(payload), /CHAIN_ID must be 137/);
+  assert.match(JSON.stringify(payload), /CHAIN_ID must be an enabled JPYC chain/);
 });
 
 test("validate-evidence-sanitization rejects leaked bearer token", async () => {

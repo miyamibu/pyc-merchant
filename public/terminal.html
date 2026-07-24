@@ -90,8 +90,15 @@
             請求金額（円）
             <input id="amountInput" type="number" min="1" step="1" value="1000" aria-describedby="amountInputError" />
           </label>
+          <label class="field-w-180" for="paymentChainSelect">
+            支払いチェーン
+            <select id="paymentChainSelect" aria-describedby="paymentChainHint" disabled>
+              <option value="">ログイン後に取得</option>
+            </select>
+          </label>
           <button id="createInvoiceBtn" class="btn btn-primary btn-main-action" data-permission="invoice.create">請求を作成</button>
         </div>
+        <p id="paymentChainHint" class="helper-text">店舗で有効化された公式JPYCチェーンだけを表示します。</p>
         <details id="invoiceDangerActions" class="details danger-actions" data-permission="invoice.create">
           <summary>会計をやり直す</summary>
           <div class="details-content">
@@ -128,6 +135,8 @@
             <p class="small">請求ID: <span id="invoiceIdText" class="mono">-</span></p>
             <p class="small">端末入口QR URL: <a id="fixedQrUrlLink" class="mono" target="_blank" rel="noopener noreferrer">-</a></p>
             <p class="small">この会計の支払いURL: <a id="paymentUrlLink" class="mono" target="_blank" rel="noopener noreferrer">-</a></p>
+            <p class="small">支払いチェーン: <span id="paymentChainText">-</span></p>
+            <p class="small">JPYCコントラクト: <span id="paymentContractText" class="mono address-text">-</span></p>
             <p class="small">有効期限: <span id="expiresAtText" class="mono nowrap">-</span></p>
             <div id="amountComparePanel" class="amount-compare" aria-label="請求額と受取額">
               <div>

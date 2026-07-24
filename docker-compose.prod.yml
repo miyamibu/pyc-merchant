@@ -23,6 +23,38 @@ services:
     env_file:
       - .env.production
     command: ["node", "src/chain-monitor.mjs"]
+    environment:
+      CHAIN_ID: "137"
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./runtime:/app/runtime
+    depends_on:
+      app:
+        condition: service_started
+
+  worker-ethereum:
+    image: jpyc-terminal-production:local
+    env_file:
+      - .env.production
+    command: ["node", "src/chain-monitor.mjs"]
+    environment:
+      CHAIN_ID: "1"
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./runtime:/app/runtime
+    depends_on:
+      app:
+        condition: service_started
+
+  worker-avalanche:
+    image: jpyc-terminal-production:local
+    env_file:
+      - .env.production
+    command: ["node", "src/chain-monitor.mjs"]
+    environment:
+      CHAIN_ID: "43114"
     restart: unless-stopped
     working_dir: /app
     volumes:

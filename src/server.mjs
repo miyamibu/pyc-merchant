@@ -57,6 +57,19 @@ import {
   unavailablePolicyPublication,
   validatePolicyVersionSubmission,
 } from "./policy-publication.mjs";
+import {
+  JPYC_CONTRACT_REFERENCE,
+  JPYC_PREPAID_DENYLIST_CONTRACTS,
+  OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
+  getSupportedPaymentChain,
+  listEnabledPaymentChains,
+  networkLabelForChainId,
+  normalizeJpycPolicyAddress,
+  parseEnabledPaymentChainIds,
+  paymentChainForInvoiceRequest,
+  publicPaymentChain,
+  validateOfficialJpycContract,
+} from "./jpyc-contract-policy.mjs";
 import { validateCommercialEvidence } from "../scripts/production-validation/validate-commercial-evidence.mjs";
 
 const CWD = process.cwd();
@@ -72,6 +85,7 @@ const DEFAULTS = {
   APP_SECRET: "__REPLACE_WITH_LONG_RANDOM_SECRET__",
   DB_PATH: "./data/app.db",
   CHAIN_ID: "137",
+  ENABLED_PAYMENT_CHAIN_IDS: "137",
   TOKEN_DECIMALS: "18",
   TOKEN_SYMBOL: "JPYC",
   TERMINAL_CODE: "TERM-001",
@@ -147,6 +161,9 @@ const DEFAULTS = {
   PRIVACY_POLICY_APPROVED: "false",
   AML_HIGH_VALUE_THRESHOLD_JPY: "300000",
   RPC_URLS: "",
+  RPC_URLS_1: "",
+  RPC_URLS_43114: "",
+  RPC_URLS_137: "",
   MONITOR_BACKSCAN_BLOCKS: "12",
   MIN_MONITOR_BACKSCAN_BLOCKS: "12",
 };
@@ -227,6 +244,9 @@ const APP_BIND_HOST = String(ENV.APP_BIND_HOST || DEFAULTS.APP_BIND_HOST || "").
 const APP_SECRET = ENV.APP_SECRET || DEFAULTS.APP_SECRET;
 const DB_PATH = path.resolve(CWD, ENV.DB_PATH || DEFAULTS.DB_PATH);
 const CHAIN_ID = String(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID).trim();
+const ENABLED_PAYMENT_CHAIN_IDS = parseEnabledPaymentChainIds(
+  ENV.ENABLED_PAYMENT_CHAIN_IDS || DEFAULTS.ENABLED_PAYMENT_CHAIN_IDS
+);
 const TOKEN_DECIMALS = Number(ENV.TOKEN_DECIMALS || DEFAULTS.TOKEN_DECIMALS);
 const TOKEN_SYMBOL = String(ENV.TOKEN_SYMBOL || DEFAULTS.TOKEN_SYMBOL || "JPYC").trim() || "JPYC";
 const TERMINAL_CODE = ENV.TERMINAL_CODE || DEFAULTS.TERMINAL_CODE;
@@ -336,7 +356,9 @@ const RPC_URLS = String(ENV.RPC_URLS || DEFAULTS.RPC_URLS)
   .filter(Boolean);
 const MONITOR_BACKSCAN_BLOCKS = Number(ENV.MONITOR_BACKSCAN_BLOCKS || DEFAULTS.MONITOR_BACKSCAN_BLOCKS);
 const MIN_MONITOR_BACKSCAN_BLOCKS = Number(ENV.MIN_MONITOR_BACKSCAN_BLOCKS || DEFAULTS.MIN_MONITOR_BACKSCAN_BLOCKS);
-const APPROVED_TOKEN_CONTRACT = APPROVED_JPYC_TOKEN_CONTRACT || String(TOKEN_CONTRACT || "").toLowerCase();
+const TOKEN_CONTRACT_NORMALIZED = normalizeJpycPolicyAddress(TOKEN_CONTRACT);
+const APPROVED_JPYC_TOKEN_CONTRACT_NORMALIZED = normalizeJpycPolicyAddress(APPROVED_JPYC_TOKEN_CONTRACT);
+const APPROVED_TOKEN_CONTRACT = OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER;
 const { toBaseUnits, decidePaymentStatus } = makePaymentLogic({
   jpycBaseUnitScale: JPYC_BASE_UNIT_SCALE,
   requiredConfirmations: REQUIRED_CONFIRMATIONS,
@@ -414,8 +436,9 @@ function assertApprovedRef(name, value) {
   }
 }
 
-if (!isEvmAddress(TOKEN_CONTRACT)) {
-  console.error("FATAL: TOKEN_CONTRACT must be an explicit 0x-prefixed 40-hex EVM address.");
+const tokenContractValidation = validateOfficialJpycContract(TOKEN_CONTRACT, "TOKEN_CONTRACT");
+if (!tokenContractValidation.ok) {
+  console.error(`FATAL: ${tokenContractValidation.code}: ${tokenContractValidation.message}`);
   process.exit(1);
 }
 if (RECIPIENT_ADDRESS && !isEvmAddress(RECIPIENT_ADDRESS)) {
@@ -553,15 +576,19 @@ if (IS_PRODUCTION) {
     console.error("FATAL: MONITOR_BACKSCAN_BLOCKS is below the approved production minimum.");
     process.exit(1);
   }
-  if (CHAIN_ID !== "137") {
-    console.error("FATAL: CHAIN_ID must be 137 in production.");
+  if (!ENABLED_PAYMENT_CHAIN_IDS.includes(CHAIN_ID)) {
+    console.error("FATAL: CHAIN_ID must be included in ENABLED_PAYMENT_CHAIN_IDS.");
     process.exit(1);
   }
-  if (!APPROVED_JPYC_TOKEN_CONTRACT || !isEvmAddress(APPROVED_JPYC_TOKEN_CONTRACT)) {
-    console.error("FATAL: APPROVED_JPYC_TOKEN_CONTRACT must be configured in production.");
+  const approvedContractValidation = validateOfficialJpycContract(
+    APPROVED_JPYC_TOKEN_CONTRACT,
+    "APPROVED_JPYC_TOKEN_CONTRACT"
+  );
+  if (!approvedContractValidation.ok) {
+    console.error(`FATAL: ${approvedContractValidation.code}: ${approvedContractValidation.message}`);
     process.exit(1);
   }
-  if (String(TOKEN_CONTRACT).toLowerCase() !== APPROVED_JPYC_TOKEN_CONTRACT) {
+  if (TOKEN_CONTRACT_NORMALIZED !== APPROVED_JPYC_TOKEN_CONTRACT_NORMALIZED) {
     console.error("FATAL: TOKEN_CONTRACT must match APPROVED_JPYC_TOKEN_CONTRACT in production.");
     process.exit(1);
   }
@@ -1236,6 +1263,7 @@ addColumnIfMissing("settlements", "event_id", "event_id TEXT");
 addColumnIfMissing("settlements", "booth_id", "booth_id TEXT");
 addColumnIfMissing("settlements", "unresolved_review_policy", "unresolved_review_policy TEXT");
 addColumnIfMissing("settlements", "unresolved_review_note", "unresolved_review_note TEXT");
+addColumnIfMissing("settlement_export_rows", "payload_json", "payload_json TEXT");
 addColumnIfMissing("audit_logs", "prev_hash", "prev_hash TEXT");
 addColumnIfMissing("audit_logs", "entry_hash", "entry_hash TEXT");
 addColumnIfMissing("terminal_sessions", "ended_reason", "ended_reason TEXT");
@@ -1261,6 +1289,44 @@ addColumnIfMissing("review_cases", "diff_jpyc_base", "diff_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "suggested_action", "suggested_action TEXT");
 addColumnIfMissing("review_cases", "refundable_candidate_jpyc_base", "refundable_candidate_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "admin_note", "admin_note TEXT");
+
+function assertNoDeniedJpycContractsInDb() {
+  const denylist = JPYC_PREPAID_DENYLIST_CONTRACTS;
+  if (denylist.length === 0) return;
+  const placeholders = denylist.map(() => "?").join(",");
+  const directChecks = [
+    { table: "stores", sql: `SELECT id FROM stores WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
+    { table: "invoices", sql: `SELECT id FROM invoices WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
+    { table: "receive_addresses", sql: `SELECT id FROM receive_addresses WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
+    { table: "payment_events", sql: `SELECT id FROM payment_events WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
+    { table: "chain_unmatched_events", sql: `SELECT id FROM chain_unmatched_events WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
+    { table: "refund_requests", sql: `SELECT id FROM refund_requests WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
+  ];
+  for (const check of directChecks) {
+    const row = db.prepare(check.sql).get(...denylist);
+    if (row) {
+      console.error(`FATAL: denylisted JPYC Prepaid contract found in ${check.table}: ${row.id || "unknown"}`);
+      process.exit(1);
+    }
+  }
+  const payloadChecks = [
+    { table: "payment_attempts", sql: "SELECT id FROM payment_attempts WHERE lower(payload_json) LIKE ? LIMIT 1" },
+    { table: "chain_dead_letters", sql: "SELECT id FROM chain_dead_letters WHERE lower(payload_json) LIKE ? LIMIT 1" },
+    { table: "suspicious_activity_logs", sql: "SELECT id FROM suspicious_activity_logs WHERE lower(payload_json) LIKE ? LIMIT 1" },
+    { table: "settlement_export_rows", sql: "SELECT id FROM settlement_export_rows WHERE lower(payload_json) LIKE ? LIMIT 1" },
+  ];
+  for (const denied of denylist) {
+    for (const check of payloadChecks) {
+      const row = db.prepare(check.sql).get(`%${denied}%`);
+      if (row) {
+        console.error(`FATAL: denylisted JPYC Prepaid contract found in ${check.table} payload: ${row.id || "unknown"}`);
+        process.exit(1);
+      }
+    }
+  }
+}
+
+assertNoDeniedJpycContractsInDb();
 addColumnIfMissing("review_cases", "action_history_json", "action_history_json TEXT");
 addColumnIfMissing("review_cases", "resolution_status", "resolution_status TEXT");
 addColumnIfMissing("review_cases", "audit_ref", "audit_ref TEXT");
@@ -1666,9 +1732,7 @@ function toDisplayJpyc(baseUnits) {
 }
 
 function getNetworkLabel(chainId) {
-  const normalized = String(chainId ?? "").trim();
-  if (normalized === "137") return "Polygon";
-  return normalized || "Unknown";
+  return networkLabelForChainId(chainId);
 }
 
 function computeInvoiceExpectedAmountAtomic(invoice) {
@@ -2196,6 +2260,10 @@ const SETTLEMENT_EXPORT_V1_SNAPSHOT_HEADERS = [
 ];
 
 const SETTLEMENT_EXPORT_V2_SNAPSHOT_HEADERS = [
+  "export_reference",
+  "settlement_id",
+  "settlement_export_run_id",
+  "settlement_export_row_id",
   "export_run_id",
   "export_version",
   "business_date",
@@ -2203,10 +2271,26 @@ const SETTLEMENT_EXPORT_V2_SNAPSHOT_HEADERS = [
   "terminal_id",
   "operator_id",
   "invoice_id",
+  "invoice_no",
   "checkout_session_id",
   "payment_session_id",
   "rail_type",
   "provider_code",
+  "chain_id",
+  "network",
+  "token_contract",
+  "recipient_address",
+  "payment_attempt_ids_json",
+  "primary_tx_hash",
+  "primary_tx_log_index",
+  "review_case_id",
+  "review_reason_type",
+  "review_status",
+  "refund_request_id",
+  "refund_tx_hash",
+  "audit_log_refs_json",
+  "external_sync_refs_json",
+  "source_ledger_snapshot_hash",
   "invoice_amount_jpyc_base",
   "invoice_status",
   "accounting_status",
@@ -2250,6 +2334,10 @@ function buildSettlementExportV2SnapshotCsv(rows, { bom = false } = {}) {
         if (header === "refund_references_json") {
           return escapeCsvCell(JSON.stringify(Array.isArray(row.refund_references) ? row.refund_references : []));
         }
+        if (header.endsWith("_json")) {
+          const field = header.slice(0, -5);
+          return escapeCsvCell(JSON.stringify(Array.isArray(row[field]) ? row[field] : []));
+        }
         return escapeCsvCell(row[header]);
       }).join(",")
     );
@@ -2284,6 +2372,10 @@ const SETTLEMENT_EXPORT_V2_REFUND_ANNOTATION_FIELDS = [
 ];
 const SETTLEMENT_EXPORT_V2_CANONICAL_JSON_ROW_FIELDS = [
   "id",
+  "export_reference",
+  "settlement_id",
+  "settlement_export_run_id",
+  "settlement_export_row_id",
   "export_run_id",
   "export_version",
   "business_date",
@@ -2291,10 +2383,26 @@ const SETTLEMENT_EXPORT_V2_CANONICAL_JSON_ROW_FIELDS = [
   "terminal_id",
   "operator_id",
   "invoice_id",
+  "invoice_no",
   "checkout_session_id",
   "payment_session_id",
   "rail_type",
   "provider_code",
+  "chain_id",
+  "network",
+  "token_contract",
+  "recipient_address",
+  "payment_attempt_ids",
+  "primary_tx_hash",
+  "primary_tx_log_index",
+  "review_case_id",
+  "review_reason_type",
+  "review_status",
+  "refund_request_id",
+  "refund_tx_hash",
+  "audit_log_refs",
+  "external_sync_refs",
+  "source_ledger_snapshot_hash",
   "invoice_amount_jpyc_base",
   "invoice_status",
   "accounting_status",
@@ -2412,8 +2520,19 @@ function compareSettlementExportV2Rows(left, right) {
 
 function loadSettlementExportRows(exportRunId, contractVersion) {
   if (!exportRunId) return [];
+  const restoreFrozenPayload = (row) => {
+    if (!row?.payload_json) return row;
+    try {
+      const payload = JSON.parse(row.payload_json);
+      return payload && typeof payload === "object" ? payload : row;
+    } catch {
+      const error = new Error(`Settlement export row payload is invalid for ${row.id}`);
+      error.code = "SETTLEMENT_EXPORT_INTEGRITY_ERROR";
+      throw error;
+    }
+  };
   if (contractVersion === SETTLEMENT_EXPORT_CONTRACT_V1) {
-    return db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId);
+    return db.prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? ORDER BY created_at ASC`).all(exportRunId).map(restoreFrozenPayload);
   }
   if (contractVersion === SETTLEMENT_EXPORT_CONTRACT_V2) {
     return db
@@ -2426,7 +2545,8 @@ function loadSettlementExportRows(exportRunId, contractVersion) {
                   provider_code ASC,
                   id ASC`
       )
-      .all(exportRunId);
+      .all(exportRunId)
+      .map(restoreFrozenPayload);
   }
   return [];
 }
@@ -2471,7 +2591,7 @@ function findForbiddenInvoiceField(payload) {
   return null;
 }
 
-function countRecipientActiveInvoices(storeId, recipientAddress) {
+function countRecipientActiveInvoices(storeId, recipientAddress, chainId, tokenContract) {
   const row = db
     .prepare(
       `SELECT COUNT(*) AS count
@@ -2479,12 +2599,14 @@ function countRecipientActiveInvoices(storeId, recipientAddress) {
        LEFT JOIN review_cases r ON r.invoice_id = i.id
        WHERE i.store_id = ?
          AND lower(i.recipient_address) = lower(?)
+         AND i.chain_id = ?
+         AND lower(i.token_contract) = lower(?)
          AND (
            i.status IN ('issued', 'payment_detected', 'confirming')
            OR (i.status = 'review_required' AND COALESCE(r.status, 'open') IN ('open', 'in_progress'))
          )`
     )
-    .get(storeId, recipientAddress);
+    .get(storeId, recipientAddress, String(chainId), String(tokenContract || ""));
   return Number(row?.count || 0);
 }
 
@@ -2508,6 +2630,7 @@ function issueInvoiceRecord({
   store,
   session,
   amountJpy,
+  paymentChain,
   checkoutSessionId = null,
   reissuedFromInvoiceId = null,
   reissueRootInvoiceId = null,
@@ -2540,10 +2663,16 @@ function issueInvoiceRecord({
     const ts = nowIso();
     const ttl = Number(store.invoice_ttl_sec || 300);
     const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
-    const chainId = String(store.chain_id || CHAIN_ID);
-    const tokenContract = String(store.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT).toLowerCase();
-    const poolConfigured = hasConfiguredReceiveAddressPool(session.store_id);
-    const allocatedAddress = poolConfigured ? allocateReceiveAddress({ storeId: session.store_id, invoiceId: id }) : null;
+    const selectedChain = paymentChain || getSupportedPaymentChain(store.chain_id) || getSupportedPaymentChain(CHAIN_ID);
+    if (!selectedChain) {
+      return { error: { code: "UNSUPPORTED_PAYMENT_CHAIN", message: "unsupported payment chain" } };
+    }
+    const chainId = String(selectedChain.chain_id);
+    const tokenContract = String(selectedChain.token_contract).toLowerCase();
+    const poolConfigured = hasConfiguredReceiveAddressPool(session.store_id, chainId);
+    const allocatedAddress = poolConfigured
+      ? allocateReceiveAddress({ storeId: session.store_id, invoiceId: id, chainId })
+      : null;
     const recipient = allocatedAddress?.address || (!poolConfigured && !IS_PRODUCTION ? String(RECIPIENT_ADDRESS || "") : "");
 
     if (!recipient) {
@@ -2555,7 +2684,12 @@ function issueInvoiceRecord({
       };
     }
 
-    const activeRecipientInvoiceCount = countRecipientActiveInvoices(session.store_id, recipient);
+    const activeRecipientInvoiceCount = countRecipientActiveInvoices(
+      session.store_id,
+      recipient,
+      chainId,
+      tokenContract
+    );
     if (activeRecipientInvoiceCount >= MAX_ACTIVE_INVOICES_PER_RECIPIENT) {
       return {
         error: {
@@ -3731,24 +3865,44 @@ function logCorrelationEvent(type, invoice, extra = {}) {
   );
 }
 
-const CHAIN_ID_NUMERIC = Number(CHAIN_ID);
 const transferInterface = new Interface(["event Transfer(address indexed from, address indexed to, uint256 value)"]);
-const rpcProviders = RPC_URLS.map((rawUrl) => {
-  try {
-    const parsed = new URL(rawUrl);
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      throw new Error(`unsupported protocol: ${parsed.protocol}`);
-    }
-    return new JsonRpcProvider(
-      parsed.toString(),
-      Number.isFinite(CHAIN_ID_NUMERIC) ? CHAIN_ID_NUMERIC : undefined,
+
+function parseRpcUrls(value, label) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((rawUrl) => {
+      try {
+        const parsed = new URL(rawUrl);
+        if (!["http:", "https:"].includes(parsed.protocol)) throw new Error(`unsupported protocol: ${parsed.protocol}`);
+        return parsed.toString();
+      } catch (error) {
+        console.error(`FATAL: ${label} contains invalid URL "${rawUrl}": ${String(error.message || error)}`);
+        process.exit(1);
+      }
+    });
+}
+
+function rpcUrlsForChain(chainId) {
+  const chainSpecific = parseRpcUrls(ENV[`RPC_URLS_${chainId}`], `RPC_URLS_${chainId}`);
+  if (chainSpecific.length > 0) return chainSpecific;
+  return String(chainId) === String(CHAIN_ID) ? parseRpcUrls(RPC_URLS.join(","), "RPC_URLS") : [];
+}
+
+const rpcProvidersByChain = new Map(
+  listEnabledPaymentChains(ENABLED_PAYMENT_CHAIN_IDS).map((chain) => {
+    const chainId = String(chain.chain_id);
+    const numericChainId = Number(chainId);
+    const providers = rpcUrlsForChain(chainId).map((url) => new JsonRpcProvider(
+      url,
+      Number.isFinite(numericChainId) ? numericChainId : undefined,
       { staticNetwork: true }
-    );
-  } catch (error) {
-    console.error(`FATAL: RPC_URLS contains invalid URL "${rawUrl}": ${String(error.message || error)}`);
-    process.exit(1);
-  }
-});
+    ));
+    return [chainId, providers];
+  })
+);
+const rpcProviders = rpcProvidersByChain.get(String(CHAIN_ID)) || [];
 
 function normalizeAddress(value) {
   if (!isEvmAddress(value)) return null;
@@ -3765,18 +3919,23 @@ function looksLikePrivateKeyMaterial(value) {
   return false;
 }
 
-function getReceiveAddressPoolPolicy(storeId) {
+function getReceiveAddressPoolPolicy(storeId, chainId = CHAIN_ID) {
   const store = db.prepare(`SELECT merchant_id FROM stores WHERE id = ?`).get(storeId);
+  const chain = getSupportedPaymentChain(chainId);
+  if (!chain) {
+    return { error: { code: "UNSUPPORTED_PAYMENT_CHAIN", message: "unsupported payment chain" } };
+  }
   return {
     merchantId: store?.merchant_id || "merchant-001",
     storeId,
-    network: CHAIN_ID,
-    tokenContract: APPROVED_TOKEN_CONTRACT,
+    network: chain.chain_id,
+    tokenContract: chain.token_contract,
   };
 }
 
-function listReceiveAddresses(storeId) {
-  const policy = getReceiveAddressPoolPolicy(storeId);
+function listReceiveAddresses(storeId, chainId = CHAIN_ID) {
+  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
+  if (policy.error) return [];
   return db
     .prepare(
       `SELECT *
@@ -3789,8 +3948,9 @@ function listReceiveAddresses(storeId) {
     .all(policy.storeId, policy.network, policy.tokenContract);
 }
 
-function hasConfiguredReceiveAddressPool(storeId) {
-  const policy = getReceiveAddressPoolPolicy(storeId);
+function hasConfiguredReceiveAddressPool(storeId, chainId = CHAIN_ID) {
+  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
+  if (policy.error) return false;
   const row = db
     .prepare(
       `SELECT COUNT(*) AS count
@@ -3803,8 +3963,9 @@ function hasConfiguredReceiveAddressPool(storeId) {
   return Number(row?.count || 0) > 0;
 }
 
-function allocateReceiveAddress({ storeId, invoiceId }) {
-  const policy = getReceiveAddressPoolPolicy(storeId);
+function allocateReceiveAddress({ storeId, invoiceId, chainId = CHAIN_ID }) {
+  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
+  if (policy.error) return null;
   const ts = nowIso();
   const allocate = db.transaction(() => {
     const selected = db
@@ -3846,7 +4007,7 @@ function allocateReceiveAddress({ storeId, invoiceId }) {
   return null;
 }
 
-function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, requestId, idempotencyKey, ip }) {
+function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chainId, requestId, idempotencyKey, ip }) {
   const normalizedEntries = [];
   const seen = new Set();
   for (const entry of addresses) {
@@ -3868,7 +4029,8 @@ function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, requ
     return { error: { code: "VALIDATION_ERROR", message: "at least one receive address is required" } };
   }
 
-  const policy = getReceiveAddressPoolPolicy(storeId);
+  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
+  if (policy.error) return { error: policy.error };
   const imported = [];
   try {
     db.transaction(() => {
@@ -3963,12 +4125,13 @@ function disableReceiveAddress({ storeId, receiveAddressId, actorId, reason, req
   return { row: after };
 }
 
-async function withRpcProvider(label, fn) {
-  if (rpcProviders.length === 0) {
+async function withRpcProvider(label, fn, chainId = CHAIN_ID) {
+  const providers = rpcProvidersByChain.get(String(chainId)) || [];
+  if (providers.length === 0) {
     throw new Error("rpc_unavailable");
   }
   let lastError = null;
-  for (const provider of rpcProviders) {
+  for (const provider of providers) {
     try {
       return await fn(provider);
     } catch (error) {
@@ -4011,6 +4174,7 @@ function getReceiptTransferLogs(receipt, tokenContract) {
 
 async function verifyTransferOnChain({
   txHash,
+  chainId = CHAIN_ID,
   expectedTokenContract = APPROVED_TOKEN_CONTRACT,
   expectedToAddress = null,
   expectedFromAddress = null,
@@ -4024,7 +4188,7 @@ async function verifyTransferOnChain({
   return withRpcProvider("verify_transfer", async (provider) => {
     const rpcChainIdHex = String(await provider.send("eth_chainId", []));
     const rpcChainId = rpcChainIdHex.startsWith("0x") ? BigInt(rpcChainIdHex).toString() : rpcChainIdHex;
-    if (String(rpcChainId) !== String(CHAIN_ID)) {
+    if (String(rpcChainId) !== String(chainId)) {
       return { ok: false, code: "WRONG_CHAIN", message: "RPC chain does not match configured chain" };
     }
 
@@ -4089,7 +4253,7 @@ async function verifyTransferOnChain({
       receipt,
       transfer: amountMatches[0] || fromMatches[0] || toMatches[0] || transferLogs[0],
     };
-  });
+  }, chainId);
 }
 
 function createSseToken({ invoiceId, terminalId, storeId, sessionId, expiresAtIso }) {
@@ -5479,6 +5643,40 @@ function hasCleanProviderAllocation(providerAllocation, invoiceId) {
   return String(providerAllocation.invoice_id || "") === String(invoiceId || "");
 }
 
+function settlementPaymentAttemptIds(invoiceId) {
+  return db
+    .prepare(`SELECT id FROM payment_attempts WHERE invoice_id = ? ORDER BY created_at ASC, id ASC`)
+    .all(invoiceId)
+    .map((row) => row.id);
+}
+
+function settlementAuditRefs(invoiceId, relatedIds = []) {
+  const targetIds = [...new Set([invoiceId, ...relatedIds].filter(Boolean))];
+  if (targetIds.length === 0) return [];
+  return db
+    .prepare(
+      `SELECT id FROM audit_logs
+       WHERE target_id IN (${targetIds.map(() => "?").join(",")})
+       ORDER BY created_at ASC, id ASC
+       LIMIT 100`
+    )
+    .all(...targetIds)
+    .map((row) => row.id);
+}
+
+function settlementPrimaryPaymentEvent(invoice) {
+  if (!invoice?.paid_tx_hash) return null;
+  return db
+    .prepare(
+      `SELECT log_index, block_timestamp, detected_at
+       FROM payment_events
+       WHERE invoice_id = ? AND tx_hash = ?
+       ORDER BY created_at ASC, id ASC
+       LIMIT 1`
+    )
+    .get(invoice.id, invoice.paid_tx_hash) || null;
+}
+
 function buildSettlementExportRow({
   invoice,
   paymentSession,
@@ -5558,6 +5756,13 @@ function buildSettlementExportRow({
   const providerPaymentRef = providerSession?.provider_payment_id || providerSession?.provider_session_id || null;
   const providerSettlementRef = providerAllocation?.external_provider_settlement_id || providerAllocation?.batch_reference || null;
   const onchainTransferRef = invoice.paid_tx_hash || null;
+  const paymentAttemptIds = settlementPaymentAttemptIds(invoice.id);
+  const primaryEvent = settlementPrimaryPaymentEvent(invoice);
+  const primaryRefund = refundSummary.refund_references.find((refund) =>
+    ["succeeded", "verified"].includes(String(refund.status)) && refund.refund_tx_hash
+  ) || refundSummary.refund_references[0] || null;
+  const auditLogRefs = settlementAuditRefs(invoice.id, [exportRunId, review?.id, primaryRefund?.refund_id]);
+  const externalSyncRefs = [...new Set([providerPaymentRef, providerSettlementRef].filter(Boolean))];
   const evidenceHash = hashProviderEvidence({
     invoice_id: invoice.id,
     payment_session_id: paymentSession?.id || null,
@@ -5571,8 +5776,13 @@ function buildSettlementExportRow({
     accounting_status: accountingStatus,
   });
 
+  const rowId = uuid();
   return {
-    id: uuid(),
+    id: rowId,
+    export_reference: `settlement-export-run:${exportRunId}`,
+    settlement_id: invoice.settlement_id || null,
+    settlement_export_run_id: exportRunId,
+    settlement_export_row_id: rowId,
     export_run_id: exportRunId,
     export_version: "v2",
     business_date: businessDate,
@@ -5580,10 +5790,25 @@ function buildSettlementExportRow({
     terminal_id: invoice.terminal_id || null,
     operator_id: invoice.operator_id || invoice.staff_user_id || null,
     invoice_id: invoice.id,
+    invoice_no: invoice.invoice_no || null,
     checkout_session_id: invoice.checkout_session_id || null,
     payment_session_id: paymentSession?.id || null,
     rail_type: paymentSession?.rail_type || PAYMENT_RAIL_TYPES.WALLET_DIRECT,
     provider_code: paymentSession?.provider_code || PROVIDER_CODES.SELF_WALLET,
+    chain_id: String(invoice.chain_id || ""),
+    network: getNetworkLabel(invoice.chain_id),
+    token_contract: invoice.token_contract || null,
+    recipient_address: invoice.recipient_address || null,
+    payment_attempt_ids: paymentAttemptIds,
+    primary_tx_hash: invoice.paid_tx_hash || null,
+    primary_tx_log_index: primaryEvent?.log_index ?? null,
+    review_case_id: review?.id || null,
+    review_reason_type: review?.reason_type || null,
+    review_status: review?.status || null,
+    refund_request_id: primaryRefund?.refund_id || null,
+    refund_tx_hash: primaryRefund?.refund_tx_hash || null,
+    audit_log_refs: auditLogRefs,
+    external_sync_refs: externalSyncRefs,
     invoice_amount_jpyc_base: invoiceAmountBase,
     invoice_status: String(invoice.status),
     accounting_status: accountingStatus,
@@ -5599,6 +5824,7 @@ function buildSettlementExportRow({
     provider_payment_ref: providerPaymentRef,
     provider_settlement_ref: providerSettlementRef,
     onchain_transfer_ref: onchainTransferRef,
+    source_ledger_snapshot_hash: evidenceHash,
     evidence_hash: evidenceHash,
     payload_schema_version: SETTLEMENT_EXPORT_CONTRACT_V2,
     export_excluded_private_data: 1,
@@ -5708,8 +5934,8 @@ function createSettlementExportSnapshot({
         payment_session_id, rail_type, provider_code, invoice_amount_jpyc_base, invoice_status, accounting_status,
         cash_recognition_status, receivable_status, onchain_cash_amount_jpyc_base, provider_receivable_amount_jpyc_base,
         exception_amount_jpyc_base, refund_amount_jpyc_base, void_amount_jpyc_base, provider_payment_ref, provider_settlement_ref,
-        onchain_transfer_ref, evidence_hash, payload_schema_version, export_excluded_private_data, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        onchain_transfer_ref, evidence_hash, payload_json, payload_schema_version, export_excluded_private_data, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       row.id,
       row.export_run_id,
@@ -5737,6 +5963,7 @@ function createSettlementExportSnapshot({
       row.provider_settlement_ref,
       row.onchain_transfer_ref,
       row.evidence_hash,
+      JSON.stringify(row),
       row.payload_schema_version,
       row.export_excluded_private_data,
       row.created_at
@@ -6440,12 +6667,15 @@ function buildIngestEvent(payload) {
 }
 
 async function buildVerifiedManualIngestEvent(invoice, payload) {
-  if (rpcProviders.length === 0) {
+  const invoiceChainId = String(invoice.chain_id || CHAIN_ID);
+  const invoiceTokenContract = String(invoice.token_contract || APPROVED_TOKEN_CONTRACT);
+  if ((rpcProvidersByChain.get(invoiceChainId) || []).length === 0) {
     return { error: { code: "RPC_UNAVAILABLE", message: "manual ingest verification requires RPC_URLS" } };
   }
   const verification = await verifyTransferOnChain({
     txHash: payload?.tx_hash,
-    expectedTokenContract: APPROVED_TOKEN_CONTRACT,
+    chainId: invoiceChainId,
+    expectedTokenContract: invoiceTokenContract,
     expectedToAddress: invoice.recipient_address,
     expectedAmountBase: String(invoice.amount_jpyc_base || "0"),
   });
@@ -6464,14 +6694,14 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
       return {
         event: {
           invoice_id: invoice.id,
-          chain_id: CHAIN_ID,
+          chain_id: invoiceChainId,
           tx_hash: parseTxHash(payload?.tx_hash),
           log_index: verification.transfer.logIndex,
           block_number: verification.transfer.blockNumber,
           confirmations: verification.confirmations,
           from_address: verification.transfer.from,
           to_address: verification.transfer.to,
-          token_contract: APPROVED_TOKEN_CONTRACT,
+          token_contract: invoiceTokenContract,
           amount_jpyc: formatJpyc(verification.transfer.amountBase),
           amount_jpyc_base: verification.transfer.amountBase,
           observed_at: verification.observedAt,
@@ -6502,14 +6732,14 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
   return {
     event: {
       invoice_id: invoice.id,
-      chain_id: CHAIN_ID,
+      chain_id: invoiceChainId,
       tx_hash: parseTxHash(payload?.tx_hash),
       log_index: verification.transfer.logIndex,
       block_number: verification.transfer.blockNumber,
       confirmations: verification.confirmations,
       from_address: verification.transfer.from,
       to_address: verification.transfer.to,
-      token_contract: APPROVED_TOKEN_CONTRACT,
+      token_contract: invoiceTokenContract,
       amount_jpyc: formatJpyc(verification.transfer.amountBase),
       amount_jpyc_base: verification.transfer.amountBase,
       observed_at: verification.observedAt,
@@ -6624,7 +6854,8 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
   }
   const verification = await verifyTransferOnChain({
     txHash,
-    expectedTokenContract: APPROVED_TOKEN_CONTRACT,
+    chainId: String(refund.refund_chain_id || CHAIN_ID),
+    expectedTokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT),
     expectedToAddress: refund.refund_to_address,
     expectedFromAddress: refund.expected_from_address || null,
     expectedAmountBase: refund.refund_amount_jpyc_base,
@@ -7976,7 +8207,10 @@ app.post("/api/v1/admin/terminals/:terminalId/payments/enable", requirePermissio
 });
 
 app.get("/api/v1/admin/receive-addresses", requirePermission("address_pool.manage"), (req, res) => {
-  const rows = listReceiveAddresses(req.session.store_id);
+  const chainId = String(req.query?.payment_chain_id || req.query?.chain_id || CHAIN_ID).trim();
+  const chainResult = paymentChainForInvoiceRequest(chainId, ENABLED_PAYMENT_CHAIN_IDS);
+  if (chainResult.error) return jsonError(res, 400, chainResult.error.code, chainResult.error.message, chainResult.error.details);
+  const rows = listReceiveAddresses(req.session.store_id, chainId);
   return res.json({
     receive_addresses: rows.map((row) => ({
       id: row.id,
@@ -7999,17 +8233,28 @@ app.post("/api/v1/admin/receive-addresses:import", requirePermission("address_po
     const idemKey = req.header("Idempotency-Key");
     const addresses = Array.isArray(req.body?.addresses) ? req.body.addresses : [];
     const sourceLabel = String(req.body?.source_label || "ops_import").trim();
+    const chainId = String(req.body?.payment_chain_id || req.body?.chain_id || CHAIN_ID).trim();
+    const chainResult = paymentChainForInvoiceRequest(chainId, ENABLED_PAYMENT_CHAIN_IDS);
+    if (chainResult.error) {
+      return { status: 400, body: { error: chainResult.error } };
+    }
     const imported = importReceiveAddresses({
       storeId: req.session.store_id,
       actorId,
       addresses,
       sourceLabel,
+      chainId,
       requestId,
       idempotencyKey: idemKey,
       ip: req.ip,
     });
     if (imported.error) {
-      const code = imported.error.code === "PRIVATE_KEY_MATERIAL_REJECTED" ? 400 : 409;
+      const code = [
+        "PRIVATE_KEY_MATERIAL_REJECTED",
+        "VALIDATION_ERROR",
+        "UNSUPPORTED_PAYMENT_CHAIN",
+        "PAYMENT_CHAIN_DISABLED",
+      ].includes(imported.error.code) ? 400 : 409;
       return { status: code, body: { error: imported.error } };
     }
     return {
@@ -8046,6 +8291,17 @@ app.post("/api/v1/admin/receive-addresses/:receiveAddressId/disable", requirePer
       return { status, body: { error: result.error } };
     }
     return { status: 200, body: { receive_address: result.row } };
+  });
+});
+
+app.get("/api/v1/payment-chains", (req, res) => {
+  if (!hasPermission(req.session, "invoice.create") && !hasPermission(req.session, "invoice.read")) {
+    return jsonError(res, 403, "FORBIDDEN", "Permission denied: invoice.read");
+  }
+  return res.json({
+    payment_chains: listEnabledPaymentChains(ENABLED_PAYMENT_CHAIN_IDS).map((chain) => publicPaymentChain(chain)),
+    official_contract_reference: JPYC_CONTRACT_REFERENCE,
+    denied_contracts: JPYC_PREPAID_DENYLIST_CONTRACTS,
   });
 });
 
@@ -8089,6 +8345,23 @@ app.post("/api/v1/invoices", (req, res) => {
         },
       };
     }
+    const paymentChainId = String(req.body?.payment_chain_id || "").trim();
+    if (!paymentChainId) {
+      return {
+        status: 400,
+        body: {
+          error: {
+            code: "PAYMENT_CHAIN_REQUIRED",
+            message: "payment_chain_id is required",
+            details: { enabled_chain_ids: ENABLED_PAYMENT_CHAIN_IDS },
+          },
+        },
+      };
+    }
+    const paymentChainResult = paymentChainForInvoiceRequest(paymentChainId, ENABLED_PAYMENT_CHAIN_IDS);
+    if (paymentChainResult.error) {
+      return { status: 400, body: { error: paymentChainResult.error } };
+    }
     if (!AML_POLICY_APPROVED && amountJpy >= AML_HIGH_VALUE_THRESHOLD_JPY) {
       return {
         status: 503,
@@ -8131,6 +8404,7 @@ app.post("/api/v1/invoices", (req, res) => {
       store,
       session: req.session,
       amountJpy,
+      paymentChain: paymentChainResult.chain,
       actorType: "staff",
       actorId,
       requestId,
@@ -8565,6 +8839,7 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
         store,
         session: req.session,
         amountJpy: Number(original.amount_jpy || 0),
+        paymentChain: getSupportedPaymentChain(original.chain_id),
         checkoutSessionId: original.checkout_session_id || null,
         reissuedFromInvoiceId: original.id,
         reissueRootInvoiceId: original.reissue_root_invoice_id || original.id,
@@ -8747,7 +9022,8 @@ app.post("/api/v1/payments/events:ingest", requirePermission("payment.ingest.man
     if (!invoice) {
       return { status: 404, body: { error: { code: "NOT_FOUND", message: "Invoice not found" } } };
     }
-    const shouldVerifyOnChain = IS_PRODUCTION || (rpcProviders.length > 0 && parseTxHash(req.body?.tx_hash));
+    const invoiceProviders = rpcProvidersByChain.get(String(invoice.chain_id || CHAIN_ID)) || [];
+    const shouldVerifyOnChain = IS_PRODUCTION || (invoiceProviders.length > 0 && parseTxHash(req.body?.tx_hash));
     const parsed = shouldVerifyOnChain
       ? await buildVerifiedManualIngestEvent(invoice, req.body || {})
       : buildIngestEvent(req.body || {});
@@ -10466,6 +10742,7 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
     confirmed_at: paymentEvidenceTimestamps.confirmedAt,
     chain_recorded_at: paymentEvidenceTimestamps.chainRecordedAt,
     chain_id: invoice.chain_id,
+    native_symbol: getSupportedPaymentChain(invoice.chain_id)?.native_symbol || null,
     token_contract: invoice.token_contract,
     recipient_address: invoice.recipient_address,
     store_name: store?.name || "JPYC Store",

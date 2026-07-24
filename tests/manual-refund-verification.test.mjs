@@ -168,7 +168,7 @@ async function waitForPendingIdempotencyClaim(db, idempotencyKey) {
 
 test("manual ingest verifies receipts on-chain before applying payment decisions", async (t) => {
   const rpc = await startMockRpcServer({ chainId: 137 });
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
   const env = baseServerEnv({
     ALLOW_MANUAL_PAYMENT_INGEST: "true",
     RPC_URLS: rpc.url,
@@ -328,7 +328,7 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
 
 test("manual ingest rejects wrong-chain RPC and refund verification promotes only exact confirmed transfers", async (t) => {
   const wrongChainRpc = await startMockRpcServer({ chainId: 1 });
-  const tokenContract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const tokenContract = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
   const wrongChainEnv = baseServerEnv({
     ALLOW_MANUAL_PAYMENT_INGEST: "true",
     RPC_URLS: wrongChainRpc.url,

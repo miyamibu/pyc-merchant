@@ -202,7 +202,7 @@ test("consent gate: mobile.html has consent section with checkbox, policy links,
   assert.match(mobileHtml, /利用規約・プライバシーポリシー・返金ポリシーを確認しました/);
   assert.match(mobileHtml, /二重送金・分割送金/);
   assert.match(mobileHtml, /誤チェーン・誤トークン・誤アドレス/);
-  assert.match(mobileHtml, /ガス代（MATIC等）/);
+  assert.match(mobileHtml, /選択されたネットワークのガス代/);
   assert.match(mobileHtml, /秘密鍵・シードフレーズを聞くことはありません/);
   assert.match(mobileHtml, /aria-live="polite"/);
 });

@@ -181,6 +181,12 @@ function getNetwork(invoice) {
   return String(invoice?.network || (invoice?.chain_id === "137" ? "Polygon" : invoice?.chain_id || "-"));
 }
 
+function getNativeSymbol(invoice) {
+  const configured = String(invoice?.native_symbol || "").trim();
+  if (configured) return configured;
+  return ({ "1": "ETH", "43114": "AVAX", "137": "POL" })[String(invoice?.chain_id || "")] || "ネットワーク通貨";
+}
+
 function getReceiveAddress(invoice) {
   return String(invoice?.receive_address || invoice?.recipient_address || "");
 }
@@ -976,10 +982,11 @@ function renderPaymentConditions(invoice) {
   const network = getNetwork(invoice) || "Polygon";
   const chainId = invoice?.chain_id || "137";
   const token = getTokenSymbol(invoice) || "JPYC";
+  const nativeSymbol = getNativeSymbol(invoice);
   el.paymentConditionsList.innerHTML = "";
   const items = [
     `対応チェーン: ${network}（チェーンID: ${chainId}）／支払いトークン: ${token}`,
-    "ガス代（MATIC）がウォレットに必要です。MATIC残高が不足していると送金できません。",
+    `ガス代（${nativeSymbol}）がウォレットに必要です。${nativeSymbol}残高が不足していると送金できません。`,
   ];
   for (const item of items) {
     const li = document.createElement("li");
@@ -1003,7 +1010,7 @@ function renderPaymentVerification(invoice) {
   el.verifyAddressText.textContent = receiveAddress || "-";
   el.verifyAddressText.title = receiveAddress || "";
   if (el.manualRiskText && !state.manualRiskVisible) {
-    el.manualRiskText.textContent = "ウォレット画面で「Polygon」「JPYC」「この画面の送金先」の3つが一致していることを確認してから送信してください。";
+    el.manualRiskText.textContent = `ウォレット画面で「${network}」「${token}」「この画面の送金先」の3つが一致していることを確認してから送信してください。`;
   }
 }
 
