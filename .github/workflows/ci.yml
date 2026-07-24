@@ -48,7 +48,6 @@ jobs:
       PIN_LOCKOUT_SEC: "900"
       SSE_TOKEN_MAX_TTL_SEC: "900"
       WORKER_STALE_SEC: "999999"
-      MAX_ACTIVE_INVOICES_PER_RECIPIENT: "50"
       REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR: "true"
       WALLET_ADAPTER_TYPE: "mock"
       ENABLE_REOWN: "false"
@@ -104,7 +103,7 @@ jobs:
       - name: Smoke
         run: |
           mkdir -p /tmp/jpyc-ci
-          node src/server.mjs > /tmp/jpyc-ci/server.log 2>&1 &
+          MAX_ACTIVE_INVOICES_PER_RECIPIENT=50 node src/server.mjs > /tmp/jpyc-ci/server.log 2>&1 &
           SERVER_PID=$!
           trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true' EXIT
           for i in $(seq 1 40); do
@@ -113,7 +112,7 @@ jobs:
             fi
             sleep 1
           done
-          SMOKE_REUSE_EXISTING=true npm run test:smoke
+          MAX_ACTIVE_INVOICES_PER_RECIPIENT=50 SMOKE_REUSE_EXISTING=true npm run test:smoke
 
       - name: Audit chain
         run: npm run test:audit-chain
@@ -176,7 +175,6 @@ jobs:
       PIN_LOCKOUT_SEC: "900"
       SSE_TOKEN_MAX_TTL_SEC: "900"
       WORKER_STALE_SEC: "999999"
-      MAX_ACTIVE_INVOICES_PER_RECIPIENT: "50"
       REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR: "true"
       WALLET_ADAPTER_TYPE: "mock"
       ENABLE_REOWN: "false"
