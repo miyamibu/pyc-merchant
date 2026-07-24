@@ -10,7 +10,7 @@ const STAFF_PIN = process.env.STAFF_PIN || "1234";
 const SECOND_ADMIN_PIN = process.env.SECOND_ADMIN_PIN || "5678";
 const SECOND_ADMIN_NAME = process.env.SECOND_ADMIN_NAME || "Smoke Approver";
 const CHAIN_ID = process.env.CHAIN_ID || "137";
-const TOKEN_CONTRACT = process.env.TOKEN_CONTRACT || "0x1111111111111111111111111111111111111111";
+const TOKEN_CONTRACT = process.env.TOKEN_CONTRACT || "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 const RECIPIENT = process.env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222";
 const SERVICE_INGEST_ID = process.env.SERVICE_INGEST_ID || "chain-monitor";
 const SERVICE_INGEST_SECRET = process.env.SERVICE_INGEST_SECRET || "replace-with-very-long-random-ingest-secret";
@@ -51,9 +51,12 @@ function buildServerEnv(targetBaseUrl) {
   env.SERVICE_INGEST_SECRET = env.SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET;
   env.METRICS_SECRET = env.METRICS_SECRET || crypto.randomBytes(32).toString("hex");
   env.CHAIN_ID = env.CHAIN_ID || CHAIN_ID;
+  env.ENABLED_PAYMENT_CHAIN_IDS = env.ENABLED_PAYMENT_CHAIN_IDS || "1,43114,137";
   env.TOKEN_CONTRACT = env.TOKEN_CONTRACT || TOKEN_CONTRACT;
+  env.APPROVED_JPYC_TOKEN_CONTRACT = env.APPROVED_JPYC_TOKEN_CONTRACT || TOKEN_CONTRACT;
+  env.JPYC_CONTRACT_APPROVAL_REF = env.JPYC_CONTRACT_APPROVAL_REF || "SMOKE-JPYC-CONTRACT-001";
   env.RECIPIENT_ADDRESS = env.RECIPIENT_ADDRESS || RECIPIENT;
-  env.TOKEN_DECIMALS = env.TOKEN_DECIMALS || "18";
+  env.TOKEN_DECIMALS = env.TOKEN_DECIMALS || "6";
   env.JPYC_BASE_UNIT_SCALE = env.JPYC_BASE_UNIT_SCALE || "1000000";
   env.REQUIRED_CONFIRMATIONS = env.REQUIRED_CONFIRMATIONS || "2";
   env.MIN_REQUIRED_CONFIRMATIONS = env.MIN_REQUIRED_CONFIRMATIONS || "2";
@@ -200,7 +203,8 @@ async function createInvoice(authorization, idempotencyKey, amountJpy) {
       "idempotency-key": idempotencyKey
     },
     body: JSON.stringify({
-      amount_jpy: amountJpy
+      amount_jpy: amountJpy,
+      payment_chain_id: CHAIN_ID
     })
   });
   assert(created.status === 201, "invoice creation failed", created);
@@ -306,7 +310,7 @@ async function main() {
   const missingIdem = await request("/api/v1/invoices", {
     method: "POST",
     headers: { "content-type": "application/json", authorization },
-    body: JSON.stringify({ amount_jpy: 100 })
+    body: JSON.stringify({ amount_jpy: 100, payment_chain_id: CHAIN_ID })
   });
   assert(missingIdem.status === 400, "idempotency validation failed", missingIdem);
   summary.idempotency = { missingKeyStatus: missingIdem.status };
