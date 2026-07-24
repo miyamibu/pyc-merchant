@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 EVIDENCE_DIR="${1:-./docs/production/evidence/${TIMESTAMP}}"
-TEMPLATE_DIR="./docs/production/evidence/templates"
+TEMPLATE_DIR="./docs/production-evidence-templates"
 mkdir -p "$EVIDENCE_DIR"
 
 copy_template() {

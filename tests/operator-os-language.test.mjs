@@ -1,7 +1,10 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
   FORBIDDEN_STORE_CUSTOMER_TERMS,
   JAPANESE_FONT_STACK,
@@ -11,7 +14,12 @@ import {
 } from "../src/operator-language.mjs";
 
 const ROOT = process.cwd();
-const ARTIFACT_DIR = path.join(ROOT, "artifacts", "operator-os", "2026-04-29");
+const ARTIFACT_DIR = mkdtempSync(path.join(tmpdir(), "jpyc-operator-os-"));
+execFileSync(process.execPath, ["scripts/generate-operator-os-artifacts.mjs", ARTIFACT_DIR], {
+  cwd: ROOT,
+  stdio: "pipe",
+});
+after(() => fs.rmSync(ARTIFACT_DIR, { recursive: true, force: true }));
 
 function read(filePath) {
   return fs.readFileSync(path.join(ROOT, filePath), "utf8");
@@ -50,15 +58,19 @@ test("manual review reasons have actionable non-custodial safe exits", () => {
 test("public pages and generated operator artifacts use robust Japanese font stack and no tofu glyphs", () => {
   const files = [
     "public/app.css",
-    "artifacts/operator-os/2026-04-29/store-staff-quick-guide.html",
-    "artifacts/operator-os/2026-04-29/admin-ops-manual.html",
-    "artifacts/operator-os/2026-04-29/customer-help.html",
-    "artifacts/operator-os/2026-04-29/internal-validation-report.html",
-    "artifacts/operator-os/2026-04-29/training-video-index.html",
   ];
   for (const file of files) {
     const text = read(file);
     assert.equal(hasTofuGlyphs(text), false, `${file} must not include tofu glyphs`);
+  }
+  for (const file of [
+    "store-staff-quick-guide.html",
+    "admin-ops-manual.html",
+    "customer-help.html",
+    "internal-validation-report.html",
+    "training-video-index.html",
+  ]) {
+    assert.equal(hasTofuGlyphs(readArtifact(file)), false, `${file} must not include tofu glyphs`);
   }
   const css = read("public/app.css");
   for (const font of ["Noto Sans JP", "Noto Sans CJK JP", "Hiragino Sans", "Yu Gothic", "Meiryo"]) {

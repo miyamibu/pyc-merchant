@@ -48,7 +48,7 @@ test("approval pack ties minutes and release record to the same closeout artifac
 
 test("production validation plan and evidence README use canonical EXT-002 naming and POC artifacts", () => {
   const validationPlan = read("docs/90-production-validation-plan.md");
-  const evidenceReadme = read("docs/production/evidence/README.md");
+  const evidenceReadme = read("docs/production-evidence.md");
 
   assert.match(validationPlan, /EXT-002-wallet-device-launch\.md/);
   assert.match(validationPlan, /POC-001\.md/);

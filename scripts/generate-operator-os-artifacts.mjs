@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 import { JAPANESE_FONT_STACK } from "../src/operator-language.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const OUT_DIR = path.join(ROOT, "artifacts", "operator-os", "2026-04-29");
+const OUT_DIR = process.argv[2]
+  ? path.resolve(process.argv[2])
+  : path.join(ROOT, "artifacts", "operator-os", "2026-04-29");
 const MP4_DIR = path.join(ROOT, "artifacts", "manual-video-mp4", "2026-04-29", "videos");
 const OUT_VIDEO_DIR = path.join(OUT_DIR, "videos");
 
