@@ -133,7 +133,7 @@ export async function loginAs(baseUrl, { terminalCode, pin, staffName }) {
   return login.data.token;
 }
 
-export async function createInvoice(baseUrl, token, amountJpy, idempotencyKey) {
+export async function createInvoice(baseUrl, token, amountJpy, idempotencyKey, paymentChainId = "137") {
   const response = await apiRequest(baseUrl, "/api/v1/invoices", {
     method: "POST",
     headers: {
@@ -141,7 +141,7 @@ export async function createInvoice(baseUrl, token, amountJpy, idempotencyKey) {
       "content-type": "application/json",
       "idempotency-key": idempotencyKey,
     },
-    body: JSON.stringify({ amount_jpy: amountJpy }),
+    body: JSON.stringify({ amount_jpy: amountJpy, payment_chain_id: String(paymentChainId) }),
   });
   if (response.status !== 201) {
     throw new Error(`validation invoice creation failed: ${JSON.stringify(response.data)}`);
