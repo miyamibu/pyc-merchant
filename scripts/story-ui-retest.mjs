@@ -360,7 +360,7 @@ async function run() {
 
     await terminalPage.fill("#refundReviewCaseId", reviewCaseId);
     await terminalPage.fill("#refundAmount", "200");
-    await terminalPage.fill("#refundAddress", "0x4444444444444444444444444444444444444444");
+    await terminalPage.fill("#refundAddress", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     await terminalPage.fill("#refundChainId", env.CHAIN_ID);
     await terminalPage.fill("#refundEvidenceNotePathInput", "output/playwright/story-ui-retest/refund-note.md");
     await terminalPage.fill("#refundCustomerNoteInput", "ローカルUI再テスト用の返金証跡記録。実送金ではありません。");

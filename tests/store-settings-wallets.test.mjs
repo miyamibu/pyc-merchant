@@ -13,9 +13,8 @@ const CWD = process.cwd();
 
 test("store settings reflect configured supported wallets and wallet adapter", async (t) => {
   const env = baseServerEnv({
-    WALLET_ADAPTER_TYPE: "reown",
-    ENABLE_REOWN: "true",
-    REOWN_PROJECT_ID: "reown-project-1234567890",
+    WALLET_ADAPTER_TYPE: "wallet_deeplink",
+    WALLET_DEEPLINK_TEMPLATE: "wallet://pay?uri={{payment_uri_encoded}}",
     SUPPORTED_WALLETS: "HashPort Wallet,WalletConnect,Injected Wallet",
   });
   const started = await startServerProcess(CWD, env);

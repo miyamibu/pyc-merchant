@@ -49,11 +49,21 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
       invoice.paid_amount_jpyc
     );
     const previousPaidBase = previousPaidBaseResult.error ? "0" : previousPaidBaseResult.value;
+    const totalPaidBaseResult = normalizeBaseAmount(
+      options.totalPaidAmountBase,
+      null
+    );
+    const totalPaidBase = totalPaidBaseResult.error || options.totalPaidAmountBase == null
+      ? (BigInt(previousPaidBase) + BigInt(amountBase)).toString()
+      : totalPaidBaseResult.value;
     const confirmations = Number(event.confirmations || 0);
-    const observedAtMs =
-      options.nowMs != null
-        ? Number(options.nowMs)
-        : (event?.observed_at ? new Date(event.observed_at).getTime() : Date.now());
+    const observedAtMs = options.blockTimestamp != null
+      ? new Date(options.blockTimestamp).getTime()
+      : (event?.block_timestamp
+        ? new Date(event.block_timestamp).getTime()
+        : (options.nowMs != null
+          ? Number(options.nowMs)
+          : (event?.observed_at ? new Date(event.observed_at).getTime() : Date.now())));
     const expiryMs = new Date(invoice.expires_at).getTime();
 
     if (!Number.isFinite(expiryMs)) {
@@ -98,14 +108,14 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
         reasonLabel: "wrong_recipient",
       };
     }
-    if (invoice.status === "paid") {
+    if (invoice.status === "paid" && options.eventAlreadyRecorded !== true) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.DUPLICATE_PAYMENT,
         reasonLabel: "duplicate_after_paid",
       };
     }
-    if (compareBaseUnits(amountBase, invoiceBase) < 0) {
+    if (compareBaseUnits(totalPaidBase, invoiceBase) < 0) {
       if (compareBaseUnits(previousPaidBase, "0") > 0) {
         return {
           nextStatus: "review_required",
@@ -119,7 +129,7 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
         reasonLabel: "insufficient_amount",
       };
     }
-    if (compareBaseUnits(amountBase, invoiceBase) > 0) {
+    if (compareBaseUnits(totalPaidBase, invoiceBase) > 0) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.OVERPAYMENT,

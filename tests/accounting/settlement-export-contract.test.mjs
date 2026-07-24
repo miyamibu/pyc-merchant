@@ -110,6 +110,11 @@ test("Settlement Export Contract v2 pins invoice-scoped refund manifest and prim
     assert.ok(schema.$defs.row.required.includes(field), `${field} must be additively required in v2 rows`);
     assert.ok(schema.$defs.row.properties[field], `${field} must be defined in v2 rows`);
   }
+  assert.ok(schema.$defs.row.required.includes("accounting_event_refs"));
+  assert.deepEqual(schema.$defs.row.properties.accounting_event_refs, {
+    type: "array",
+    items: { type: "string", minLength: 1 },
+  });
 });
 
 test("buildDailyAccountingSummary aggregates cancelled rows alongside other accounting statuses", () => {
@@ -189,6 +194,9 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(serverSource, /content_hashes/);
   assert.match(serverSource, /SETTLEMENT_EXPORT_V2_CANONICAL_HASH_SCOPE/);
   assert.match(serverSource, /refund_references_json/);
+  assert.match(serverSource, /accounting_event_refs_json/);
+  assert.match(serverSource, /accounting_event_journal/);
+  assert.match(serverSource, /ACTIVE_INVOICES_BLOCK_CLOSE/);
   assert.match(serverSource, /settlement_id = \? AND store_id = \?/);
   assert.match(serverSource, /buildSettlementExportV1SnapshotCsv\(rows, \{ bom: true \}\)/);
   assert.match(serverSource, /buildSettlementExportV2SnapshotCsv\(rows, \{ bom: true \}\)/);

@@ -16,6 +16,14 @@ const POLICY_VERSIONS = {
   refund_policy_version: "draft-v1",
 };
 
+function applyPolicySnapshot(invoice) {
+  const urls = invoice?.policy_urls;
+  const versions = invoice?.policy_versions;
+  if (urls && typeof urls === "object") Object.assign(POLICY_URLS, urls);
+  if (versions && typeof versions === "object") Object.assign(POLICY_VERSIONS, versions);
+  initPolicyLinks();
+}
+
 const INVOICE_STATUS_ALIASES = Object.freeze({
   manual_review: "review_required",
 });
@@ -695,26 +703,34 @@ function focusConsentGate() {
   }, reduceMotion ? 0 : 300);
 }
 
-function buildWalletLaunchTarget(invoice) {
-  if (!invoice) return null;
+function buildWalletLaunchCandidates(invoice) {
+  if (!invoice) return [];
   const candidates = [
-    { type: "payment_uri", url: invoice.payment_uri },
     { type: "wallet_deeplink", url: invoice.wallet_deeplink },
+    { type: "payment_uri", url: invoice.payment_uri },
     { type: "wallet_url", url: invoice.wallet_url },
   ];
+  const validCandidates = [];
+  const seenUrls = new Set();
   for (const candidate of candidates) {
     if (typeof candidate.url !== "string" || !candidate.url.trim()) continue;
     const raw = candidate.url.trim();
+    if (seenUrls.has(raw)) continue;
     try {
       const parsed = new URL(raw);
       if (WALLET_LAUNCH_PROTOCOLS.has(parsed.protocol) && !parsed.username && !parsed.password) {
-        return { type: candidate.type, url: raw };
+        validCandidates.push({ type: candidate.type, url: raw });
+        seenUrls.add(raw);
       }
     } catch {
       // Unsafe or malformed targets fall through to the copy guidance.
     }
   }
-  return null;
+  return validCandidates;
+}
+
+function buildWalletLaunchTarget(invoice) {
+  return buildWalletLaunchCandidates(invoice)[0] || null;
 }
 
 function buildManualPaymentInstructions(invoice, options = {}) {
@@ -979,8 +995,8 @@ function renderPaymentConditions(invoice) {
   const show = WAITING_STATUSES.has(status);
   el.paymentConditionsCard.classList.toggle("hidden", !show);
   if (!show) return;
-  const network = getNetwork(invoice) || "Polygon";
-  const chainId = invoice?.chain_id || "137";
+  const network = getNetwork(invoice);
+  const chainId = invoice?.chain_id || "-";
   const token = getTokenSymbol(invoice) || "JPYC";
   const nativeSymbol = getNativeSymbol(invoice);
   el.paymentConditionsList.innerHTML = "";
@@ -1001,8 +1017,8 @@ function renderPaymentVerification(invoice) {
   if (!el.paymentVerifyCard) return;
   el.paymentVerifyCard.classList.toggle("hidden", !show);
   if (!show) return;
-  const network = getNetwork(invoice) || "Polygon";
-  const chainId = invoice?.chain_id || "137";
+  const network = getNetwork(invoice);
+  const chainId = invoice?.chain_id || "-";
   const token = getTokenSymbol(invoice) || "JPYC";
   const receiveAddress = getReceiveAddress(invoice);
   el.verifyNetworkText.textContent = `${network}（チェーンID: ${chainId}）`;
@@ -1080,6 +1096,7 @@ function renderInvoice(invoice) {
     state.announcedRemainingThreshold = null;
     state.manualRiskVisible = false;
   }
+  applyPolicySnapshot(invoice);
   state.invoice = invoice;
   state.manualActionHint = buildPaymentMethodHint(invoice);
   const status = canonicalInvoiceStatus(invoice?.status);
@@ -1173,6 +1190,42 @@ function setLaunchInProgress(inProgress) {
   applyPaymentActionGate(state.invoice);
 }
 
+function launchWalletWithFallback(invoice) {
+  const candidates = buildWalletLaunchCandidates(invoice);
+  if (candidates.length === 0) return false;
+  let hiddenDuringLaunch = false;
+  const markHidden = () => {
+    if (document.visibilityState === "hidden") hiddenDuringLaunch = true;
+  };
+  document.addEventListener("visibilitychange", markHidden);
+  const finish = () => document.removeEventListener("visibilitychange", markHidden);
+  const attempt = (index) => {
+    const candidate = candidates[index];
+    if (!candidate) {
+      finish();
+      setLaunchInProgress(false);
+      showManualRiskWarning(invoice);
+      setMethodPanel(true, buildManualPaymentInstructions(invoice, { includeHelp: true }));
+      announce("ウォレットを開けなかったため、手動送金の案内を表示しました");
+      return;
+    }
+    if (index > 0) {
+      setMethodPanel(true, "前のウォレット起動を確認できなかったため、別の起動方式を試します。");
+      announce("別のウォレット起動方式を試します");
+    }
+    location.href = candidate.url;
+    window.setTimeout(() => {
+      if (hiddenDuringLaunch || document.visibilityState === "hidden" || !state.launchInProgress) {
+        finish();
+        return;
+      }
+      attempt(index + 1);
+    }, 1800);
+  };
+  attempt(0);
+  return true;
+}
+
 async function refreshAfterBrowserRecovery() {
   const result = await loadInvoice({ silent: true, force: true });
   if (result?.ok) setLaunchInProgress(false);
@@ -1232,7 +1285,7 @@ async function handleWalletPay() {
   setMethodPanel(true, launchMessage);
   announce("ウォレットを開きます");
   setLaunchInProgress(true);
-  location.href = launchTarget.url;
+  launchWalletWithFallback(invoice);
 }
 
 function announceConsentRequired() {

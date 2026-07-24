@@ -13,16 +13,21 @@ test("mock adapter is unavailable for real transfer", () => {
   assert.equal(adapter.status, "mock_only");
 });
 
-test("reown adapter requires feature flag and project id", () => {
-  const disabled = createWalletAdapter({ WALLET_ADAPTER_TYPE: "reown", ENABLE_REOWN: "false", REOWN_PROJECT_ID: "pid" });
-  assert.equal(disabled.available, false);
-  assert.equal(disabled.status, "disabled_by_flag");
+test("Reown is not advertised until a real session integration exists", () => {
+  const reown = createWalletAdapter({ WALLET_ADAPTER_TYPE: "reown", ENABLE_REOWN: "true", REOWN_PROJECT_ID: "real-project-id" });
+  assert.equal(reown.available, false);
+  assert.equal(reown.status, "reown_session_not_implemented");
+});
 
-  const missingId = createWalletAdapter({ WALLET_ADAPTER_TYPE: "reown", ENABLE_REOWN: "true", REOWN_PROJECT_ID: "" });
-  assert.equal(missingId.available, false);
-  assert.equal(missingId.status, "missing_project_id");
+test("configured wallet deeplink adapter requires a reviewed template", () => {
+  const missingTemplate = createWalletAdapter({ WALLET_ADAPTER_TYPE: "wallet_deeplink" });
+  assert.equal(missingTemplate.available, false);
+  assert.equal(missingTemplate.status, "missing_deeplink_template");
 
-  const enabled = createWalletAdapter({ WALLET_ADAPTER_TYPE: "reown", ENABLE_REOWN: "true", REOWN_PROJECT_ID: "real-project-id" });
+  const enabled = createWalletAdapter({
+    WALLET_ADAPTER_TYPE: "wallet_deeplink",
+    WALLET_DEEPLINK_TEMPLATE: "wallet://pay?uri={{payment_uri_encoded}}",
+  });
   assert.equal(enabled.available, true);
   assert.equal(enabled.status, "ready");
 });
@@ -52,9 +57,7 @@ test("buildEip681PaymentUri returns Polygon ERC-20 transfer URI", () => {
 test("buildWalletLaunchPayload expands deeplink template and preserves copy fallback", () => {
   const payload = buildWalletLaunchPayload({
     env: {
-      WALLET_ADAPTER_TYPE: "reown",
-      ENABLE_REOWN: "true",
-      REOWN_PROJECT_ID: "real-project-id",
+      WALLET_ADAPTER_TYPE: "wallet_deeplink",
       WALLET_HELP_URL: "https://wallet.example/help",
       WALLET_DEEPLINK_TEMPLATE: "hashport://pay?uri={{payment_uri_encoded}}&chain={{chain_id}}&token={{token_symbol_encoded}}",
       SUPPORTED_WALLETS: "HashPort Wallet,WalletConnect",

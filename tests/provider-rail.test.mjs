@@ -253,7 +253,7 @@ test("provider authorized updates provider_summary and terminal SSE refreshes", 
   assert.notEqual(after.data.status, "paid");
 });
 
-test("provider authorized does not become paid and appears as provider_receivable", async (t) => {
+test("provider authorized does not become paid and blocks close until settlement", async (t) => {
   const ctx = await startProviderTestServer();
   t.after(async () => {
     ctx.db.close();
@@ -291,21 +291,11 @@ test("provider authorized does not become paid and appears as provider_receivabl
     }),
     body: JSON.stringify({ business_date: businessDateJst() }),
   });
-  assert.equal(closeRes.status, 200);
-  assert.equal(closeRes.data.accounting_summary.onchain_cash_confirmed.amount_jpyc_base, "0");
-  assert.equal(closeRes.data.accounting_summary.provider_receivable.count, 1);
-  assert.equal(
-    closeRes.data.accounting_summary.provider_receivable.amount_jpyc_base,
-    String(detail.data.amounts.amount_jpyc_base)
-  );
-
-  const exportRow = ctx.db
-    .prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? AND invoice_id = ?`)
-    .get(closeRes.data.export_run_id, created.data.invoice_id);
-  assert.equal(exportRow.accounting_status, "provider_receivable");
+  assert.equal(closeRes.status, 409);
+  assert.equal(closeRes.data.error.code, "ACTIVE_INVOICES_BLOCK_CLOSE");
 });
 
-test("provider captured without tx_hash does not pollute paid amount", async (t) => {
+test("provider captured without tx_hash does not pollute paid amount or bypass close", async (t) => {
   const ctx = await startProviderTestServer();
   t.after(async () => {
     ctx.db.close();
@@ -341,13 +331,8 @@ test("provider captured without tx_hash does not pollute paid amount", async (t)
     }),
     body: JSON.stringify({ business_date: businessDateJst() }),
   });
-  assert.equal(closeRes.status, 200);
-  const row = ctx.db
-    .prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? AND invoice_id = ?`)
-    .get(closeRes.data.export_run_id, created.data.invoice_id);
-  assert.equal(row.accounting_status, "provider_receivable");
-  assert.equal(Number(row.onchain_cash_amount_jpyc_base), 0);
-  assert.equal(Number(row.provider_receivable_amount_jpyc_base), Number(detail.data.amounts.amount_jpyc_base));
+  assert.equal(closeRes.status, 409);
+  assert.equal(closeRes.data.error.code, "ACTIVE_INVOICES_BLOCK_CLOSE");
 });
 
 test("provider captured with tx_hash stays non-paid until existing payment ingest verifies it", async (t) => {
@@ -487,6 +472,17 @@ test("provider batch settlement does not auto-pay and daily close separates wall
     occurred_at: new Date().toISOString(),
   }, "batch-auth");
   assert.equal(providerEvent.status, 200);
+
+  const blockedBeforeSettlement = await apiRequest(ctx.started.baseUrl, "/api/v1/settlements/daily:close", {
+    method: "POST",
+    headers: authHeaders(ctx.admin.token, {
+      "content-type": "application/json",
+      "idempotency-key": `provider-close-before-settlement-${Date.now()}`,
+    }),
+    body: JSON.stringify({ business_date: businessDateJst() }),
+  });
+  assert.equal(blockedBeforeSettlement.status, 409);
+  assert.equal(blockedBeforeSettlement.data.error.code, "ACTIVE_INVOICES_BLOCK_CLOSE");
 
   const settlement = await ingestProviderSettlement(ctx.started.baseUrl, ctx.env, {
     provider_code: "mock_provider",
@@ -675,4 +671,102 @@ test("private provider fields are rejected, void is not refund, and duplicate pr
   assert.ok(Number(row.void_amount_jpyc_base) > 0);
   assert.equal(row.export_excluded_private_data, 1);
   assert.equal(Object.prototype.hasOwnProperty.call(row, "payer_ref_hash"), false);
+});
+
+test("provider settlement allocation identity and payload conflicts fail closed", async (t) => {
+  const ctx = await startProviderTestServer();
+  t.after(async () => {
+    ctx.db.close();
+    await stopServerProcess(ctx.started.proc);
+  });
+
+  const created = await createInvoice(ctx.started.baseUrl, ctx.admin.token, 1250, `provider-settlement-id-${Date.now()}`);
+  assert.equal(created.status, 201);
+  const detail = await getInvoice(ctx.started.baseUrl, ctx.admin.token, created.data.invoice_id);
+  const providerPaymentId = `pay-settlement-id-${Date.now()}`;
+  const providerEvent = await ingestProviderEvent(ctx.started.baseUrl, ctx.env, {
+    provider_code: "mock_provider",
+    provider_event_id: `evt-settlement-id-${Date.now()}`,
+    provider_payment_id: providerPaymentId,
+    provider_session_id: `sess-settlement-id-${Date.now()}`,
+    invoice_id: created.data.invoice_id,
+    event_type: "authorized",
+    provider_status: "authorized",
+    amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+    occurred_at: new Date().toISOString(),
+  }, "settlement-id-event");
+  assert.equal(providerEvent.status, 200);
+
+  const settlementId = `settlement-id-${Date.now()}`;
+  const body = {
+    provider_code: "mock_provider",
+    provider_settlement_id: settlementId,
+    settlement_status: "confirmed",
+    settlement_amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+    reported_at: "2026-07-24T00:00:00.000Z",
+    allocations: [{
+      provider_payment_id: providerPaymentId,
+      invoice_id: created.data.invoice_id,
+      allocated_amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+      allocation_status: "matched",
+    }],
+  };
+  const first = await ingestProviderSettlement(ctx.started.baseUrl, ctx.env, body, "settlement-id-first");
+  assert.equal(first.status, 200);
+  assert.equal(first.data.disputed, false);
+  const replay = await ingestProviderSettlement(ctx.started.baseUrl, ctx.env, body, "settlement-id-replay");
+  assert.equal(replay.status, 200);
+  assert.equal(replay.data.disputed, false);
+  const allocationCount = ctx.db
+    .prepare(`SELECT COUNT(*) AS count FROM provider_settlement_allocations WHERE provider_settlement_id = (SELECT id FROM provider_settlements WHERE provider_settlement_id = ?)`)
+    .get(settlementId);
+  assert.equal(allocationCount.count, 1);
+
+  const conflict = await ingestProviderSettlement(ctx.started.baseUrl, ctx.env, {
+    ...body,
+    batch_reference: "conflicting-payload",
+  }, "settlement-id-conflict");
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.data.error.code, "PROVIDER_SETTLEMENT_PAYLOAD_CONFLICT");
+  const conflictedSettlement = ctx.db
+    .prepare(`SELECT settlement_status FROM provider_settlements WHERE provider_settlement_id = ?`)
+    .get(settlementId);
+  assert.equal(conflictedSettlement.settlement_status, "disputed");
+
+  const duplicateProviderPaymentId = `pay-settlement-dup-${Date.now()}`;
+  const duplicateProviderEvent = await ingestProviderEvent(ctx.started.baseUrl, ctx.env, {
+    provider_code: "mock_provider",
+    provider_event_id: `evt-settlement-dup-${Date.now()}`,
+    provider_payment_id: duplicateProviderPaymentId,
+    provider_session_id: `sess-settlement-dup-${Date.now()}`,
+    invoice_id: created.data.invoice_id,
+    event_type: "authorized",
+    provider_status: "authorized",
+    amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+    occurred_at: new Date().toISOString(),
+  }, "settlement-dup-event");
+  assert.equal(duplicateProviderEvent.status, 200);
+  const duplicateSettlementId = `settlement-id-in-payload-${Date.now()}`;
+  const duplicate = await ingestProviderSettlement(ctx.started.baseUrl, ctx.env, {
+    ...body,
+    provider_settlement_id: duplicateSettlementId,
+    settlement_amount_jpyc_base: String(BigInt(detail.data.amounts.amount_jpyc_base) * 2n),
+    allocations: [{
+      provider_payment_id: duplicateProviderPaymentId,
+      invoice_id: created.data.invoice_id,
+      allocated_amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+      allocation_status: "matched",
+    }, {
+      provider_payment_id: duplicateProviderPaymentId,
+      invoice_id: created.data.invoice_id,
+      allocated_amount_jpyc_base: detail.data.amounts.amount_jpyc_base,
+      allocation_status: "matched",
+    }],
+  }, "settlement-id-duplicate-payload");
+  assert.equal(duplicate.status, 200);
+  assert.equal(duplicate.data.disputed, true);
+  const duplicateAllocationCount = ctx.db
+    .prepare(`SELECT COUNT(*) AS count FROM provider_settlement_allocations WHERE provider_settlement_id = (SELECT id FROM provider_settlements WHERE provider_settlement_id = ?)`)
+    .get(duplicateSettlementId);
+  assert.equal(duplicateAllocationCount.count, 1);
 });

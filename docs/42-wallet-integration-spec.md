@@ -86,7 +86,7 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
 
 ## Runtime modes
 - `mock`: 開発・テスト用
-- `reown`: env と Project ID が揃った場合のみ `ready`
+- `reown`: 実セッション／AppKit統合が未実装のため、設定値だけでは `ready` にしない
 - 利用不可の場合も公開APIは `reason` と copy fallback を返す
 
 ## Validation

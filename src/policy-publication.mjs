@@ -38,6 +38,10 @@ export function isPublishedPolicyVersion(value) {
   return Boolean(version) && !/(?:draft|pending|placeholder|example)/i.test(version);
 }
 
+export function isPublishedPolicyHash(value) {
+  return /^[0-9a-f]{64}$/i.test(String(value || "").trim());
+}
+
 export function extractPolicyObjectValues(content, constantName, requiredKeys) {
   const values = Object.fromEntries(requiredKeys.map((key) => [key, ""]));
   const blockMatch = String(content || "").match(new RegExp(`const\\s+${constantName}\\s*=\\s*\\{([\\s\\S]*?)\\};`, "m"));

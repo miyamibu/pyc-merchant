@@ -223,7 +223,7 @@ test("Settlement Export v1 compatibility and v2 refund integrity", async (t) => 
         to_address: env.RECIPIENT_ADDRESS,
         confirmations: 2,
         tx_hash: randomTxHash("v2-refund-overpay"),
-        from_address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        from_address: REFUND_TO_ADDRESS,
       },
       `v2-refund-payment-${Date.now()}`
     );

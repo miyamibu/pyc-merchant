@@ -49,7 +49,7 @@ test("refund evidence registry enforces two-person rule and keeps recorded state
       to_address: env.RECIPIENT_ADDRESS,
       confirmations: 2,
       tx_hash: randomTxHash("refund-reg-overpay"),
-      from_address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      from_address: "0x4444444444444444444444444444444444444444",
     },
     `refund-reg-ingest-${Date.now()}`
   );
@@ -134,7 +134,7 @@ test("refund evidence registry enforces two-person rule and keeps recorded state
     headers: authHeaders(requester.token),
   });
   assert.equal(readBack.status, 200);
-  assert.equal(readBack.data.refund_case_id, request.data.refund_request_id);
+  assert.notEqual(readBack.data.refund_case_id, request.data.refund_request_id);
   assert.equal(readBack.data.executed_wallet, "0x5555555555555555555555555555555555555555");
   assert.equal(readBack.data.evidence_note_path, "docs/production/evidence/demo/refund-executed.md");
   assert.ok(Array.isArray(readBack.data.audit_log_refs));

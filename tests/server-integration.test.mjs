@@ -255,12 +255,15 @@ test("server security integration flows", async (t) => {
     assert.equal(overpay.status, 200);
     assert.equal(overpay.data.status, "review_required");
 
-    const businessDateJst = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Asia/Tokyo",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(new Date());
+    // Keep this close test isolated from the later issuance tests. The production
+    // gate intentionally blocks issuance for a store/date after close, so use a
+    // deterministic historical business date for the two invoices under test.
+    const businessDateJst = "1999-01-01";
+    db.prepare(`UPDATE invoices SET business_date = ? WHERE id IN (?, ?)`).run(
+      businessDateJst,
+      paidInvoice.data.invoice_id,
+      reviewInvoice.data.invoice_id
+    );
     const closeRes = await apiRequest(started.baseUrl, "/api/v1/settlements/daily:close", {
       method: "POST",
       headers: authHeaders(admin.token, {
@@ -348,7 +351,7 @@ test("server security integration flows", async (t) => {
   });
 
   await t.test("SR-15 kill switch blocks invoice creation and changes are audited", async () => {
-    const disable = await apiRequest(started.baseUrl, "/api/v1/admin/payments/disable", {
+    const disable = await apiRequest(started.baseUrl, "/api/v1/admin/stores/store-001/payments/disable", {
       method: "POST",
       headers: authHeaders(admin.token, {
         "content-type": "application/json",
@@ -357,13 +360,13 @@ test("server security integration flows", async (t) => {
       body: JSON.stringify({ reason: "incident-test" }),
     });
     assert.equal(disable.status, 200);
-    assert.equal(disable.data.payments_disabled, true);
+    assert.equal(disable.data.disabled, true);
 
     const blocked = await createInvoice(started.baseUrl, admin.token, 1700, `inv-blocked-${Date.now()}`);
     assert.equal(blocked.status, 503);
     assert.equal(blocked.data.error.code, "PAYMENTS_DISABLED");
 
-    const enable = await apiRequest(started.baseUrl, "/api/v1/admin/payments/enable", {
+    const enable = await apiRequest(started.baseUrl, "/api/v1/admin/stores/store-001/payments/enable", {
       method: "POST",
       headers: authHeaders(admin.token, {
         "content-type": "application/json",
@@ -372,14 +375,14 @@ test("server security integration flows", async (t) => {
       body: JSON.stringify({ reason: "recover-test" }),
     });
     assert.equal(enable.status, 200);
-    assert.equal(enable.data.payments_disabled, false);
+    assert.equal(enable.data.disabled, false);
 
     const audit = await apiRequest(started.baseUrl, "/api/v1/audit-logs?limit=200", {
       headers: authHeaders(admin.token),
     });
     const actions = (audit.data.audit_logs || []).map((row) => row.action);
-    assert.ok(actions.includes("payments.disabled"));
-    assert.ok(actions.includes("payments.enabled"));
+    assert.ok(actions.includes("payments.store_disabled"));
+    assert.ok(actions.includes("payments.store_enabled"));
   });
 
   await t.test("SR-06 manual refund is recorded, external signer blocked without legal gate, duplicate tx hash blocked", async () => {
@@ -398,7 +401,7 @@ test("server security integration flows", async (t) => {
         to_address: env.RECIPIENT_ADDRESS,
         confirmations: 2,
         tx_hash: randomTxHash("refund-overpay"),
-        from_address: "0xcccccccccccccccccccccccccccccccccccccccc",
+        from_address: "0x4444444444444444444444444444444444444444",
       },
       `pay-refund-${Date.now()}`
     );
@@ -539,7 +542,7 @@ test("server security integration flows", async (t) => {
         to_address: env.RECIPIENT_ADDRESS,
         confirmations: 2,
         tx_hash: randomTxHash("refund-overpay-2"),
-        from_address: "0xdddddddddddddddddddddddddddddddddddddddd",
+        from_address: "0x5555555555555555555555555555555555555555",
       },
       `pay-refund-2-${Date.now()}`
     );

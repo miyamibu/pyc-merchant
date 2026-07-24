@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -148,7 +149,113 @@ function validateReleaseId(value) {
     || /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
 }
 
-function loadReleaseManifest(manifestPath) {
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function releaseSigningPayload(manifest) {
+  const unsigned = { ...(manifest || {}) };
+  delete unsigned.signatures;
+  delete unsigned.signature;
+  return Buffer.from(stableJson(unsigned), "utf8");
+}
+
+function resolveArtifactPath(rawPath) {
+  const resolved = path.resolve(process.cwd(), String(rawPath || "").trim());
+  const relative = path.relative(process.cwd(), resolved);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+  return resolved;
+}
+
+function verifyManifestArtifacts(manifest) {
+  const rawEntries = manifest?.artifact_hashes ?? manifest?.artifacts ?? manifest?.files;
+  const entries = Array.isArray(rawEntries)
+    ? rawEntries.filter((entry) => entry && typeof entry === "object").map((entry) => ({
+      field: String(entry.field || entry.name || "").trim(),
+      path: String(entry.path || entry.file || entry.relative_path || "").trim(),
+      expected: String(entry.sha256 || entry.hash || "").trim().toLowerCase(),
+    }))
+    : Object.entries(rawEntries || {}).map(([field, entry]) => ({
+      field: String(entry?.field || field).trim(),
+      path: String(entry?.path || entry?.file || entry?.relative_path || (typeof entry === "string" ? field : "")).trim(),
+      expected: String(entry?.sha256 || entry?.hash || (typeof entry === "string" ? entry : "")).trim().toLowerCase(),
+    }));
+  const blockers = [];
+  const verifiedFields = [];
+  for (const field of ["source_hash", "lockfile_hash", "migration_hash", "env_hash", "db_snapshot_hash", "backup_hash"]) {
+    const declared = String(manifest?.[field] || "").trim().toLowerCase();
+    const entry = entries.find((candidate) => candidate.field === field);
+    if (!declared || !entry?.path || entry.expected !== declared) {
+      blockers.push(`manifest_hash_unverifiable_${field}`);
+      continue;
+    }
+    const artifactPath = resolveArtifactPath(entry.path);
+    if (!artifactPath || !fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
+      blockers.push(`manifest_artifact_missing_${field}`);
+      continue;
+    }
+    const actual = crypto.createHash("sha256").update(fs.readFileSync(artifactPath)).digest("hex");
+    if (actual !== declared) blockers.push(`manifest_artifact_hash_mismatch_${field}`);
+    else verifiedFields.push(field);
+  }
+  return { ok: blockers.length === 0, verified_fields: verifiedFields, blockers };
+}
+
+function verifyManifestSignatures(manifest, env = {}) {
+  const signatures = Array.isArray(manifest?.signatures) ? manifest.signatures : [];
+  const validSignatureIndexes = [];
+  const blockers = [];
+  const payload = releaseSigningPayload(manifest);
+  const trustedKeys = new Map();
+  for (const rawPath of String(env.RELEASE_TRUSTED_PUBLIC_KEY_PATHS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)) {
+    const trustedPath = resolveArtifactPath(rawPath);
+    try {
+      const publicKey = fs.readFileSync(trustedPath, "utf8").trim();
+      if (publicKey) trustedKeys.set(crypto.createHash("sha256").update(publicKey).digest("hex"), publicKey);
+    } catch (_error) {
+      // Missing trusted keys remain a hard blocker below.
+    }
+  }
+  const revokedKeyIds = new Set(String(env.RELEASE_REVOKED_KEY_IDS || "").split(",").map((value) => value.trim()).filter(Boolean));
+  if (trustedKeys.size === 0) blockers.push("manifest_trusted_key_set_missing");
+  for (const [index, entry] of signatures.entries()) {
+    const algorithm = String(entry?.algorithm || "").trim().toLowerCase();
+    const publicKey = entry?.public_key_pem || entry?.public_key;
+    const encodedSignature = entry?.signature_base64 || entry?.signature;
+    const keyId = String(entry?.key_id || "").trim();
+    const trustedPublicKey = trustedKeys.get(keyId);
+    if (algorithm !== "ed25519" || !publicKey || !encodedSignature || !keyId) {
+      blockers.push(`manifest_signature_${index}_unsupported`);
+      continue;
+    }
+    if (!trustedPublicKey || trustedPublicKey.trim() !== String(publicKey).trim()) {
+      blockers.push(`manifest_signature_${index}_untrusted_key`);
+      continue;
+    }
+    if (revokedKeyIds.has(keyId)) {
+      blockers.push(`manifest_signature_${index}_revoked_key`);
+      continue;
+    }
+    try {
+      const signature = Buffer.from(String(encodedSignature), String(entry.encoding || "base64"));
+      if (crypto.verify(null, payload, publicKey, signature)) validSignatureIndexes.push(index);
+      else blockers.push(`manifest_signature_${index}_invalid`);
+    } catch (_error) {
+      blockers.push(`manifest_signature_${index}_invalid`);
+    }
+  }
+  if (validSignatureIndexes.length === 0) blockers.push("manifest_no_valid_signature");
+  return { ok: blockers.length === 0, valid_signature_indexes: validSignatureIndexes, blockers };
+}
+
+function loadReleaseManifest(manifestPath, env = {}) {
   if (!manifestPath) return { ok: false, path: null, blockers: ["missing_release_manifest"] };
   const resolved = path.resolve(process.cwd(), manifestPath);
   if (!fs.existsSync(resolved)) return { ok: false, path: resolved, blockers: ["missing_release_manifest"] };
@@ -205,7 +312,17 @@ function loadReleaseManifest(manifestPath) {
   if (!Number.isFinite(expiresAt)) blockers.push("manifest_expires_at_invalid");
   if (Number.isFinite(issuedAt) && issuedAt > Date.now() + 60_000) blockers.push("manifest_issued_at_in_future");
   if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) blockers.push("manifest_expired");
-  return { ok: blockers.length === 0, path: resolved, manifest, blockers };
+  const artifactVerification = verifyManifestArtifacts(manifest);
+  const signatureVerification = verifyManifestSignatures(manifest, env);
+  blockers.push(...artifactVerification.blockers, ...signatureVerification.blockers);
+  return {
+    ok: blockers.length === 0,
+    path: resolved,
+    manifest,
+    blockers,
+    artifact_verification: artifactVerification,
+    signature_verification: signatureVerification,
+  };
 }
 
 function evaluateDangerousFlags(env) {
@@ -227,7 +344,19 @@ function evaluateDangerousFlags(env) {
   if (manualIngest && isPlaceholderLike(env.MANUAL_INGEST_APPROVAL_REF)) {
     blockers.push("ALLOW_MANUAL_PAYMENT_INGEST requires MANUAL_INGEST_APPROVAL_REF");
   }
-  if (walletAdapterType === "mock") blockers.push("WALLET_ADAPTER_TYPE=mock is not allowed");
+  if (!["wallet_deeplink", "hashport_deeplink"].includes(walletAdapterType)) {
+    blockers.push("WALLET_ADAPTER_TYPE must be a configured wallet deeplink adapter");
+  }
+  if (!String(env.WALLET_DEEPLINK_TEMPLATE || env.HASHPORT_WALLET_DEEPLINK_TEMPLATE || "").trim()) {
+    blockers.push("a reviewed wallet deeplink template is required");
+  }
+  const enabledChains = String(env.ENABLED_PAYMENT_CHAIN_IDS || env.CHAIN_ID || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (enabledChains.length > 1) {
+    blockers.push("multi-chain production-like issuance requires an approved per-chain policy and credential registry");
+  }
   if (!isStrongSecret(env.APP_SECRET)) blockers.push("APP_SECRET is weak/default");
   if (!isStrongSecret(env.SERVICE_INGEST_SECRET)) blockers.push("SERVICE_INGEST_SECRET is weak/default");
   if (!isStrongSecret(env.METRICS_SECRET)) blockers.push("METRICS_SECRET is weak/default");
@@ -263,7 +392,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const releaseId = String(env.RELEASE_ID || "").trim();
   const evidenceDir = String(env.COMMERCIAL_EVIDENCE_DIR || "").trim();
   const manifestPath = String(env.RELEASE_MANIFEST || "").trim();
-  const releaseManifest = loadReleaseManifest(manifestPath);
+  const releaseManifest = loadReleaseManifest(manifestPath, env);
   if (releaseManifest.manifest && releaseId && String(releaseManifest.manifest.release_id || "").trim() !== releaseId) {
     releaseManifest.blockers.push("manifest_release_id_mismatch_selected_release");
     releaseManifest.ok = false;
@@ -352,6 +481,15 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   };
 
   const blockers = { P0: [], P1: [], P2: [] };
+  const releaseGateRequired = appEnv === "production"
+    || ["pilot", "commercial"].includes(String(env.DEPLOYMENT_STAGE || "").trim().toLowerCase())
+    || commercialMode;
+  if (releaseGateRequired && !/^0x[0-9a-fA-F]{40}$/.test(String(env.REFUND_TREASURY_ADDRESS || "").trim())) {
+    blockers.P0.push("REFUND_TREASURY_ADDRESS must be a configured EVM address for production-like refund verification");
+  }
+  if (releaseGateRequired && /^(?:|replace|todo|tbd|example|dummy|changeme)$/i.test(String(env.REFUND_TREASURY_APPROVAL_REF || "").trim())) {
+    blockers.P0.push("REFUND_TREASURY_APPROVAL_REF must identify the approved store/chain treasury");
+  }
 
   if (!gates.legal_gate) blockers.P0.push("missing legal approval gate/reference");
   if (!gates.aml_gate) blockers.P0.push("missing AML approval gate/reference");

@@ -53,10 +53,10 @@ test("wallet launch revalidates immediately and prevents rapid duplicate launch"
   assert.match(handler, /applyPaymentActionGate\(\)/);
   assert.match(handler, /await loadInvoice\(\{ silent: true, force: true \}\)/);
   assert.match(handler, /setLaunchInProgress\(true\)/);
-  assert.ok(handler.indexOf("await loadInvoice") < handler.indexOf("location.href"));
-  const launchState = between(mobileJs, "function setLaunchInProgress", "async function handleWalletPay");
+  assert.ok(handler.indexOf("await loadInvoice") < handler.indexOf("launchWalletWithFallback"));
+  const launchState = between(mobileJs, "function setLaunchInProgress", "function launchWalletWithFallback");
   assert.doesNotMatch(launchState, /setTimeout/);
-  assert.match(launchState, /async function refreshAfterBrowserRecovery/);
+  assert.match(mobileJs, /async function refreshAfterBrowserRecovery/);
   assert.match(mobileJs, /visibilityState === "visible"\) void refreshAfterBrowserRecovery\(\)/);
   assert.match(mobileJs, /setLaunchInProgress\(false\);\s*void loadInvoice\(\{ silent: false, force: true \}\)/);
   for (const functionName of ["handleCopyInfo", "handleCopyAddress", "handleCopyAmount", "handleCopyInvoice", "handleShowMethods"]) {
@@ -201,12 +201,15 @@ test("paid receipt requires server transaction hash and confirmation time", () =
 
 test("wallet and help navigation reject unsafe URL schemes", () => {
   const mobileJs = read("public/mobile.js");
-  const launchTarget = between(mobileJs, "function buildWalletLaunchTarget", "function buildManualPaymentInstructions");
+  const launchTarget = between(mobileJs, "function buildWalletLaunchCandidates", "function buildWalletLaunchTarget");
 
   assert.match(mobileJs, /WALLET_LAUNCH_PROTOCOLS\s*=\s*new Set/);
   assert.match(launchTarget, /WALLET_LAUNCH_PROTOCOLS\.has\(parsed\.protocol\)/);
   assert.match(launchTarget, /!parsed\.username && !parsed\.password/);
-  assert.ok(launchTarget.indexOf('{ type: "payment_uri"') < launchTarget.indexOf('{ type: "wallet_deeplink"'), "validated EIP-681 target must be preferred");
+  assert.ok(launchTarget.indexOf('{ type: "wallet_deeplink"') < launchTarget.indexOf('{ type: "wallet_url"'), "reviewed wallet deeplink must be preferred");
+  assert.ok(launchTarget.indexOf('{ type: "wallet_deeplink"') < launchTarget.indexOf('{ type: "payment_uri"'), "reviewed wallet deeplink must precede the standard URI");
+  assert.ok(launchTarget.indexOf('{ type: "payment_uri"') < launchTarget.indexOf('{ type: "wallet_url"'), "standard payment URI must precede the generic wallet URL fallback");
+  assert.match(launchTarget, /const seenUrls = new Set\(\)/);
   assert.doesNotMatch(launchTarget, /return \{ type: candidate\.type, url: candidate\.url\.trim\(\) \}/);
   assert.match(mobileJs, /parsed\.protocol === "https:" \|\| parsed\.origin === window\.location\.origin/);
 });

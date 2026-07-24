@@ -133,9 +133,14 @@ test("production fatal guards reject unsafe startup configs", async (t) => {
       pattern: /legal\/AML\/privacy\/APPI approvals/i,
     },
     {
-      name: "weak reown project id",
-      env: { REOWN_PROJECT_ID: "example" },
-      pattern: /REOWN_PROJECT_ID/i,
+      name: "missing wallet deeplink template",
+      env: { WALLET_DEEPLINK_TEMPLATE: "" },
+      pattern: /wallet deeplink adapter is not fully configured/i,
+    },
+    {
+      name: "missing internal worker origin",
+      env: { INTERNAL_APP_ORIGIN: "" },
+      pattern: /INTERNAL_APP_ORIGIN/i,
     },
   ];
 

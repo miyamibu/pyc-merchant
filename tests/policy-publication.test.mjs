@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   evaluatePolicyPublicationSource,
+  isPublishedPolicyHash,
   isPublishedPolicyUrl,
   isPublishedPolicyVersion,
   validatePolicyVersionSubmission,
@@ -53,6 +54,13 @@ test("published policy source requires production URLs and non-placeholder versi
   const draft = evaluatePolicyPublicationSource(policySource({ termsVersion: "draft-v1" }));
   assert.equal(draft.ok, false);
   assert.deepEqual(draft.missing_version_keys, ["terms_version"]);
+});
+
+test("policy content hashes require a full SHA-256 digest", () => {
+  assert.equal(isPublishedPolicyHash("a".repeat(64)), true);
+  assert.equal(isPublishedPolicyHash("A".repeat(64)), true);
+  assert.equal(isPublishedPolicyHash("a".repeat(63)), false);
+  assert.equal(isPublishedPolicyHash("g".repeat(64)), false);
 });
 
 test("policy URLs reject credentials, placeholders, local names, and non-public IP ranges", () => {

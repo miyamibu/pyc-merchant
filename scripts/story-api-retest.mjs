@@ -157,16 +157,16 @@ async function run() {
       });
     }
 
-    await request("payments disable global", ["AS-004"], "/api/v1/admin/payments/disable", {
+    await request("payments disable global denied for store admin", ["AS-004"], "/api/v1/admin/payments/disable", {
       method: "POST",
       headers: headers({ "content-type": "application/json", "idempotency-key": idem("payments-disable") }),
       body: JSON.stringify({ reason: "story_api_retest" }),
-    });
-    await request("payments enable global", ["AS-004"], "/api/v1/admin/payments/enable", {
+    }, [403]);
+    await request("payments enable global denied for store admin", ["AS-004"], "/api/v1/admin/payments/enable", {
       method: "POST",
       headers: headers({ "content-type": "application/json", "idempotency-key": idem("payments-enable") }),
       body: JSON.stringify({ reason: "story_api_retest" }),
-    });
+    }, [403]);
     await request("payments disable terminal", ["AS-004"], `/api/v1/admin/terminals/${encodeURIComponent(existingTerminalId)}/payments/disable`, {
       method: "POST",
       headers: headers({ "content-type": "application/json", "idempotency-key": idem("terminal-disable") }),
@@ -345,12 +345,12 @@ async function run() {
       body: JSON.stringify({ reason: "story_api_retest" }),
     });
 
-    await request("chain monitor status", ["AS-010"], "/api/v1/chain-monitor/status", { headers: headers() });
-    await request("chain monitor unmatched", ["AS-010"], "/api/v1/chain-monitor/unmatched?limit=5", { headers: headers() });
-    await request("chain monitor dead letters", ["AS-010"], "/api/v1/chain-monitor/dead-letters?limit=5", { headers: headers() });
+    await request("chain monitor status denied for store admin", ["AS-010"], "/api/v1/chain-monitor/status", { headers: headers() }, [403]);
+    await request("chain monitor unmatched denied for store admin", ["AS-010"], "/api/v1/chain-monitor/unmatched?limit=5", { headers: headers() }, [403]);
+    await request("chain monitor dead letters denied for store admin", ["AS-010"], "/api/v1/chain-monitor/dead-letters?limit=5", { headers: headers() }, [403]);
 
     await request("audit log list", ["AS-009"], "/api/v1/audit-logs?limit=20", { headers: headers() });
-    await request("audit chain verify", ["AS-009", "AS-017"], "/api/v1/audit-logs/verify-chain", { headers: headers() });
+    await request("audit chain verify denied for store admin", ["AS-009", "AS-017"], "/api/v1/audit-logs/verify-chain", { headers: headers() }, [403]);
     await request("audit csv export", ["AS-009"], "/api/v1/audit-logs/export", { headers: headers() });
 
     const reviewListForDetail = await request("review list for detail", ["AS-006"], "/api/v1/reviews?status=open&limit=10", { headers: headers() });

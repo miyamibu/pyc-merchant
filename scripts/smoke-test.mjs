@@ -12,6 +12,7 @@ const SECOND_ADMIN_NAME = process.env.SECOND_ADMIN_NAME || "Smoke Approver";
 const CHAIN_ID = process.env.CHAIN_ID || "137";
 const TOKEN_CONTRACT = process.env.TOKEN_CONTRACT || "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 const RECIPIENT = process.env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222";
+const CUSTOMER_ADDRESS = process.env.CUSTOMER_ADDRESS || "0x3333333333333333333333333333333333333333";
 const SERVICE_INGEST_ID = process.env.SERVICE_INGEST_ID || "chain-monitor";
 const SERVICE_INGEST_SECRET = process.env.SERVICE_INGEST_SECRET || "replace-with-very-long-random-ingest-secret";
 const SESSION_EXPIRE_WAIT_MS = Number(process.env.SESSION_EXPIRE_WAIT_MS || 0);
@@ -232,7 +233,7 @@ async function ingestPayment(authorization, idempotencyKey, link, amountJpyc, mo
       to_address: RECIPIENT,
       confirmations: 2,
       tx_hash: randomTxHash(`${mode}-${link.invoiceId}`),
-      from_address: "0xcustomer"
+      from_address: CUSTOMER_ADDRESS
     })
   });
 }
@@ -450,7 +451,7 @@ async function main() {
     body: JSON.stringify({
       review_case_id: reviewId,
       refund_amount_jpyc: 100,
-      refund_to_address: "0x3333333333333333333333333333333333333333",
+      refund_to_address: CUSTOMER_ADDRESS,
       refund_chain_id: CHAIN_ID
     })
   });
@@ -529,7 +530,7 @@ async function main() {
         to_address: RECIPIENT,
         confirmations: 2,
         tx_hash: randomTxHash("public-disabled"),
-        from_address: "0xcustomer"
+        from_address: CUSTOMER_ADDRESS
       })
     }
   );

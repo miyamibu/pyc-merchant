@@ -172,7 +172,7 @@ export function buildWalletLaunchPayload({
 }
 
 export function createWalletAdapter(env = process.env) {
-  const adapterType = String(env.WALLET_ADAPTER_TYPE || "mock");
+  const adapterType = String(env.WALLET_ADAPTER_TYPE || "mock").trim().toLowerCase();
   const reownProjectId = normalizeString(env.REOWN_PROJECT_ID);
   const walletHelpUrl = normalizeString(env.WALLET_HELP_URL || "https://walletconnect.com/");
   const reownEnabled = parseFlag(env.ENABLE_REOWN, false);
@@ -188,26 +188,28 @@ export function createWalletAdapter(env = process.env) {
   };
 
   if (adapterType === "reown") {
-    if (!reownEnabled) {
+    return {
+      ...baseConfig,
+      available: false,
+      status: "reown_session_not_implemented",
+      reason: "Reown AppKit/WalletConnect session integration is not implemented; use a configured wallet deeplink adapter"
+    };
+  }
+
+  if (["wallet_deeplink", "hashport_deeplink"].includes(adapterType)) {
+    if (!walletDeeplinkTemplateConfigured) {
       return {
         ...baseConfig,
         available: false,
-        status: "disabled_by_flag",
-        reason: "Reown adapter is disabled by feature flag"
-      };
-    }
-    if (!baseConfig.reown_project_id_configured) {
-      return {
-        ...baseConfig,
-        available: false,
-        status: "missing_project_id",
-        reason: "Reown Project ID is not configured"
+        status: "missing_deeplink_template",
+        reason: "A reviewed wallet deeplink template is required"
       };
     }
     return {
       ...baseConfig,
       available: true,
       status: "ready",
+      integration: "configured_deeplink",
       reason: null
     };
   }
@@ -215,8 +217,10 @@ export function createWalletAdapter(env = process.env) {
   return {
     ...baseConfig,
     available: false,
-    status: "mock_only",
-    reason: "Mock adapter active. Real wallet transfer is unavailable."
+    status: adapterType === "mock" ? "mock_only" : "unsupported_adapter",
+    reason: adapterType === "mock"
+      ? "Mock adapter active. Real wallet transfer is unavailable."
+      : `Unsupported wallet adapter type: ${adapterType}`
   };
 }
 

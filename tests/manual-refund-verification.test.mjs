@@ -114,6 +114,28 @@ async function verifyRefund(baseUrl, token, refundId, idemKey, refundTxHash = nu
   });
 }
 
+async function recordRefundFundingLineage(baseUrl, token, refundId, payload, idemPrefix) {
+  return apiRequest(baseUrl, `/api/v1/refunds/${encodeURIComponent(refundId)}/funding-lineage`, {
+    method: "POST",
+    headers: authHeaders(token, {
+      "content-type": "application/json",
+      "idempotency-key": `${idemPrefix}-${Date.now()}`,
+    }),
+    body: JSON.stringify(payload),
+  });
+}
+
+async function verifyRefundFundingLineage(baseUrl, token, refundId, idemPrefix) {
+  return apiRequest(baseUrl, `/api/v1/refunds/${encodeURIComponent(refundId)}/funding-lineage/verify`, {
+    method: "POST",
+    headers: authHeaders(token, {
+      "content-type": "application/json",
+      "idempotency-key": `${idemPrefix}-${Date.now()}`,
+    }),
+    body: "{}",
+  });
+}
+
 function holdNextReceiptResponse(rpc, txHash) {
   let markEntered;
   const entered = new Promise((resolve) => {
@@ -176,6 +198,8 @@ test("manual ingest verifies receipts on-chain before applying payment decisions
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
     TOKEN_DECIMALS: "6",
     JPYC_BASE_UNIT_SCALE: "1000000",
+    REFUND_TREASURY_ADDRESS: "0xdddddddddddddddddddddddddddddddddddddddd",
+    REFUND_TREASURY_APPROVAL_REF: "TREASURY-2026-001",
   });
   const started = await startServerProcess(CWD, env);
 
@@ -336,6 +360,8 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
     TOKEN_DECIMALS: "6",
     JPYC_BASE_UNIT_SCALE: "1000000",
+    REFUND_TREASURY_ADDRESS: "0xdddddddddddddddddddddddddddddddddddddddd",
+    REFUND_TREASURY_APPROVAL_REF: "TREASURY-2026-001",
   });
   const wrongChainStarted = await startServerProcess(CWD, wrongChainEnv);
   t.after(async () => {
@@ -378,6 +404,8 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
     TOKEN_DECIMALS: "6",
     JPYC_BASE_UNIT_SCALE: "1000000",
+    REFUND_TREASURY_ADDRESS: "0xdddddddddddddddddddddddddddddddddddddddd",
+    REFUND_TREASURY_APPROVAL_REF: "TREASURY-2026-001",
   });
   const started = await startServerProcess(CWD, env);
   const testDb = new Database(env.DB_PATH, { readonly: true });
@@ -405,7 +433,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: paymentTx,
       tokenContract,
-      fromAddress: "0x9999999999999999999999999999999999999999",
+      fromAddress: toAddress,
       toAddress: detail.data.chain.recipient_address,
       amountBase: String(BigInt(detail.data.amounts.amount_jpyc_base) + BigInt(paidAmount - invoiceAmount) * 1_000_000n),
       blockNumber: 300 + Math.floor(Math.random() * 100),
@@ -422,10 +450,74 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     return {
       refundId: request.data.refund_request_id,
       invoice: refreshed.data,
+      payerAddress: toAddress,
       refundToAddress: toAddress,
       refundAmountBase: request.data.refund_amount_jpyc_base,
     };
   }
+
+  await t.test("refund funding lineage is recorded, verified, and permits treasury-origin refund verification", async () => {
+    const scenario = await createRefundScenario("refund-funding-lineage", 2205, 2405, 200, "0x4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d");
+    const treasuryAddress = env.REFUND_TREASURY_ADDRESS;
+    const sweepTx = randomTxHash("refund-funding-sweep");
+    const sweepAmountBase = scenario.refundAmountBase;
+    const sourceAddress = scenario.invoice.chain.recipient_address;
+    rpc.registerTransfer({
+      txHash: sweepTx,
+      tokenContract,
+      fromAddress: sourceAddress,
+      toAddress: treasuryAddress,
+      amountBase: sweepAmountBase,
+      blockNumber: 700,
+    });
+    rpc.setLatestBlock(702);
+
+    const recorded = await recordRefundFundingLineage(
+      started.baseUrl,
+      admin.token,
+      scenario.refundId,
+      {
+        source_address: sourceAddress,
+        treasury_address: treasuryAddress,
+        chain_id: env.CHAIN_ID,
+        sweep_tx_hash: sweepTx,
+        sweep_amount_jpyc_base: sweepAmountBase,
+      },
+      "refund-funding-record"
+    );
+    assert.equal(recorded.status, 201);
+    assert.equal(recorded.data.funding_lineage.status, "recorded");
+
+    const verifiedLineage = await verifyRefundFundingLineage(
+      started.baseUrl,
+      admin.token,
+      scenario.refundId,
+      "refund-funding-verify"
+    );
+    assert.equal(verifiedLineage.status, 200);
+    assert.equal(verifiedLineage.data.funding_lineage.status, "verified");
+
+    const refundTx = randomTxHash("refund-funding-treasury");
+    const executed = await executeRefund(started.baseUrl, admin.token, scenario.refundId, refundTx, "refund-funding-execute");
+    assert.equal(executed.status, 200);
+    rpc.registerTransfer({
+      txHash: refundTx,
+      tokenContract,
+      fromAddress: treasuryAddress,
+      toAddress: scenario.refundToAddress,
+      amountBase: scenario.refundAmountBase,
+      blockNumber: 800,
+    });
+    rpc.setLatestBlock(802);
+    const refundVerified = await verifyRefund(
+      started.baseUrl,
+      admin.token,
+      scenario.refundId,
+      `refund-funding-refund-verify-${Date.now()}`
+    );
+    assert.equal(refundVerified.status, 200);
+    assert.equal(refundVerified.data.status, "succeeded");
+  });
 
   await t.test("recorded refund is promoted to succeeded after exact on-chain verification", async () => {
     const scenario = await createRefundScenario("refund-success", 2200, 2400, 200, "0x4444444444444444444444444444444444444444");
@@ -436,7 +528,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: refundTx,
       tokenContract,
-      fromAddress: scenario.invoice.chain.recipient_address,
+      fromAddress: scenario.payerAddress,
       toAddress: scenario.refundToAddress,
       amountBase: scenario.refundAmountBase,
       blockNumber: 600,
@@ -485,7 +577,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: refundTx,
       tokenContract,
-      fromAddress: scenario.invoice.chain.recipient_address,
+      fromAddress: scenario.payerAddress,
       toAddress: scenario.refundToAddress,
       amountBase: scenario.refundAmountBase,
       blockNumber: 605,
@@ -549,7 +641,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       rpc.registerTransfer({
         txHash,
         tokenContract,
-        fromAddress: scenario.invoice.chain.recipient_address,
+        fromAddress: scenario.payerAddress,
         toAddress: scenario.refundToAddress,
         amountBase: scenario.refundAmountBase,
         blockNumber,
@@ -606,7 +698,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: wrongTokenTx,
       tokenContract: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      fromAddress: wrongToken.invoice.chain.recipient_address,
+      fromAddress: wrongToken.payerAddress,
       toAddress: wrongToken.refundToAddress,
       amountBase: wrongToken.refundAmountBase,
       blockNumber: 610,
@@ -622,7 +714,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: wrongToTx,
       tokenContract,
-      fromAddress: wrongTo.invoice.chain.recipient_address,
+      fromAddress: wrongTo.payerAddress,
       toAddress: "0x7777777777777777777777777777777777777777",
       amountBase: wrongTo.refundAmountBase,
       blockNumber: 620,
@@ -654,7 +746,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: wrongAmountTx,
       tokenContract,
-      fromAddress: wrongAmount.invoice.chain.recipient_address,
+      fromAddress: wrongAmount.payerAddress,
       toAddress: wrongAmount.refundToAddress,
       amountBase: String(BigInt(wrongAmount.refundAmountBase) + 1_000_000n),
       blockNumber: 640,
@@ -672,12 +764,12 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     rpc.registerTransfer({
       txHash: pendingTx,
       tokenContract,
-      fromAddress: pending.invoice.chain.recipient_address,
+      fromAddress: pending.payerAddress,
       toAddress: pending.refundToAddress,
       amountBase: pending.refundAmountBase,
-      blockNumber: 650,
+      blockNumber: 900,
     });
-    rpc.setLatestBlock(650);
+    rpc.setLatestBlock(900);
     const verifyPending = await verifyRefund(started.baseUrl, admin.token, pending.refundId, `refund-pending-verify-${Date.now()}`);
     assert.equal(verifyPending.status, 200);
     assert.equal(verifyPending.data.status, "pending_verification");

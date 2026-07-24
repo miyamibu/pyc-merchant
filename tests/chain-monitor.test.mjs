@@ -63,6 +63,23 @@ test("exact amount but insufficient confirmations → confirming", () => {
   assert.equal(r.nextStatus, "confirming");
 });
 
+test("cumulative split payments reach paid only when the recorded total matches", () => {
+  const splitInvoice = { ...baseInvoice, amount_jpyc: 1000, amount_jpyc_base: "1000" };
+  const first = decidePaymentStatus(splitInvoice, { ...baseEvent, amount_jpyc_base: "300" }, {
+    previousPaidAmountBase: "0",
+    totalPaidAmountBase: "300",
+  });
+  assert.equal(first.nextStatus, "review_required");
+  assert.equal(first.reasonType, "UNDERPAYMENT");
+
+  const second = decidePaymentStatus(splitInvoice, { ...baseEvent, amount_jpyc_base: "700" }, {
+    previousPaidAmountBase: "300",
+    totalPaidAmountBase: "1000",
+  });
+  assert.equal(second.nextStatus, "paid");
+  assert.equal(second.reasonLabel, "confirmed");
+});
+
 // --- decidePaymentStatus: review_required branches ---
 
 test("expired invoice → LATE_PAYMENT", () => {
@@ -142,6 +159,15 @@ test("past expires_at exact payment -> late_arrival review_required", () => {
   );
   assert.equal(r.nextStatus, "review_required");
   assert.equal(r.reasonType, "LATE_PAYMENT");
+});
+
+test("canonical block timestamp is used for expiry and the exact boundary is accepted", () => {
+  const boundary = "2024-01-01T00:00:00.000Z";
+  const r = decidePaymentStatus(
+    { ...baseInvoice, expires_at: boundary },
+    { ...baseEvent, block_timestamp: boundary, observed_at: "2024-01-01T00:00:30.000Z" }
+  );
+  assert.equal(r.nextStatus, "paid");
 });
 
 test("invalid expires_at -> invalid_invoice_expiry review_required", () => {

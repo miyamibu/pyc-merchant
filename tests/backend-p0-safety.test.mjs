@@ -120,7 +120,7 @@ test("backend P0 safety guards preserve audit secrecy, refund balance, and publi
       to_address: env.RECIPIENT_ADDRESS,
       confirmations: 2,
       tx_hash: randomTxHash("refund-cap-overpay"),
-      from_address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      from_address: REFUND_TO_ADDRESS,
     },
     `refund-cap-payment-${Date.now()}`
   );
@@ -321,7 +321,8 @@ test("backend P0 safety guards preserve audit secrecy, refund balance, and publi
 
   const legacyRow = db.prepare(`SELECT id FROM audit_logs ORDER BY rowid ASC LIMIT 1`).get();
   assert.ok(legacyRow?.id);
-  db.prepare(`UPDATE audit_logs SET after_state = ?, target_id = ?, request_id = ?, idempotency_key = ? WHERE id = ?`).run(
+  db.prepare(`UPDATE audit_logs SET store_id = ?, after_state = ?, target_id = ?, request_id = ?, idempotency_key = ? WHERE id = ?`).run(
+    "store-001",
     JSON.stringify({
       pin_hash: "legacy-pin-secret",
       token_hash: "legacy-token-secret",
