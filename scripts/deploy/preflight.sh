@@ -26,6 +26,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < "$ENV_FILE"
 
 required_keys=(
+  APP_IMAGE_REF
+  NGINX_IMAGE_REF
   APP_ENV
   APP_PORT
   APP_HOST
@@ -72,12 +74,22 @@ for key in "${required_keys[@]}"; do
   fi
 done
 
+for key in APP_IMAGE_REF NGINX_IMAGE_REF; do
+  value="${!key:-}"
+  if [[ -n "$value" && ! "$value" =~ @sha256:[0-9a-fA-F]{64}$ ]]; then
+    echo "preflight failed: $key must be a registry reference pinned by sha256 digest" >&2
+    exit 1
+  fi
+done
+
 if [[ "${#missing[@]}" -gt 0 ]]; then
   printf 'preflight failed: missing required values: %s\n' "${missing[*]}" >&2
   exit 1
 fi
 
-mkdir -p "$(dirname "${DB_PATH:-./runtime/data/app.db}")" "${BACKUP_DIR:-./runtime/backups}" ./runtime/logs
+if [[ "$ALLOW_EMPTY" != "--allow-empty" ]]; then
+  mkdir -p "$(dirname "${DB_PATH:-./runtime/data/app.db}")" "${BACKUP_DIR:-./runtime/backups}" ./runtime/logs
+fi
 node --check src/server.mjs >/dev/null
 node --check src/chain-monitor.mjs >/dev/null
 

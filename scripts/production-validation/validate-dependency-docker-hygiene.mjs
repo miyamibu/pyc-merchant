@@ -106,13 +106,29 @@ function main() {
     ensure(/FROM node@sha256:[a-f0-9]{64} AS deps/.test(dockerfile), "Dockerfile deps stage must pin Node image by digest");
     ensure(/FROM node@sha256:[a-f0-9]{64} AS runtime/.test(dockerfile), "Dockerfile runtime stage must pin Node image by digest");
     ensure(/USER appuser/.test(dockerfile), "Dockerfile must drop root privileges");
+    ensure(/org\.opencontainers\.image\.revision/.test(dockerfile), "Dockerfile must label the source commit");
     ensure(!/COPY \. \./.test(dockerfile), "Dockerfile must not copy the full workspace blindly");
     record("dockerfile_runtime_hardening", true);
 
     const compose = readText("docker-compose.prod.yml");
     ensure(/\.env\.production/.test(compose), "docker-compose.prod.yml must reference .env.production");
-    ensure(/jpyc-terminal-production:local/.test(compose), "docker-compose.prod.yml must use the built local app image");
-    record("compose_uses_production_env", true);
+    ensure(!/^\s+build:/m.test(compose), "production compose must not build images on the deployment host");
+    ensure(/\$\{APP_IMAGE_REF:\?/.test(compose), "production compose must require APP_IMAGE_REF");
+    ensure(/\$\{NGINX_IMAGE_REF:\?/.test(compose), "production compose must require NGINX_IMAGE_REF");
+    ensure(!/jpyc-terminal-production:local/.test(compose), "production compose must not use a mutable local app image tag");
+    ensure(!/condition:\s*service_started/.test(compose), "workers must wait for app health, not service start");
+    ensure((compose.match(/condition:\s*service_healthy/g) || []).length >= 5, "compose readiness ordering must be health-based");
+    for (const requiredControl of ["read_only: true", "cap_drop:", "no-new-privileges:true", "tmpfs:", "pids_limit:"]) {
+      ensure(compose.includes(requiredControl), `production compose must include ${requiredControl}`);
+    }
+    record("compose_release_and_runtime_hardening", true);
+
+    const systemd = readText("deploy/systemd/jpyc-payment-terminal.service");
+    ensure(!/up\s+--build/.test(systemd), "systemd must not rebuild the release image");
+    ensure(/up\s+--no-build\s+--pull never/.test(systemd), "systemd must start the verified image without build or implicit pull");
+    ensure(/verify-release-image\.mjs/.test(systemd), "systemd must verify release image identity before start");
+    ensure(/compose\s+--env-file \.env\.production/.test(systemd), "systemd compose commands must use the production interpolation env file");
+    record("systemd_release_identity_preflight", true);
 
     const lockfile = JSON.parse(readText("package-lock.json"));
     const licenses = collectLicensesFromLockfile(lockfile);
@@ -121,11 +137,20 @@ function main() {
 
     let dockerBuildStatus = { skipped: true, reason: "docker_unavailable" };
     if (!skipDocker && hasDocker()) {
-      execFileSync("docker", ["build", ".", "--tag", "jpyc-terminal-production:hygiene"], {
+      const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim();
+      ensure(/^[a-f0-9]{40}$/.test(sourceCommit), "Docker build requires an exact source commit");
+      execFileSync("docker", [
+        "build",
+        "--build-arg",
+        `SOURCE_COMMIT=${sourceCommit}`,
+        ".",
+        "--tag",
+        "jpyc-terminal-production:hygiene",
+      ], {
         cwd: ROOT,
         stdio: "ignore",
       });
-      dockerBuildStatus = { skipped: false };
+      dockerBuildStatus = { skipped: false, source_commit: sourceCommit };
     }
     record("docker_build", true, dockerBuildStatus);
 

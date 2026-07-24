@@ -96,7 +96,7 @@
       </div>
       <p id="receiptEvidenceNotice" class="helper-text" role="status" aria-live="polite" aria-atomic="true"></p>
       <div class="inline-action-group">
-        <button id="copyReceiptBtn" class="btn btn-secondary btn-compact" aria-label="お支払い状況をコピー">状況メモをコピー</button>
+        <button id="copyReceiptBtn" class="btn btn-secondary btn-compact" aria-label="お支払い状況をコピー" disabled>状況メモをコピー</button>
       </div>
       <p class="helper-text">取引番号とサーバー確認日時が表示された場合のみ、お支払い確認書として保管できます。</p>
     </section>
@@ -119,7 +119,7 @@
           <article class="step-card">
             <span class="step-index">2</span>
             <strong>金額と送金先を確認</strong>
-            <p class="helper-text">ウォレット画面で、表示されたネットワーク・JPYC・この画面の送金先の3つが一致していることを確認してから送信します。</p>
+            <p class="helper-text">ウォレット画面で、ネットワーク・JPYC・公式コントラクト・この画面の送金先がすべて一致していることを確認してから送信します。</p>
           </article>
           <article class="step-card">
             <span class="step-index">3</span>
@@ -157,10 +157,10 @@
       </section>
       <section id="paymentVerifyCard" class="panel stack hidden" aria-labelledby="paymentVerifyTitle">
         <div class="section-header">
-          <h3 id="paymentVerifyTitle" class="title title-md">送金前の3点照合</h3>
+          <h3 id="paymentVerifyTitle" class="title title-md">送金前の4点照合</h3>
           <span class="badge">必ず確認</span>
         </div>
-        <p class="helper-text">ウォレットで送信する前に、以下の3つがこの画面と完全に一致していることを確認してください。</p>
+        <p class="helper-text">ウォレットで送信する前に、以下の4つがこの画面と完全に一致していることを確認してください。</p>
         <div class="verify-grid">
           <div class="verify-item">
             <span class="info-label">ネットワーク</span>
@@ -169,6 +169,11 @@
           <div class="verify-item">
             <span class="info-label">トークン</span>
             <p id="verifyTokenText" class="info-value">JPYC</p>
+          </div>
+          <div class="verify-item verify-item-wide">
+            <span class="info-label">公式JPYCコントラクト（全文）</span>
+            <p id="tokenContractText" class="info-value mono contract-address-text">-</p>
+            <button id="copyTokenContractBtn" class="btn btn-secondary btn-compact" type="button" disabled>公式コントラクトをコピー</button>
           </div>
           <div class="verify-item verify-item-wide">
             <span class="info-label">送金先</span>

@@ -55,6 +55,15 @@ body {
   height: 100%;
 }
 
+.terminal-surface {
+  --control-height: 48px;
+  --tap-target-min: 48px;
+}
+
+.terminal-surface .wrap {
+  padding-bottom: max(var(--space-8), env(safe-area-inset-bottom));
+}
+
 body {
   margin: 0;
   color: var(--color-text);
@@ -260,6 +269,69 @@ label {
   border-radius: var(--radius-md);
   padding: var(--space-4);
   box-shadow: var(--shadow-card);
+}
+
+.fulfillment-banner {
+  position: sticky;
+  top: calc(env(safe-area-inset-top) + var(--space-2));
+  z-index: 30;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 2px solid #dec58d;
+  border-radius: var(--radius-md);
+  background: #fff8e8;
+  box-shadow: var(--shadow-pop);
+}
+
+.fulfillment-banner[data-decision="allow"] {
+  border-color: #87c8a9;
+  background: #eefaf4;
+}
+
+.fulfillment-banner .title,
+.fulfillment-banner p {
+  margin: 0;
+}
+
+.store-payments-control {
+  position: sticky;
+  top: calc(env(safe-area-inset-top) + 96px);
+  z-index: 40;
+  margin: var(--space-4) 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  width: min(520px, calc(100vw - var(--space-8)));
+  padding: var(--space-3);
+  border: 2px solid #e2b1ad;
+  border-radius: var(--radius-md);
+  background: #fff8f7;
+  box-shadow: var(--shadow-pop);
+}
+
+.store-payments-control[data-state="stopped"] {
+  border-color: var(--color-danger);
+  background: var(--color-danger-soft);
+}
+
+.store-payments-control[data-state="active"] {
+  border-color: #dec58d;
+  background: #fff8e8;
+}
+
+.store-payments-control .title,
+.store-payments-control p {
+  margin: 0;
+}
+
+.store-payments-control-actions {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 176px;
 }
 
 .panel {
@@ -711,6 +783,15 @@ label {
 .preset-chip .btn-remove:hover:not(:disabled) {
   background: rgba(180, 55, 47, 0.12);
   color: #8d2b24;
+}
+
+.terminal-surface .btn-compact,
+.terminal-surface .preset-chip .btn {
+  min-height: var(--tap-target-min);
+}
+
+.terminal-surface .preset-chip .btn-remove {
+  min-width: var(--tap-target-min);
 }
 
 .helper-text {
@@ -1176,6 +1257,15 @@ tbody tr:last-child td {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.contract-address-text {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-all;
 }
 
 .field-flex-1 {
@@ -1865,7 +1955,41 @@ tbody tr:last-child td {
   }
 }
 
-@media (max-width: 900px) {
+@media (min-width: 900px) and (max-width: 1160px) {
+  .terminal-surface .grid-main {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+  }
+
+  .terminal-surface .terminal-session-card {
+    grid-column: span 3;
+  }
+
+  .terminal-surface .terminal-invoice-card {
+    grid-column: span 9;
+  }
+
+  .terminal-surface .col-6 {
+    grid-column: span 6;
+  }
+
+  .terminal-surface .col-12 {
+    grid-column: span 12;
+  }
+
+  .terminal-surface .split-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 36%);
+  }
+
+}
+
+@media (min-width: 900px) {
+  .terminal-surface .metrics-grid,
+  .terminal-surface .metrics-grid-compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 899px) {
   .step-grid,
   .split-layout {
     grid-template-columns: 1fr;
@@ -1879,6 +2003,22 @@ tbody tr:last-child td {
 @media (max-width: 760px) {
   .wrap {
     padding: var(--space-4);
+  }
+
+  .terminal-surface .wrap {
+    padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
+  }
+
+  .store-payments-control {
+    top: calc(env(safe-area-inset-top) + 156px);
+    margin: var(--space-3) 0 0;
+    width: auto;
+    grid-template-columns: 1fr;
+  }
+
+  .store-payments-control-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    min-width: 0;
   }
 
   .section-header {
@@ -1908,6 +2048,10 @@ tbody tr:last-child td {
 
   .terminal-surface .btn-main-action {
     width: 100%;
+  }
+
+  .fulfillment-banner {
+    grid-template-columns: 1fr;
   }
 
   .verify-grid,
@@ -1959,6 +2103,7 @@ tbody tr:last-child td {
   }
 
   .btn,
+  .store-payments-control,
   .toast-host {
     display: none !important;
   }

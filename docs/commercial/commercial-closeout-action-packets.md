@@ -235,8 +235,11 @@ Also required (A-5 / A-6 gates):
 | `TOKEN_CONTRACT` | approved JPYC Polygon contract address |
 | `APPROVED_JPYC_TOKEN_CONTRACT` | same as `TOKEN_CONTRACT` |
 | `JPYC_CONTRACT_APPROVAL_REF` | approval ref from A-5 gate |
-| `TOKEN_DECIMALS` | `6` |
+| `TOKEN_DECIMALS` | `18`（on-chain atomic unit） |
 | `JPYC_BASE_UNIT_SCALE` | `1000000` |
+| `APPROVED_TOKEN_NAME` | independently approved value when available; otherwise blank |
+| `APPROVED_TOKEN_CODE_HASH` | independently approved Keccak-256 hash when available; otherwise blank |
+| `APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH` | independently approved value when proxy verification applies; otherwise blank |
 | `REQUIRED_CONFIRMATIONS` | approved value (recommend ≥ 12) |
 | `MIN_REQUIRED_CONFIRMATIONS` | same |
 | `CONFIRMATIONS_POLICY_APPROVAL_REF` | approval ref from A-6 gate |

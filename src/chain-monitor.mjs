@@ -11,11 +11,19 @@ import {
   parseDecimalToBaseUnits,
   scaleToDecimals,
 } from "./amounts.mjs";
+import { decideMonitoringLifecycle } from "./payment-logic.mjs";
 import {
   OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
   getSupportedPaymentChain,
   validateOfficialJpycContract,
 } from "./jpyc-contract-policy.mjs";
+import {
+  APPROVED_LEDGER_BASE_UNIT_SCALE,
+  APPROVED_TOKEN_DECIMALS,
+  tokenMetadataPolicyFromEnv,
+  verifyRpcEndpointTokenMetadata,
+  verifyRpcTokenMetadataEndpoints,
+} from "./token-metadata.mjs";
 
 const CWD = process.cwd();
 const DEFAULTS = {
@@ -28,6 +36,10 @@ const DEFAULTS = {
   APPROVED_JPYC_TOKEN_CONTRACT: "",
   JPYC_CONTRACT_APPROVAL_REF: "",
   TOKEN_DECIMALS: "18",
+  TOKEN_SYMBOL: "JPYC",
+  APPROVED_TOKEN_NAME: "",
+  APPROVED_TOKEN_CODE_HASH: "",
+  APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH: "",
   JPYC_BASE_UNIT_SCALE: "",
   RPC_URLS: "",
   RPC_URLS_1: "",
@@ -99,6 +111,11 @@ const TOKEN_CONTRACT = String(ENV.TOKEN_CONTRACT || DEFAULTS.TOKEN_CONTRACT).toL
 const APPROVED_JPYC_TOKEN_CONTRACT = String(ENV.APPROVED_JPYC_TOKEN_CONTRACT || DEFAULTS.APPROVED_JPYC_TOKEN_CONTRACT).toLowerCase();
 const JPYC_CONTRACT_APPROVAL_REF = String(ENV.JPYC_CONTRACT_APPROVAL_REF || DEFAULTS.JPYC_CONTRACT_APPROVAL_REF || "");
 const TOKEN_DECIMALS = Number(ENV.TOKEN_DECIMALS || DEFAULTS.TOKEN_DECIMALS);
+const APPROVED_TOKEN_NAME = String(ENV.APPROVED_TOKEN_NAME || DEFAULTS.APPROVED_TOKEN_NAME || "").trim();
+const APPROVED_TOKEN_CODE_HASH = String(ENV.APPROVED_TOKEN_CODE_HASH || DEFAULTS.APPROVED_TOKEN_CODE_HASH || "").trim().toLowerCase();
+const APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH = String(
+  ENV.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || DEFAULTS.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || ""
+).trim().toLowerCase();
 const JPYC_BASE_UNIT_SCALE = String(ENV.JPYC_BASE_UNIT_SCALE || DEFAULTS.JPYC_BASE_UNIT_SCALE || "");
 const JPYC_DECIMALS = scaleToDecimals(JPYC_BASE_UNIT_SCALE);
 const CHAIN_ID_NUMERIC = Number(CHAIN_ID);
@@ -194,8 +211,13 @@ if (IS_PRODUCTION && REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
   console.error("FATAL: REQUIRED_CONFIRMATIONS is below MIN_REQUIRED_CONFIRMATIONS.");
   process.exit(1);
 }
-if (IS_PRODUCTION && TOKEN_DECIMALS !== JPYC_DECIMALS) {
-  console.error("FATAL: TOKEN_DECIMALS and JPYC_BASE_UNIT_SCALE are inconsistent in production.");
+if (PRODUCTION_LIKE && (TOKEN_DECIMALS !== APPROVED_TOKEN_DECIMALS || JPYC_BASE_UNIT_SCALE !== APPROVED_LEDGER_BASE_UNIT_SCALE)) {
+  console.error("FATAL: production-like monitor requires token atomic decimals=18 and ledger base scale=1000000.");
+  process.exit(1);
+}
+if (PRODUCTION_LIKE && (!APPROVED_TOKEN_NAME || !/^0x[0-9a-f]{64}$/.test(APPROVED_TOKEN_CODE_HASH)
+  || !/^0x[0-9a-f]{64}$/.test(APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH))) {
+  console.error("FATAL: production-like monitor requires approved token name, code hash, and implementation code hash pins.");
   process.exit(1);
 }
 if (PRODUCTION_LIKE && !INTERNAL_APP_ORIGIN) {
@@ -302,6 +324,11 @@ CREATE TABLE IF NOT EXISTS chain_dead_letters (
   reason TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   retry_count INTEGER NOT NULL DEFAULT 0,
+  observation_count INTEGER NOT NULL DEFAULT 0,
+  retry_attempt_count INTEGER NOT NULL DEFAULT 0,
+  consecutive_retry_failures INTEGER NOT NULL DEFAULT 0,
+  last_observed_at TEXT,
+  last_attempted_at TEXT,
   last_error TEXT,
   next_retry_at TEXT,
   resolved_at TEXT,
@@ -324,6 +351,10 @@ CREATE TABLE IF NOT EXISTS chain_rpc_failovers (
 `);
 
 function addColumnIfMissing(tableName, columnName, ddl) {
+  const tableExists = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(tableName);
+  if (!tableExists) return;
   const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
   const exists = columns.some((column) => column.name === columnName);
   if (exists) return;
@@ -332,6 +363,11 @@ function addColumnIfMissing(tableName, columnName, ddl) {
 
 addColumnIfMissing("chain_dead_letters", "status", "status TEXT NOT NULL DEFAULT 'pending'");
 addColumnIfMissing("chain_dead_letters", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "observation_count", "observation_count INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "retry_attempt_count", "retry_attempt_count INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "consecutive_retry_failures", "consecutive_retry_failures INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "last_observed_at", "last_observed_at TEXT");
+addColumnIfMissing("chain_dead_letters", "last_attempted_at", "last_attempted_at TEXT");
 addColumnIfMissing("chain_dead_letters", "last_error", "last_error TEXT");
 addColumnIfMissing("chain_dead_letters", "next_retry_at", "next_retry_at TEXT");
 addColumnIfMissing("chain_dead_letters", "resolved_at", "resolved_at TEXT");
@@ -339,11 +375,25 @@ addColumnIfMissing("chain_dead_letters", "claimed_by", "claimed_by TEXT");
 addColumnIfMissing("chain_dead_letters", "claimed_until", "claimed_until TEXT");
 addColumnIfMissing("chain_rpc_failovers", "chain_id", "chain_id TEXT");
 addColumnIfMissing("chain_rpc_failovers", "provider_url_hash", "provider_url_hash TEXT");
+addColumnIfMissing("invoices", "monitor_until", "monitor_until TEXT");
+addColumnIfMissing("invoices", "integrity_hold", "integrity_hold INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("invoices", "integrity_hold_reason", "integrity_hold_reason TEXT");
+addColumnIfMissing("invoices", "integrity_hold_at", "integrity_hold_at TEXT");
+addColumnIfMissing("invoices", "last_reconciled_block", "last_reconciled_block INTEGER");
+addColumnIfMissing("payment_events", "amount_atomic", "amount_atomic TEXT");
+addColumnIfMissing("payment_events", "chain_verified", "chain_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "token_verified", "token_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "recipient_verified", "recipient_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
+addColumnIfMissing("payment_events", "within_expiry", "within_expiry INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "recognition_status", "recognition_status TEXT NOT NULL DEFAULT 'pending'");
+addColumnIfMissing("payment_events", "reorg_id", "reorg_id TEXT");
 
 const transferInterface = new Interface(["event Transfer(address indexed from, address indexed to, uint256 value)"]);
 const providers = VALID_RPC_URLS.map((url) =>
   new JsonRpcProvider(url, Number.isFinite(CHAIN_ID_NUMERIC) ? CHAIN_ID_NUMERIC : undefined, { staticNetwork: true })
 );
+let verifiedProviderIndexes = null;
 const checkpointKey = `last_block:${CHAIN_ID}:${ACTIVE_TOKEN_CONTRACT}`;
 const checkpointHashKey = `last_block_hash:${CHAIN_ID}:${ACTIVE_TOKEN_CONTRACT}`;
 const WORKER_ID = `${CHAIN_ID}:${crypto.randomUUID()}`;
@@ -361,6 +411,55 @@ function toAppBaseUnitsFromTokenValue(tokenValueBaseUnits) {
     return { error: "non_exact_decimal_conversion", value: converted.value };
   }
   return { value: converted.value };
+}
+
+function canonicalStatusForLog(log, block) {
+  const observedBlockHash = String(log?.blockHash || "").trim().toLowerCase();
+  const canonicalBlockHash = String(block?.hash || "").trim().toLowerCase();
+  if (!observedBlockHash || !canonicalBlockHash) return "unknown";
+  return observedBlockHash === canonicalBlockHash ? "canonical" : "unknown";
+}
+
+function buildPaymentIngestPayload({
+  invoiceId,
+  amountBase,
+  amountAtomic,
+  toAddress,
+  fromAddress,
+  confirmations,
+  txHash,
+  logIndex,
+  blockNumber,
+  blockHash,
+  blockTimestamp,
+  detectedAt,
+  canonicalStatus,
+  amountConversionExact,
+  amountConversionError = null,
+}) {
+  return {
+    invoice_id: String(invoiceId),
+    amount_jpyc: formatBaseUnitsForDisplay(String(amountBase), JPYC_DECIMALS),
+    chain_id: CHAIN_ID,
+    token_contract: ACTIVE_TOKEN_CONTRACT,
+    to_address: String(toAddress || "").toLowerCase(),
+    from_address: String(fromAddress || "").toLowerCase(),
+    confirmations: Number(confirmations || 0),
+    tx_hash: String(txHash),
+    log_index: Number(logIndex ?? 0),
+    block_number: Number(blockNumber || 0),
+    block_hash: String(blockHash || ""),
+    amount_jpyc_base: String(amountBase),
+    amount_atomic: String(amountAtomic),
+    token_decimals: TOKEN_DECIMALS,
+    ledger_decimals: JPYC_DECIMALS,
+    amount_conversion_exact: amountConversionExact === true,
+    amount_conversion_error: amountConversionExact === true ? null : String(amountConversionError || "non_exact_decimal_conversion"),
+    canonical_status: canonicalStatus === "canonical" ? "canonical" : "unknown",
+    source: "chain_monitor",
+    block_timestamp: blockTimestamp || null,
+    detected_at: detectedAt,
+  };
 }
 
 function workerStateKey(key) {
@@ -426,11 +525,7 @@ function recordReorg({ fromBlock, toBlock, previousHash, observedHash, reason })
     String(reason || "checkpoint_mismatch"),
     detectedAt
   );
-  setState("worker:last_reorg_at", detectedAt);
-  setState("worker:last_reorg_from", fromBlock ?? "");
-  setState("worker:last_reorg_to", toBlock ?? "");
-  setState("worker:last_reorg_reason", reason || "checkpoint_mismatch");
-  return db
+  const reorgId = db
     .prepare(
       `SELECT id FROM chain_reorgs
        WHERE chain_id = ?
@@ -442,18 +537,78 @@ function recordReorg({ fromBlock, toBlock, previousHash, observedHash, reason })
        ORDER BY detected_at DESC LIMIT 1`
     )
     .get(CHAIN_ID, fromBlock ?? null, toBlock ?? null, previousHash || null, observedHash || null, String(reason || "checkpoint_mismatch"))?.id || null;
+  const from = Number.isFinite(Number(fromBlock)) ? Number(fromBlock) : null;
+  const to = Number.isFinite(Number(toBlock)) ? Number(toBlock) : from;
+  const monitorUntil = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+  if (reorgId && from != null && to != null) {
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE payment_events
+         SET canonical_status = 'disputed',
+             recognition_status = 'review_required',
+             reorg_id = ?
+         WHERE chain_id = ? AND block_number BETWEEN ? AND ?`
+      ).run(reorgId, CHAIN_ID, Math.min(from, to), Math.max(from, to));
+      db.prepare(
+        `UPDATE invoices
+         SET integrity_hold = 1,
+             integrity_hold_reason = 'chain_reorg_detected',
+             integrity_hold_at = COALESCE(integrity_hold_at, ?),
+             monitor_until = CASE
+               WHEN monitor_until IS NULL OR monitor_until < ? THEN ?
+               ELSE monitor_until
+             END,
+             updated_at = ?
+         WHERE id IN (
+           SELECT DISTINCT invoice_id FROM payment_events
+           WHERE reorg_id = ?
+         )`
+      ).run(detectedAt, detectedAt, monitorUntil, detectedAt, reorgId);
+    })();
+  }
+  setState("worker:last_reorg_at", detectedAt);
+  setState("worker:last_reorg_id", reorgId || "");
+  setState("worker:last_reorg_from", fromBlock ?? "");
+  setState("worker:last_reorg_to", toBlock ?? "");
+  setState("worker:last_reorg_reason", reason || "checkpoint_mismatch");
+  return reorgId;
 }
 
 function getCandidateInvoices() {
-  return db
+  const rows = db
     .prepare(
-      `SELECT id, amount_jpyc, amount_jpyc_base, recipient_address, status
+      `SELECT id, amount_jpyc, amount_jpyc_base, recipient_address, status, monitor_until, integrity_hold,
+              last_reconciled_block
        FROM invoices
        WHERE chain_id = ?
          AND lower(token_contract) = ?
-         AND status IN ('issued', 'payment_detected', 'confirming', 'expired', 'review_required')`
+         AND status IN ('issued', 'payment_detected', 'confirming', 'expired', 'review_required', 'paid', 'settled', 'refunded', 'cancelled')`
     )
     .all(CHAIN_ID, ACTIVE_TOKEN_CONTRACT);
+  return rows.filter((invoice) => {
+    const lifecycle = decideMonitoringLifecycle(invoice, {
+      recipientAddress: invoice.recipient_address,
+      addressUsed: ["payment_detected", "confirming", "paid", "settled", "refunded", "review_required"].includes(invoice.status),
+      integrityHold: Number(invoice.integrity_hold || 0) === 1,
+      monitorUntil: invoice.monitor_until,
+      lastReconciledBlock: invoice.last_reconciled_block,
+    });
+    return lifecycle.shouldMonitor || lifecycle.shouldReconcileUsedAddress;
+  });
+}
+
+function markUsedAddressesReconciled(invoices, blockNumber) {
+  const normalizedBlock = Number(blockNumber);
+  if (!Number.isSafeInteger(normalizedBlock) || normalizedBlock < 0 || !Array.isArray(invoices) || invoices.length === 0) return;
+  const update = db.prepare(
+    `UPDATE invoices
+     SET last_reconciled_block = ?
+     WHERE id = ? AND chain_id = ?
+       AND (last_reconciled_block IS NULL OR last_reconciled_block < ?)`
+  );
+  db.transaction(() => {
+    for (const invoice of invoices) update.run(normalizedBlock, invoice.id, CHAIN_ID, normalizedBlock);
+  })();
 }
 
 function selectInvoiceForLog(invoices, toAddress, amountJpyc) {
@@ -476,6 +631,26 @@ function selectInvoiceForLog(invoices, toAddress, amountJpyc) {
 async function withProvider(label, fn) {
   let lastError = null;
   for (const [providerIndex, provider] of providers.entries()) {
+    if (verifiedProviderIndexes && !verifiedProviderIndexes.has(providerIndex)) continue;
+    if (lastError) {
+      const revalidation = await verifySingleProviderMetadata(providerIndex);
+      if (!revalidation.ok) {
+        verifiedProviderIndexes?.delete(providerIndex);
+        setState("worker:rpc_metadata_status", verifiedProviderIndexes?.size ? "partially_verified" : "quarantined");
+        console.error(
+          JSON.stringify({
+            ts: nowIso(),
+            level: "error",
+            type: "chain.provider_quarantined_on_failover",
+            label,
+            provider_index: providerIndex,
+            endpoint_id: revalidation.endpoint_id || null,
+            failure_codes: (revalidation.failures || []).map((failure) => failure.code),
+          })
+        );
+        continue;
+      }
+    }
     try {
       return await fn(provider);
     } catch (error) {
@@ -509,6 +684,70 @@ async function withProvider(label, fn) {
     }
   }
   throw lastError || new Error(`All providers failed for ${label}`);
+}
+
+function tokenMetadataPolicy() {
+  return tokenMetadataPolicyFromEnv({
+    ...ENV,
+    CHAIN_ID,
+    TOKEN_CONTRACT: ACTIVE_TOKEN_CONTRACT,
+    TOKEN_DECIMALS: String(TOKEN_DECIMALS),
+    REQUIRE_TOKEN_METADATA_PINS: PRODUCTION_LIKE ? "true" : "false",
+  });
+}
+
+async function metadataRpcRequest(rpcUrl, method, params) {
+  const probe = new JsonRpcProvider(
+    rpcUrl,
+    Number.isFinite(CHAIN_ID_NUMERIC) ? CHAIN_ID_NUMERIC : undefined,
+    { staticNetwork: false }
+  );
+  try {
+    return await probe.send(method, params);
+  } finally {
+    try { probe.destroy(); } catch (_error) { /* best effort */ }
+  }
+}
+
+async function verifySingleProviderMetadata(providerIndex) {
+  const rpcUrl = VALID_RPC_URLS[providerIndex];
+  if (!rpcUrl) {
+    return {
+      ok: false,
+      endpoint_id: null,
+      failures: [{ code: "RPC_PROVIDER_INDEX_INVALID" }],
+    };
+  }
+  return verifyRpcEndpointTokenMetadata({
+    rpcUrl,
+    rpcRequest: metadataRpcRequest,
+    policy: tokenMetadataPolicy(),
+  });
+}
+
+async function verifyConfiguredRpcMetadata() {
+  const result = await verifyRpcTokenMetadataEndpoints({
+    rpcUrls: VALID_RPC_URLS,
+    rpcRequest: metadataRpcRequest,
+    policy: tokenMetadataPolicy(),
+  });
+  verifiedProviderIndexes = new Set(
+    result.endpoints
+      .map((endpoint, index) => endpoint.endpoint_state === "verified" ? index : null)
+      .filter((index) => index != null)
+  );
+  setState(
+    "worker:rpc_metadata_status",
+    result.ok ? "verified" : (verifiedProviderIndexes.size > 0 ? "partially_verified" : "quarantined")
+  );
+  setState("worker:rpc_verified_count", result.verified_count);
+  setState("worker:rpc_quarantined_count", result.quarantined_count);
+  if (verifiedProviderIndexes.size === 0) {
+    const error = new Error("RPC token metadata validation failed; all mismatched endpoints are quarantined");
+    error.code = "RPC_METADATA_QUARANTINED";
+    throw error;
+  }
+  return result;
 }
 
 async function postIngest(payload, idempotencyKey) {
@@ -559,7 +798,7 @@ function upsertDeadLetter({ chainId, txHash, logIndex, invoiceId, payload, reaso
   const ts = nowIso();
   const existing = db
     .prepare(
-      `SELECT id, retry_count
+      `SELECT id, retry_count, observation_count, retry_attempt_count
        FROM chain_dead_letters
        WHERE chain_id = ?
          AND tx_hash = ?
@@ -570,8 +809,10 @@ function upsertDeadLetter({ chainId, txHash, logIndex, invoiceId, payload, reaso
   if (!existing) {
     db.prepare(
       `INSERT INTO chain_dead_letters
-       (id, chain_id, tx_hash, log_index, invoice_id, payload_json, reason, status, retry_count, last_error, next_retry_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?)`
+       (id, chain_id, tx_hash, log_index, invoice_id, payload_json, reason, status, retry_count,
+        observation_count, retry_attempt_count, consecutive_retry_failures, last_observed_at,
+        last_error, next_retry_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, 1, 0, 0, ?, ?, ?, ?)`
     ).run(
       crypto.randomUUID(),
       chainId,
@@ -580,25 +821,33 @@ function upsertDeadLetter({ chainId, txHash, logIndex, invoiceId, payload, reaso
       invoiceId ?? null,
       JSON.stringify(payload),
       String(reason),
+      ts,
       String(reason),
       deadLetterNextRetryAt(1),
       ts
     );
   } else {
-    const nextRetryCount = Number(existing.retry_count || 0) + 1;
+    const nextObservationCount = Number(existing.observation_count || existing.retry_count || 0) + 1;
+    const retryAttemptCount = Number(existing.retry_attempt_count || 0);
     db.prepare(
       `UPDATE chain_dead_letters
        SET payload_json = ?,
            reason = ?,
            status = 'pending',
            retry_count = ?,
+           observation_count = ?,
+           retry_attempt_count = ?,
+           last_observed_at = ?,
            last_error = ?,
-           next_retry_at = ?,
+           next_retry_at = COALESCE(next_retry_at, ?),
            resolved_at = NULL,
            claimed_by = NULL,
            claimed_until = NULL
        WHERE id = ?`
-    ).run(JSON.stringify(payload), String(reason), nextRetryCount, String(reason), deadLetterNextRetryAt(nextRetryCount), existing.id);
+    ).run(
+      JSON.stringify(payload), String(reason), nextObservationCount + retryAttemptCount, nextObservationCount,
+      retryAttemptCount, ts, String(reason), deadLetterNextRetryAt(Math.max(retryAttemptCount, 1)), existing.id
+    );
   }
   refreshDeadLetterStateMetrics();
 }
@@ -632,15 +881,23 @@ async function retryPendingDeadLetters() {
       )
       .run(WORKER_ID, claimUntil, row.id, CHAIN_ID, startedAt);
     if (!claimed.changes) continue;
+    const attemptAt = nowIso();
+    const nextAttemptCount = Number(row.retry_attempt_count || 0) + 1;
+    db.prepare(
+      `UPDATE chain_dead_letters
+       SET retry_attempt_count = ?, last_attempted_at = ?,
+           retry_count = COALESCE(observation_count, retry_count, 0) + ?
+       WHERE id = ? AND chain_id = ?`
+    ).run(nextAttemptCount, attemptAt, nextAttemptCount, row.id, CHAIN_ID);
     let payload;
     try {
       payload = JSON.parse(row.payload_json);
     } catch (error) {
-      const nextRetryCount = Number(row.retry_count || 0) + 1;
-      const abandoned = nextRetryCount >= MONITOR_DEAD_LETTER_MAX_RETRIES;
+      const consecutiveFailures = Number(row.consecutive_retry_failures || 0) + 1;
+      const abandoned = consecutiveFailures >= MONITOR_DEAD_LETTER_MAX_RETRIES;
       db.prepare(
         `UPDATE chain_dead_letters
-         SET retry_count = ?,
+         SET consecutive_retry_failures = ?,
              status = ?,
              last_error = ?,
              next_retry_at = ?,
@@ -649,10 +906,10 @@ async function retryPendingDeadLetters() {
              claimed_until = NULL
          WHERE id = ?`
       ).run(
-        nextRetryCount,
+        consecutiveFailures,
         abandoned ? "abandoned" : "pending",
         `invalid_payload_json:${String(error.message || error)}`,
-        abandoned ? null : deadLetterNextRetryAt(nextRetryCount),
+        abandoned ? null : deadLetterNextRetryAt(nextAttemptCount),
         abandoned ? 1 : 0,
         nowIso(),
         row.id
@@ -660,7 +917,7 @@ async function retryPendingDeadLetters() {
       continue;
     }
 
-    const idemSeed = `${row.chain_id}:${row.tx_hash}:${row.log_index ?? -1}:${row.invoice_id || ""}:retry:${row.retry_count || 0}`;
+    const idemSeed = `${row.chain_id}:${row.tx_hash}:${row.log_index ?? -1}:${row.invoice_id || ""}:retry:${nextAttemptCount}`;
     const idemKey = `chain-retry-${sha256(idemSeed).slice(0, 46)}`;
     try {
       await postIngest(payload, idemKey);
@@ -669,18 +926,19 @@ async function retryPendingDeadLetters() {
          SET status = 'resolved',
              resolved_at = ?,
              last_error = NULL,
+             consecutive_retry_failures = 0,
              next_retry_at = NULL,
              claimed_by = NULL,
              claimed_until = NULL
          WHERE id = ? AND chain_id = ?`
       ).run(nowIso(), row.id, CHAIN_ID);
     } catch (error) {
-      const nextRetryCount = Number(row.retry_count || 0) + 1;
-      const abandoned = nextRetryCount >= MONITOR_DEAD_LETTER_MAX_RETRIES;
+      const consecutiveFailures = Number(row.consecutive_retry_failures || 0) + 1;
+      const abandoned = consecutiveFailures >= MONITOR_DEAD_LETTER_MAX_RETRIES;
       const message = String(error.message || error);
       db.prepare(
         `UPDATE chain_dead_letters
-         SET retry_count = ?,
+         SET consecutive_retry_failures = ?,
              status = ?,
              last_error = ?,
              next_retry_at = ?,
@@ -689,10 +947,10 @@ async function retryPendingDeadLetters() {
              claimed_until = NULL
          WHERE id = ? AND chain_id = ?`
       ).run(
-        nextRetryCount,
+        consecutiveFailures,
         abandoned ? "abandoned" : "pending",
         message,
-        abandoned ? null : deadLetterNextRetryAt(nextRetryCount),
+        abandoned ? null : deadLetterNextRetryAt(nextAttemptCount),
         abandoned ? 1 : 0,
         nowIso(),
         row.id,
@@ -859,32 +1117,10 @@ async function runCycle() {
       continue;
     }
     const toAddress = String(parsed.args.to || "").toLowerCase();
-    const amountConversion = toAppBaseUnitsFromTokenValue(parsed.args.value.toString());
-    if (amountConversion.error) {
-      try {
-        upsertDeadLetter({
-          chainId: CHAIN_ID,
-          txHash: String(log.transactionHash),
-          logIndex: Number(log.index ?? log.logIndex ?? 0),
-          invoiceId: null,
-          payload: {
-            tx_hash: String(log.transactionHash),
-            log_index: Number(log.index ?? log.logIndex ?? 0),
-            block_number: Number(log.blockNumber ?? 0),
-            to_address: toAddress,
-            token_value_raw: parsed.args.value.toString(),
-            token_decimals: TOKEN_DECIMALS,
-            app_scale_decimals: JPYC_DECIMALS,
-          },
-          reason: "non_exact_decimal_conversion",
-        });
-      } catch (deadLetterError) {
-        throw new Error(`dead_letter_store_failed:${String(deadLetterError.message || deadLetterError)}`);
-      }
-      continue;
-    }
+    const amountAtomic = parsed.args.value.toString();
+    const amountConversion = toAppBaseUnitsFromTokenValue(amountAtomic);
     const amountBase = amountConversion.value;
-    if (compareBaseUnits(amountBase, "0") <= 0) continue;
+    if (!amountConversion.error && compareBaseUnits(amountBase, "0") <= 0) continue;
     const amountJpyc = formatBaseUnitsForDisplay(amountBase, JPYC_DECIMALS);
     const confirmations = Math.max(0, latestBlock - Number(log.blockNumber) + 1);
     const blockNumber = Number(log.blockNumber || 0);
@@ -895,8 +1131,12 @@ async function runCycle() {
     }
     const blockTimestamp = blockTimestampIso(blockData);
     const detectedAt = nowIso();
+    const canonicalStatus = canonicalStatusForLog(log, blockData);
     const selected = selectInvoiceForLog(invoices, toAddress, amountBase);
     if (!selected.invoice) {
+      const unmatchedReason = amountConversion.error
+        ? `${amountConversion.error}:${selected.reason}`
+        : selected.reason;
       try {
         db.prepare(
           `INSERT INTO chain_unmatched_events
@@ -912,7 +1152,7 @@ async function runCycle() {
           toAddress,
           amountJpyc,
           amountBase,
-          selected.reason,
+          unmatchedReason,
           JSON.stringify({
             tx_hash: log.transactionHash,
             log_index: Number(log.index ?? log.logIndex ?? 0),
@@ -922,6 +1162,12 @@ async function runCycle() {
             to_address: toAddress,
             amount_jpyc: amountJpyc,
             amount_jpyc_base: amountBase,
+            amount_atomic: amountAtomic,
+            token_decimals: TOKEN_DECIMALS,
+            ledger_decimals: JPYC_DECIMALS,
+            amount_conversion_exact: !amountConversion.error,
+            amount_conversion_error: amountConversion.error || null,
+            canonical_status: canonicalStatus,
           }),
           nowIso()
         );
@@ -939,28 +1185,29 @@ async function runCycle() {
           log_index: Number(log.index ?? log.logIndex ?? 0),
           to_address: toAddress,
           amount_jpyc: amountJpyc,
-          reason: selected.reason
+          reason: unmatchedReason
         })
       );
       continue;
     }
 
-    const payload = {
-      invoice_id: selected.invoice.id,
-      amount_jpyc: amountJpyc,
-      chain_id: CHAIN_ID,
-      token_contract: ACTIVE_TOKEN_CONTRACT,
-      to_address: toAddress,
-      from_address: String(parsed.args.from || "").toLowerCase(),
+    const payload = buildPaymentIngestPayload({
+      invoiceId: selected.invoice.id,
+      amountBase,
+      amountAtomic,
+      toAddress,
+      fromAddress: parsed.args.from,
       confirmations,
-      tx_hash: log.transactionHash,
-      log_index: Number(log.index ?? log.logIndex ?? 0),
-      block_number: Number(log.blockNumber || 0),
-      block_hash: String(log.blockHash || blockData?.hash || ""),
-      amount_jpyc_base: amountBase,
-      block_timestamp: blockTimestamp,
-      detected_at: detectedAt
-    };
+      txHash: log.transactionHash,
+      logIndex: Number(log.index ?? log.logIndex ?? 0),
+      blockNumber,
+      blockHash: log.blockHash || blockData?.hash || "",
+      blockTimestamp,
+      detectedAt,
+      canonicalStatus,
+      amountConversionExact: !amountConversion.error,
+      amountConversionError: amountConversion.error || null,
+    });
     const idemSeed = `${CHAIN_ID}:${payload.tx_hash}:${payload.log_index}:${payload.invoice_id}:confirmations:${payload.confirmations}`;
     const idemKey = `chain-${sha256(idemSeed).slice(0, 48)}`;
     try {
@@ -1001,12 +1248,14 @@ async function runCycle() {
     }
   }
   setCheckpoint(toBlock, latestBlockData?.hash || null);
+  markUsedAddressesReconciled(invoices, toBlock);
   setState("worker:last_cycle_at", nowIso());
   setState("worker:last_checkpoint", toBlock);
 }
 
 let stopping = false;
 async function main() {
+  await verifyConfiguredRpcMetadata();
   setState("worker:started_at", nowIso());
   setState("worker:chain_id", CHAIN_ID);
   setState("worker:token_contract", ACTIVE_TOKEN_CONTRACT);
@@ -1081,6 +1330,11 @@ process.on("SIGTERM", () => {
 
 export {
   db,
+  buildPaymentIngestPayload,
+  canonicalStatusForLog,
+  getCandidateInvoices,
+  selectInvoiceForLog,
+  toAppBaseUnitsFromTokenValue,
   upsertDeadLetter,
   retryPendingDeadLetters,
   runCycle,

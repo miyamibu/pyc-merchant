@@ -43,6 +43,10 @@ export const PROTECTED_DELETE_TABLES = new Set([
   "payment_reconciliation_links",
   "review_cases",
   "refund_requests",
+  "refund_funding_lineage",
+  "refund_funding_allocations",
+  "refund_funding_sweeps",
+  "refund_funding_allocation_parts",
   "settlements",
   "settlement_exports",
   "settlement_export_runs",
@@ -75,6 +79,10 @@ export const ALLOWED_DELETE_RULES = new Map([
       reason: "expired non-business runtime records only",
     },
   ],
+]);
+
+export const TEST_ONLY_DELETE_TABLES = new Set([
+  "chain_dead_letters",
 ]);
 
 const DANGEROUS_LINE_RULES = [
@@ -210,6 +218,11 @@ function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
   const match = line.match(/\bdelete\s+from\s+[`"[]?([a-zA-Z_][\w]*)[`"\]]?/i);
   if (!match) return findings;
   const tableName = String(match[1] || "").toLowerCase();
+  const relativePath = normalizeRelativePath(rootDir, filePath);
+
+  if (relativePath.startsWith("tests/") && TEST_ONLY_DELETE_TABLES.has(tableName)) {
+    return findings;
+  }
 
   if (ALLOWED_DELETE_RULES.has(tableName)) {
     const allowRule = ALLOWED_DELETE_RULES.get(tableName);
@@ -240,7 +253,19 @@ function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
         excerpt: line,
       })
     );
+    return findings;
   }
+
+  findings.push(
+    buildFinding({
+      rootDir,
+      filePath,
+      lineNumber,
+      ruleId: "sql.delete.unclassified-table",
+      message: `DELETE FROM ${tableName} is not covered by an explicit safe cleanup rule`,
+      excerpt: line,
+    })
+  );
 
   return findings;
 }

@@ -187,6 +187,7 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(contractDoc, /POST \/api\/v1\/settlement-exports` creates an on-demand immutable settlement export snapshot/);
   assert.match(contractDoc, /GET \/api\/v1\/settlement-exports\/:id\/download` returns the existing snapshot as JSON or UTF-8 BOM CSV/);
   assert.match(contractDoc, /content hash metadata/);
+  assert.match(contractDoc, /one `refund_primary` row per `refund_request_id`/);
   assert.match(serverSource, /app\.post\("\/api\/v1\/settlements\/daily:close"/);
   assert.match(serverSource, /app\.post\("\/api\/v1\/settlement-exports"/);
   assert.match(serverSource, /app\.get\("\/api\/v1\/settlement-exports\/:id\/download"/);
@@ -196,6 +197,7 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(serverSource, /refund_references_json/);
   assert.match(serverSource, /accounting_event_refs_json/);
   assert.match(serverSource, /accounting_event_journal/);
+  assert.match(serverSource, /legacy_refund_references_json/);
   assert.match(serverSource, /ACTIVE_INVOICES_BLOCK_CLOSE/);
   assert.match(serverSource, /settlement_id = \? AND store_id = \?/);
   assert.match(serverSource, /buildSettlementExportV1SnapshotCsv\(rows, \{ bom: true \}\)/);
@@ -214,4 +216,10 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(dailyClosePost[0], /createSettlementExportSnapshot/);
   assert.doesNotMatch(dailyGet[0], /createSettlementExportSnapshot|INSERT INTO settlement_exports/);
   assert.doesNotMatch(monthlyGet[0], /createSettlementExportSnapshot|INSERT INTO settlement_exports/);
+  assert.match(dailyGet[0], /legacyRows\.refund_rows\.filter/);
+  assert.match(monthlyGet[0], /legacyRows\.refund_rows\.filter/);
+  assert.match(dailyGet[0], /refund_rows:\s*legacyRows\.refund_rows/);
+  assert.match(monthlyGet[0], /refund_rows:\s*legacyRows\.refund_rows/);
+  assert.doesNotMatch(dailyGet[0], /refund_requested_count:\s*rows\.filter/);
+  assert.doesNotMatch(monthlyGet[0], /refund_requested_count:\s*rows\.filter/);
 });

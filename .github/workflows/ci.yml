@@ -21,15 +21,19 @@ jobs:
       SERVICE_INGEST_SECRET: "ci-ingest-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       DB_PATH: "./data/ci.db"
+      # Syntax-only digest fixtures for production compose validation. They are
+      # never published or accepted as production release identities.
+      APP_IMAGE_REF: "registry.invalid/jpyc-terminal@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      NGINX_IMAGE_REF: "registry.invalid/nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
       TERMINAL_CODE: "TERM-001"
       STAFF_PIN: "1234"
       SECOND_ADMIN_PIN: "5678"
-      ENABLED_PAYMENT_CHAIN_IDS: "1,43114,137"
+      ENABLED_PAYMENT_CHAIN_IDS: "137"
       TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29"
       APPROVED_JPYC_TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29"
       JPYC_CONTRACT_APPROVAL_REF: "CI-JPYC-CONTRACT-001"
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222"
-      TOKEN_DECIMALS: "6"
+      TOKEN_DECIMALS: "18"
       JPYC_BASE_UNIT_SCALE: "1000000"
       REQUIRED_CONFIRMATIONS: "2"
       MIN_REQUIRED_CONFIRMATIONS: "2"
@@ -57,6 +61,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Verify exact source SHA
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - uses: actions/setup-node@v4
         with:
@@ -129,10 +136,31 @@ jobs:
         run: docker version
 
       - name: Docker build
-        run: docker build . --tag jpyc-terminal-production:ci
+        run: |
+          mkdir -p /tmp/jpyc-ci
+          IMAGE_TAG="jpyc-terminal-production:ci-${GITHUB_SHA}"
+          docker build --build-arg "SOURCE_COMMIT=${GITHUB_SHA}" . --tag "${IMAGE_TAG}"
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE_TAG}")"
+          jq -n \
+            --arg source_sha "${GITHUB_SHA}" \
+            --arg local_image_id "${IMAGE_ID}" \
+            '{source_sha: $source_sha, local_image_id: $local_image_id, registry_digest: null, production_release_eligible: false}' \
+            > /tmp/jpyc-ci/build-metadata.json
+
+      - name: Verify image source label
+        run: |
+          IMAGE_TAG="jpyc-terminal-production:ci-${GITHUB_SHA}"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE_TAG}")" = "${GITHUB_SHA}"
 
       - name: Docker compose config
-        run: docker compose -f docker-compose.prod.yml config
+        run: docker compose --env-file .env.production -f docker-compose.prod.yml config
+
+      - name: Upload CI build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-metadata-${{ github.sha }}
+          path: /tmp/jpyc-ci/build-metadata.json
+          if-no-files-found: error
 
   production-validation-evidence:
     needs: validate
@@ -148,15 +176,17 @@ jobs:
       METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       DB_PATH: "./docs/production/evidence/ci-validation.db"
       BACKUP_DIR: "./docs/production/evidence/ci-backups"
+      APP_IMAGE_REF: "registry.invalid/jpyc-terminal@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      NGINX_IMAGE_REF: "registry.invalid/nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
       TERMINAL_CODE: "TERM-001"
       STAFF_PIN: "1234"
       SECOND_ADMIN_PIN: "5678"
-      ENABLED_PAYMENT_CHAIN_IDS: "1,43114,137"
+      ENABLED_PAYMENT_CHAIN_IDS: "137"
       TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29"
       APPROVED_JPYC_TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29"
       JPYC_CONTRACT_APPROVAL_REF: "CI-JPYC-CONTRACT-001"
       RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222"
-      TOKEN_DECIMALS: "6"
+      TOKEN_DECIMALS: "18"
       JPYC_BASE_UNIT_SCALE: "1000000"
       REQUIRED_CONFIRMATIONS: "2"
       MIN_REQUIRED_CONFIRMATIONS: "2"
@@ -184,6 +214,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify exact source SHA
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24.17.0
@@ -208,6 +241,6 @@ jobs:
       - name: Upload production validation evidence
         uses: actions/upload-artifact@v4
         with:
-          name: production-validation-evidence-${{ github.run_number }}
+          name: production-validation-evidence-${{ github.sha }}
           path: ${{ steps.evidence.outputs.path }}
           if-no-files-found: error

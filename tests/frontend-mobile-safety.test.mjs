@@ -24,9 +24,9 @@ test("mobile payment actions share one fail-closed gate", () => {
   const gate = between(mobileJs, "function evaluatePaymentActionGate", "function startPolling");
 
   assert.match(mobileJs, /PAYMENT_ACTION_STATUSES\s*=\s*new Set\(\["issued", "open"\]\)/);
-  assert.match(gate, /state\.lastRefreshSucceeded/);
+  assert.match(gate, /hasFreshInvoiceObservation\(invoice\)/);
   assert.match(gate, /state\.refreshInProgress/);
-  assert.match(gate, /lastRefreshInvoiceId/);
+  assert.match(mobileJs, /lastRefreshInvoiceId/);
   assert.match(gate, /remainingSeconds\(invoice\.expires_at\)/);
   assert.match(gate, /customerMode\.mode !== "wallet_qr"/);
   assert.match(gate, /validatePaymentDetails\(invoice\)/);
@@ -41,25 +41,33 @@ test("mobile payment actions share one fail-closed gate", () => {
   assert.match(gate, /el\.copyAddressBtn\.disabled\s*=\s*!walletAllowed/);
   assert.match(gate, /el\.copyAmountBtn\.disabled\s*=\s*!walletAllowed/);
   assert.match(gate, /el\.copyInvoiceBtn\.disabled\s*=\s*!walletAllowed/);
-  for (const id of ["walletPayBtn", "copyInfoBtn", "showMethodsBtn", "copyAddressBtn", "copyAmountBtn", "copyInvoiceBtn"]) {
+  assert.match(gate, /el\.copyTokenContractBtn\.disabled\s*=\s*!walletAllowed/);
+  for (const id of ["walletPayBtn", "copyInfoBtn", "showMethodsBtn", "copyAddressBtn", "copyTokenContractBtn", "copyAmountBtn", "copyInvoiceBtn"]) {
     assert.match(mobileHtml, new RegExp(`id="${id}"[^>]*disabled`), `${id} must be disabled before JS validation`);
   }
 });
 
-test("wallet launch revalidates immediately and prevents rapid duplicate launch", () => {
+test("wallet launch revalidates immediately and uses one launch method per tap", () => {
   const mobileJs = read("public/mobile.js");
   const handler = between(mobileJs, "async function handleWalletPay", "function announceConsentRequired");
 
   assert.match(handler, /applyPaymentActionGate\(\)/);
   assert.match(handler, /await loadInvoice\(\{ silent: true, force: true \}\)/);
   assert.match(handler, /setLaunchInProgress\(true\)/);
-  assert.ok(handler.indexOf("await loadInvoice") < handler.indexOf("launchWalletWithFallback"));
-  const launchState = between(mobileJs, "function setLaunchInProgress", "function launchWalletWithFallback");
+  assert.ok(handler.indexOf("await loadInvoice") < handler.indexOf("launchWalletOnce"));
+  const launchState = between(mobileJs, "function setLaunchInProgress", "function launchWalletOnce");
   assert.doesNotMatch(launchState, /setTimeout/);
+  const launchOnce = between(mobileJs, "function launchWalletOnce", "async function refreshAfterBrowserRecovery");
+  assert.match(launchOnce, /const candidate = buildWalletLaunchTarget\(invoice\)/);
+  assert.equal((launchOnce.match(/location\.href\s*=/g) || []).length, 1);
+  assert.doesNotMatch(launchOnce, /attempt\s*\(|candidate\s*=\s*candidates\[/);
+  assert.match(launchOnce, /自動で別のアプリを起動しません/);
+  assert.match(launchOnce, /支払い情報をコピー/);
+  assert.match(launchOnce, /WALLET_RECOVERY_DELAY_MS/);
   assert.match(mobileJs, /async function refreshAfterBrowserRecovery/);
   assert.match(mobileJs, /visibilityState === "visible"\) void refreshAfterBrowserRecovery\(\)/);
   assert.match(mobileJs, /setLaunchInProgress\(false\);\s*void loadInvoice\(\{ silent: false, force: true \}\)/);
-  for (const functionName of ["handleCopyInfo", "handleCopyAddress", "handleCopyAmount", "handleCopyInvoice", "handleShowMethods"]) {
+  for (const functionName of ["handleCopyInfo", "handleCopyAddress", "handleCopyTokenContract", "handleCopyAmount", "handleCopyInvoice", "handleShowMethods"]) {
     const marker = functionName === "handleShowMethods" ? `function ${functionName}` : `async function ${functionName}`;
     const start = mobileJs.indexOf(marker);
     assert.notEqual(start, -1, `${functionName} is missing`);
@@ -69,15 +77,17 @@ test("wallet launch revalidates immediately and prevents rapid duplicate launch"
 
 test("payment detail validation rejects missing or mismatched transfer fields", () => {
   const mobileJs = read("public/mobile.js");
+  const officialContractSource = between(mobileJs, "function getOfficialTokenContract", "function getNetwork");
   const source = between(mobileJs, "function validatePaymentDetails", "function evaluatePaymentActionGate");
   const context = vm.createContext({ URL });
-  vm.runInContext(`${source}\nglobalThis.validatePaymentDetails = validatePaymentDetails;`, context);
+  vm.runInContext(`${officialContractSource}\n${source}\nglobalThis.validatePaymentDetails = validatePaymentDetails;`, context);
   const validatePaymentDetails = context.validatePaymentDetails;
   const token = "0x1111111111111111111111111111111111111111";
   const recipient = "0x2222222222222222222222222222222222222222";
   const valid = {
     chain_id: "137",
     token_contract: token,
+    official_token_contract: token,
     receive_address: recipient,
     recipient_address: recipient,
     amount_jpyc: 1000,
@@ -92,6 +102,8 @@ test("payment detail validation rejects missing or mismatched transfer fields", 
   for (const mutation of [
     { chain_id: "" },
     { token_contract: "" },
+    { official_token_contract: "" },
+    { official_token_contract: "0x3333333333333333333333333333333333333333" },
     { receive_address: "" },
     { recipient_address: "0x3333333333333333333333333333333333333333" },
     { amount_jpyc: 0 },
@@ -122,6 +134,57 @@ test("invoice refresh rejects stale responses and refreshes on browser recovery 
   assert.match(mobileJs, /addEventListener\("online"/);
   assert.match(mobileJs, /setBlockingWarning\("\u8acb\u6c42\u306e\u6700\u65b0\u72b6\u614b\u3092\u78ba\u8a8d\u3067\u304d\u306a\u3044\u305f\u3081/);
   assert.match(mobileJs, /closeErrorBannerBtn\.classList\.toggle\("hidden", Boolean\(state\.blockingWarning\)\)/);
+  assert.match(mobileJs, /function failClosedInvoiceObservation/);
+  assert.match(mobileJs, /function scheduleObservationFreshnessHold/);
+  assert.match(mobileJs, /renderCustomerAction\(state\.invoice\)/);
+  assert.match(mobileJs, /renderReceiptCard\(state\.invoice\)/);
+  assert.match(mobileJs, /renderStatus\(state\.invoice\)/);
+  assert.match(mobileJs, /state\.observationFreshnessTimer = setTimeout/);
+});
+
+test("mobile observation age and failures remove stale completion state", () => {
+  const mobileJs = read("public/mobile.js");
+  const source = between(mobileJs, "function hasFreshInvoiceObservation", "function hasIntegrityHold");
+  const now = Date.now();
+  const context = vm.createContext({
+    OBSERVATION_FRESHNESS_MS: 30_000,
+    state: {
+      lastRefreshSucceeded: true,
+      lastRefreshInvoiceId: "invoice-1",
+      lastRefreshAtMs: now - 1_000,
+    },
+  });
+  vm.runInContext(`${source}\nglobalThis.hasFreshInvoiceObservation = hasFreshInvoiceObservation;`, context);
+  const invoice = { invoice_id: "invoice-1" };
+  assert.equal(context.hasFreshInvoiceObservation(invoice), true);
+  context.state.lastRefreshSucceeded = false;
+  assert.equal(context.hasFreshInvoiceObservation(invoice), false);
+  context.state.lastRefreshSucceeded = true;
+  context.state.lastRefreshAtMs = now - 30_001;
+  assert.equal(context.hasFreshInvoiceObservation(invoice), false);
+
+  const receiptHandler = between(mobileJs, "async function handleCopyReceipt", "async function loadInvoice");
+  assert.match(receiptHandler, /hasIntegrityHold\(invoice\)/);
+  assert.match(receiptHandler, /!hasFreshInvoiceObservation\(invoice\)/);
+  assert.match(receiptHandler, /!\["paid", "settled"\]\.includes\(status\)/);
+});
+
+test("official token contract is server-sourced, fully wrapped, and copied through the fresh payment gate", () => {
+  const mobileJs = read("public/mobile.js");
+  const mobileHtml = read("public/mobile.html");
+  const css = read("public/app.css");
+  const server = read("src/server.mjs");
+
+  assert.match(server, /official_token_contract:\s*officialPaymentChain\?\.token_contract\s*\|\|\s*null/);
+  assert.match(mobileHtml, /id="tokenContractText"[^>]*contract-address-text/);
+  assert.match(mobileHtml, /id="copyTokenContractBtn"[^>]*disabled/);
+  assert.match(mobileJs, /tokenContractText\.textContent = tokenContract \|\| "-"/);
+  assert.match(mobileJs, /async function handleCopyTokenContract/);
+  assert.match(mobileJs, /copyTokenContractBtn\.addEventListener\("click"/);
+  assert.match(mobileJs, /await copyText\(getOfficialTokenContract\(invoice\)\)/);
+  assert.match(mobileJs, /`公式JPYCコントラクト: \$\{getOfficialTokenContract\(invoice\) \|\| "-"\}`/);
+  assert.match(css, /\.contract-address-text\s*\{[\s\S]*?white-space:\s*normal;[\s\S]*?overflow-wrap:\s*anywhere;[\s\S]*?word-break:\s*break-all;/);
+  assert.doesNotMatch(mobileJs, /0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29/i);
 });
 
 test("policy and consent recording gates fail closed until server persistence succeeds", () => {
@@ -188,6 +251,8 @@ test("paid receipt requires server transaction hash and confirmation time", () =
   assert.match(receipt, /invoice\?\.chain_recorded_at/);
   assert.match(receipt, /invoice\?\.confirmed_at/);
   assert.match(receipt, /complete: Boolean\(txHash\) && Number\.isFinite\(confirmedAtMs\)/);
+  assert.match(receipt, /hasFreshInvoiceObservation\(invoice\)/);
+  assert.match(receipt, /copyReceiptBtn\.disabled = !isPaid/);
   assert.match(receipt, /evidence\.complete \? "\u304a\u652f\u6255\u3044\u78ba\u8a8d\u66f8" : "\u304a\u652f\u6255\u3044\u72b6\u6cc1\u30e1\u30e2"/);
   assert.match(mobileJs, /`\u30b3\u30d4\u30fc\u65e5\u6642: \$\{copyTimestamp\}`/);
   assert.match(mobileHtml, /id="receiptConfirmedAt"/);
@@ -204,6 +269,7 @@ test("wallet and help navigation reject unsafe URL schemes", () => {
   const launchTarget = between(mobileJs, "function buildWalletLaunchCandidates", "function buildWalletLaunchTarget");
 
   assert.match(mobileJs, /WALLET_LAUNCH_PROTOCOLS\s*=\s*new Set/);
+  assert.match(launchTarget, /adapter\.available !== true \|\| adapter\.status !== "ready"/);
   assert.match(launchTarget, /WALLET_LAUNCH_PROTOCOLS\.has\(parsed\.protocol\)/);
   assert.match(launchTarget, /!parsed\.username && !parsed\.password/);
   assert.ok(launchTarget.indexOf('{ type: "wallet_deeplink"') < launchTarget.indexOf('{ type: "wallet_url"'), "reviewed wallet deeplink must be preferred");
@@ -212,6 +278,17 @@ test("wallet and help navigation reject unsafe URL schemes", () => {
   assert.match(launchTarget, /const seenUrls = new Set\(\)/);
   assert.doesNotMatch(launchTarget, /return \{ type: candidate\.type, url: candidate\.url\.trim\(\) \}/);
   assert.match(mobileJs, /parsed\.protocol === "https:" \|\| parsed\.origin === window\.location\.origin/);
+});
+
+test("wallet support labels remain capability-scoped instead of claiming broad support", () => {
+  const mobileJs = read("public/mobile.js");
+  assert.match(mobileJs, /WALLET_SCOPED_CAPABILITY_PREFIX/);
+  assert.match(mobileJs, /WALLET_BROAD_TESTED_PREFIX/);
+  assert.match(mobileJs, /未検証（検証OS・バージョン不明）/);
+  assert.match(mobileJs, /未検証: \$\{value\}/);
+  assert.match(mobileJs, /手動送金のみ: 支払い情報コピー/);
+  assert.match(mobileJs, /walletSupportTitle\.textContent = "ウォレット起動状況"/);
+  assert.match(mobileJs, /この端末の動作保証ではありません/);
 });
 
 test("remaining-time announcements are thresholded and compact mobile controls meet 44px", () => {

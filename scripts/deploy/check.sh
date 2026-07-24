@@ -7,19 +7,21 @@ cd "$ROOT_DIR"
 bash -n scripts/deploy/*.sh
 bash -n scripts/production-validation/*.sh
 node --check scripts/production-validation/lib.mjs >/dev/null
+node --check scripts/production-validation/release-identity.mjs >/dev/null
 node --check scripts/production-validation/validate-production-config.mjs >/dev/null
 node --check scripts/production-validation/validate-evidence-sanitization.mjs >/dev/null
 node --check scripts/production-validation/validate-dependency-docker-hygiene.mjs >/dev/null
 node --check scripts/production-validation/validate-public-invoice-api.mjs >/dev/null
 node --check scripts/production-validation/validate-wallet-launch.mjs >/dev/null
 node --check scripts/production-validation/validate-smoke-payment-flow.mjs >/dev/null
+node --check scripts/deploy/verify-release-image.mjs >/dev/null
 bash ./scripts/deploy/preflight.sh .env.production.example --allow-empty
 node ./scripts/production-validation/validate-production-config.mjs --env-file .env.production.example --allow-empty --skip-rpc >/dev/null
 node ./scripts/production-validation/validate-dependency-docker-hygiene.mjs --skip-docker true >/dev/null
 
 if command -v docker >/dev/null 2>&1; then
   if [[ -f .env.production ]]; then
-    docker compose -f docker-compose.prod.yml config >/dev/null
+    docker compose --env-file .env.production -f docker-compose.prod.yml config >/dev/null
   else
     tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/jpyc-compose-check.XXXXXX")"
     cleanup() {
@@ -36,7 +38,9 @@ if command -v docker >/dev/null 2>&1; then
     fi
     (
       cd "$tmp_dir"
-      docker compose -f docker-compose.prod.yml config >/dev/null
+      APP_IMAGE_REF="registry.invalid/jpyc-terminal@sha256:$(printf '1%.0s' {1..64})" \
+      NGINX_IMAGE_REF="registry.invalid/nginx@sha256:$(printf '2%.0s' {1..64})" \
+        docker compose --env-file .env.production -f docker-compose.prod.yml config >/dev/null
     )
   fi
 fi

@@ -10,7 +10,9 @@
 - `TOKEN_CONTRACT === APPROVED_JPYC_TOKEN_CONTRACT`
 - `JPYC_CONTRACT_APPROVAL_REF` が空でない
 - `REQUIRED_CONFIRMATIONS >= MIN_REQUIRED_CONFIRMATIONS >= 1`
-- `TOKEN_DECIMALS === scaleToDecimals(JPYC_BASE_UNIT_SCALE)`
+- `TOKEN_DECIMALS=18`（on-chain ERC-20 atomic unit）
+- `JPYC_BASE_UNIT_SCALE=1000000`（内部会計ledger unit）
+- 上記2値を同一単位として比較せず、境界でexact conversionを行う
 
 ## Required env checklist
 - `CHAIN_ID`
@@ -19,6 +21,9 @@
 - `JPYC_CONTRACT_APPROVAL_REF`
 - `TOKEN_DECIMALS`
 - `JPYC_BASE_UNIT_SCALE`
+- `APPROVED_TOKEN_NAME`（承認値がある場合のみ）
+- `APPROVED_TOKEN_CODE_HASH`（承認値がある場合のみ）
+- `APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH`（承認値がある場合のみ）
 - `REQUIRED_CONFIRMATIONS`
 - `MIN_REQUIRED_CONFIRMATIONS`
 - `CONFIRMATIONS_POLICY_APPROVAL_REF`
@@ -29,10 +34,11 @@
 ## JPYC contract verification checklist (human approval required)
 1. コントラクトアドレスが Polygon mainnet の公式公開情報と一致。
 2. explorer 上で `Transfer` イベント仕様が ERC-20 と整合。
-3. proxy/upgradeable の有無を確認し、運用手順に反映。
-4. pause/freeze/blocklist/fee-hook 等の管理機能有無を確認。
-5. 異常時（pause, blacklist）発生時の merchant 運用手順を Runbook に反映。
-6. 上記確認結果を `JPYC_CONTRACT_APPROVAL_REF` に紐づく承認記録へ保存。
+3. RPCごとに `eth_chainId`, `decimals()`, `symbol()`, `name()`, `eth_getCode`, ERC-1967 implementation slot を確認。
+4. proxy/upgradeable の有無を確認し、運用手順に反映。implementation code hashは承認値がある場合のみ比較し、推測値を設定しない。
+5. pause/freeze/blocklist/fee-hook 等の管理機能有無を確認。
+6. 異常時（pause, blacklist）発生時の merchant 運用手順を Runbook に反映。
+7. 上記確認結果を `JPYC_CONTRACT_APPROVAL_REF` に紐づく承認記録へ保存。
 
 ## Confirmation policy checklist
 1. 想定 reorg 深さと downtime を基に `MIN_REQUIRED_CONFIRMATIONS` を決定。

@@ -12,6 +12,17 @@ import {
   fetchPinnedPublicHttps,
   validatePublicHttpsUrl,
 } from "../../src/public-endpoint-security.mjs";
+import {
+  convertBaseUnitsBetweenDecimals,
+  parseDecimalToBaseUnits,
+  scaleToDecimals,
+} from "../../src/amounts.mjs";
+import {
+  APPROVED_LEDGER_BASE_UNIT_SCALE,
+  APPROVED_TOKEN_DECIMALS,
+  tokenMetadataPolicyFromEnv,
+  verifyRpcTokenMetadataEndpoints,
+} from "../../src/token-metadata.mjs";
 
 function parseArgs(argv) {
   const args = new Map();
@@ -146,6 +157,14 @@ async function main() {
     const enabledChainIds = parseEnabledPaymentChainIds(env.ENABLED_PAYMENT_CHAIN_IDS || "1,43114,137");
     const tokenContract = normalizeAddress(env.TOKEN_CONTRACT);
     const approvedTokenContract = normalizeAddress(env.APPROVED_JPYC_TOKEN_CONTRACT);
+    const tokenDecimals = Number(env.TOKEN_DECIMALS || APPROVED_TOKEN_DECIMALS);
+    const ledgerBaseUnitScale = String(env.JPYC_BASE_UNIT_SCALE || APPROVED_LEDGER_BASE_UNIT_SCALE).trim();
+    let ledgerDecimals = null;
+    try {
+      ledgerDecimals = scaleToDecimals(ledgerBaseUnitScale);
+    } catch (_error) {
+      ensure(false, "JPYC_BASE_UNIT_SCALE must be a positive power of 10", { value: ledgerBaseUnitScale });
+    }
     const rpcUrls = String(env[`RPC_URLS_${chainId}`] || env.RPC_URLS || "")
       .split(",")
       .map((value) => value.trim())
@@ -184,10 +203,42 @@ async function main() {
     });
     record("payment_chain_enabled", true, { value: chainId, network: paymentChain.network });
 
+    ensure(tokenDecimals === APPROVED_TOKEN_DECIMALS, "TOKEN_DECIMALS must match the approved JPYC token decimals", {
+      expected: APPROVED_TOKEN_DECIMALS,
+      actual: tokenDecimals,
+    });
+    ensure(ledgerBaseUnitScale === APPROVED_LEDGER_BASE_UNIT_SCALE, "JPYC_BASE_UNIT_SCALE must remain the approved ledger scale", {
+      expected: APPROVED_LEDGER_BASE_UNIT_SCALE,
+      actual: ledgerBaseUnitScale,
+    });
+    record("token_ledger_amount_contract", true, {
+      token_decimals: tokenDecimals,
+      ledger_base_unit_scale: ledgerBaseUnitScale,
+      ledger_decimals: ledgerDecimals,
+    });
+
     ensure(validateOfficialJpycContract(tokenContract, "TOKEN_CONTRACT").ok, "TOKEN_CONTRACT must be the official funds-transfer JPYC contract", {
       token_contract: tokenContract,
       expected: OFFICIAL_JPYC_CONTRACT_ADDRESS,
     });
+
+    const approvedTokenName = String(env.APPROVED_TOKEN_NAME || "").trim();
+    const approvedTokenCodeHash = String(env.APPROVED_TOKEN_CODE_HASH || "").trim().toLowerCase();
+    const approvedImplementationCodeHash = String(env.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || "").trim().toLowerCase();
+    if (productionChecks && !allowEmpty) {
+      ensure(approvedTokenName, "APPROVED_TOKEN_NAME is required for production metadata verification", {});
+      ensure(/^0x[0-9a-f]{64}$/.test(approvedTokenCodeHash),
+        "APPROVED_TOKEN_CODE_HASH must be a 32-byte code hash for production metadata verification", {});
+      ensure(/^0x[0-9a-f]{64}$/.test(approvedImplementationCodeHash),
+        "APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH must be a 32-byte proxy implementation hash for production metadata verification", {});
+      record("token_metadata_approval_pins", true, {
+        token_name: approvedTokenName,
+        token_code_hash: approvedTokenCodeHash,
+        implementation_code_hash: approvedImplementationCodeHash,
+      });
+    } else {
+      record("token_metadata_approval_pins", true, { skipped: true, reason: "allow-empty" });
+    }
 
     if (approvedTokenContract) {
       ensure(tokenContract === approvedTokenContract, "TOKEN_CONTRACT must match APPROVED_JPYC_TOKEN_CONTRACT", {
@@ -254,15 +305,22 @@ async function main() {
       record("cors_origins_include_app_host", true, { skipped: true, reason: "allow-empty" });
     }
 
+    const oneJpyLedgerBase = parseDecimalToBaseUnits("1", ledgerDecimals);
+    const oneJpyTokenAtomic = convertBaseUnitsBetweenDecimals(oneJpyLedgerBase, ledgerDecimals, tokenDecimals);
+    ensure(oneJpyTokenAtomic.exact, "1 JPYC ledger amount must convert exactly to token atomic units", {
+      ledger_base_amount: oneJpyLedgerBase,
+      ledger_decimals: ledgerDecimals,
+      token_decimals: tokenDecimals,
+    });
     const deeplinkPayload = buildWalletLaunchPayload({
       env,
       chainId,
       network: paymentChain.network,
       tokenSymbol: "JPYC",
       tokenContract: tokenContract || OFFICIAL_JPYC_CONTRACT_ADDRESS,
-      tokenDecimals: Number(env.TOKEN_DECIMALS || "18"),
+      tokenDecimals,
       receiveAddress: String(env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222"),
-      expectedAmountAtomic: "1000000",
+      expectedAmountAtomic: oneJpyTokenAtomic.value,
       amountJpy: 1,
       expiresAt: "2099-01-01T00:00:00.000Z",
       payUrl: publicBaseUrl || "https://pay.miyamibu.xyz/pay?ref=test",
@@ -273,6 +331,7 @@ async function main() {
     record("wallet_payload_chain", true, {
       network: deeplinkPayload.network,
       payment_uri: deeplinkPayload.payment_uri,
+      expected_amount_atomic: oneJpyTokenAtomic.value,
     });
 
     if (String(env.WALLET_DEEPLINK_TEMPLATE || env.HASHPORT_WALLET_DEEPLINK_TEMPLATE || "").trim()) {
@@ -291,13 +350,15 @@ async function main() {
     record("forbidden_secret_env_absent", true);
 
     if (skipRpc) {
+      ensure(!productionChecks || allowEmpty, "--skip-rpc is not allowed for non-template production validation", {});
       record("rpc_reachability", true, { skipped: true, reason: "skip-rpc" });
+      record("rpc_token_metadata", true, { skipped: true, reason: "skip-rpc" });
     } else {
       if (!productionChecks && rpcUrls.length === 0) {
         record("rpc_reachability", true, { skipped: true, reason: "rpc_not_configured_non_production" });
+        record("rpc_token_metadata", true, { skipped: true, reason: "rpc_not_configured_non_production" });
       } else {
         ensure(rpcUrls.length > 0, "RPC_URLS must not be empty", {});
-      const rpcChecks = [];
         for (const rpcUrl of rpcUrls) {
           const rpcUrlValidation = validatePublicHttpsUrl(rpcUrl);
           if (productionChecks) {
@@ -306,14 +367,33 @@ async function main() {
               errors: rpcUrlValidation.errors,
             });
           }
-          const chainIdHex = String(await rpcRequest(rpcUrl, "eth_chainId", []));
-          const rpcChainId = chainIdHex.startsWith("0x") ? BigInt(chainIdHex).toString() : chainIdHex;
-          const blockHex = String(await rpcRequest(rpcUrl, "eth_blockNumber", []));
-          const latestBlock = blockHex.startsWith("0x") ? Number(BigInt(blockHex)) : Number(blockHex);
-          rpcChecks.push({ rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId, latest_block: latestBlock });
-          ensure(rpcChainId === chainId, "RPC chainId drift detected", { rpc_url: sanitizeRpcUrl(rpcUrl), chain_id: rpcChainId, expected_chain_id: chainId });
         }
-        record("rpc_reachability", true, { providers: rpcChecks });
+        const rpcMetadata = await verifyRpcTokenMetadataEndpoints({
+          rpcUrls,
+          rpcRequest,
+          policy: tokenMetadataPolicyFromEnv({
+            ...env,
+            CHAIN_ID: chainId,
+            TOKEN_CONTRACT: tokenContract,
+            TOKEN_DECIMALS: String(tokenDecimals),
+            REQUIRE_TOKEN_METADATA_PINS: productionChecks && !allowEmpty ? "true" : "false",
+          }),
+        });
+        ensure(rpcMetadata.ok, "RPC token metadata validation failed; quarantined endpoints cannot be used", {
+          configured_count: rpcMetadata.configured_count,
+          verified_count: rpcMetadata.verified_count,
+          quarantined_count: rpcMetadata.quarantined_count,
+          endpoints: rpcMetadata.endpoints,
+        });
+        record("rpc_reachability", true, {
+          configured_count: rpcMetadata.configured_count,
+          verified_count: rpcMetadata.verified_count,
+        });
+        record("rpc_token_metadata", true, {
+          configured_count: rpcMetadata.configured_count,
+          verified_count: rpcMetadata.verified_count,
+          endpoints: rpcMetadata.endpoints,
+        });
       }
     }
 

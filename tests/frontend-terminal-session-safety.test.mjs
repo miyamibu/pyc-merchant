@@ -43,6 +43,261 @@ test("terminal session identity and effective permissions fail closed", () => {
   assert.doesNotMatch(js, /function isAdminRole/);
 });
 
+test("authorized store users always have a scoped audited payment stop control", () => {
+  const html = read("public/terminal.html");
+  const js = read("public/terminal.js");
+  const css = read("public/app.css");
+  const server = read("src/server.mjs");
+
+  assert.match(html, /id="storePaymentsControl"[^>]*[\s\S]*?data-permission="payments\.control"/);
+  assert.match(html, /id="storePaymentsToggleBtn"/);
+  assert.match(html, /全体停止の解除や変更はできません/);
+  assert.match(html, /操作は監査ログに記録されます/);
+  const storeControlCss = css.match(/\.store-payments-control\s*\{([\s\S]*?)\n\}/);
+  assert.ok(storeControlCss);
+  assert.match(storeControlCss[1], /position:\s*sticky/);
+  assert.doesNotMatch(storeControlCss[1], /position:\s*fixed/);
+  assert.match(js, /requireUiPermission\("payments\.control"/);
+  assert.match(js, /\/api\/v1\/admin\/stores\/\$\{encodeURIComponent\(state\.storeId\)\}\/payments\/\$\{action\}/);
+  assert.doesNotMatch(js, /\/api\/v1\/admin\/payments\/(?:disable|enable)/);
+  assert.match(js, /const action = storeDisabled \? "enable" : "disable"/);
+  assert.match(js, /paymentIssuanceAllowed\(\)/);
+  assert.match(js, /state\.paymentsReadState === "ready"/);
+  assert.match(server, /payments: getPaymentsDisableState\(\{ storeId: terminal\.store_id, terminalId: terminal\.id \}\)/);
+  assert.match(server, /payments\.store_disabled/);
+  assert.match(server, /payments\.store_enabled/);
+});
+
+test("terminal removes disabled provider rail controls before binding events", () => {
+  const html = read("public/terminal.html");
+  const js = read("public/terminal.js");
+
+  assert.match(html, /<body[^>]*data-provider-rail-enabled="false"/);
+  for (const id of ["presentTapBtn", "resumeQrBtn", "providerControlHint", "tapModePanel"]) {
+    assert.match(html, new RegExp(`id="${id}"[^>]*data-provider-rail|data-provider-rail[^>]*id="${id}"`));
+  }
+  assert.match(html, /<p[^>]*data-provider-rail[^>]*>[^<]*<span id="providerOperatorStateText"/);
+  assert.match(html, /<p[^>]*data-provider-rail[^>]*>[^<]*<span id="providerStatusText"/);
+  assert.match(js, /const PROVIDER_RAIL_ENABLED = document\.body\?\.dataset\.providerRailEnabled === "true"/);
+  assert.match(js, /document\.querySelectorAll\("\[data-provider-rail\]"\)\.forEach\(\(node\) => node\.remove\(\)\)/);
+  assert.ok(js.indexOf('document.querySelectorAll("[data-provider-rail]")') < js.indexOf("const el = {"));
+  assert.match(js, /const tapOnly = PROVIDER_RAIL_ENABLED && providerSummary\?\.qr_available === false/);
+  assert.match(js, /if \(!PROVIDER_RAIL_ENABLED \|\| !el\.presentTapBtn\) return/);
+  assert.match(js, /if \(PROVIDER_RAIL_ENABLED && el\.presentTapBtn && el\.resumeQrBtn\)/);
+});
+
+test("terminal keeps fulfillment decision visible and fails closed on integrity hold", () => {
+  const html = read("public/terminal.html");
+  const js = read("public/terminal.js");
+  const css = read("public/app.css");
+
+  assert.match(html, /id="fulfillmentDecisionBanner"/);
+  assert.match(html, /id="fulfillmentDecisionBadge"/);
+  assert.match(html, /id="fulfillmentDecisionTitle"/);
+  assert.match(html, /id="fulfillmentDecisionBody"/);
+  assert.match(js, /function hasIntegrityHold/);
+  assert.match(js, /hold_fulfillment/);
+  assert.match(js, /reorg_detected/);
+  assert.match(js, /if \(hasIntegrityHold\(invoice\)\) return "integrity_hold"/);
+  assert.match(js, /記録整合性を確認中・渡さない/);
+  assert.match(js, /renderFulfillmentDecisionBanner\(invoice\)/);
+  assert.match(css, /\.fulfillment-banner\s*\{[\s\S]*?position:\s*sticky/);
+  assert.match(css, /\.fulfillment-banner\[data-decision="allow"\]/);
+});
+
+test("paid terminal invoices stay observable for post-payment reorg holds", () => {
+  const js = read("public/terminal.js");
+  const server = read("src/server.mjs");
+
+  assert.match(js, /const ACTIVE_INVOICE_STATUSES = new Set\([\s\S]*"paid"[\s\S]*"settled"/);
+  assert.match(js, /function shouldObserveInvoice\(invoice = state\.currentInvoice\)/);
+  assert.match(js, /if \(!shouldObserveInvoice\(\)\)/);
+  assert.match(js, /const FINAL_INVOICE_STATUSES = new Set\(\["cancelled"\]\)/);
+  assert.match(server, /monitor_until: invoice\.monitor_until \|\| null/);
+  assert.match(server, /integrity_hold: Number\(invoice\.integrity_hold \|\| 0\) === 1/);
+  assert.match(server, /const writeStreamSnapshotIfChanged = \(\) =>/);
+  assert.match(server, /const snapshotTimer = setInterval\(writeStreamSnapshotIfChanged, 2_000\)/);
+  assert.match(js, /const FULFILLMENT_FRESHNESS_MS = 30_000/);
+  assert.match(js, /function hasFreshFulfillmentObservation/);
+  assert.match(js, /function isFulfillmentObservationUnavailable/);
+  assert.match(js, /wouldAllowFulfillment\(invoice\)/);
+  assert.match(js, /providerDecision === "allow_fulfillment"/);
+  assert.match(js, /function failClosedFulfillmentObservation/);
+  assert.match(js, /state\.fulfillmentFreshnessTimer = setTimeout/);
+  assert.match(js, /setInvoiceStatusPill\(state\.invoiceStatus\)/);
+  assert.match(js, /renderProviderControls\(state\.currentInvoice\)/);
+  assert.match(js, /renderCustomerFacingQr\(\)/);
+  assert.match(js, /observation_unavailable/);
+  assert.match(js, /failClosedFulfillmentObservation\(\);\s*void loadInvoice\(updatedInvoiceId/);
+  assert.match(js, /状態更新を確認できないため渡さない/);
+});
+
+test("terminal refreshes fulfillment evidence after iPad/Safari resume events", () => {
+  const js = read("public/terminal.js");
+  assert.match(js, /function refreshFulfillmentObservationAfterResume/);
+  assert.match(js, /window\.addEventListener\("pageshow"/);
+  assert.match(js, /window\.addEventListener\("online"/);
+  assert.match(js, /document\.addEventListener\("visibilitychange"/);
+  assert.match(js, /failClosedFulfillmentObservation\(\)/);
+});
+
+test("terminal fulfillment allow paths require a fresh observation", () => {
+  const js = read("public/terminal.js");
+  const source = extractSourceBlock(js, "function wouldAllowFulfillment", "function renderFulfillmentDecisionBanner");
+  const state = {
+    lastInvoiceRefreshAt: new Date(Date.now() - 1_000).toISOString(),
+    fulfillmentObservationValid: true,
+    sseStatus: "open",
+    fallbackPollingStatus: "idle",
+  };
+  const context = vm.createContext({
+    state,
+    PROVIDER_RAIL_ENABLED: true,
+    FULFILLMENT_FRESHNESS_MS: 30_000,
+    hasIntegrityHold: () => false,
+    effectiveOperatorStatus: (invoice) => invoice?.status || "idle",
+    getOperatorActionPolicy: () => ({
+      handoff: "hold",
+      next: "wait",
+      manager: "manager",
+    }),
+  });
+  vm.runInContext(`${source}\nthis.resolveForTest = resolveFulfillmentDecisionModel;`, context);
+
+  assert.equal(context.resolveForTest({ status: "paid" }).decision, "allow");
+  assert.equal(context.resolveForTest({
+    status: "payment_detected",
+    provider_summary: { fulfillment_decision: "allow_fulfillment" },
+  }).decision, "allow");
+
+  state.fulfillmentObservationValid = false;
+  assert.equal(context.resolveForTest({ status: "paid" }).decision, "hold");
+  assert.equal(context.resolveForTest({
+    status: "payment_detected",
+    provider_summary: { fulfillment_decision: "allow_fulfillment" },
+  }).decision, "hold");
+
+  state.fulfillmentObservationValid = true;
+  state.lastInvoiceRefreshAt = new Date(Date.now() - 30_001).toISOString();
+  assert.equal(context.resolveForTest({ status: "settled" }).decision, "hold");
+});
+
+test("terminal integrity hold overrides every provider fulfillment surface", () => {
+  const js = read("public/terminal.js");
+
+  const statusElements = { invoiceStatusPill: { textContent: "", className: "" } };
+  const statusContext = vm.createContext({
+    state: { currentInvoice: { status: "paid", integrity_hold: true } },
+    el: statusElements,
+    canonicalInvoiceStatus: (value) => value,
+    hasIntegrityHold: () => true,
+    isFulfillmentObservationUnavailable: () => false,
+  });
+  const statusSource = extractSourceBlock(js, "function setInvoiceStatusPill", "function clearQr");
+  vm.runInContext(`${statusSource}\nthis.renderStatusForTest = setInvoiceStatusPill;`, statusContext);
+  statusContext.renderStatusForTest("paid");
+  assert.equal(statusElements.invoiceStatusPill.textContent, "記録整合性を確認中");
+  assert.equal(statusElements.invoiceStatusPill.className, "status-pill s-red");
+
+  const providerElements = {
+    providerOperatorStateText: { textContent: "" },
+    providerStatusText: { textContent: "" },
+    providerControlHint: { textContent: "" },
+    presentTapBtn: { disabled: false },
+    resumeQrBtn: { disabled: false },
+  };
+  const providerContext = vm.createContext({
+    PROVIDER_RAIL_ENABLED: true,
+    state: { invoiceOperationsInFlight: new Set(), invoiceId: "inv-1" },
+    el: providerElements,
+    hasPermission: () => true,
+    hasIntegrityHold: () => true,
+    isFulfillmentObservationUnavailable: () => false,
+  });
+  const providerSource = extractSourceBlock(js, "function renderProviderControls", "function renderAmountCompare");
+  vm.runInContext(`${providerSource}\nthis.renderProviderForTest = renderProviderControls;`, providerContext);
+  providerContext.renderProviderForTest({
+    status: "paid",
+    integrity_hold: true,
+    provider_summary: { fulfillment_decision: "allow_fulfillment" },
+  });
+  assert.equal(providerElements.providerStatusText.textContent, "商品引渡し保留");
+  assert.equal(providerElements.presentTapBtn.disabled, true);
+  assert.equal(providerElements.resumeQrBtn.disabled, true);
+
+  const customerElements = {
+    qrCanvas: { classList: { toggle() {} } },
+    tapModePanel: { classList: { toggle() {} } },
+    tapModeBadge: { textContent: "", className: "" },
+    tapModeTitle: { textContent: "" },
+    tapModeBody: { textContent: "" },
+    tapModeAmount: { textContent: "" },
+    customerDisplayHint: { textContent: "" },
+    fixedQrUrlLink: { textContent: "", href: "", removeAttribute() {} },
+  };
+  const customerContext = vm.createContext({
+    PROVIDER_RAIL_ENABLED: true,
+    state: { fixedQrUrl: "" },
+    el: customerElements,
+    hasIntegrityHold: () => true,
+    isFulfillmentObservationUnavailable: () => false,
+    formatJpy: () => "¥1,250",
+    drawQr() {},
+    clearQr() {},
+  });
+  const customerSource = extractSourceBlock(js, "function providerBadgeClass", "function renderCustomerFacingQr");
+  vm.runInContext(`${customerSource}\nthis.renderCustomerForTest = renderCustomerFacingDisplay;`, customerContext);
+  customerContext.renderCustomerForTest({
+    status: "paid",
+    integrity_hold: true,
+    amounts: { amount_jpy: 1250 },
+    provider_summary: {
+      qr_available: false,
+      operator_state: { code: "fulfillment_ok", label: "商品引渡しOK" },
+    },
+  });
+  assert.equal(customerElements.tapModeBadge.className, "status-pill s-red");
+  assert.match(customerElements.tapModeTitle.textContent, /まだ渡さない/);
+});
+
+test("terminal observer connection changes rerender every fulfillment surface", () => {
+  const js = read("public/terminal.js");
+  let safetyRenderCount = 0;
+  const context = vm.createContext({
+    state: {},
+    nowIso: () => "2026-07-25T00:00:00.000Z",
+    renderConnectionStatus() {},
+    renderDiagnostics() {},
+    renderFulfillmentSafetySurfaces() { safetyRenderCount += 1; },
+  });
+  const source = extractSourceBlock(js, "function setSseStatus", "function renderDiagnostics");
+  vm.runInContext(`${source}\nthis.setSseForTest = setSseStatus; this.setFallbackForTest = setFallbackPollingStatus;`, context);
+
+  context.setFallbackForTest("active", "SSE fallback polling");
+  assert.equal(context.state.fallbackPollingStatus, "active");
+  assert.equal(safetyRenderCount, 1);
+
+  context.setSseForTest("open", "connected");
+  assert.equal(context.state.sseStatus, "open");
+  assert.equal(safetyRenderCount, 2);
+});
+
+test("terminal keeps iPad landscape in columns and all terminal controls at least 48px", () => {
+  const html = read("public/terminal.html");
+  const css = read("public/app.css");
+
+  assert.match(html, /terminal-session-card/);
+  assert.match(html, /terminal-invoice-card/);
+  assert.match(css, /\.terminal-surface\s*\{\s*--control-height:\s*48px;\s*--tap-target-min:\s*48px;/);
+  assert.match(css, /\.terminal-surface \.btn-compact,[\s\S]*?min-height:\s*var\(--tap-target-min\)/);
+  assert.match(css, /\.terminal-surface \.preset-chip \.btn-remove\s*\{\s*min-width:\s*var\(--tap-target-min\)/);
+  assert.match(css, /@media \(min-width: 900px\) and \(max-width: 1160px\)[\s\S]*?\.terminal-surface \.grid-main\s*\{\s*grid-template-columns:\s*repeat\(12/);
+  assert.match(css, /\.terminal-surface \.terminal-session-card\s*\{\s*grid-column:\s*span 3/);
+  assert.match(css, /\.terminal-surface \.terminal-invoice-card\s*\{\s*grid-column:\s*span 9/);
+  assert.match(css, /\.terminal-surface \.metrics-grid,[\s\S]*?grid-template-columns:\s*repeat\(2/);
+  assert.match(css, /@media \(max-width: 899px\)/);
+});
+
 test("refund request uses one stable operation key and server read-back", () => {
   const html = read("public/terminal.html");
   const js = read("public/terminal.js");
@@ -219,13 +474,20 @@ test("same-session late invoice and review responses cannot overwrite the latest
   const invoiceResolvers = new Map();
   const renderedInvoices = [];
   const invoiceContext = vm.createContext({
-    state: { invoiceRequestSequence: 0, latestInvoiceRequestId: "", lastInvoiceRefreshAt: "" },
+    state: {
+      invoiceRequestSequence: 0,
+      latestInvoiceRequestId: "",
+      lastInvoiceRefreshAt: "",
+      fulfillmentObservationValid: false,
+    },
     el: { invoiceStatusPill: { textContent: "" } },
     requestJson(pathname) {
       return new Promise((resolve) => invoiceResolvers.set(pathname, resolve));
     },
     nowIso: () => "2026-07-15T00:00:00.000Z",
     renderInvoice(invoice) { renderedInvoices.push(invoice.invoice_id); },
+    scheduleFulfillmentFreshnessHold() {},
+    failClosedFulfillmentObservation() {},
     showToast() {},
     isIgnoredRequestError: () => false,
   });

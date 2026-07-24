@@ -51,7 +51,7 @@ PostgreSQL移行時は `expires_at` index と定期ジョブ（例: cron/pg_cron
 
 1. 先に PostgreSQL 側で制約・index を作成してからデータ投入する。
 2. `REAL` 由来の金額列は `_base` を正として再計算検証する。
-3. 監査チェーン (`audit_logs.prev_hash/entry_hash`) は移行後に再検証 (`verify-chain`) を必須化する。
+3. 監査チェーン (`audit_logs.prev_hash/entry_hash`) は移行時に過去hashを再計算せず、`audit_epochs.previous_tail_hash` で旧tailから新epochへbridgeしたうえで `verify-chain` を必須化する。
 4. 切替期間は二重書きではなく read-only 期間を設け、差分検証ログを保存する。
 
 ## コアテーブル
@@ -143,6 +143,8 @@ PostgreSQL移行時は `expires_at` index と定期ジョブ（例: cron/pg_cron
 
 ### `audit_logs`
 - `id` (uuid, pk)
+- `store_id` (text, nullable; 新規行はhash対象、旧行の後付け帰属は別表)
+- `audit_epoch` (text, nullable; epoch-aware新規行は必須)
 - `actor_type` (system/staff/admin/service)
 - `actor_id` (text)
 - `action` (text)
@@ -155,6 +157,17 @@ PostgreSQL移行時は `expires_at` index と定期ジョブ（例: cron/pg_cron
 - `ip_address` (text, nullable)
 - `created_at`
 
+### `audit_epochs`
+- `id` (uuid, pk)
+- `start_rowid`, `hash_version`
+- `previous_epoch_id`, `previous_tail_hash`
+- `reason`, `attestation_hash`, `created_at`
+- UPDATE/DELETE禁止triggerで不変。旧epochの `audit_logs` は書き換えない。
+
+### `audit_log_store_attributions`
+- 旧 `audit_logs` 行の店舗帰属を、元 `entry_hash` に紐づく不変アテステーションとして保存する。
+- 旧行の `store_id` / `prev_hash` / `entry_hash` は更新しない。
+
 ## 一意制約・インデックス
 - `invoices.invoice_no` unique
 - `payment_events` unique `(chain_id, tx_hash, coalesce(log_index, -1), event_type)`
@@ -164,6 +177,7 @@ PostgreSQL移行時は `expires_at` index と定期ジョブ（例: cron/pg_cron
 
 ## 監査・保存方針（ドラフト）
 - `audit_logs` は論理削除しない。
+- 既存 `audit_logs` をrechainしない。hash仕様変更は必ず新epochと旧tail attestationで表現する。
 - `payment_events.raw_payload` は最小限マスキングを実施。
 - 保存期間は法務回答で確定（`open-questions` Q-009）。
 

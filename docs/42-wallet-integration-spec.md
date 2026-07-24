@@ -73,6 +73,9 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
   - `{{network_encoded}}`
   - `{{pay_url}}`
   - `{{pay_url_encoded}}`
+- 承認テンプレートは、送金値を意味の対応する query parameter の値全体へ1対1で結び付ける。fragment、重複parameter、固定値または未結合のquery parameterは許可しない
+- `payment_uri` をラップする場合は `{{payment_uri_encoded}}` を使用し、承認済みの `uri` / `payment_uri` / `request` parameterへ結び付ける
+- 起動直前に、実際の請求で展開した query parameter と `payment_uri` / 受取アドレス / atomic amount / chain ID / token contract を完全一致で再検証する。検証できない場合はdeeplinkを返さずcopy fallbackへ退避する
 
 ## Public page launch order
 `public/mobile.js` の「ウォレットで支払う」ボタンは次の順で起動を試みる。

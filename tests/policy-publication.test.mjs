@@ -4,10 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   evaluatePolicyPublicationSource,
+  hashPolicyContent,
   isPublishedPolicyHash,
   isPublishedPolicyUrl,
   isPublishedPolicyVersion,
+  POLICY_CONTENT_HASH_CANONICALIZATION,
   validatePolicyVersionSubmission,
+  verifyPolicyContentHashes,
 } from "../src/policy-publication.mjs";
 
 const ROOT = process.cwd();
@@ -61,6 +64,40 @@ test("policy content hashes require a full SHA-256 digest", () => {
   assert.equal(isPublishedPolicyHash("A".repeat(64)), true);
   assert.equal(isPublishedPolicyHash("a".repeat(63)), false);
   assert.equal(isPublishedPolicyHash("g".repeat(64)), false);
+});
+
+test("policy content hashes are verified from exact UTF-8 bytes on the server", () => {
+  const contents = {
+    terms: "JPYC Merchant Terms\nVersion: 2026-07-25\n",
+    privacy: "プライバシーポリシー\n",
+    refund: "Refund policy\r\nNo automatic execution.\r\n",
+  };
+  const hashes = {
+    terms_hash: hashPolicyContent(contents.terms),
+    privacy_hash: hashPolicyContent(contents.privacy),
+    refund_policy_hash: hashPolicyContent(contents.refund),
+  };
+
+  const verified = verifyPolicyContentHashes(contents, hashes);
+  assert.equal(verified.ok, true);
+  assert.equal(verified.canonicalization, POLICY_CONTENT_HASH_CANONICALIZATION);
+  assert.deepEqual(verified.computed_hashes, hashes);
+  assert.deepEqual(verified.missing_content_keys, []);
+  assert.deepEqual(verified.mismatch_hash_keys, []);
+
+  const changedLineEndings = verifyPolicyContentHashes(
+    { ...contents, refund: contents.refund.replaceAll("\r\n", "\n") },
+    hashes
+  );
+  assert.equal(changedLineEndings.ok, false);
+  assert.deepEqual(changedLineEndings.mismatch_hash_keys, ["refund_policy_hash"]);
+
+  const missingContent = verifyPolicyContentHashes(
+    { terms: contents.terms, privacy: contents.privacy },
+    hashes
+  );
+  assert.equal(missingContent.ok, false);
+  assert.deepEqual(missingContent.missing_content_keys, ["refund"]);
 });
 
 test("policy URLs reject credentials, placeholders, local names, and non-public IP ranges", () => {

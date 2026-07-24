@@ -81,18 +81,22 @@ test("production env example declares the required approval and verification gat
     "MANUAL_INGEST_APPROVAL_REF",
     "SETTLEMENT_UNRESOLVED_REVIEW_POLICY",
     "RPC_URLS",
+    "APPROVED_TOKEN_NAME",
+    "APPROVED_TOKEN_CODE_HASH",
+    "APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH",
+    "WALLET_ADAPTER_REGISTRY_JSON",
     "SSE_TOKEN_MAX_TTL_SEC",
   ]) {
     assert.match(content, new RegExp(`^${key}=`, "m"), `${key} is missing from .env.production.example`);
   }
 });
 
-test("env examples keep JPYC token decimals aligned with the configured base unit scale", () => {
+test("env examples separate 18-decimal token atomic units from the 1e6 accounting ledger scale", () => {
   for (const fileName of [".env.example", ".env.production.example"]) {
     const content = fs.readFileSync(path.join(ROOT, fileName), "utf8");
     const decimals = content.match(/^TOKEN_DECIMALS=(\d+)$/m)?.[1];
     const scale = content.match(/^JPYC_BASE_UNIT_SCALE=(\d+)$/m)?.[1];
-    assert.equal(decimals, "6", `${fileName} TOKEN_DECIMALS must match 1_000_000 base unit scale`);
+    assert.equal(decimals, "18", `${fileName} TOKEN_DECIMALS must match the on-chain JPYC atomic unit`);
     assert.equal(scale, "1000000", `${fileName} JPYC_BASE_UNIT_SCALE must stay at 1_000_000`);
   }
 });

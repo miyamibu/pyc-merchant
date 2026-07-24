@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/app.css" />
   <script src="/vendor/qrcode.min.js"></script>
 </head>
-<body class="terminal-surface">
+<body class="terminal-surface" data-provider-rail-enabled="false">
   <div class="wrap">
     <header class="section-header">
       <div class="stack">
@@ -17,8 +17,52 @@
       <a class="btn btn-secondary btn-compact dev-only-link" href="/prototype.html">アニメーションを見る</a>
     </header>
 
+    <section
+      id="fulfillmentDecisionBanner"
+      class="fulfillment-banner mt-16"
+      data-decision="hold"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      aria-labelledby="fulfillmentDecisionTitle"
+    >
+      <span id="fulfillmentDecisionBadge" class="status-pill s-yellow">商品はまだ渡さない</span>
+      <div class="stack gap-tight">
+        <h2 id="fulfillmentDecisionTitle" class="title title-md">会計状態を確認中です</h2>
+        <p id="fulfillmentDecisionBody" class="helper-text">サーバーの判定を確認できるまで、商品引渡しと追加送金の案内を止めてください。</p>
+      </div>
+    </section>
+
+    <aside
+      id="storePaymentsControl"
+      class="store-payments-control hidden"
+      data-permission="payments.control"
+      data-state="unknown"
+      aria-labelledby="storePaymentsControlTitle"
+    >
+      <div class="stack gap-tight">
+        <div class="row row-between">
+          <h2 id="storePaymentsControlTitle" class="title title-md">店舗決済コントロール</h2>
+          <span id="storePaymentsStatusBadge" class="status-pill s-gray">状態未確認</span>
+        </div>
+        <p id="storePaymentsStatusText" class="helper-text" role="status" aria-live="polite" aria-atomic="true">
+          状態が不明なときも、店舗の新規決済停止は実行できます。
+        </p>
+        <p class="small">この操作は現在の店舗だけが対象で、全体停止の解除や変更はできません。操作は監査ログに記録されます。</p>
+      </div>
+      <div class="store-payments-control-actions">
+        <button id="storePaymentsRefreshBtn" class="btn btn-secondary btn-compact" type="button">状態を再確認</button>
+        <button
+          id="storePaymentsToggleBtn"
+          class="btn btn-danger"
+          type="button"
+          aria-describedby="storePaymentsStatusText"
+        >店舗の新規決済を停止</button>
+      </div>
+    </aside>
+
     <main class="grid-main mt-16">
-      <section class="card stack col-4" aria-labelledby="sessionSectionTitle">
+      <section class="card stack col-4 terminal-session-card" aria-labelledby="sessionSectionTitle">
         <div class="section-header">
           <h2 id="sessionSectionTitle" class="title title-lg">端末セッション</h2>
           <span id="sessionRolePill" class="role-pill role-staff">未ログイン</span>
@@ -80,7 +124,7 @@
         </div>
       </section>
 
-      <section class="card stack col-8" aria-labelledby="invoiceCreateTitle">
+      <section class="card stack col-8 terminal-invoice-card" aria-labelledby="invoiceCreateTitle">
         <div class="section-header">
           <h2 id="invoiceCreateTitle" class="title title-lg">請求作成（運用起点）</h2>
           <span id="invoiceStatusPill" class="status-pill s-gray" role="status" aria-live="polite" aria-atomic="true">未発行</span>
@@ -152,22 +196,22 @@
             <p class="small">請求額: <span id="amountText" class="mono nowrap">-</span></p>
             <p class="small">受取額: <span id="paidText" class="mono nowrap">-</span></p>
             <p class="small">状態理由: <span id="reasonText" class="mono">-</span></p>
-            <p class="small">店頭案内状態: <span id="providerOperatorStateText" class="mono">-</span></p>
-            <p class="small">店頭端末連携状態: <span id="providerStatusText" class="mono">-</span></p>
+            <p class="small" data-provider-rail>店頭案内状態: <span id="providerOperatorStateText" class="mono">-</span></p>
+            <p class="small" data-provider-rail>店頭端末連携状態: <span id="providerStatusText" class="mono">-</span></p>
             <div class="inline-action-group">
               <button id="refreshBtn" class="btn btn-secondary" data-permission="invoice.read">最新状態を取得</button>
               <button id="reissueInvoiceBtn" class="btn btn-secondary" data-permission="invoice.create">QRを再発行</button>
-              <button id="presentTapBtn" class="btn btn-primary" type="button" data-permission="invoice.create">タッチ決済を提示</button>
-              <button id="resumeQrBtn" class="btn btn-secondary" type="button" data-permission="invoice.create">QR案内へ戻す</button>
+              <button id="presentTapBtn" class="btn btn-primary" type="button" data-provider-rail data-permission="invoice.create">タッチ決済を提示</button>
+              <button id="resumeQrBtn" class="btn btn-secondary" type="button" data-provider-rail data-permission="invoice.create">QR案内へ戻す</button>
             </div>
-            <p id="providerControlHint" class="helper-text">QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。</p>
+            <p id="providerControlHint" class="helper-text" data-provider-rail>QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。</p>
           </section>
 
           <section class="panel stack">
-            <h3 class="title title-md">お客様提示（端末入口QR / タッチ案内）</h3>
+            <h3 class="title title-md">お客様提示（端末入口QR）</h3>
             <canvas id="qrCanvas" width="420" height="420" aria-label="決済QR"></canvas>
             <p id="qrAccessibleText" class="visually-hidden">請求IDと金額は現在の請求欄に表示されます。</p>
-            <div id="tapModePanel" class="panel stack hidden" aria-live="polite" aria-atomic="true">
+            <div id="tapModePanel" class="panel stack hidden" data-provider-rail aria-live="polite" aria-atomic="true">
               <span id="tapModeBadge" class="status-pill s-blue">タッチ案内</span>
               <p id="tapModeTitle" class="title title-md">カード・スマホをかざしてください</p>
               <p id="tapModeBody" class="helper-text">店頭端末でタッチ決済をご案内しています。</p>
@@ -185,7 +229,7 @@
           <p id="operatorGuideHeadline" class="title title-md">商品を渡してよいか、次に何をするかをこのカードで確認します</p>
           <p id="operatorGuideBody" class="helper-text">送金は常にお客様のウォレットで行います。店舗側は画面の状態確認、確認待ち対応、返金証跡の記録に集中します。</p>
           <div class="stack gap-tight">
-            <p class="small"><strong>対応ウォレット</strong></p>
+            <p class="small"><strong>ウォレット起動状況</strong></p>
             <div id="operatorWalletChips" class="chip-group" aria-live="polite" aria-atomic="true"></div>
             <a
               id="operatorWalletHelpLink"

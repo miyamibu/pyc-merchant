@@ -253,9 +253,22 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
   - 旧 invoice の lineage を維持しつつ、新しい invoice を作成する。
   - current invoice pointer は同一 transaction 内で新 invoice へ swap する。
 
+## Customer Policy Publication
+
+- `PATCH /api/v1/admin/stores/:storeId/customer-policies` はURL・公開version・SHA-256 hashに加え、`contents.terms` / `contents.privacy` / `contents.refund` の公開本文を必須とする。
+- サーバーは本文を正規化せず、受信したUTF-8実バイトのSHA-256 (`sha256_utf8_exact_bytes_v1`) を計算する。改行コードやUnicode表現が異なれば別hashとする。
+- 申告hashとサーバー計算hashが1つでも不一致、または本文不足の場合は `400 POLICY_PUBLICATION_INVALID` とし、store設定や同意証跡を更新しない。
+- invoiceのpolicy snapshotには本文ではなく、サーバー計算hashとcanonicalization証跡を保存する。
+- 発行時 `policy_snapshot_json` を持たないinvoiceは、後日のstore policyへfallbackしない。公開invoice APIはpolicyを `null` とし、同意APIは `snapshot_missing: true` でfail-closedにする。
+
 ## Settlement Export endpoints and versioning
 
 - `POST /api/v1/settlement-exports` と新規の `POST /api/v1/settlements/daily:close` は `settlement_export_v2` snapshotを作成し、レスポンスで `contract_version` を明示する。
+- `GET /api/v1/settlements/daily:export` と `GET /api/v1/settlements/monthly:export` は現行ledgerを読むlegacy operational exportであり、保存済みv1/v2 snapshotの代替やsource of truthとはしない。
+  - review/refundとのjoinで同一invoiceが複数行になる場合、detail行は保持しつつ決定的に1行だけを `invoice_primary` とし、その他を `invoice_detail_only` とする。
+  - invoice件数とinvoice単位の金額集計にはprimary行だけを使い、join倍増による二重計上を認めない。
+  - 返金件数は `refund_request_id` ごとに決定的な `refund_primary` 行を1行だけ使い、review等とのjoinで同一refundを重複集計しない。
+  - JSONはjoin証跡の `rows`、invoice単位の `invoice_rows`、`refund_request_id` 単位の `refund_rows` を分離する。CSVは1 invoice=1行のまま、全refund参照を `legacy_refund_references_json` に決定順で格納し、代表refund以外の証跡を落とさない。
 - `GET /api/v1/settlement-exports/:id` は保存時の契約版を読み、`contract_version` を返す。保存済みv1を読取時にv2へ合成しない。
 - `GET /api/v1/settlement-exports/:id/download` は保存時の契約版でserialiseし、`x-settlement-export-contract-version` を返す。
   - v1は既存JSON形状とBOM付きCSV header/bytesを維持する。

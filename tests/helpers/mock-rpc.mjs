@@ -2,6 +2,11 @@ import http from "node:http";
 import { Interface } from "ethers";
 
 const transferInterface = new Interface(["event Transfer(address indexed from, address indexed to, uint256 value)"]);
+const metadataInterface = new Interface([
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
+  "function name() view returns (string)",
+]);
 
 function toHex(value) {
   return `0x${BigInt(value).toString(16)}`;
@@ -15,7 +20,16 @@ function fakeHash(prefix, number) {
   return `0x${String(prefix).repeat(64).slice(0, 56)}${BigInt(number).toString(16).padStart(8, "0")}`;
 }
 
-export async function startMockRpcServer({ chainId = 137 } = {}) {
+export async function startMockRpcServer({
+  chainId = 137,
+  tokenContract = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
+  tokenDecimals = 18,
+  tokenSymbol = "JPYC",
+  tokenName = "JPY Coin",
+  tokenCode = "0x6001600055",
+  implementationAddress = null,
+  implementationCode = "0x6002600055",
+} = {}) {
   const receipts = new Map();
   const blocks = new Map();
   let latestBlock = 1;
@@ -32,6 +46,9 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
     logIndex = 0,
     status = 1,
     includeTransferLog = true,
+    additionalTransfers = [],
+    receiptBlockHashPrefix = "b",
+    canonicalBlockHashPrefix = receiptBlockHashPrefix,
   }) {
     const normalizedTxHash = String(txHash).toLowerCase();
     const normalizedTokenContract = normalizeAddress(tokenContract);
@@ -41,27 +58,39 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
     blocks.set(Number(blockNumber), {
       number: Number(blockNumber),
       timestamp: Number(blockTimestamp),
+      hash: fakeHash(canonicalBlockHashPrefix, blockNumber),
     });
     const logs = [];
-    if (includeTransferLog) {
-      const encoded = transferInterface.encodeEventLog("Transfer", [normalizedFrom, normalizedTo, BigInt(amountBase)]);
+    const appendTransferLog = ({
+      fromAddress: transferFrom = normalizedFrom,
+      toAddress: transferTo = normalizedTo,
+      amountBase: transferAmount = amountBase,
+      logIndex: transferLogIndex = logIndex,
+    }) => {
+      const encoded = transferInterface.encodeEventLog("Transfer", [
+        normalizeAddress(transferFrom),
+        normalizeAddress(transferTo),
+        BigInt(transferAmount),
+      ]);
       logs.push({
         address: normalizedTokenContract,
         topics: encoded.topics,
         data: encoded.data,
-        logIndex: toHex(logIndex),
+        logIndex: toHex(transferLogIndex),
         transactionHash: normalizedTxHash,
         blockNumber: toHex(blockNumber),
-        blockHash: fakeHash("b", blockNumber),
+        blockHash: fakeHash(receiptBlockHashPrefix, blockNumber),
         transactionIndex: "0x0",
         removed: false,
       });
-    }
+    };
+    if (includeTransferLog) appendTransferLog({});
+    for (const transfer of additionalTransfers) appendTransferLog(transfer || {});
     receipts.set(normalizedTxHash, {
       transactionHash: normalizedTxHash,
       transactionIndex: "0x0",
       blockNumber: toHex(blockNumber),
-      blockHash: fakeHash("b", blockNumber),
+      blockHash: fakeHash(receiptBlockHashPrefix, blockNumber),
       from: normalizedFrom,
       to: normalizedTo,
       cumulativeGasUsed: "0x0",
@@ -96,6 +125,36 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
       if (method === "eth_blockNumber") {
         return { jsonrpc: "2.0", id, result: toHex(latestBlock) };
       }
+      if (method === "eth_getCode") {
+        const requestedAddress = normalizeAddress(item.params?.[0]);
+        const code = requestedAddress === normalizeAddress(implementationAddress)
+          ? implementationCode
+          : requestedAddress === normalizeAddress(tokenContract) ? tokenCode : "0x";
+        return { jsonrpc: "2.0", id, result: code };
+      }
+      if (method === "eth_getStorageAt") {
+        const storage = implementationAddress
+          ? `0x${String(implementationAddress).slice(2).padStart(64, "0")}`
+          : "0x0";
+        return { jsonrpc: "2.0", id, result: storage };
+      }
+      if (method === "eth_call") {
+        const requestedAddress = normalizeAddress(item.params?.[0]?.to);
+        if (requestedAddress !== normalizeAddress(tokenContract)) {
+          return { jsonrpc: "2.0", id, error: { code: -32000, message: "unknown token contract" } };
+        }
+        const selector = String(item.params?.[0]?.data || "").slice(0, 10);
+        if (selector === metadataInterface.getFunction("decimals").selector) {
+          return { jsonrpc: "2.0", id, result: metadataInterface.encodeFunctionResult("decimals", [tokenDecimals]) };
+        }
+        if (selector === metadataInterface.getFunction("symbol").selector) {
+          return { jsonrpc: "2.0", id, result: metadataInterface.encodeFunctionResult("symbol", [tokenSymbol]) };
+        }
+        if (selector === metadataInterface.getFunction("name").selector) {
+          return { jsonrpc: "2.0", id, result: metadataInterface.encodeFunctionResult("name", [tokenName]) };
+        }
+        return { jsonrpc: "2.0", id, error: { code: -32602, message: "unknown metadata selector" } };
+      }
       if (method === "eth_getBlockByNumber") {
         const raw = String(item.params?.[0] || "0x1");
         const blockNumber = Number(BigInt(raw));
@@ -106,7 +165,7 @@ export async function startMockRpcServer({ chainId = 137 } = {}) {
           id,
           result: {
             number: toHex(block.number),
-            hash: fakeHash("c", block.number),
+            hash: block.hash || fakeHash("b", block.number),
             parentHash: fakeHash("d", Math.max(block.number - 1, 0)),
             timestamp: toHex(block.timestamp),
             nonce: "0x0000000000000000",

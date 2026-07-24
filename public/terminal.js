@@ -1,9 +1,22 @@
-const ACTIVE_INVOICE_STATUSES = new Set(["issued", "payment_detected", "confirming"]);
-const FINAL_INVOICE_STATUSES = new Set(["paid", "review_required", "expired", "cancelled", "settled"]);
+// A paid invoice remains observable because the chain-monitor can discover a
+// later reorg and set an integrity hold directly in SQLite. Closing the stream
+// at `paid` would leave the operator's "商品を渡してOK" banner stale.
+const ACTIVE_INVOICE_STATUSES = new Set([
+  "issued",
+  "payment_detected",
+  "confirming",
+  "paid",
+  "settled",
+  "review_required",
+  "expired",
+  "refunded",
+]);
+const FINAL_INVOICE_STATUSES = new Set(["cancelled"]);
 const INVOICE_STATUS_ALIASES = Object.freeze({
   manual_review: "review_required",
 });
 const FALLBACK_POLL_INTERVAL_MS = 10_000;
+const FULFILLMENT_FRESHNESS_MS = 30_000;
 const SETTINGS_KEY = "jpyc_terminal_settings";
 const DEFAULT_AMOUNT_PRESETS = Object.freeze([500, 1000, 3000, 5000, 10000]);
 const MAX_AMOUNT_PRESET_COUNT = 12;
@@ -41,6 +54,13 @@ const REFUND_VERIFY_RETRYABLE_STATUSES = new Set([
 const ADDRESS_POOL_WARN_THRESHOLD = 5;
 const WORKER_STALE_WARN_SEC = 300;
 const OPS_AUTO_REFRESH_INTERVAL_MS = 60_000;
+const PROVIDER_RAIL_ENABLED = document.body?.dataset.providerRailEnabled === "true";
+const WALLET_SCOPED_CAPABILITY_PREFIX = /^(?:検証済み環境（[^）]*(?:iOS|Android)[^）]*ウォレット[^）]*）|起動導線あり(?:（[^）]*）)?|手動送金のみ|未検証(?:（[^）]*）)?):\s*/;
+const WALLET_BROAD_TESTED_PREFIX = /^実機検証済み:\s*(.+)$/;
+
+if (!PROVIDER_RAIL_ENABLED) {
+  document.querySelectorAll("[data-provider-rail]").forEach((node) => node.remove());
+}
 
 function normalizeReviewReason(reasonType) {
   const raw = String(reasonType || "").trim();
@@ -61,6 +81,27 @@ function canonicalInvoiceStatus(status) {
   const raw = String(status || "").trim();
   if (!raw) return "";
   return INVOICE_STATUS_ALIASES[raw] || raw;
+}
+
+function hasIntegrityHold(invoice) {
+  if (!invoice) return false;
+  const integrityHold = invoice.integrity_hold;
+  const explicitHold = integrityHold === true
+    || ["active", "hold", "integrity_hold"].includes(String(integrityHold || "").toLowerCase())
+    || (integrityHold && typeof integrityHold === "object"
+      && (integrityHold.active === true || ["active", "hold"].includes(String(integrityHold.status || "").toLowerCase())));
+  const fulfillmentDecision = String(
+    invoice.fulfillment_decision || invoice.provider_summary?.fulfillment_decision || ""
+  ).toLowerCase();
+  const statusReason = String(invoice.status_reason || "").toLowerCase();
+  return explicitHold
+    || ["hold", "hold_fulfillment", "deny_fulfillment", "integrity_hold"].includes(fulfillmentDecision)
+    || ["integrity_hold", "reorg_detected", "chain_reorg", "reorg_integrity_hold"].includes(statusReason);
+}
+
+function effectiveOperatorStatus(invoice) {
+  if (hasIntegrityHold(invoice)) return "integrity_hold";
+  return canonicalInvoiceStatus(invoice?.status) || "idle";
 }
 
 function getOperatorActionPolicy(status) {
@@ -121,6 +162,22 @@ function getOperatorActionPolicy(status) {
       script: "お客様への一言: お支払い内容を確認します。追加で送金せず、この画面をお見せください。",
       action: "店長確認",
     },
+    integrity_hold: {
+      label: "記録整合性を確認中",
+      handoff: "商品引渡し: 絶対に渡さない",
+      next: "次にやること: 追加送金を促さず、自動更新を待って店長または管理者へ引き継ぎます。",
+      manager: "店長確認: 必須。記録整合性の保留が解除されるまで会計判断を進めません。",
+      script: "お客様への一言: お支払い記録を確認しています。追加で送金せず、そのままお待ちください。",
+      action: "商品引渡し保留",
+    },
+    observation_unavailable: {
+      label: "最新状態を再確認中",
+      handoff: "商品引渡し: 渡さない",
+      next: "次にやること: 自動更新または最新取得が成功するまで待ちます。",
+      manager: "店長確認: 再取得できない場合は必要です。",
+      script: "お客様への一言: 最新状態を確認しています。追加送金せず、そのままお待ちください。",
+      action: "商品引渡し保留",
+    },
     expired: {
       label: "期限切れ",
       handoff: "商品引渡し: まだ渡さない",
@@ -157,6 +214,10 @@ const state = {
   sessionExpiresAt: "",
   sessionExpiryTimer: null,
   supportedWallets: [],
+  paymentsDisableState: null,
+  paymentsReadState: "unknown",
+  storePaymentsControlInFlight: false,
+  storePaymentsOperation: null,
   paymentChains: [],
   fixedQrUrl: "",
   fixedQrToken: "",
@@ -181,6 +242,8 @@ const state = {
   fallbackPollingUpdatedAt: "",
   lastFallbackPollAt: "",
   lastInvoiceRefreshAt: "",
+  fulfillmentObservationValid: false,
+  fulfillmentFreshnessTimer: null,
   reviewRows: [],
   selectedReviewId: "",
   selectedReviewDetail: null,
@@ -241,6 +304,11 @@ const el = {
   autoResetSecInput: document.getElementById("autoResetSecInput"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
   opsWarnings: document.getElementById("opsWarnings"),
+  storePaymentsControl: document.getElementById("storePaymentsControl"),
+  storePaymentsStatusBadge: document.getElementById("storePaymentsStatusBadge"),
+  storePaymentsStatusText: document.getElementById("storePaymentsStatusText"),
+  storePaymentsRefreshBtn: document.getElementById("storePaymentsRefreshBtn"),
+  storePaymentsToggleBtn: document.getElementById("storePaymentsToggleBtn"),
   amountInput: document.getElementById("amountInput"),
   amountInputError: document.getElementById("amountInputError"),
   paymentChainSelect: document.getElementById("paymentChainSelect"),
@@ -269,6 +337,10 @@ const el = {
   amountComparePaid: document.getElementById("amountComparePaid"),
   amountCompareDelta: document.getElementById("amountCompareDelta"),
   reasonText: document.getElementById("reasonText"),
+  fulfillmentDecisionBanner: document.getElementById("fulfillmentDecisionBanner"),
+  fulfillmentDecisionBadge: document.getElementById("fulfillmentDecisionBadge"),
+  fulfillmentDecisionTitle: document.getElementById("fulfillmentDecisionTitle"),
+  fulfillmentDecisionBody: document.getElementById("fulfillmentDecisionBody"),
   providerOperatorStateText: document.getElementById("providerOperatorStateText"),
   providerStatusText: document.getElementById("providerStatusText"),
   refreshBtn: document.getElementById("refreshBtn"),
@@ -501,6 +573,7 @@ function setDiagnosticsBadge(label) {
 }
 
 function renderChipGroup(host, values, fallback = "未設定") {
+  if (!host) return;
   host.innerHTML = "";
   const items = Array.isArray(values) && values.length > 0 ? values : [fallback];
   for (const value of items) {
@@ -509,6 +582,292 @@ function renderChipGroup(host, values, fallback = "未設定") {
     chip.textContent = String(value || fallback);
     host.appendChild(chip);
   }
+}
+
+function normalizeWalletCapabilityLabels(values, { manualOnly = false } = {}) {
+  const labels = (Array.isArray(values) ? values : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .map((value) => {
+      const broadTested = value.match(WALLET_BROAD_TESTED_PREFIX);
+      if (broadTested) {
+        return `未検証（検証OS・バージョン不明）: ${broadTested[1]}`;
+      }
+      return WALLET_SCOPED_CAPABILITY_PREFIX.test(value) ? value : `未検証: ${value}`;
+    });
+  if (manualOnly && !labels.some((value) => value.startsWith("手動送金のみ:"))) {
+    labels.push("手動送金のみ: 支払い情報コピー");
+  }
+  return labels;
+}
+
+function normalizePaymentsDisableState(value) {
+  if (!value || typeof value !== "object") return null;
+  const keys = ["env_forced", "global_disabled", "store_disabled", "terminal_disabled"];
+  if (keys.some((key) => typeof value[key] !== "boolean")) return null;
+  const normalized = Object.fromEntries(keys.map((key) => [key, value[key] === true]));
+  return {
+    ...normalized,
+    disabled: Object.values(normalized).some(Boolean),
+  };
+}
+
+function paymentIssuanceAllowed() {
+  return state.paymentsReadState === "ready"
+    && state.paymentsDisableState?.disabled === false;
+}
+
+function renderStorePaymentsControl() {
+  if (!el.storePaymentsControl || !el.storePaymentsToggleBtn) return;
+  const canControl = hasPermission("payments.control");
+  const payments = state.paymentsReadState === "ready" ? state.paymentsDisableState : null;
+  const storeDisabled = payments?.store_disabled === true;
+  let panelState = "unknown";
+  let badge = "状態未確認";
+  let badgeClass = "s-red";
+  let detail = "停止状態を確認できません。安全のため新規請求は作成せず、店舗停止のみ実行できます。";
+
+  if (state.paymentsReadState === "loading") {
+    badge = "状態確認中";
+    badgeClass = "s-yellow";
+    detail = "店舗・端末・全体の停止状態を確認しています。確認中でも店舗停止は実行できます。";
+  } else if (payments?.env_forced) {
+    panelState = "stopped";
+    badge = "環境強制停止中";
+    detail = `環境設定による全体停止中です。店舗UIでは解除できません。${storeDisabled ? " 店舗停止も有効です。" : ""}`;
+  } else if (payments?.global_disabled) {
+    panelState = "stopped";
+    badge = "全体停止中";
+    detail = `プラットフォーム全体の停止中です。店舗UIでは解除できません。${storeDisabled ? " 店舗停止も有効です。" : ""}`;
+  } else if (storeDisabled) {
+    panelState = "stopped";
+    badge = "店舗停止中";
+    detail = "現在の店舗で新規決済を停止しています。既存の請求・支払い証跡は削除されません。";
+  } else if (payments?.terminal_disabled) {
+    panelState = "stopped";
+    badge = "この端末は停止中";
+    detail = "この端末だけが停止中です。店舗全体の停止とは別の操作です。";
+  } else if (payments) {
+    panelState = "active";
+    badge = "店舗受付中";
+    badgeClass = "s-green";
+    detail = "店舗・端末・全体の停止は有効ではありません。";
+  }
+
+  el.storePaymentsControl.dataset.state = panelState;
+  el.storePaymentsStatusBadge.textContent = badge;
+  el.storePaymentsStatusBadge.className = `status-pill ${badgeClass}`;
+  el.storePaymentsStatusText.textContent = detail;
+  el.storePaymentsRefreshBtn.disabled = !canControl || state.storePaymentsControlInFlight;
+  el.storePaymentsToggleBtn.textContent = storeDisabled
+    ? "店舗停止だけを解除"
+    : "店舗の新規決済を停止";
+  el.storePaymentsToggleBtn.className = `btn ${storeDisabled ? "btn-secondary" : "btn-danger"}`;
+  el.storePaymentsToggleBtn.disabled = !canControl || state.storePaymentsControlInFlight;
+  el.storePaymentsToggleBtn.classList.toggle("loading", state.storePaymentsControlInFlight);
+}
+
+function setPaymentsDisableState(value, readState = "ready") {
+  const normalized = normalizePaymentsDisableState(value);
+  state.paymentsDisableState = normalized;
+  state.paymentsReadState = normalized && readState === "ready" ? "ready" : readState;
+  renderStorePaymentsControl();
+  syncInvoiceOperationControls();
+}
+
+async function loadStorePaymentsState({ silent = false } = {}) {
+  if (!state.token || !state.storeId) return;
+  state.paymentsDisableState = null;
+  state.paymentsReadState = "loading";
+  renderStorePaymentsControl();
+  syncInvoiceOperationControls();
+  try {
+    const data = await requestJson(`/api/v1/stores/${encodeURIComponent(state.storeId)}/settings`);
+    const normalized = normalizePaymentsDisableState(data.payments);
+    if (!normalized) throw new Error("店舗決済の停止状態が不完全です");
+    state.storePaymentsOperation = null;
+    setPaymentsDisableState(normalized);
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    setPaymentsDisableState(null, "error");
+    if (!silent) showToast("店舗決済の停止状態を確認できません。新規請求は停止しました", true);
+  }
+}
+
+async function handleStorePaymentsToggle() {
+  if (!requireUiPermission("payments.control", "店舗決済コントロール")) return;
+  if (!state.storeId || state.storePaymentsControlInFlight) return;
+  const storeDisabled = state.paymentsReadState === "ready"
+    && state.paymentsDisableState?.store_disabled === true;
+  const action = storeDisabled ? "enable" : "disable";
+  if (action === "enable" && !window.confirm(
+    "現在の店舗の停止だけを解除します。全体停止・環境強制停止・端末停止は解除されません。続けますか？"
+  )) return;
+
+  const signature = `${action}:${state.storeId}`;
+  if (state.storePaymentsOperation?.signature !== signature) {
+    state.storePaymentsOperation = {
+      signature,
+      idempotencyKey: idempotencyKey(`store-payments-${action}`),
+    };
+  }
+  const operation = state.storePaymentsOperation;
+  state.storePaymentsControlInFlight = true;
+  state.paymentsDisableState = null;
+  state.paymentsReadState = "loading";
+  renderStorePaymentsControl();
+  syncInvoiceOperationControls();
+  try {
+    const data = await requestJson(
+      `/api/v1/admin/stores/${encodeURIComponent(state.storeId)}/payments/${action}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": operation.idempotencyKey,
+        },
+        body: JSON.stringify({
+          reason: action === "disable" ? "terminal_store_emergency_stop" : "terminal_store_stop_cleared",
+        }),
+      }
+    );
+    state.storePaymentsOperation = null;
+    setPaymentsDisableState(data);
+    showToast(action === "disable"
+      ? "店舗の新規決済を停止し、監査ログに記録しました"
+      : "店舗停止だけを解除し、監査ログに記録しました");
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    setPaymentsDisableState(null, "error");
+    showToast("操作結果を確認できません。同じ操作を再試行するか、状態を再確認してください", true);
+  } finally {
+    state.storePaymentsControlInFlight = false;
+    renderStorePaymentsControl();
+    syncInvoiceOperationControls();
+  }
+}
+
+function wouldAllowFulfillment(invoice) {
+  const status = effectiveOperatorStatus(invoice);
+  const providerDecision = PROVIDER_RAIL_ENABLED
+    ? String(invoice?.provider_summary?.fulfillment_decision || "").toLowerCase()
+    : "";
+  return ["paid", "settled"].includes(status) || providerDecision === "allow_fulfillment";
+}
+
+function hasFreshFulfillmentObservation() {
+  const lastRefreshMs = Date.parse(state.lastInvoiceRefreshAt || "");
+  return state.fulfillmentObservationValid === true
+    && Number.isFinite(lastRefreshMs)
+    && Date.now() - lastRefreshMs <= FULFILLMENT_FRESHNESS_MS
+    && (state.sseStatus === "open" || state.fallbackPollingStatus === "active");
+}
+
+function isFulfillmentObservationUnavailable(invoice = state.currentInvoice) {
+  return !hasIntegrityHold(invoice)
+    && wouldAllowFulfillment(invoice)
+    && !hasFreshFulfillmentObservation();
+}
+
+function resolveFulfillmentDecisionModel(invoice) {
+  if (hasIntegrityHold(invoice)) {
+    const policy = getOperatorActionPolicy("integrity_hold");
+    return {
+      decision: "hold",
+      badge: "記録整合性を確認中・渡さない",
+      badgeClass: "s-red",
+      title: policy.handoff,
+      body: `${policy.next} ${policy.manager}`,
+    };
+  }
+  const status = effectiveOperatorStatus(invoice);
+  const providerDecision = PROVIDER_RAIL_ENABLED
+    ? String(invoice?.provider_summary?.fulfillment_decision || "").toLowerCase()
+    : "";
+  if (isFulfillmentObservationUnavailable(invoice)) {
+    return {
+      decision: "hold",
+      badge: "状態更新を確認できないため渡さない",
+      badgeClass: "s-red",
+      title: "最新の支払い状態を確認できるまで渡さない",
+      body: "リアルタイム更新または最新取得が止まっています。再取得が成功するまで商品を渡さず、必要なら店長へ連絡してください。",
+    };
+  }
+  if (providerDecision === "allow_fulfillment") {
+    return {
+      decision: "allow",
+      badge: "商品を渡してOK",
+      badgeClass: "s-green",
+      title: "店頭端末の引渡し許可を確認しました",
+      body: "商品を渡せます。JPYCの支払い確認と日次締めは別の記録として追跡されます。",
+    };
+  }
+  const policy = getOperatorActionPolicy(status);
+  const allow = ["paid", "settled"].includes(status);
+  return {
+    decision: allow ? "allow" : "hold",
+    badge: allow ? "商品を渡してOK" : "商品はまだ渡さない",
+    badgeClass: allow ? "s-green" : status === "review_required" ? "s-red" : "s-yellow",
+    title: policy.handoff,
+    body: `${policy.next} ${policy.manager}`,
+  };
+}
+
+function renderFulfillmentDecisionBanner(invoice = state.currentInvoice) {
+  if (!el.fulfillmentDecisionBanner) return;
+  const model = resolveFulfillmentDecisionModel(invoice);
+  el.fulfillmentDecisionBanner.dataset.decision = model.decision;
+  el.fulfillmentDecisionBadge.textContent = model.badge;
+  el.fulfillmentDecisionBadge.className = `status-pill ${model.badgeClass}`;
+  el.fulfillmentDecisionTitle.textContent = model.title;
+  el.fulfillmentDecisionBody.textContent = model.body;
+}
+
+function stopFulfillmentFreshnessTimer() {
+  if (!state.fulfillmentFreshnessTimer) return;
+  clearTimeout(state.fulfillmentFreshnessTimer);
+  state.fulfillmentFreshnessTimer = null;
+}
+
+function failClosedFulfillmentObservation() {
+  state.fulfillmentObservationValid = false;
+  stopFulfillmentFreshnessTimer();
+  renderFulfillmentSafetySurfaces();
+}
+
+function refreshFulfillmentObservationAfterResume() {
+  if (!state.token || !state.invoiceId || document.visibilityState === "hidden") return;
+  // iPad/Safari may suspend timers and EventSource while backgrounded. Keep
+  // the last green decision hidden until a fresh server response is accepted.
+  failClosedFulfillmentObservation();
+  void loadInvoice(state.invoiceId, { silent: true }).then((result) => {
+    if (result?.status === "ok" && state.sseStatus !== "open") {
+      void connectTerminalStream();
+    }
+  });
+}
+
+function renderFulfillmentSafetySurfaces() {
+  setInvoiceStatusPill(state.invoiceStatus);
+  renderProviderControls(state.currentInvoice);
+  renderCustomerFacingQr();
+  renderOperatorGuide();
+}
+
+function scheduleFulfillmentFreshnessHold() {
+  stopFulfillmentFreshnessTimer();
+  if (!wouldAllowFulfillment(state.currentInvoice)) return;
+  const lastRefreshMs = Date.parse(state.lastInvoiceRefreshAt || "");
+  if (!Number.isFinite(lastRefreshMs)) {
+    failClosedFulfillmentObservation();
+    return;
+  }
+  const delayMs = Math.max(lastRefreshMs + FULFILLMENT_FRESHNESS_MS - Date.now() + 1, 1);
+  state.fulfillmentFreshnessTimer = setTimeout(() => {
+    state.fulfillmentFreshnessTimer = null;
+    state.fulfillmentObservationValid = false;
+    renderFulfillmentSafetySurfaces();
+  }, delayMs);
 }
 
 function normalizeAmountPresetList(values) {
@@ -747,7 +1106,10 @@ function buildMonitorWarnings(monitor) {
 
 function renderOperatorGuide() {
   const invoice = state.currentInvoice;
-  const status = canonicalInvoiceStatus(invoice?.status) || "idle";
+  const invoiceStatus = effectiveOperatorStatus(invoice);
+  const status = isFulfillmentObservationUnavailable(invoice)
+    ? "observation_unavailable"
+    : invoiceStatus;
   const providerSummary = invoice?.provider_summary || null;
   const walletAdapter = invoice?.wallet_adapter || {};
   const reviewCaseId = invoice?.review_case_id || null;
@@ -757,9 +1119,9 @@ function renderOperatorGuide() {
       : state.supportedWallets;
   const streamStatus =
     state.sseStatus === "open"
-      ? "SSE 接続中"
+      ? "自動更新中"
       : state.fallbackPollingStatus === "active"
-        ? "Polling fallback"
+        ? "低速更新に切替中"
         : state.token
           ? "待機中"
           : "未ログイン";
@@ -902,6 +1264,28 @@ function renderOperatorGuide() {
         "お客様には店舗側で確認する旨を短く案内します。",
       ],
     },
+    integrity_hold: {
+      badge: "記録整合性を確認中",
+      headline: "商品を渡さず、追加送金も案内しないでください",
+      body: "チェーン記録の整合性を確認しています。保留が解除されるまで、会計判断を進めません。",
+      action: "商品引渡し保留",
+      items: [
+        "商品は渡さず、店長または管理者を呼びます。",
+        "お客様には追加で送金しないよう案内します。",
+        "画面の保留表示が解除されるまで自動更新を待ちます。",
+      ],
+    },
+    observation_unavailable: {
+      badge: "状態再確認中",
+      headline: "最新状態を確認できるまで商品を渡さないでください",
+      body: "最後に確認した完了表示は再確認中です。自動更新または最新取得が成功するまで引渡しを保留します。",
+      action: "商品引渡し保留",
+      items: [
+        "商品は渡さず、自動更新または最新状態の再取得を待ちます。",
+        "お客様には追加送金しないよう案内します。",
+        "再取得できない場合は店長または管理者へ引き継ぎます。",
+      ],
+    },
     expired: {
       badge: "再発行",
       headline: "期限切れです。必要なら新しい QR を再発行してください",
@@ -927,7 +1311,11 @@ function renderOperatorGuide() {
   };
 
   const fallback = guideMap[status] || guideMap.idle;
-  const providerFallback = providerSummary?.available ? providerGuideMap[providerSummary.operator_state?.code] : null;
+  const providerFallback = PROVIDER_RAIL_ENABLED
+    && !["integrity_hold", "observation_unavailable"].includes(status)
+    && providerSummary?.available
+    ? providerGuideMap[providerSummary.operator_state?.code]
+    : null;
   const resolvedGuide = providerFallback || fallback;
   const actionPolicy = getOperatorActionPolicy(providerFallback ? "review_required" : status);
   el.operatorGuideBadge.textContent = providerFallback ? resolvedGuide.badge : actionPolicy.label;
@@ -951,7 +1339,10 @@ function renderOperatorGuide() {
     el.operatorWalletHelpLink.classList.add("hidden");
     el.operatorWalletHelpLink.removeAttribute("href");
   } else {
-    renderChipGroup(el.operatorWalletChips, supportedWallets, walletAdapter.reason ? "手動送金案内" : "ウォレット確認待ち");
+    const capabilityLabels = normalizeWalletCapabilityLabels(supportedWallets, {
+      manualOnly: walletAdapter.available !== true || walletAdapter.status !== "ready",
+    });
+    renderChipGroup(el.operatorWalletChips, capabilityLabels, "未検証: ウォレット情報なし");
     setHelperLink(el.operatorWalletHelpLink, invoice?.wallet_help_url || "", "お客様向けウォレット案内を開く");
   }
 
@@ -964,6 +1355,7 @@ function renderOperatorGuide() {
     li.textContent = item;
     el.operatorGuideList.appendChild(li);
   }
+  renderFulfillmentDecisionBanner(invoice);
 }
 
 function computeReviewSuggestion(review) {
@@ -1272,7 +1664,7 @@ function setSseStatus(status, reason = "") {
   state.sseUpdatedAt = nowIso();
   renderConnectionStatus();
   renderDiagnostics();
-  renderOperatorGuide();
+  renderFulfillmentSafetySurfaces();
 }
 
 function setFallbackPollingStatus(status, reason = "") {
@@ -1281,7 +1673,7 @@ function setFallbackPollingStatus(status, reason = "") {
   state.fallbackPollingUpdatedAt = nowIso();
   renderConnectionStatus();
   renderDiagnostics();
-  renderOperatorGuide();
+  renderFulfillmentSafetySurfaces();
 }
 
 function renderDiagnostics() {
@@ -1519,6 +1911,10 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
   state.invoiceDiagnostics = null;
   state.diagnosticsUpdatedAt = "";
   state.supportedWallets = [];
+  state.paymentsDisableState = null;
+  state.paymentsReadState = "unknown";
+  state.storePaymentsControlInFlight = false;
+  state.storePaymentsOperation = null;
   state.paymentChains = [];
   state.fixedQrUrl = "";
   state.fixedQrToken = "";
@@ -1623,13 +2019,14 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
 
 function syncInvoiceOperationControls() {
   const canCreate = hasPermission("invoice.create");
+  const canIssuePayment = canCreate && paymentIssuanceAllowed();
   const busy = state.invoiceOperationsInFlight.size > 0;
   const hasPaymentChain = Boolean(el.paymentChainSelect?.value);
-  if (el.createInvoiceBtn) el.createInvoiceBtn.disabled = !canCreate || busy || !hasPaymentChain;
-  if (el.paymentChainSelect) el.paymentChainSelect.disabled = !canCreate || busy || state.paymentChains.length === 0;
+  if (el.createInvoiceBtn) el.createInvoiceBtn.disabled = !canIssuePayment || busy || !hasPaymentChain;
+  if (el.paymentChainSelect) el.paymentChainSelect.disabled = !canIssuePayment || busy || state.paymentChains.length === 0;
   if (el.cancelInvoiceBtn) el.cancelInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
   if (el.expireInvoiceBtn) el.expireInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
-  if (el.reissueInvoiceBtn) el.reissueInvoiceBtn.disabled = !canCreate || busy || !state.invoiceId;
+  if (el.reissueInvoiceBtn) el.reissueInvoiceBtn.disabled = !canIssuePayment || busy || !state.invoiceId;
   if (state.currentInvoice) renderProviderControls(state.currentInvoice);
 }
 
@@ -1829,6 +2226,16 @@ async function requestText(path, options = {}, policy = {}) {
 
 function setInvoiceStatusPill(statusRaw) {
   const status = canonicalInvoiceStatus(statusRaw);
+  if (hasIntegrityHold(state.currentInvoice)) {
+    el.invoiceStatusPill.textContent = "記録整合性を確認中";
+    el.invoiceStatusPill.className = "status-pill s-red";
+    return;
+  }
+  if (isFulfillmentObservationUnavailable(state.currentInvoice)) {
+    el.invoiceStatusPill.textContent = "最新状態を再確認中";
+    el.invoiceStatusPill.className = "status-pill s-red";
+    return;
+  }
   const labelMap = {
     issued: ["発行済み", "s-blue"],
     payment_detected: ["入金検知", "s-blue"],
@@ -1894,9 +2301,9 @@ function providerBadgeClass(operatorStateCode) {
 
 function renderCustomerFacingDisplay(invoice) {
   const providerSummary = invoice?.provider_summary || null;
-  const tapOnly = providerSummary?.qr_available === false;
+  const tapOnly = PROVIDER_RAIL_ENABLED && providerSummary?.qr_available === false;
   el.qrCanvas.classList.toggle("hidden", tapOnly);
-  el.tapModePanel.classList.toggle("hidden", !tapOnly);
+  if (el.tapModePanel) el.tapModePanel.classList.toggle("hidden", !tapOnly);
   if (!tapOnly) {
     if (state.fixedQrUrl) {
       drawQr(state.fixedQrUrl);
@@ -1909,6 +2316,26 @@ function renderCustomerFacingDisplay(invoice) {
     }
     el.customerDisplayHint.textContent =
       "このQRは端末ごとの固定入口です。お客様画面は、その時点の current invoice に一度だけ解決されます。";
+    return;
+  }
+
+  if (hasIntegrityHold(invoice)) {
+    el.tapModeBadge.textContent = "記録整合性を確認中";
+    el.tapModeBadge.className = "status-pill s-red";
+    el.tapModeTitle.textContent = "商品はまだ渡さないでください";
+    el.tapModeBody.textContent = "支払い記録の整合性確認が完了するまで、店頭端末の完了案内を保留しています。";
+    el.tapModeAmount.textContent = formatJpy(invoice?.amounts?.amount_jpy || 0);
+    el.customerDisplayHint.textContent = "追加操作を行わず、スタッフが記録を確認するまでお待ちください。";
+    return;
+  }
+
+  if (isFulfillmentObservationUnavailable(invoice)) {
+    el.tapModeBadge.textContent = "状態再確認中";
+    el.tapModeBadge.className = "status-pill s-red";
+    el.tapModeTitle.textContent = "商品はまだ渡さないでください";
+    el.tapModeBody.textContent = "最新状態の取得が成功するまで、店頭端末の完了案内を保留しています。";
+    el.tapModeAmount.textContent = formatJpy(invoice?.amounts?.amount_jpy || 0);
+    el.customerDisplayHint.textContent = "追加操作を行わず、スタッフが最新状態を再取得するまでお待ちください。";
     return;
   }
 
@@ -1932,6 +2359,12 @@ function stopFallbackPolling() {
     state.fallbackPollTimer = null;
   }
   setFallbackPollingStatus("idle", "停止中");
+}
+
+function shouldObserveInvoice(invoice = state.currentInvoice) {
+  const status = canonicalInvoiceStatus(invoice?.status || state.invoiceStatus);
+  if (!state.invoiceId || !status || FINAL_INVOICE_STATUSES.has(status)) return false;
+  return ACTIVE_INVOICE_STATUSES.has(status) || hasIntegrityHold(invoice);
 }
 
 function stopSseReconnect() {
@@ -1959,7 +2392,7 @@ function scheduleSseReconnect() {
 
 function startFallbackPollingIfNeeded() {
   stopFallbackPolling();
-  if (!state.invoiceId || !ACTIVE_INVOICE_STATUSES.has(state.invoiceStatus)) {
+  if (!shouldObserveInvoice()) {
     setFallbackPollingStatus("idle", "対象請求なし");
     return;
   }
@@ -1973,8 +2406,25 @@ function startFallbackPollingIfNeeded() {
 }
 
 function renderProviderControls(invoice) {
+  if (!PROVIDER_RAIL_ENABLED) return;
   const providerSummary = invoice?.provider_summary || null;
   const canControlProvider = hasPermission("invoice.create") && state.invoiceOperationsInFlight.size === 0;
+  if (hasIntegrityHold(invoice)) {
+    el.providerOperatorStateText.textContent = "記録整合性を確認中";
+    el.providerStatusText.textContent = "商品引渡し保留";
+    el.providerControlHint.textContent = "支払い記録の整合性確認が完了するまで店頭判断を止めてください。";
+    el.presentTapBtn.disabled = true;
+    el.resumeQrBtn.disabled = true;
+    return;
+  }
+  if (isFulfillmentObservationUnavailable(invoice)) {
+    el.providerOperatorStateText.textContent = "最新状態を再確認中";
+    el.providerStatusText.textContent = "商品引渡し保留";
+    el.providerControlHint.textContent = "自動更新または最新取得が成功するまで店頭判断を止めてください。";
+    el.presentTapBtn.disabled = true;
+    el.resumeQrBtn.disabled = true;
+    return;
+  }
   if (!providerSummary?.available) {
     el.providerOperatorStateText.textContent = "QR案内";
     el.providerStatusText.textContent = "店頭端末未提示";
@@ -2077,6 +2527,8 @@ function clearInvoiceView() {
   state.invoiceId = "";
   state.invoiceStatus = "";
   state.currentInvoice = null;
+  state.fulfillmentObservationValid = false;
+  stopFulfillmentFreshnessTimer();
   state.invoiceDiagnostics = null;
   state.selectedReviewId = "";
   state.selectedReviewDetail = null;
@@ -2093,11 +2545,13 @@ function clearInvoiceView() {
   renderAmountCompare(null);
   if (el.qrAccessibleText) el.qrAccessibleText.textContent = "請求IDと金額は現在の請求欄に表示されます。";
   el.reasonText.textContent = "-";
-  el.providerOperatorStateText.textContent = "-";
-  el.providerStatusText.textContent = "-";
-  el.providerControlHint.textContent = "QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。";
-  el.presentTapBtn.disabled = true;
-  el.resumeQrBtn.disabled = true;
+  if (el.providerOperatorStateText) el.providerOperatorStateText.textContent = "-";
+  if (el.providerStatusText) el.providerStatusText.textContent = "-";
+  if (el.providerControlHint) {
+    el.providerControlHint.textContent = "QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。";
+  }
+  if (el.presentTapBtn) el.presentTapBtn.disabled = true;
+  if (el.resumeQrBtn) el.resumeQrBtn.disabled = true;
   renderCustomerFacingQr();
   closeSse("未接続");
   stopFallbackPolling();
@@ -2123,7 +2577,9 @@ async function loadInvoice(invoiceId, options = {}) {
       throw new Error("請求IDが一致しない応答を受け取ったため破棄しました");
     }
     state.lastInvoiceRefreshAt = nowIso();
+    state.fulfillmentObservationValid = true;
     renderInvoice(data);
+    scheduleFulfillmentFreshnessHold();
     if (!options.silent) {
       showToast(`請求状態を更新しました（${el.invoiceStatusPill.textContent}）`);
     }
@@ -2134,6 +2590,7 @@ async function loadInvoice(invoiceId, options = {}) {
       || requestSequence !== state.invoiceRequestSequence
       || state.latestInvoiceRequestId !== requestedInvoiceId
     ) return { status: "stale" };
+    failClosedFulfillmentObservation();
     if (!options.silent) showToast(String(error.message || error), true);
     return { status: "failed", error };
   }
@@ -2210,6 +2667,7 @@ async function connectTerminalStream() {
     sseToken = await fetchSseToken(invoiceId);
   } catch (error) {
     if (isIgnoredRequestError(error) || !isSessionGenerationCurrent(sessionGeneration)) return;
+    failClosedFulfillmentObservation();
     setNetworkStatus("再接続中（トークン取得失敗）");
     setSseStatus("reconnecting", "トークン取得失敗");
     startFallbackPollingIfNeeded();
@@ -2251,6 +2709,7 @@ async function connectTerminalStream() {
       state.lastStreamEventAt = nowIso();
       renderDiagnostics();
       if (state.invoiceId === updatedInvoiceId) {
+        failClosedFulfillmentObservation();
         void loadInvoice(updatedInvoiceId, { silent: true });
       }
     } catch (_error) {
@@ -2276,6 +2735,7 @@ async function connectTerminalStream() {
       stream.close();
       return;
     }
+    failClosedFulfillmentObservation();
     setNetworkStatus("再接続中（自動更新中）");
     setSseStatus("reconnecting", "自動再接続待ち");
     startFallbackPollingIfNeeded();
@@ -2307,6 +2767,7 @@ function applyPermissionVisibility() {
     node.setAttribute("aria-hidden", visible ? "false" : "true");
     if ("disabled" in node) node.disabled = !visible;
   }
+  renderStorePaymentsControl();
   syncInvoiceOperationControls();
   updateRefundStepState();
 }
@@ -2641,6 +3102,10 @@ async function handleLogin() {
       : "");
     state.diagnosticsEnabled = data.diagnostic_mode_enabled === true;
     state.supportedWallets = Array.isArray(data.supported_wallets) ? data.supported_wallets : [];
+    setPaymentsDisableState(
+      data.payments,
+      normalizePaymentsDisableState(data.payments) ? "ready" : "error"
+    );
     state.fixedQrUrl = typeof data.fixed_qr_url === "string" ? data.fixed_qr_url : "";
     state.fixedQrToken = typeof data.public_entry_token === "string" ? data.public_entry_token : "";
     el.staffPin.value = "";
@@ -2777,6 +3242,16 @@ async function handleLogout() {
 
 async function handleCreateInvoice() {
   if (!requireUiPermission("invoice.create", "請求作成")) return;
+  if (!paymentIssuanceAllowed()) {
+    renderStorePaymentsControl();
+    showToast(
+      state.paymentsDisableState?.disabled
+        ? "店舗・端末・全体のいずれかで決済が停止中です"
+        : "決済停止状態を確認できないため、新規請求は作成できません",
+      true
+    );
+    return;
+  }
   const amount = Number(el.amountInput.value);
   const paymentChainId = String(el.paymentChainSelect?.value || "").trim();
   if (!Number.isInteger(amount) || amount <= 0) {
@@ -2854,6 +3329,10 @@ async function postInvoiceAction(actionPath, actionLabel, invoiceId = state.invo
 
 async function handleReissueInvoice() {
   if (!requireUiPermission("invoice.create", "QR再発行")) return;
+  if (!paymentIssuanceAllowed()) {
+    showToast("決済停止状態が有効または未確認のため、QRを再発行できません", true);
+    return;
+  }
   const targetInvoiceId = String(state.invoiceId || "").trim();
   if (!targetInvoiceId) {
     showToast("再発行対象の請求がありません", true);
@@ -2882,6 +3361,7 @@ async function handleReissueInvoice() {
 }
 
 async function handlePresentTap() {
+  if (!PROVIDER_RAIL_ENABLED || !el.presentTapBtn) return;
   if (!requireUiPermission("invoice.create", "タッチ決済の提示")) return;
   const targetInvoiceId = String(state.invoiceId || "").trim();
   if (!targetInvoiceId) {
@@ -2920,6 +3400,7 @@ async function handlePresentTap() {
 }
 
 async function handleResumeQr() {
+  if (!PROVIDER_RAIL_ENABLED || !el.resumeQrBtn) return;
   if (!requireUiPermission("invoice.create", "QR案内へ戻す操作")) return;
   const targetInvoiceId = String(state.invoiceId || "").trim();
   if (!targetInvoiceId) {
@@ -3639,6 +4120,8 @@ function loadTerminalSettings() {
 function bindEvents() {
   el.loginBtn.addEventListener("click", () => void handleLogin());
   el.logoutBtn.addEventListener("click", () => void handleLogout());
+  el.storePaymentsRefreshBtn.addEventListener("click", () => void loadStorePaymentsState());
+  el.storePaymentsToggleBtn.addEventListener("click", () => void handleStorePaymentsToggle());
   el.amountPresetList.addEventListener("click", (event) => {
     const actionButton = event.target.closest("[data-preset-action]");
     if (!actionButton) return;
@@ -3670,6 +4153,7 @@ function bindEvents() {
   });
   if (el.connectionRefreshBtn) {
     el.connectionRefreshBtn.addEventListener("click", () => {
+      if (state.token && state.storeId) void loadStorePaymentsState({ silent: true });
       if (state.invoiceId) {
         if (!requireUiPermission("invoice.read", "請求の最新状態取得")) return;
         void loadInvoice(state.invoiceId);
@@ -3679,8 +4163,10 @@ function bindEvents() {
     });
   }
   el.reissueInvoiceBtn.addEventListener("click", () => void handleReissueInvoice());
-  el.presentTapBtn.addEventListener("click", () => void handlePresentTap());
-  el.resumeQrBtn.addEventListener("click", () => void handleResumeQr());
+  if (PROVIDER_RAIL_ENABLED && el.presentTapBtn && el.resumeQrBtn) {
+    el.presentTapBtn.addEventListener("click", () => void handlePresentTap());
+    el.resumeQrBtn.addEventListener("click", () => void handleResumeQr());
+  }
 
   el.loadReviewsBtn.addEventListener("click", () => void loadReviews());
   el.reviewStatusFilter.addEventListener("change", () => void loadReviews());
@@ -3738,6 +4224,11 @@ function bindEvents() {
     stopFallbackPolling();
     stopOpsAutoRefresh();
     stopSessionExpiryTimer();
+  });
+  window.addEventListener("pageshow", refreshFulfillmentObservationAfterResume);
+  window.addEventListener("online", refreshFulfillmentObservationAfterResume);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshFulfillmentObservationAfterResume();
   });
 }
 

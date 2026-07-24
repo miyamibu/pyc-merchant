@@ -56,6 +56,7 @@ Define a stable accounting interface and frozen accounting snapshot for daily cl
 - `GET /api/v1/settlement-exports/:id` returns existing snapshot metadata and rows scoped to the caller's store and must not recalculate or mutate accounting state.
 - `GET /api/v1/settlement-exports/:id/download` returns the existing snapshot as JSON or UTF-8 BOM CSV and must not recalculate or mutate accounting state.
 - Formal export snapshots include content hash metadata so downloaded JSON/CSV payloads can be reconciled to the immutable export record.
+- Legacy daily/monthly operational exports keep joined review/refund detail rows for traceability, expose deterministic `invoice_rows` (one primary row per invoice) and `refund_rows` (one `refund_primary` row per `refund_request_id`), calculate invoice totals/CSV from invoice-primary rows, and calculate refund counters from refund-primary rows. The one-row-per-invoice CSV carries every linked refund in a deterministic JSON aggregate column defined by the API specification, so avoiding duplicate invoice amounts does not discard secondary refunds. This behavior does not rewrite stored v1 snapshot bytes.
 - `paid` remains chain-verified only.
 - Wallet-direct paid invoices export as `onchain_cash_confirmed`.
 - Provider accepted/captured without chain-paid evidence exports as `provider_receivable`.

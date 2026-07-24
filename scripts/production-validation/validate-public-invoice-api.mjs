@@ -28,15 +28,15 @@ try {
   assert.equal(publicInvoice.data.chain_id, "137");
   assert.equal(publicInvoice.data.network, "Polygon");
   assert.equal(publicInvoice.data.token_symbol, "JPYC");
-  assert.equal(Number(publicInvoice.data.token_decimals), 6);
+  assert.equal(Number(publicInvoice.data.token_decimals), 18);
   assert.equal(publicInvoice.data.receive_address.toLowerCase(), env.RECIPIENT_ADDRESS.toLowerCase());
   assert.equal(publicInvoice.data.pay_url, created.payment_url);
   assert.equal(publicInvoice.data.copy_fallback.copy_network, "Polygon");
   assert.equal(publicInvoice.data.copy_fallback.copy_token, "JPYC");
   assert.match(publicInvoice.data.payment_uri, /ethereum:/);
   assert.match(publicInvoice.data.payment_uri, /@137\/transfer\?/);
-  assert.match(publicInvoice.data.payment_uri, /uint256=2300000000/);
-  assert.equal(publicInvoice.data.expected_amount_atomic, "2300000000");
+  assert.match(publicInvoice.data.payment_uri, /uint256=2300000000000000000000/);
+  assert.equal(publicInvoice.data.expected_amount_atomic, "2300000000000000000000");
 
   const payRedirect = await fetch(created.payment_url, { redirect: "manual" });
   assert.equal(payRedirect.status, 302);

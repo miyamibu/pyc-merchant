@@ -709,6 +709,7 @@ test("server security integration flows", async (t) => {
     assert.equal(publicInvoice.data.token_symbol, "JPYC");
     assert.equal(Number(publicInvoice.data.token_decimals), Number(env.TOKEN_DECIMALS));
     assert.equal(String(publicInvoice.data.token_contract).toLowerCase(), env.TOKEN_CONTRACT.toLowerCase());
+    assert.equal(String(publicInvoice.data.official_token_contract).toLowerCase(), env.TOKEN_CONTRACT.toLowerCase());
     assert.equal(String(publicInvoice.data.receive_address).toLowerCase(), env.RECIPIENT_ADDRESS.toLowerCase());
     assert.equal(publicInvoice.data.pay_url, invoice.data.payment_url);
     assert.equal(publicInvoice.data.wallet_url, publicInvoice.data.payment_uri);

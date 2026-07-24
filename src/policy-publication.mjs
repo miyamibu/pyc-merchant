@@ -1,5 +1,13 @@
+import crypto from "node:crypto";
+
 export const POLICY_URL_KEYS = Object.freeze(["terms", "privacy", "refund"]);
 export const POLICY_VERSION_KEYS = Object.freeze(["terms_version", "privacy_version", "refund_policy_version"]);
+export const POLICY_CONTENT_HASH_CANONICALIZATION = "sha256_utf8_exact_bytes_v1";
+export const POLICY_CONTENT_HASH_KEYS = Object.freeze({
+  terms: "terms_hash",
+  privacy: "privacy_hash",
+  refund: "refund_policy_hash",
+});
 
 export function isPublicPolicyHostname(value) {
   const host = String(value || "").trim().toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
@@ -40,6 +48,40 @@ export function isPublishedPolicyVersion(value) {
 
 export function isPublishedPolicyHash(value) {
   return /^[0-9a-f]{64}$/i.test(String(value || "").trim());
+}
+
+export function hashPolicyContent(content) {
+  if (typeof content !== "string" || !content.trim()) return null;
+  return crypto.createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+export function verifyPolicyContentHashes(contents, hashes) {
+  const submittedContents = contents && typeof contents === "object" && !Array.isArray(contents)
+    ? contents
+    : {};
+  const submittedHashes = hashes && typeof hashes === "object" && !Array.isArray(hashes)
+    ? hashes
+    : {};
+  const missingContentKeys = POLICY_URL_KEYS.filter(
+    (key) => typeof submittedContents[key] !== "string" || !submittedContents[key].trim()
+  );
+  const computedHashes = {};
+  const mismatchHashKeys = [];
+  for (const key of POLICY_URL_KEYS) {
+    const hashKey = POLICY_CONTENT_HASH_KEYS[key];
+    const computed = hashPolicyContent(submittedContents[key]);
+    computedHashes[hashKey] = computed;
+    if (computed && computed !== String(submittedHashes[hashKey] || "").trim().toLowerCase()) {
+      mismatchHashKeys.push(hashKey);
+    }
+  }
+  return {
+    ok: missingContentKeys.length === 0 && mismatchHashKeys.length === 0,
+    canonicalization: POLICY_CONTENT_HASH_CANONICALIZATION,
+    computed_hashes: computedHashes,
+    missing_content_keys: missingContentKeys,
+    mismatch_hash_keys: mismatchHashKeys,
+  };
 }
 
 export function extractPolicyObjectValues(content, constantName, requiredKeys) {

@@ -33,6 +33,16 @@ test("receive address reissue keeps old QR on late-arrival review path and scope
     staffName: "Demo Staff",
   });
 
+  const globalDisableDenied = await apiRequest(started.baseUrl, "/api/v1/admin/payments/disable", {
+    method: "POST",
+    headers: authHeaders(admin.token, {
+      "content-type": "application/json",
+      "idempotency-key": `global-disable-denied-${Date.now()}`,
+    }),
+    body: JSON.stringify({ reason: "store_admin_must_not_control_global" }),
+  });
+  assert.equal(globalDisableDenied.status, 403);
+
   const importRes = await apiRequest(started.baseUrl, "/api/v1/admin/receive-addresses:import", {
     method: "POST",
     headers: authHeaders(admin.token, {
@@ -152,6 +162,12 @@ test("receive address reissue keeps old QR on late-arrival review path and scope
   assert.equal(blockedByStore.data.error.code, "PAYMENTS_DISABLED");
   assert.equal(blockedByStore.data.error.details.store_disabled, true);
 
+  db.prepare(
+    `INSERT INTO app_config(key, value, updated_by, updated_at)
+     VALUES ('payments.disabled', 'true', 'test-platform-ops', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at`
+  ).run(new Date().toISOString());
+
   const enableStore = await apiRequest(
     started.baseUrl,
     `/api/v1/admin/stores/${encodeURIComponent(admin.storeId)}/payments/enable`,
@@ -166,6 +182,15 @@ test("receive address reissue keeps old QR on late-arrival review path and scope
   );
   assert.equal(enableStore.status, 200);
   assert.equal(enableStore.data.store_disabled, false);
+  assert.equal(enableStore.data.global_disabled, true);
+  assert.equal(enableStore.data.disabled, true);
+
+  const stillBlockedByGlobal = await createInvoice(started.baseUrl, admin.token, 1313, `global-still-blocked-${Date.now()}`);
+  assert.equal(stillBlockedByGlobal.status, 503);
+  assert.equal(stillBlockedByGlobal.data.error.details.global_disabled, true);
+  assert.equal(stillBlockedByGlobal.data.error.details.store_disabled, false);
+  db.prepare(`UPDATE app_config SET value = 'false', updated_by = 'test-cleanup', updated_at = ? WHERE key = 'payments.disabled'`)
+    .run(new Date().toISOString());
 
   const audit = await apiRequest(started.baseUrl, "/api/v1/audit-logs?limit=200", {
     headers: authHeaders(admin.token),

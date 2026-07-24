@@ -11,6 +11,14 @@ import {
 } from "../../src/policy-publication.mjs";
 import { validateCommercialEvidence } from "./validate-commercial-evidence.mjs";
 import { renderCommercialScorecard } from "./validate-commercial-scorecard.mjs";
+import {
+  resolveSafeExistingFile,
+  verifyReleaseImageReferenceContract,
+} from "./release-identity.mjs";
+import {
+  APPROVED_LEDGER_BASE_UNIT_SCALE,
+  APPROVED_TOKEN_DECIMALS,
+} from "../../src/token-metadata.mjs";
 
 const DEFAULT_EVIDENCE_ROOT = path.resolve(process.cwd(), "docs/production/evidence");
 
@@ -164,14 +172,7 @@ function releaseSigningPayload(manifest) {
   return Buffer.from(stableJson(unsigned), "utf8");
 }
 
-function resolveArtifactPath(rawPath) {
-  const resolved = path.resolve(process.cwd(), String(rawPath || "").trim());
-  const relative = path.relative(process.cwd(), resolved);
-  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
-  return resolved;
-}
-
-function verifyManifestArtifacts(manifest) {
+export function verifyManifestArtifacts(manifest, { root = process.cwd() } = {}) {
   const rawEntries = manifest?.artifact_hashes ?? manifest?.artifacts ?? manifest?.files;
   const entries = Array.isArray(rawEntries)
     ? rawEntries.filter((entry) => entry && typeof entry === "object").map((entry) => ({
@@ -193,19 +194,20 @@ function verifyManifestArtifacts(manifest) {
       blockers.push(`manifest_hash_unverifiable_${field}`);
       continue;
     }
-    const artifactPath = resolveArtifactPath(entry.path);
-    if (!artifactPath || !fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
-      blockers.push(`manifest_artifact_missing_${field}`);
+    const artifactPath = resolveSafeExistingFile(entry.path, { root });
+    if (!artifactPath.ok) {
+      const suffix = artifactPath.reason === "missing" ? "missing" : `unsafe_${artifactPath.reason}`;
+      blockers.push(`manifest_artifact_${suffix}_${field}`);
       continue;
     }
-    const actual = crypto.createHash("sha256").update(fs.readFileSync(artifactPath)).digest("hex");
+    const actual = crypto.createHash("sha256").update(fs.readFileSync(artifactPath.path)).digest("hex");
     if (actual !== declared) blockers.push(`manifest_artifact_hash_mismatch_${field}`);
     else verifiedFields.push(field);
   }
   return { ok: blockers.length === 0, verified_fields: verifiedFields, blockers };
 }
 
-function verifyManifestSignatures(manifest, env = {}) {
+function verifyManifestSignatures(manifest, env = {}, { root = process.cwd() } = {}) {
   const signatures = Array.isArray(manifest?.signatures) ? manifest.signatures : [];
   const validSignatureIndexes = [];
   const blockers = [];
@@ -215,9 +217,10 @@ function verifyManifestSignatures(manifest, env = {}) {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean)) {
-    const trustedPath = resolveArtifactPath(rawPath);
+    const trustedPath = resolveSafeExistingFile(rawPath, { root });
     try {
-      const publicKey = fs.readFileSync(trustedPath, "utf8").trim();
+      if (!trustedPath.ok) continue;
+      const publicKey = fs.readFileSync(trustedPath.path, "utf8").trim();
       if (publicKey) trustedKeys.set(crypto.createHash("sha256").update(publicKey).digest("hex"), publicKey);
     } catch (_error) {
       // Missing trusted keys remain a hard blocker below.
@@ -255,10 +258,16 @@ function verifyManifestSignatures(manifest, env = {}) {
   return { ok: blockers.length === 0, valid_signature_indexes: validSignatureIndexes, blockers };
 }
 
-function loadReleaseManifest(manifestPath, env = {}) {
+export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd() } = {}) {
   if (!manifestPath) return { ok: false, path: null, blockers: ["missing_release_manifest"] };
-  const resolved = path.resolve(process.cwd(), manifestPath);
-  if (!fs.existsSync(resolved)) return { ok: false, path: resolved, blockers: ["missing_release_manifest"] };
+  const manifestFile = resolveSafeExistingFile(manifestPath, { root });
+  if (!manifestFile.ok) {
+    const blocker = manifestFile.reason === "missing"
+      ? "missing_release_manifest"
+      : `unsafe_release_manifest_path_${manifestFile.reason}`;
+    return { ok: false, path: null, blockers: [blocker] };
+  }
+  const resolved = manifestFile.path;
 
   let manifest;
   try {
@@ -277,6 +286,7 @@ function loadReleaseManifest(manifestPath, env = {}) {
     "runtime",
     "base_image_digest",
     "app_image_digest",
+    "nginx_image_digest",
     "env_hash",
     "db_snapshot_hash",
     "backup_hash",
@@ -294,14 +304,20 @@ function loadReleaseManifest(manifestPath, env = {}) {
   }
   if (String(manifest.app_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_app_image_digest_null");
   if (String(manifest.base_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_base_image_digest_null");
+  const imageReferenceVerification = verifyReleaseImageReferenceContract({
+    manifest,
+    appImageRef: env.APP_IMAGE_REF,
+    nginxImageRef: env.NGINX_IMAGE_REF,
+  });
+  blockers.push(...imageReferenceVerification.blockers);
   if (!Array.isArray(manifest.signatures) || manifest.signatures.length === 0) blockers.push("manifest_missing_signatures");
   if (String(manifest.revocation_status || "").trim().toLowerCase() !== "valid") blockers.push("manifest_revocation_not_valid");
   const currentCommit = spawnSync("git", ["rev-parse", "HEAD"], {
-    cwd: process.cwd(),
+    cwd: root,
     encoding: "utf8",
   }).stdout?.trim() || "";
   const currentTree = spawnSync("git", ["status", "--porcelain"], {
-    cwd: process.cwd(),
+    cwd: root,
     encoding: "utf8",
   }).stdout?.trim() || "";
   if (currentCommit && String(manifest.commit || "").trim() !== currentCommit) blockers.push("manifest_commit_mismatch_current_HEAD");
@@ -312,14 +328,15 @@ function loadReleaseManifest(manifestPath, env = {}) {
   if (!Number.isFinite(expiresAt)) blockers.push("manifest_expires_at_invalid");
   if (Number.isFinite(issuedAt) && issuedAt > Date.now() + 60_000) blockers.push("manifest_issued_at_in_future");
   if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) blockers.push("manifest_expired");
-  const artifactVerification = verifyManifestArtifacts(manifest);
-  const signatureVerification = verifyManifestSignatures(manifest, env);
+  const artifactVerification = verifyManifestArtifacts(manifest, { root });
+  const signatureVerification = verifyManifestSignatures(manifest, env, { root });
   blockers.push(...artifactVerification.blockers, ...signatureVerification.blockers);
   return {
     ok: blockers.length === 0,
     path: resolved,
     manifest,
     blockers,
+    image_reference_verification: imageReferenceVerification,
     artifact_verification: artifactVerification,
     signature_verification: signatureVerification,
   };
@@ -403,6 +420,12 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const approvedTokenContract = String(env.APPROVED_JPYC_TOKEN_CONTRACT || "").trim().toLowerCase();
   const tokenDecimals = Number(env.TOKEN_DECIMALS || NaN);
   const scaleDecimals = parseScaleDecimals(env.JPYC_BASE_UNIT_SCALE);
+  const approvedTokenName = String(env.APPROVED_TOKEN_NAME || "").trim();
+  const approvedTokenCodeHash = String(env.APPROVED_TOKEN_CODE_HASH || "").trim().toLowerCase();
+  const approvedImplementationCodeHash = String(env.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || "").trim().toLowerCase();
+  const tokenMetadataApprovalPinsGate = Boolean(approvedTokenName)
+    && /^0x[0-9a-f]{64}$/.test(approvedTokenCodeHash)
+    && /^0x[0-9a-f]{64}$/.test(approvedImplementationCodeHash);
 
   const legalGate = boolFlag(env.LEGAL_GATE_APPROVED, false) && !isPlaceholderLike(env.LEGAL_GATE_APPROVAL_REF);
   const amlGate = boolFlag(env.AML_POLICY_APPROVED, false) && !isPlaceholderLike(env.AML_POLICY_APPROVAL_REF);
@@ -415,7 +438,9 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     && tokenContract === approvedTokenContract
     && Number.isFinite(tokenDecimals)
     && scaleDecimals != null
-    && tokenDecimals === scaleDecimals;
+    && tokenDecimals === APPROVED_TOKEN_DECIMALS
+    && String(env.JPYC_BASE_UNIT_SCALE || "").trim() === APPROVED_LEDGER_BASE_UNIT_SCALE
+    && tokenMetadataApprovalPinsGate;
 
   const requiredConfirmations = Number(env.REQUIRED_CONFIRMATIONS || 2);
   const minRequiredConfirmations = Number(env.MIN_REQUIRED_CONFIRMATIONS || 2);
@@ -464,6 +489,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     privacy_gate: privacyGate,
     appi_gate: appiGate,
     jpyc_contract_gate: jpycContractGate,
+    token_metadata_approval_pins_gate: tokenMetadataApprovalPinsGate,
     confirmation_policy_gate: confirmationPolicyGate,
     backscan_policy_gate: backscanPolicyGate,
     dangerous_flags_gate: dangerousFlags.ok,
@@ -495,7 +521,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.aml_gate) blockers.P0.push("missing AML approval gate/reference");
   if (!gates.privacy_gate) blockers.P0.push("missing privacy approval gate/reference");
   if (!gates.appi_gate) blockers.P0.push("missing APPI approval gate/reference");
-  if (!gates.jpyc_contract_gate) blockers.P0.push("JPYC contract gate failed (chain/contract/ref/decimals mismatch)");
+  if (!gates.jpyc_contract_gate) blockers.P0.push("JPYC contract gate failed (chain/contract/ref/decimals/ledger-scale/metadata-pin mismatch)");
   if (!gates.confirmation_policy_gate) blockers.P0.push("confirmation policy gate failed");
   if (!gates.backscan_policy_gate) blockers.P0.push("backscan policy gate failed");
   if (!gates.dangerous_flags_gate) blockers.P0.push(...dangerousFlags.blockers);

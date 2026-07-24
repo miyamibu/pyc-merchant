@@ -129,7 +129,8 @@ test("terminal staff/admin IA and review empty/loading/error placeholders are pr
   assert.match(terminalHtml, /請求作成（運用起点）/);
   assert.match(terminalHtml, /端末入口QR URL/);
   assert.match(terminalHtml, /この会計の支払いURL/);
-  assert.match(terminalHtml, /お客様提示（端末入口QR \/ タッチ案内）/);
+  assert.match(terminalHtml, /お客様提示（端末入口QR）/);
+  assert.match(terminalHtml, /data-provider-rail-enabled="false"/);
   assert.match(terminalHtml, /id="presentTapBtn"/);
   assert.match(terminalHtml, /id="resumeQrBtn"/);
   assert.match(terminalHtml, /id="tapModePanel"/);
@@ -241,7 +242,12 @@ test("consent gate: detail copy buttons and handlers all enforce state.consented
     /el\.copyInvoiceBtn\.disabled\s*=\s*!walletAllowed/,
     "copyInvoiceBtn must follow walletAllowed (consent-aware) gate in renderInvoice"
   );
-  for (const handlerName of ["handleCopyInfo", "handleCopyAddress", "handleCopyAmount", "handleCopyInvoice"]) {
+  assert.match(
+    mobileJs,
+    /el\.copyTokenContractBtn\.disabled\s*=\s*!walletAllowed/,
+    "copyTokenContractBtn must follow walletAllowed (consent-aware) gate in renderInvoice"
+  );
+  for (const handlerName of ["handleCopyInfo", "handleCopyAddress", "handleCopyTokenContract", "handleCopyAmount", "handleCopyInvoice"]) {
     const fnPattern = new RegExp(
       `async function ${handlerName}\\([^)]*\\)\\s*\\{[\\s\\S]*?if \\(!state\\.consented\\)`,
     );

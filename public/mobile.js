@@ -29,11 +29,18 @@ const INVOICE_STATUS_ALIASES = Object.freeze({
 });
 
 const POLL_INTERVAL_MS = 5000;
+const OBSERVATION_FRESHNESS_MS = 30_000;
 const REMAINING_ANNOUNCEMENT_THRESHOLDS_SEC = [300, 120, 60, 30, 10, 0];
-const FINAL_STATUSES = new Set(["paid", "settled", "review_required", "expired", "cancelled"]);
+// A paid/settled invoice remains observable because a later chain reorg can
+// invalidate the fulfillment decision. Only an explicitly cancelled invoice
+// is terminal for the public customer view.
+const FINAL_STATUSES = new Set(["cancelled"]);
 const WAITING_STATUSES = new Set(["issued", "open", "payment_detected", "confirming"]);
 const PAYMENT_ACTION_STATUSES = new Set(["issued", "open"]);
 const WALLET_LAUNCH_PROTOCOLS = new Set(["https:", "ethereum:", "hashport:", "wallet:", "wc:"]);
+const WALLET_SCOPED_CAPABILITY_PREFIX = /^(?:検証済み環境（[^）]*(?:iOS|Android)[^）]*ウォレット[^）]*）|起動導線あり(?:（[^）]*）)?|手動送金のみ|未検証(?:（[^）]*）)?):\s*/;
+const WALLET_BROAD_TESTED_PREFIX = /^実機検証済み:\s*(.+)$/;
+const WALLET_RECOVERY_DELAY_MS = 1800;
 
 const STATUS_COPY = {
   issued: { label: "支払い待ち", pill: "s-blue", title: "送金をお待ちしています" },
@@ -64,6 +71,8 @@ const state = {
   consentController: null,
   lastRefreshSucceeded: false,
   lastRefreshInvoiceId: "",
+  lastRefreshAtMs: 0,
+  observationFreshnessTimer: null,
   refreshSequence: 0,
   refreshController: null,
   refreshInProgress: false,
@@ -95,6 +104,7 @@ const el = {
   customerActionBody: document.getElementById("customerActionBody"),
   customerActionList: document.getElementById("customerActionList"),
   walletAvailabilityBadge: document.getElementById("walletAvailabilityBadge"),
+  walletSupportTitle: document.getElementById("walletSupportTitle"),
   supportedWalletChips: document.getElementById("supportedWalletChips"),
   walletSupportText: document.getElementById("walletSupportText"),
   walletHelpLink: document.getElementById("walletHelpLink"),
@@ -116,6 +126,8 @@ const el = {
   paymentVerifyCard: document.getElementById("paymentVerifyCard"),
   verifyNetworkText: document.getElementById("verifyNetworkText"),
   verifyTokenText: document.getElementById("verifyTokenText"),
+  tokenContractText: document.getElementById("tokenContractText"),
+  copyTokenContractBtn: document.getElementById("copyTokenContractBtn"),
   verifyAddressText: document.getElementById("verifyAddressText"),
   manualRiskText: document.getElementById("manualRiskText"),
   toggleAddressBtn: document.getElementById("toggleAddressBtn"),
@@ -185,6 +197,10 @@ function getTokenSymbol(invoice) {
   return String(invoice?.token_symbol || "JPYC");
 }
 
+function getOfficialTokenContract(invoice) {
+  return String(invoice?.official_token_contract || "").trim();
+}
+
 function getNetwork(invoice) {
   return String(invoice?.network || (invoice?.chain_id === "137" ? "Polygon" : invoice?.chain_id || "-"));
 }
@@ -222,6 +238,23 @@ function renderChipGroup(host, values, fallback = "案内準備中") {
     chip.textContent = value;
     host.appendChild(chip);
   }
+}
+
+function normalizeWalletCapabilityLabels(values, { manualOnly = false } = {}) {
+  const labels = (Array.isArray(values) ? values : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .map((value) => {
+      const broadTested = value.match(WALLET_BROAD_TESTED_PREFIX);
+      if (broadTested) {
+        return `未検証（検証OS・バージョン不明）: ${broadTested[1]}`;
+      }
+      return WALLET_SCOPED_CAPABILITY_PREFIX.test(value) ? value : `未検証: ${value}`;
+    });
+  if (manualOnly && !labels.some((value) => value.startsWith("手動送金のみ:"))) {
+    labels.push("手動送金のみ: 支払い情報コピー");
+  }
+  return labels;
 }
 
 function setHelperLink(linkEl, href, label) {
@@ -341,9 +374,27 @@ function canonicalInvoiceStatus(status) {
   return INVOICE_STATUS_ALIASES[raw] || raw;
 }
 
+function hasFreshInvoiceObservation(invoice = state.invoice) {
+  return state.lastRefreshSucceeded
+    && String(state.lastRefreshInvoiceId || "") === String(invoice?.invoice_id || "")
+    && Number.isFinite(state.lastRefreshAtMs)
+    && state.lastRefreshAtMs > 0
+    && Date.now() - state.lastRefreshAtMs <= OBSERVATION_FRESHNESS_MS;
+}
+
+function hasIntegrityHold(invoice) {
+  if (!invoice) return false;
+  const explicitHold = invoice.integrity_hold === true
+    || invoice.integrity_hold === 1
+    || ["active", "hold", "integrity_hold"].includes(String(invoice.integrity_hold || "").toLowerCase());
+  const statusReason = String(invoice.integrity_hold_reason || invoice.status_reason || "").toLowerCase();
+  return explicitHold || ["integrity_hold", "chain_reorg_detected", "reorg_detected", "chain_reorg"].includes(statusReason);
+}
+
 function validatePaymentDetails(invoice) {
   const chainId = String(invoice?.chain_id || "").trim();
   const tokenContract = String(invoice?.token_contract || "").trim();
+  const officialTokenContract = getOfficialTokenContract(invoice);
   const receiveAddress = String(invoice?.receive_address || "").trim();
   const recipientAddress = String(invoice?.recipient_address || "").trim();
   const amountJpyc = Number(invoice?.amount_jpyc);
@@ -355,6 +406,10 @@ function validatePaymentDetails(invoice) {
 
   if (!/^\d+$/.test(chainId) || BigInt(chainId) <= 0n) return { ok: false, reason: "chain_id" };
   if (!evmAddressPattern.test(tokenContract)) return { ok: false, reason: "token_contract" };
+  if (!evmAddressPattern.test(officialTokenContract)
+    || officialTokenContract.toLowerCase() !== tokenContract.toLowerCase()) {
+    return { ok: false, reason: "official_token_contract" };
+  }
   if (!evmAddressPattern.test(receiveAddress)) return { ok: false, reason: "receive_address" };
   if (!recipientAddress || recipientAddress.toLowerCase() !== receiveAddress.toLowerCase()) {
     return { ok: false, reason: "recipient_mismatch" };
@@ -416,9 +471,15 @@ function evaluatePaymentActionGate(invoice = state.invoice) {
       blockingMessage: "再取得が完了するまで、送金・手動送金・コピー操作を停止しています。",
     };
   }
-  const refreshMatchesInvoice =
-    state.lastRefreshSucceeded
-    && String(state.lastRefreshInvoiceId || "") === String(invoice.invoice_id || "");
+  if (hasIntegrityHold(invoice)) {
+    return {
+      allowed: false,
+      code: "integrity_hold",
+      message: "記録整合性を確認中です。追加送金は行わないでください。",
+      blockingMessage: "チェーン再編成または支払い記録の整合性確認中です。送金・手動送金・コピー操作を停止しています。店舗スタッフへお声がけください。",
+    };
+  }
+  const refreshMatchesInvoice = hasFreshInvoiceObservation(invoice);
   if (!refreshMatchesInvoice) {
     return {
       allowed: false,
@@ -516,6 +577,7 @@ function applyPaymentActionGate(invoice = state.invoice) {
   el.copyAddressBtn.disabled = !walletAllowed;
   el.copyAmountBtn.disabled = !walletAllowed;
   el.copyInvoiceBtn.disabled = !walletAllowed;
+  el.copyTokenContractBtn.disabled = !walletAllowed;
   if (el.paymentGateHint && el.paymentGateHint.textContent !== gate.message) {
     el.paymentGateHint.textContent = gate.message;
   }
@@ -539,6 +601,39 @@ function stopPolling() {
   if (!state.pollTimer) return;
   clearInterval(state.pollTimer);
   state.pollTimer = null;
+}
+
+function stopObservationFreshnessTimer() {
+  if (!state.observationFreshnessTimer) return;
+  clearTimeout(state.observationFreshnessTimer);
+  state.observationFreshnessTimer = null;
+}
+
+function renderInvoiceObservationState() {
+  if (!state.invoice) return;
+  renderCustomerAction(state.invoice);
+  renderReceiptCard(state.invoice);
+  renderStatus(state.invoice);
+  applyPaymentActionGate(state.invoice);
+}
+
+function failClosedInvoiceObservation() {
+  state.lastRefreshSucceeded = false;
+  state.lastRefreshInvoiceId = "";
+  state.lastRefreshAtMs = 0;
+  stopObservationFreshnessTimer();
+  renderInvoiceObservationState();
+}
+
+function scheduleObservationFreshnessHold() {
+  stopObservationFreshnessTimer();
+  if (!state.invoice || !hasFreshInvoiceObservation(state.invoice)) return;
+  const delayMs = Math.max(state.lastRefreshAtMs + OBSERVATION_FRESHNESS_MS - Date.now() + 1, 1);
+  state.observationFreshnessTimer = setTimeout(() => {
+    state.observationFreshnessTimer = null;
+    state.lastRefreshSucceeded = false;
+    renderInvoiceObservationState();
+  }, delayMs);
 }
 
 function startRemainingTimer(invoice) {
@@ -705,6 +800,8 @@ function focusConsentGate() {
 
 function buildWalletLaunchCandidates(invoice) {
   if (!invoice) return [];
+  const adapter = invoice.wallet_adapter || {};
+  if (adapter.available !== true || adapter.status !== "ready") return [];
   const candidates = [
     { type: "wallet_deeplink", url: invoice.wallet_deeplink },
     { type: "payment_uri", url: invoice.payment_uri },
@@ -740,6 +837,7 @@ function buildManualPaymentInstructions(invoice, options = {}) {
     "ウォレットが自動起動しない場合は、以下の内容を手動で入力して送金してください。",
     `ネットワーク: ${fallback.copy_network || getNetwork(invoice) || "-"}`,
     `トークン: ${fallback.copy_token || getTokenSymbol(invoice) || "JPYC"}`,
+    `公式JPYCコントラクト: ${getOfficialTokenContract(invoice) || "-"}`,
     `支払い先: ${fallback.copy_receive_address || getReceiveAddress(invoice) || "-"}`,
   ];
   if (invoice?.amount_jpy != null) {
@@ -755,6 +853,9 @@ function buildManualPaymentInstructions(invoice, options = {}) {
 }
 
 function buildPaymentMethodHint(invoice) {
+  if (hasIntegrityHold(invoice)) {
+    return "支払い記録の整合性確認中です。追加送金は行わず、店舗スタッフへお声がけください。";
+  }
   const customerMode = invoice?.customer_payment_mode || {};
   if (customerMode.mode && customerMode.mode !== "wallet_qr") {
     return customerMode.body || "この会計は店頭端末でご案内します。スタッフの案内に従ってください。";
@@ -804,11 +905,13 @@ function renderWalletSupport(invoice) {
   const launchTarget = buildWalletLaunchTarget(invoice);
   const adapter = invoice?.wallet_adapter || {};
   const supportedWallets = Array.isArray(invoice?.supported_wallets) ? invoice.supported_wallets : [];
-  renderChipGroup(el.supportedWalletChips, supportedWallets, launchTarget ? "対応ウォレット確認中" : "手動送金も可能");
+  const capabilityLabels = normalizeWalletCapabilityLabels(supportedWallets, { manualOnly: !launchTarget });
+  if (el.walletSupportTitle) el.walletSupportTitle.textContent = "ウォレット起動状況";
+  renderChipGroup(el.supportedWalletChips, capabilityLabels, "未検証: ウォレット情報なし");
 
   if (launchTarget) {
     el.walletAvailabilityBadge.textContent = "起動導線あり";
-    el.walletSupportText.textContent = "メインボタンからウォレット起動を試せます。起動しない場合は支払い情報コピーか手動送金案内をご利用ください。";
+    el.walletSupportText.textContent = "表示したOS・ウォレット版は検証記録の範囲であり、この端末の動作保証ではありません。起動しない場合は支払い情報コピーか手動送金案内をご利用ください。";
   } else if (adapter.reason) {
     el.walletAvailabilityBadge.textContent = "手動案内";
     el.walletSupportText.textContent = `自動起動が使えないため、手動送金をご案内します（${adapter.reason}）。`;
@@ -821,6 +924,41 @@ function renderWalletSupport(invoice) {
 }
 
 function renderCustomerAction(invoice) {
+  if (hasIntegrityHold(invoice)) {
+    el.customerActionBadge.textContent = "要確認";
+    el.customerActionTitle.textContent = "支払い記録を確認中です。追加送金はしないでください";
+    el.customerActionBody.textContent = "チェーン再編成または支払い記録の整合性確認が完了するまで、支払い完了とは扱いません。店舗スタッフへお声がけください。";
+    el.customerActionList.innerHTML = "";
+    for (const item of [
+      "追加送金や再送信は行わないでください。",
+      "この画面をスタッフに見せてください。",
+      "確認が完了するまで商品・サービスの案内に従ってください。",
+    ]) {
+      const li = document.createElement("li");
+      li.textContent = item;
+      el.customerActionList.appendChild(li);
+    }
+    state.manualActionHint = el.customerActionBody.textContent;
+    return;
+  }
+  const status = canonicalInvoiceStatus(invoice?.status);
+  if (["paid", "settled"].includes(status) && !hasFreshInvoiceObservation(invoice)) {
+    el.customerActionBadge.textContent = "状態保留";
+    el.customerActionTitle.textContent = "最新の支払い状態を確認できません";
+    el.customerActionBody.textContent = "再取得が成功するまで、この画面を支払い完了の根拠として使わず、店舗スタッフへお声がけください。";
+    el.customerActionList.innerHTML = "";
+    for (const item of [
+      "追加送金や再送信は行わないでください。",
+      "「最新の状態に更新」を押して再取得してください。",
+      "再取得できない場合は店舗スタッフにこの画面を見せてください。",
+    ]) {
+      const li = document.createElement("li");
+      li.textContent = item;
+      el.customerActionList.appendChild(li);
+    }
+    state.manualActionHint = el.customerActionBody.textContent;
+    return;
+  }
   const customerMode = invoice?.customer_payment_mode || {};
   if (customerMode.mode && customerMode.mode !== "wallet_qr") {
     el.customerActionBadge.textContent =
@@ -846,7 +984,6 @@ function renderCustomerAction(invoice) {
     state.manualActionHint = customerMode.body || "";
     return;
   }
-  const status = canonicalInvoiceStatus(invoice?.status);
   const hasLaunchTarget = Boolean(buildWalletLaunchTarget(invoice));
   const actionMap = {
     issued: {
@@ -1020,13 +1157,16 @@ function renderPaymentVerification(invoice) {
   const network = getNetwork(invoice);
   const chainId = invoice?.chain_id || "-";
   const token = getTokenSymbol(invoice) || "JPYC";
+  const tokenContract = getOfficialTokenContract(invoice);
   const receiveAddress = getReceiveAddress(invoice);
   el.verifyNetworkText.textContent = `${network}（チェーンID: ${chainId}）`;
   el.verifyTokenText.textContent = token;
+  el.tokenContractText.textContent = tokenContract || "-";
+  el.tokenContractText.title = tokenContract || "";
   el.verifyAddressText.textContent = receiveAddress || "-";
   el.verifyAddressText.title = receiveAddress || "";
   if (el.manualRiskText && !state.manualRiskVisible) {
-    el.manualRiskText.textContent = `ウォレット画面で「${network}」「${token}」「この画面の送金先」の3つが一致していることを確認してから送信してください。`;
+    el.manualRiskText.textContent = `ウォレット画面で「${network}」「${token}」「公式JPYCコントラクト」「この画面の送金先」がすべて一致していることを確認してから送信してください。`;
   }
 }
 
@@ -1045,8 +1185,11 @@ function getReceiptEvidence(invoice) {
 
 function renderReceiptCard(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status);
-  const isPaid = status === "paid" || status === "settled";
+  const isPaid = !hasIntegrityHold(invoice)
+    && hasFreshInvoiceObservation(invoice)
+    && (status === "paid" || status === "settled");
   el.receiptCard.classList.toggle("hidden", !isPaid);
+  el.copyReceiptBtn.disabled = !isPaid;
   if (!isPaid) return;
   const evidence = getReceiptEvidence(invoice);
   el.receiptTitle.textContent = evidence.complete ? "お支払い確認書" : "お支払い状況メモ";
@@ -1070,8 +1213,18 @@ function renderReceiptCard(invoice) {
 
 function renderStatus(invoice) {
   const status = canonicalInvoiceStatus(invoice?.status);
-  const unknownStatus = !STATUS_COPY[status];
-  const meta = STATUS_COPY[status] || {
+  const hold = hasIntegrityHold(invoice);
+  const observationUnavailable = ["paid", "settled"].includes(status) && !hasFreshInvoiceObservation(invoice);
+  const unknownStatus = !STATUS_COPY[status] && !hold;
+  const meta = observationUnavailable ? {
+    label: "最新状態を確認中",
+    pill: "s-red",
+    title: "再取得できるまで支払い完了として扱えません。",
+  } : hold ? {
+    label: "整合性確認中",
+    pill: "s-red",
+    title: "支払い記録を確認中です。追加送金はしないでください。",
+  } : STATUS_COPY[status] || {
     label: "状態確認中",
     pill: "s-gray",
     title: "支払い状況を確認中です。",
@@ -1085,7 +1238,11 @@ function renderStatus(invoice) {
     if (el.uxStateDetail.textContent !== detail) el.uxStateDetail.textContent = detail;
     return;
   }
-  const detail = state.manualActionHint || "";
+  const detail = observationUnavailable
+    ? "最新の請求状態を取得できません。追加送金せず、再取得または店舗スタッフの確認をお待ちください。"
+    : hold
+    ? "チェーン再編成または支払い記録の確認中です。店舗スタッフへお声がけください。"
+    : state.manualActionHint || "";
   if (el.uxStateDetail.textContent !== detail) el.uxStateDetail.textContent = detail;
 }
 
@@ -1141,6 +1298,7 @@ function buildCopyPayload(invoice) {
     `金額: ${formatJpy(invoice.amount_jpy)} (${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)})`,
     `支払いネットワーク: ${fallback.copy_network || getNetwork(invoice) || "-"}`,
     `支払い通貨: ${fallback.copy_token || getTokenSymbol(invoice)}`,
+    `公式JPYCコントラクト: ${getOfficialTokenContract(invoice) || "-"}`,
     `支払い先: ${fallback.copy_receive_address || getReceiveAddress(invoice) || "-"}`,
     `送金額: ${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`,
     `期限: ${formatDateTime(invoice.expires_at)}`,
@@ -1190,39 +1348,19 @@ function setLaunchInProgress(inProgress) {
   applyPaymentActionGate(state.invoice);
 }
 
-function launchWalletWithFallback(invoice) {
-  const candidates = buildWalletLaunchCandidates(invoice);
-  if (candidates.length === 0) return false;
-  let hiddenDuringLaunch = false;
-  const markHidden = () => {
-    if (document.visibilityState === "hidden") hiddenDuringLaunch = true;
-  };
-  document.addEventListener("visibilitychange", markHidden);
-  const finish = () => document.removeEventListener("visibilitychange", markHidden);
-  const attempt = (index) => {
-    const candidate = candidates[index];
-    if (!candidate) {
-      finish();
-      setLaunchInProgress(false);
-      showManualRiskWarning(invoice);
-      setMethodPanel(true, buildManualPaymentInstructions(invoice, { includeHelp: true }));
-      announce("ウォレットを開けなかったため、手動送金の案内を表示しました");
-      return;
-    }
-    if (index > 0) {
-      setMethodPanel(true, "前のウォレット起動を確認できなかったため、別の起動方式を試します。");
-      announce("別のウォレット起動方式を試します");
-    }
-    location.href = candidate.url;
-    window.setTimeout(() => {
-      if (hiddenDuringLaunch || document.visibilityState === "hidden" || !state.launchInProgress) {
-        finish();
-        return;
-      }
-      attempt(index + 1);
-    }, 1800);
-  };
-  attempt(0);
+function launchWalletOnce(invoice) {
+  const candidate = buildWalletLaunchTarget(invoice);
+  if (!candidate) return false;
+  location.href = candidate.url;
+  window.setTimeout(() => {
+    if (document.visibilityState === "hidden" || !state.launchInProgress) return;
+    setLaunchInProgress(false);
+    setMethodPanel(
+      true,
+      "ウォレットが開かなかった場合は、自動で別のアプリを起動しません。「支払い情報をコピー」または「手動送金を表示」を選んでください。"
+    );
+    announce("ウォレットが開かなかった場合の手動送金案内を表示しました");
+  }, WALLET_RECOVERY_DELAY_MS);
   return true;
 }
 
@@ -1277,15 +1415,10 @@ async function handleWalletPay() {
     announce("手動送金の案内を表示しました");
     return;
   }
-  const launchMessage = launchTarget.type === "wallet_deeplink"
-    ? "ウォレット用の deeplink を開きます。内容をご確認のうえ送金してください。"
-    : launchTarget.type === "payment_uri"
-      ? "標準 payment URI でウォレット起動を試みます。内容をご確認のうえ送金してください。"
-      : "ウォレット起動URLを開きます。内容をご確認のうえ送金してください。";
-  setMethodPanel(true, launchMessage);
+  setMethodPanel(true, "選択されたウォレットを1回だけ開きます。内容をご確認のうえ送金してください。");
   announce("ウォレットを開きます");
   setLaunchInProgress(true);
-  launchWalletWithFallback(invoice);
+  launchWalletOnce(invoice);
 }
 
 function announceConsentRequired() {
@@ -1322,6 +1455,22 @@ async function handleCopyAddress() {
   try {
     await copyText(getCopyFallback(invoice).copy_receive_address || getReceiveAddress(invoice) || "");
     announce("支払い先をコピーしました");
+  } catch (error) {
+    showError(String(error.message || error));
+  }
+}
+
+async function handleCopyTokenContract() {
+  if (!state.invoice) return;
+  if (!state.consented) {
+    announceConsentRequired();
+    return;
+  }
+  const invoice = await getFreshPayableInvoiceForAction();
+  if (!invoice) return;
+  try {
+    await copyText(getOfficialTokenContract(invoice));
+    announce("公式JPYCコントラクトをコピーしました");
   } catch (error) {
     showError(String(error.message || error));
   }
@@ -1375,6 +1524,14 @@ async function handleShowMethods() {
 async function handleCopyReceipt() {
   const invoice = state.invoice;
   if (!invoice) return;
+  const status = canonicalInvoiceStatus(invoice.status);
+  if (hasIntegrityHold(invoice)
+    || !hasFreshInvoiceObservation(invoice)
+    || !["paid", "settled"].includes(status)) {
+    showError("最新の支払い状態を確認できないため、確認書はコピーできません。再取得してください。");
+    announce("最新状態を再取得するまで確認書はコピーできません");
+    return;
+  }
   try {
     const evidence = getReceiptEvidence(invoice);
     const copyTimestamp = formatDateTime(new Date().toISOString());
@@ -1401,9 +1558,7 @@ async function loadInvoice(options = {}) {
   const path = signedInvoicePath();
   if (!path) {
     stopPolling();
-    state.lastRefreshSucceeded = false;
-    state.lastRefreshInvoiceId = "";
-    applyPaymentActionGate(state.invoice);
+    failClosedInvoiceObservation();
     setBlockingWarning("このURLは無効です。署名付きの支払いURLを確認するまで、すべての支払い操作を停止しています。");
     return { ok: false, invalidPath: true };
   }
@@ -1430,19 +1585,19 @@ async function loadInvoice(options = {}) {
     updateServerClock(response, requestStartedAtMs, data.server_now);
     state.lastRefreshSucceeded = true;
     state.lastRefreshInvoiceId = String(data.invoice_id || "");
+    state.lastRefreshAtMs = Date.now();
     state.refreshInProgress = false;
     showError("");
     renderInvoice(data);
+    scheduleObservationFreshnessHold();
     if (!silent) announce(`現在の状態は ${el.statusPill.textContent} です`);
     return { ok: true, invoice: data };
   } catch (error) {
     if (error?.name === "AbortError" || requestSequence !== state.refreshSequence) {
       return { ok: false, aborted: true };
     }
-    state.lastRefreshSucceeded = false;
-    state.lastRefreshInvoiceId = "";
     state.refreshInProgress = false;
-    applyPaymentActionGate(state.invoice);
+    failClosedInvoiceObservation();
     setBlockingWarning("請求の最新状態を確認できないため、送金・手動送金・コピー操作を停止しています。再取得してください。");
     state.transientError = `請求情報の読み込みに失敗しました。${String(error.message || error)}`;
     renderErrorBanner();
@@ -1484,6 +1639,7 @@ function bindEvents() {
   el.showMethodsBtn.addEventListener("click", () => void handleShowMethods());
   el.copyInfoBtn.addEventListener("click", () => void handleCopyInfo());
   el.copyAddressBtn.addEventListener("click", () => void handleCopyAddress());
+  el.copyTokenContractBtn.addEventListener("click", () => void handleCopyTokenContract());
   el.copyAmountBtn.addEventListener("click", () => void handleCopyAmount());
   el.copyInvoiceBtn.addEventListener("click", () => void handleCopyInvoice());
   el.copyReceiptBtn.addEventListener("click", () => void handleCopyReceipt());
@@ -1503,6 +1659,7 @@ function bindEvents() {
   window.addEventListener("beforeunload", () => {
     stopPolling();
     stopRemainingTimer();
+    stopObservationFreshnessTimer();
     if (state.refreshController) state.refreshController.abort();
     if (state.consentController) state.consentController.abort();
   });

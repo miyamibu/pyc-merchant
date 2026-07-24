@@ -28,8 +28,10 @@
 - 失敗時は `status=pending` として upsert、重複行を増やさない。
 - retry worker が `next_retry_at` 到達分を再送。
 - 成功時: `status=resolved`, `resolved_at` 記録。
-- 失敗時: `retry_count++` + exponential backoff。
-- `retry_count >= MONITOR_DEAD_LETTER_MAX_RETRIES` で `status=abandoned`。
+- 再観測時は `observation_count` / `last_observed_at` のみ増加し、再送失敗数とは混ぜない。
+- 実際の再送試行は `retry_attempt_count` / `last_attempted_at`、連続失敗は `consecutive_retry_failures` で記録する。
+- `consecutive_retry_failures >= MONITOR_DEAD_LETTER_MAX_RETRIES` で `status=abandoned`。
+- 旧 `retry_count` は互換表示用であり、abandon判定の根拠にしない。
 
 ## Checkpoint policy
 - ingest 失敗時に dead-letter へ永続保存できた場合は checkpoint を進めてよい。
@@ -46,7 +48,8 @@
 - `APP_ENV=production` で `MONITOR_BACKSCAN_BLOCKS < MIN_MONITOR_BACKSCAN_BLOCKS` は起動失敗。
 - `APPROVED_JPYC_TOKEN_CONTRACT` と `JPYC_CONTRACT_APPROVAL_REF` が未設定なら起動失敗。
 - `CONFIRMATIONS_POLICY_APPROVAL_REF` と `BACKSCAN_POLICY_APPROVAL_REF` が未設定なら起動失敗。
-- `TOKEN_DECIMALS` と `JPYC_BASE_UNIT_SCALE` が不整合なら起動失敗。
+- `TOKEN_DECIMALS=18` と `JPYC_BASE_UNIT_SCALE=1000000` の境界変換がexactでなければ自動認識しない。
+- RPC endpointごとにchain ID、token metadata、contract codeを検証し、不一致endpointはquarantineする。
 
 ## Same policy across components
 - chain monitor の paid 候補判定

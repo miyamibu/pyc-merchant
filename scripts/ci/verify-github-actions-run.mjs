@@ -71,6 +71,17 @@ function getRepoFromGitRemote() {
   }
 }
 
+function getCurrentGitSha() {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim() || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function getTokenFromGhCli() {
   if (!commandExists("gh")) return null;
   try {
@@ -91,6 +102,7 @@ export function getVerificationPolicy(run) {
     requireEvidenceArtifact: event === "push",
     requiredJobs: event === "push" ? ["validate", "production-validation-evidence"] : ["validate"],
     requiredValidateSteps: [
+      "Verify exact source SHA",
       "Check",
       "Test",
       "Audit",
@@ -99,7 +111,9 @@ export function getVerificationPolicy(run) {
       "Smoke",
       "Docker version",
       "Docker build",
+      "Verify image source label",
       "Docker compose config",
+      "Upload CI build metadata",
     ],
   };
 }
@@ -141,6 +155,7 @@ async function resolveRun(repo, token, options) {
   const params = new URLSearchParams({ per_page: "20" });
   if (options.branch) params.set("branch", options.branch);
   if (options.event) params.set("event", options.event);
+  if (options.expectedSha) params.set("head_sha", options.expectedSha);
   const runs = await githubRequest(`/repos/${repo}/actions/workflows/${workflowId}/runs?${params.toString()}`, token);
   const run = (runs.workflow_runs || [])[0];
   if (!run) {
@@ -157,9 +172,14 @@ function findStep(job, stepName) {
   return (job?.steps || []).find((step) => String(step.name || "").trim() === stepName) || null;
 }
 
-export function verifyRunContract({ run, jobs, artifacts }) {
+export function verifyRunContract({ run, jobs, artifacts, expectedSha = null }) {
   const policy = getVerificationPolicy(run);
   const failures = [];
+  const runSha = String(run?.head_sha || "").trim().toLowerCase();
+  const requiredSha = String(expectedSha || "").trim().toLowerCase();
+  if (requiredSha && runSha !== requiredSha) {
+    failures.push(`workflow head SHA ${runSha || "missing"} does not match expected SHA ${requiredSha}`);
+  }
   if (run.conclusion !== "success") {
     failures.push(`workflow conclusion is ${run.conclusion || "unknown"}`);
   }
@@ -193,10 +213,19 @@ export function verifyRunContract({ run, jobs, artifacts }) {
     }
   }
 
+  const buildMetadataName = runSha ? `ci-build-metadata-${runSha}` : null;
+  const buildMetadataArtifact = artifacts.find((artifact) => String(artifact.name || "") === buildMetadataName);
+  if (!buildMetadataArtifact) {
+    failures.push(`exact-SHA CI build metadata artifact is missing: ${buildMetadataName || "head SHA missing"}`);
+  } else if (buildMetadataArtifact.expired === true) {
+    failures.push("exact-SHA CI build metadata artifact is already expired");
+  }
+
   if (policy.requireEvidenceArtifact) {
-    const evidenceArtifact = artifacts.find((artifact) => String(artifact.name || "").startsWith("production-validation-evidence-"));
+    const evidenceName = runSha ? `production-validation-evidence-${runSha}` : null;
+    const evidenceArtifact = artifacts.find((artifact) => String(artifact.name || "") === evidenceName);
     if (!evidenceArtifact) {
-      failures.push("production-validation-evidence artifact is missing");
+      failures.push(`production-validation-evidence artifact is missing: ${evidenceName || "head SHA missing"}`);
     } else if (evidenceArtifact.expired === true) {
       failures.push("production-validation-evidence artifact is already expired");
     }
@@ -225,6 +254,7 @@ function toSummary(run, jobs, artifacts, verification, options = {}) {
     event: run.event,
     status: run.status,
     conclusion: run.conclusion,
+    head_sha: run.head_sha || null,
     html_url: run.html_url,
     workflow_run_url: run.html_url,
     jobs: jobs.map((job) => ({
@@ -257,6 +287,7 @@ async function main() {
     runId: args.get("run-id") || null,
     branch: args.get("branch") || null,
     event: args.get("event") || null,
+    expectedSha: args.get("sha") || getCurrentGitSha(),
     dryRun: args.get("dry-run") === "true",
   };
 
@@ -271,6 +302,7 @@ async function main() {
           run_id: options.runId,
           branch: options.branch,
           event: options.event,
+          expected_sha: options.expectedSha,
           token_source: process.env.GITHUB_TOKEN ? "GITHUB_TOKEN" : process.env.GH_TOKEN ? "GH_TOKEN" : "gh auth token",
         },
         null,
@@ -294,7 +326,7 @@ async function main() {
   const artifactsPayload = await githubRequest(`/repos/${repo}/actions/runs/${run.id}/artifacts?per_page=100`, token);
   const jobs = jobsPayload.jobs || [];
   const artifacts = artifactsPayload.artifacts || [];
-  const verification = verifyRunContract({ run, jobs, artifacts });
+  const verification = verifyRunContract({ run, jobs, artifacts, expectedSha: options.expectedSha });
   const summary = toSummary(run, jobs, artifacts, verification, { repo });
 
   console.log(JSON.stringify(summary, null, 2));

@@ -47,7 +47,7 @@ async function loadMonitorModule(extraEnv = {}) {
   });
 }
 
-test("SR-07 dead-letter upsert dedupes by tx/log/invoice and increments retry_count", async () => {
+test("SR-07 dead-letter upsert dedupes by tx/log/invoice and separates observations from retries", async () => {
   const mod = await loadMonitorModule();
   mod.db.prepare(`DELETE FROM chain_dead_letters`).run();
 
@@ -70,10 +70,38 @@ test("SR-07 dead-letter upsert dedupes by tx/log/invoice and increments retry_co
 
   const count = mod.db.prepare(`SELECT COUNT(*) AS c FROM chain_dead_letters`).get();
   assert.equal(Number(count.c), 1);
-  const row = mod.db.prepare(`SELECT retry_count, reason, status FROM chain_dead_letters`).get();
+  const row = mod.db
+    .prepare(`SELECT retry_count, observation_count, retry_attempt_count, consecutive_retry_failures, reason, status FROM chain_dead_letters`)
+    .get();
   assert.equal(Number(row.retry_count), 2);
+  assert.equal(Number(row.observation_count), 2);
+  assert.equal(Number(row.retry_attempt_count), 0);
+  assert.equal(Number(row.consecutive_retry_failures), 0);
   assert.equal(row.reason, "ingest_failed_2");
   assert.equal(row.status, "pending");
+});
+
+test("SR-07 repeated observation does not increment retry attempts or failure streak", async () => {
+  const mod = await loadMonitorModule();
+  mod.db.prepare(`DELETE FROM chain_dead_letters`).run();
+  const txHash = "0x" + "e".repeat(64);
+  const payload = { invoice_id: "inv-5", tx_hash: txHash };
+  mod.upsertDeadLetter({ chainId: "137", txHash, logIndex: 4, invoiceId: "inv-5", payload, reason: "ingest_failed" });
+  mod.db.prepare(
+    `UPDATE chain_dead_letters
+     SET retry_attempt_count = 1, consecutive_retry_failures = 1, last_attempted_at = ?, next_retry_at = ?
+     WHERE tx_hash = ?`
+  ).run(new Date(Date.now() - 1000).toISOString(), new Date(Date.now() - 1000).toISOString(), txHash);
+
+  mod.upsertDeadLetter({ chainId: "137", txHash, logIndex: 4, invoiceId: "inv-5", payload, reason: "observed_again" });
+  const row = mod.db
+    .prepare(`SELECT observation_count, retry_attempt_count, consecutive_retry_failures, last_observed_at, last_attempted_at FROM chain_dead_letters WHERE tx_hash = ?`)
+    .get(txHash);
+  assert.equal(Number(row.observation_count), 2);
+  assert.equal(Number(row.retry_attempt_count), 1);
+  assert.equal(Number(row.consecutive_retry_failures), 1);
+  assert.ok(row.last_observed_at);
+  assert.ok(row.last_attempted_at);
 });
 
 test("SR-07 dead-letter retry success resolves pending rows", async () => {
@@ -109,10 +137,14 @@ test("SR-07 dead-letter retry success resolves pending rows", async () => {
     global.fetch = originalFetch;
   }
 
-  const row = mod.db.prepare(`SELECT status, resolved_at, retry_count FROM chain_dead_letters`).get();
+  const row = mod.db.prepare(`SELECT status, resolved_at, retry_count, observation_count, retry_attempt_count, consecutive_retry_failures, last_attempted_at FROM chain_dead_letters`).get();
   assert.equal(row.status, "resolved");
   assert.ok(row.resolved_at);
   assert.ok(Number(row.retry_count) >= 1);
+  assert.equal(Number(row.observation_count), 1);
+  assert.equal(Number(row.retry_attempt_count), 1);
+  assert.equal(Number(row.consecutive_retry_failures), 0);
+  assert.ok(row.last_attempted_at);
 });
 
 test("SR-07 dead-letter retry abandons after max retries", async () => {
@@ -135,7 +167,7 @@ test("SR-07 dead-letter retry abandons after max retries", async () => {
     reason: "ingest_failed",
   });
   mod.db
-    .prepare(`UPDATE chain_dead_letters SET retry_count = 1, next_retry_at = ? WHERE tx_hash = ?`)
+    .prepare(`UPDATE chain_dead_letters SET retry_count = 1, observation_count = 1, retry_attempt_count = 1, consecutive_retry_failures = 1, next_retry_at = ? WHERE tx_hash = ?`)
     .run(new Date(Date.now() - 1000).toISOString(), "0x" + "c".repeat(64));
 
   const originalFetch = global.fetch;
@@ -151,10 +183,13 @@ test("SR-07 dead-letter retry abandons after max retries", async () => {
   }
 
   const row = mod.db
-    .prepare(`SELECT status, retry_count, resolved_at, last_error FROM chain_dead_letters WHERE tx_hash = ?`)
+    .prepare(`SELECT status, retry_count, observation_count, retry_attempt_count, consecutive_retry_failures, resolved_at, last_error FROM chain_dead_letters WHERE tx_hash = ?`)
     .get("0x" + "c".repeat(64));
   assert.equal(row.status, "abandoned");
-  assert.equal(Number(row.retry_count), 2);
+  assert.equal(Number(row.consecutive_retry_failures), 2);
+  assert.equal(Number(row.observation_count), 1);
+  assert.equal(Number(row.retry_attempt_count), 2);
+  assert.ok(Number(row.retry_count) >= 2);
   assert.ok(row.resolved_at);
   assert.match(String(row.last_error || ""), /ingest_failed/i);
 });
@@ -181,7 +216,7 @@ test("SR-07 dead-letter transient retry failure stays pending until max retries"
   mod.db.prepare(`UPDATE chain_dead_letters SET next_retry_at = ?`).run(new Date(Date.now() - 1000).toISOString());
 
   const before = mod.db
-    .prepare(`SELECT retry_count, next_retry_at FROM chain_dead_letters WHERE tx_hash = ?`)
+    .prepare(`SELECT retry_count, observation_count, retry_attempt_count, next_retry_at FROM chain_dead_letters WHERE tx_hash = ?`)
     .get("0x" + "d".repeat(64));
 
   const originalFetch = global.fetch;
@@ -197,10 +232,12 @@ test("SR-07 dead-letter transient retry failure stays pending until max retries"
   }
 
   const row = mod.db
-    .prepare(`SELECT status, retry_count, resolved_at, last_error, next_retry_at FROM chain_dead_letters WHERE tx_hash = ?`)
+    .prepare(`SELECT status, retry_count, observation_count, retry_attempt_count, resolved_at, last_error, next_retry_at FROM chain_dead_letters WHERE tx_hash = ?`)
     .get("0x" + "d".repeat(64));
   assert.equal(row.status, "pending");
   assert.equal(Number(row.retry_count), Number(before.retry_count) + 1);
+  assert.equal(Number(row.observation_count), Number(before.observation_count));
+  assert.equal(Number(row.retry_attempt_count), Number(before.retry_attempt_count) + 1);
   assert.equal(row.resolved_at, null);
   assert.match(String(row.last_error || ""), /ingest_failed/i);
   assert.ok(new Date(row.next_retry_at).getTime() > Date.now());

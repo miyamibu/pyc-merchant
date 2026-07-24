@@ -51,14 +51,18 @@ import {
   CASH_RECOGNITION_STATUS_VALUES,
   RECEIVABLE_STATUS_VALUES,
   buildDailyAccountingSummary,
+  normalizeLegacySettlementRows,
 } from "./settlement-export.mjs";
+import { planRefundFundingAllocation } from "./refund-funding-allocation.mjs";
 import {
   evaluatePolicyPublicationSource,
   isPublishedPolicyHash,
   isPublishedPolicyUrl,
   isPublishedPolicyVersion,
+  POLICY_CONTENT_HASH_CANONICALIZATION,
   unavailablePolicyPublication,
   validatePolicyVersionSubmission,
+  verifyPolicyContentHashes,
 } from "./policy-publication.mjs";
 import {
   JPYC_CONTRACT_REFERENCE,
@@ -74,6 +78,7 @@ import {
   validateOfficialJpycContract,
 } from "./jpyc-contract-policy.mjs";
 import { validateCommercialEvidence } from "../scripts/production-validation/validate-commercial-evidence.mjs";
+import { APPROVED_LEDGER_BASE_UNIT_SCALE, APPROVED_TOKEN_DECIMALS } from "./token-metadata.mjs";
 
 const CWD = process.cwd();
 const DEFAULTS = {
@@ -92,6 +97,9 @@ const DEFAULTS = {
   ENABLED_PAYMENT_CHAIN_IDS: "137",
   TOKEN_DECIMALS: "18",
   TOKEN_SYMBOL: "JPYC",
+  APPROVED_TOKEN_NAME: "",
+  APPROVED_TOKEN_CODE_HASH: "",
+  APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH: "",
   TERMINAL_CODE: "TERM-001",
   STAFF_PIN: "1234",
   SECOND_ADMIN_PIN: "",
@@ -126,6 +134,8 @@ const DEFAULTS = {
   WALLET_HELP_URL: "",
   WALLET_DEEPLINK_TEMPLATE: "",
   HASHPORT_WALLET_DEEPLINK_TEMPLATE: "",
+  WALLET_ADAPTER_ID: "",
+  WALLET_ADAPTER_REGISTRY_JSON: "",
   SUPPORTED_WALLETS: "HashPort Wallet,WalletConnect,Injected Wallet",
   DIAGNOSTIC_MODE_ENABLED: "false",
   DIAGNOSTIC_MODE_APPROVAL_REF: "",
@@ -263,6 +273,11 @@ const ENABLED_PAYMENT_CHAIN_IDS = parseEnabledPaymentChainIds(
 );
 const TOKEN_DECIMALS = Number(ENV.TOKEN_DECIMALS || DEFAULTS.TOKEN_DECIMALS);
 const TOKEN_SYMBOL = String(ENV.TOKEN_SYMBOL || DEFAULTS.TOKEN_SYMBOL || "JPYC").trim() || "JPYC";
+const APPROVED_TOKEN_NAME = String(ENV.APPROVED_TOKEN_NAME || DEFAULTS.APPROVED_TOKEN_NAME || "").trim();
+const APPROVED_TOKEN_CODE_HASH = String(ENV.APPROVED_TOKEN_CODE_HASH || DEFAULTS.APPROVED_TOKEN_CODE_HASH || "").trim().toLowerCase();
+const APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH = String(
+  ENV.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || DEFAULTS.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || ""
+).trim().toLowerCase();
 const TERMINAL_CODE = ENV.TERMINAL_CODE || DEFAULTS.TERMINAL_CODE;
 const STAFF_PIN = ENV.STAFF_PIN || DEFAULTS.STAFF_PIN;
 const SECOND_ADMIN_PIN = String(ENV.SECOND_ADMIN_PIN || DEFAULTS.SECOND_ADMIN_PIN || "");
@@ -399,7 +414,11 @@ const MIN_MONITOR_BACKSCAN_BLOCKS = Number(ENV.MIN_MONITOR_BACKSCAN_BLOCKS || DE
 const TOKEN_CONTRACT_NORMALIZED = normalizeJpycPolicyAddress(TOKEN_CONTRACT);
 const APPROVED_JPYC_TOKEN_CONTRACT_NORMALIZED = normalizeJpycPolicyAddress(APPROVED_JPYC_TOKEN_CONTRACT);
 const APPROVED_TOKEN_CONTRACT = OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER;
-const { toBaseUnits, decidePaymentStatus } = makePaymentLogic({
+const {
+  toBaseUnits,
+  decidePaymentStatus,
+  decideQualifiedPaymentStatus,
+} = makePaymentLogic({
   jpycBaseUnitScale: JPYC_BASE_UNIT_SCALE,
   requiredConfirmations: REQUIRED_CONFIRMATIONS,
 });
@@ -597,6 +616,11 @@ if (IS_PRODUCTION) {
     console.error("FATAL: TOKEN_CONTRACT/RECIPIENT_ADDRESS must not be dummy addresses in production.");
     process.exit(1);
   }
+  if (!APPROVED_TOKEN_NAME || !/^0x[0-9a-f]{64}$/.test(APPROVED_TOKEN_CODE_HASH)
+    || !/^0x[0-9a-f]{64}$/.test(APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH)) {
+    console.error("FATAL: production requires approved token name, code hash, and implementation code hash pins.");
+    process.exit(1);
+  }
   if (INSECURE_SECRETS.has(METRICS_SECRET) || METRICS_SECRET.length < 32 || isWeakSecretValue(METRICS_SECRET)) {
     console.error("FATAL: METRICS_SECRET must be configured securely in production.");
     process.exit(1);
@@ -655,8 +679,8 @@ if (IS_PRODUCTION) {
   assertApprovedRef("APPI_DISCLOSURE_PROCEDURE_REF", APPI_DISCLOSURE_PROCEDURE_REF);
   assertApprovedRef("CONFIRMATIONS_POLICY_APPROVAL_REF", CONFIRMATIONS_POLICY_APPROVAL_REF);
   assertApprovedRef("BACKSCAN_POLICY_APPROVAL_REF", BACKSCAN_POLICY_APPROVAL_REF);
-  if (TOKEN_DECIMALS !== JPYC_SCALE_DECIMALS) {
-    console.error("FATAL: TOKEN_DECIMALS and JPYC_BASE_UNIT_SCALE are inconsistent in production.");
+  if (TOKEN_DECIMALS !== APPROVED_TOKEN_DECIMALS || JPYC_BASE_UNIT_SCALE !== APPROVED_LEDGER_BASE_UNIT_SCALE) {
+    console.error("FATAL: production requires token atomic decimals=18 and ledger base scale=1000000.");
     process.exit(1);
   }
   if (!CHECKOUT_SESSION_IMPLEMENTED) {
@@ -713,6 +737,9 @@ CREATE TABLE IF NOT EXISTS stores (
   terms_hash TEXT,
   privacy_hash TEXT,
   refund_policy_hash TEXT,
+  terms_content TEXT,
+  privacy_content TEXT,
+  refund_policy_content TEXT,
   refund_treasury_address TEXT,
   refund_treasury_chain_id TEXT,
   refund_treasury_approval_ref TEXT,
@@ -815,6 +842,10 @@ CREATE TABLE IF NOT EXISTS invoices (
   paid_amount_jpyc_base INTEGER NOT NULL DEFAULT 0,
   paid_tx_hash TEXT,
   policy_snapshot_json TEXT,
+  monitor_until TEXT,
+  integrity_hold INTEGER NOT NULL DEFAULT 0,
+  integrity_hold_reason TEXT,
+  integrity_hold_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -833,6 +864,14 @@ CREATE TABLE IF NOT EXISTS payment_events (
   token_contract TEXT NOT NULL,
   amount_jpyc REAL NOT NULL,
   amount_jpyc_base INTEGER NOT NULL DEFAULT 0,
+  amount_atomic TEXT,
+  chain_verified INTEGER NOT NULL DEFAULT 0,
+  token_verified INTEGER NOT NULL DEFAULT 0,
+  recipient_verified INTEGER NOT NULL DEFAULT 0,
+  canonical_status TEXT NOT NULL DEFAULT 'unknown',
+  within_expiry INTEGER NOT NULL DEFAULT 0,
+  recognition_status TEXT NOT NULL DEFAULT 'pending',
+  reorg_id TEXT,
   observed_at TEXT NOT NULL,
   block_hash TEXT,
   block_timestamp TEXT,
@@ -982,9 +1021,60 @@ CREATE TABLE IF NOT EXISTS refund_funding_lineage (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_refund_funding_lineage_sweep
 ON refund_funding_lineage(chain_id, sweep_tx_hash, COALESCE(sweep_tx_log_index, -1));
 
+CREATE TABLE IF NOT EXISTS refund_funding_allocations (
+  id TEXT PRIMARY KEY,
+  funding_lineage_id TEXT NOT NULL REFERENCES refund_funding_lineage(id),
+  refund_request_id TEXT NOT NULL UNIQUE REFERENCES refund_requests(id),
+  amount_jpyc_base INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refund_funding_allocations_lineage
+ON refund_funding_allocations(funding_lineage_id, created_at ASC);
+
+-- v2 funding evidence is sweep-primary and keeps the refund relationship
+-- many-to-many. The legacy tables above remain readable for existing records,
+-- but new verification uses these tables so one refund can consume several
+-- independently verified sweeps without overwriting lineage.
+CREATE TABLE IF NOT EXISTS refund_funding_sweeps (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  store_id TEXT NOT NULL REFERENCES stores(id),
+  chain_id TEXT NOT NULL,
+  source_address TEXT NOT NULL,
+  treasury_address TEXT NOT NULL,
+  sweep_tx_hash TEXT NOT NULL,
+  sweep_tx_log_index INTEGER,
+  sweep_amount_jpyc_base INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'recorded',
+  evidence_note_path TEXT,
+  evidence_json TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_refund_funding_sweeps_tx
+ON refund_funding_sweeps(chain_id, sweep_tx_hash, COALESCE(sweep_tx_log_index, -1));
+
+CREATE TABLE IF NOT EXISTS refund_funding_allocation_parts (
+  id TEXT PRIMARY KEY,
+  funding_sweep_id TEXT NOT NULL REFERENCES refund_funding_sweeps(id),
+  refund_request_id TEXT NOT NULL REFERENCES refund_requests(id),
+  amount_jpyc_base INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_refund_funding_allocation_parts_refund
+ON refund_funding_allocation_parts(refund_request_id, created_at ASC, id ASC);
+CREATE INDEX IF NOT EXISTS idx_refund_funding_allocation_parts_sweep
+ON refund_funding_allocation_parts(funding_sweep_id, created_at ASC, id ASC);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id TEXT PRIMARY KEY,
   store_id TEXT REFERENCES stores(id),
+  audit_epoch TEXT,
   actor_type TEXT NOT NULL,
   actor_id TEXT NOT NULL,
   action TEXT NOT NULL,
@@ -999,6 +1089,50 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   ip_address TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_epochs (
+  id TEXT PRIMARY KEY,
+  start_rowid INTEGER NOT NULL UNIQUE,
+  hash_version TEXT NOT NULL,
+  previous_epoch_id TEXT,
+  previous_tail_hash TEXT,
+  reason TEXT NOT NULL,
+  attestation_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS audit_epochs_immutable_update
+BEFORE UPDATE ON audit_epochs
+BEGIN
+  SELECT RAISE(ABORT, 'audit epochs are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_epochs_immutable_delete
+BEFORE DELETE ON audit_epochs
+BEGIN
+  SELECT RAISE(ABORT, 'audit epochs are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS audit_log_store_attributions (
+  audit_log_id TEXT PRIMARY KEY REFERENCES audit_logs(id),
+  store_id TEXT NOT NULL REFERENCES stores(id),
+  attribution_method TEXT NOT NULL,
+  source_entry_hash TEXT NOT NULL,
+  attestation_hash TEXT NOT NULL,
+  attributed_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS audit_log_store_attributions_immutable_update
+BEFORE UPDATE ON audit_log_store_attributions
+BEGIN
+  SELECT RAISE(ABORT, 'audit store attributions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_log_store_attributions_immutable_delete
+BEFORE DELETE ON audit_log_store_attributions
+BEGIN
+  SELECT RAISE(ABORT, 'audit store attributions are immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
   id TEXT PRIMARY KEY,
@@ -1294,6 +1428,11 @@ CREATE TABLE IF NOT EXISTS chain_dead_letters (
   reason TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   retry_count INTEGER NOT NULL DEFAULT 0,
+  observation_count INTEGER NOT NULL DEFAULT 0,
+  retry_attempt_count INTEGER NOT NULL DEFAULT 0,
+  consecutive_retry_failures INTEGER NOT NULL DEFAULT 0,
+  last_observed_at TEXT,
+  last_attempted_at TEXT,
   last_error TEXT,
   next_retry_at TEXT,
   resolved_at TEXT,
@@ -1428,6 +1567,7 @@ addColumnIfMissing("settlement_export_rows", "payload_json", "payload_json TEXT"
 addColumnIfMissing("audit_logs", "prev_hash", "prev_hash TEXT");
 addColumnIfMissing("audit_logs", "entry_hash", "entry_hash TEXT");
 addColumnIfMissing("audit_logs", "store_id", "store_id TEXT");
+addColumnIfMissing("audit_logs", "audit_epoch", "audit_epoch TEXT");
 addColumnIfMissing("terminal_sessions", "ended_reason", "ended_reason TEXT");
 addColumnIfMissing("staff_users", "permissions_override", "permissions_override TEXT");
 addColumnIfMissing("staff_users", "merchant_id", "merchant_id TEXT");
@@ -1442,10 +1582,26 @@ addColumnIfMissing("stores", "refund_policy_version", "refund_policy_version TEX
 addColumnIfMissing("stores", "terms_hash", "terms_hash TEXT");
 addColumnIfMissing("stores", "privacy_hash", "privacy_hash TEXT");
 addColumnIfMissing("stores", "refund_policy_hash", "refund_policy_hash TEXT");
+addColumnIfMissing("stores", "terms_content", "terms_content TEXT");
+addColumnIfMissing("stores", "privacy_content", "privacy_content TEXT");
+addColumnIfMissing("stores", "refund_policy_content", "refund_policy_content TEXT");
 addColumnIfMissing("stores", "refund_treasury_address", "refund_treasury_address TEXT");
 addColumnIfMissing("stores", "refund_treasury_chain_id", "refund_treasury_chain_id TEXT");
 addColumnIfMissing("stores", "refund_treasury_approval_ref", "refund_treasury_approval_ref TEXT");
 addColumnIfMissing("invoices", "policy_snapshot_json", "policy_snapshot_json TEXT");
+addColumnIfMissing("invoices", "monitor_until", "monitor_until TEXT");
+addColumnIfMissing("invoices", "last_reconciled_block", "last_reconciled_block INTEGER");
+addColumnIfMissing("invoices", "integrity_hold", "integrity_hold INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("invoices", "integrity_hold_reason", "integrity_hold_reason TEXT");
+addColumnIfMissing("invoices", "integrity_hold_at", "integrity_hold_at TEXT");
+addColumnIfMissing("payment_events", "amount_atomic", "amount_atomic TEXT");
+addColumnIfMissing("payment_events", "chain_verified", "chain_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "token_verified", "token_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "recipient_verified", "recipient_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
+addColumnIfMissing("payment_events", "within_expiry", "within_expiry INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "recognition_status", "recognition_status TEXT NOT NULL DEFAULT 'pending'");
+addColumnIfMissing("payment_events", "reorg_id", "reorg_id TEXT");
 addColumnIfMissing("terminals", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("terminals", "public_entry_token", "public_entry_token TEXT");
 addColumnIfMissing("terminals", "current_invoice_id", "current_invoice_id TEXT");
@@ -1454,6 +1610,11 @@ addColumnIfMissing("checkout_sessions", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("idempotency_records", "expires_at", "expires_at TEXT");
 addColumnIfMissing("chain_dead_letters", "status", "status TEXT NOT NULL DEFAULT 'pending'");
 addColumnIfMissing("chain_dead_letters", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "observation_count", "observation_count INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "retry_attempt_count", "retry_attempt_count INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "consecutive_retry_failures", "consecutive_retry_failures INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("chain_dead_letters", "last_observed_at", "last_observed_at TEXT");
+addColumnIfMissing("chain_dead_letters", "last_attempted_at", "last_attempted_at TEXT");
 addColumnIfMissing("chain_dead_letters", "last_error", "last_error TEXT");
 addColumnIfMissing("chain_dead_letters", "next_retry_at", "next_retry_at TEXT");
 addColumnIfMissing("chain_dead_letters", "resolved_at", "resolved_at TEXT");
@@ -1471,6 +1632,33 @@ addColumnIfMissing("review_cases", "diff_jpyc_base", "diff_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "suggested_action", "suggested_action TEXT");
 addColumnIfMissing("review_cases", "refundable_candidate_jpyc_base", "refundable_candidate_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "admin_note", "admin_note TEXT");
+
+db.exec(`
+CREATE VIEW IF NOT EXISTS audit_logs_scoped AS
+SELECT a.id,
+       COALESCE(attribution.store_id, a.store_id) AS store_id,
+       CASE
+         WHEN attribution.store_id IS NOT NULL THEN 'attested'
+         WHEN a.store_id IS NOT NULL THEN 'embedded'
+         ELSE 'unattributed'
+       END AS store_id_source,
+       a.audit_epoch,
+       a.actor_type,
+       a.actor_id,
+       a.action,
+       a.target_type,
+       a.target_id,
+       a.request_id,
+       a.idempotency_key,
+       a.before_state,
+       a.after_state,
+       a.prev_hash,
+       a.entry_hash,
+       a.ip_address,
+       a.created_at
+FROM audit_logs a
+LEFT JOIN audit_log_store_attributions attribution ON attribution.audit_log_id = a.id;
+`);
 
 function assertNoDeniedJpycContractsInDb() {
   const denylist = JPYC_PREPAID_DENYLIST_CONTRACTS;
@@ -1685,6 +1873,11 @@ function summarizeInvoiceForTerminalState(invoice) {
     amount_jpy: invoice.amount_jpy,
     amount_jpyc_base: invoice.amount_jpyc_base,
     paid_amount_jpyc_base: invoice.paid_amount_jpyc_base,
+    monitor_until: invoice.monitor_until || null,
+    last_reconciled_block: invoice.last_reconciled_block ?? null,
+    integrity_hold: Number(invoice.integrity_hold || 0) === 1,
+    integrity_hold_reason: invoice.integrity_hold_reason || null,
+    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
     expires_at: invoice.expires_at,
     payment_url: invoice.payment_url,
     recipient_address: invoice.recipient_address,
@@ -2024,11 +2217,27 @@ function getNetworkLabel(chainId) {
 
 function computeInvoiceExpectedAmountAtomic(invoice) {
   const invoiceBase = String(invoice?.amount_jpyc_base || safeDecimalToBase(invoice?.amount_jpyc, "invoice.wallet_payload.amount"));
+  const converted = convertLedgerBaseToTokenAtomicExact(invoiceBase);
+  return converted.error ? null : converted.value;
+}
+
+function convertLedgerBaseToTokenAtomicExact(amountBase) {
   try {
-    const converted = convertBaseUnitsBetweenDecimals(invoiceBase, JPYC_SCALE_DECIMALS, TOKEN_DECIMALS);
-    return converted.value;
-  } catch (_error) {
-    return null;
+    const converted = convertBaseUnitsBetweenDecimals(String(amountBase), JPYC_SCALE_DECIMALS, TOKEN_DECIMALS);
+    if (!converted.exact) {
+      return { error: "ledger amount cannot be represented exactly in token atomic units" };
+    }
+    return { value: converted.value };
+  } catch (error) {
+    return { error: String(error.message || error) };
+  }
+}
+
+function convertTokenAtomicToLedgerBase(amountAtomic) {
+  try {
+    return convertBaseUnitsBetweenDecimals(String(amountAtomic), TOKEN_DECIMALS, JPYC_SCALE_DECIMALS);
+  } catch (error) {
+    return { error: String(error.message || error) };
   }
 }
 
@@ -2114,7 +2323,7 @@ function listInvoiceReissueHistory(invoice) {
 }
 
 function buildInvoiceWalletPayload(invoice, store = null) {
-  return buildWalletLaunchPayload({
+  const payload = buildWalletLaunchPayload({
     env: ENV,
     chainId: invoice?.chain_id || CHAIN_ID,
     network: getNetworkLabel(invoice?.chain_id || CHAIN_ID),
@@ -2128,6 +2337,13 @@ function buildInvoiceWalletPayload(invoice, store = null) {
     payUrl: invoice?.payment_url,
     storeName: store?.name,
   });
+  // Preserve the public API's historical wallet_url field as a copyable
+  // EIP-681 payment URI when no reviewed deeplink is available. The mobile
+  // client only launches when wallet_adapter.status === "ready".
+  return {
+    ...payload,
+    wallet_url: payload.wallet_url || payload.payment_uri || null,
+  };
 }
 
 function buildInvoiceDiagnostics(invoice, store = null, reviewCase = null) {
@@ -2137,6 +2353,9 @@ function buildInvoiceDiagnostics(invoice, store = null, reviewCase = null) {
     generated_at: nowIso(),
     invoice_status: invoice.status,
     status_reason: invoice.status_reason || null,
+    monitor_until: invoice.monitor_until || null,
+    integrity_hold: Number(invoice.integrity_hold || 0) === 1,
+    integrity_hold_reason: invoice.integrity_hold_reason || null,
     review_reason_type: reviewCase?.reason_type ? normalizeReviewReasonCode(reviewCase.reason_type) : null,
     payment_uri: walletPayload.payment_uri,
     wallet_deeplink: walletPayload.wallet_deeplink,
@@ -2245,10 +2464,20 @@ runMigration("20260724_002_refund_aggregate_lineage", () => {
   }
 });
 
-function computeAuditEntryHash(prevHash, entryData) {
-  const payload = JSON.stringify({
-    prev_hash: prevHash || null,
-    store_id: entryData.storeId || null,
+const AUDIT_HASH_VERSION_LEGACY_V1 = "audit_hash_v1";
+const AUDIT_HASH_VERSION_STORE_V2 = "audit_hash_store_v2";
+const AUDIT_HASH_VERSION_EPOCH_V3 = "audit_hash_epoch_v3";
+const AUDIT_HASH_VERSIONS = new Set([
+  AUDIT_HASH_VERSION_LEGACY_V1,
+  AUDIT_HASH_VERSION_STORE_V2,
+  AUDIT_HASH_VERSION_EPOCH_V3,
+]);
+
+function computeAuditEntryHash(prevHash, entryData, hashVersion = AUDIT_HASH_VERSION_EPOCH_V3) {
+  if (!AUDIT_HASH_VERSIONS.has(hashVersion)) {
+    throw new Error(`Unsupported audit hash version: ${String(hashVersion || "")}`);
+  }
+  const common = {
     actor_type: entryData.actorType,
     actor_id: entryData.actorId,
     action: entryData.action,
@@ -2259,13 +2488,40 @@ function computeAuditEntryHash(prevHash, entryData) {
     before_state: entryData.beforeState || null,
     after_state: entryData.afterState || null,
     ip_address: entryData.ip || null,
-    created_at: entryData.createdAt
-  });
+    created_at: entryData.createdAt,
+  };
+  let payload;
+  if (hashVersion === AUDIT_HASH_VERSION_LEGACY_V1) {
+    payload = JSON.stringify({ prev_hash: prevHash || null, ...common });
+  } else if (hashVersion === AUDIT_HASH_VERSION_STORE_V2) {
+    payload = JSON.stringify({
+      prev_hash: prevHash || null,
+      store_id: entryData.storeId || null,
+      ...common,
+    });
+  } else {
+    payload = JSON.stringify({
+      prev_hash: prevHash || null,
+      audit_epoch: entryData.auditEpoch || null,
+      store_id: entryData.storeId || null,
+      ...common,
+    });
+  }
   return sha256(payload);
 }
 
 runMigration("20260419_002_audit_hash_backfill", () => {
   const rows = db.prepare(`SELECT rowid, * FROM audit_logs ORDER BY rowid ASC`).all();
+  const hashedRows = rows.filter((row) => row.entry_hash != null && String(row.entry_hash).trim() !== "");
+  if (hashedRows.length > 0) {
+    if (hashedRows.length !== rows.length || !auditRowsMatchHashVersion(rows, AUDIT_HASH_VERSION_LEGACY_V1)) {
+      throw new Error("Refusing to overwrite a partial or invalid pre-existing audit hash chain");
+    }
+    return;
+  }
+  if (rows.some((row) => row.prev_hash != null && String(row.prev_hash).trim() !== "")) {
+    throw new Error("Refusing to backfill audit rows with unexpected pre-existing prev_hash values");
+  }
   let prevHash = null;
   for (const row of rows) {
     const createdAt = row.created_at || nowIso();
@@ -2281,7 +2537,7 @@ runMigration("20260419_002_audit_hash_backfill", () => {
       afterState: parseJsonWithWarning(row.after_state, "audit_hash_backfill.after_state", null),
       ip: row.ip_address,
       createdAt
-    });
+    }, AUDIT_HASH_VERSION_LEGACY_V1);
     db.prepare(`UPDATE audit_logs SET prev_hash = ?, entry_hash = ? WHERE id = ?`).run(prevHash, entryHash, row.id);
     prevHash = entryHash;
   }
@@ -2289,26 +2545,8 @@ runMigration("20260419_002_audit_hash_backfill", () => {
 
 runMigration("20260419_003_audit_hash_rechain_rowid", () => {
   const rows = db.prepare(`SELECT rowid, * FROM audit_logs ORDER BY rowid ASC`).all();
-  let prevHash = null;
-  for (const row of rows) {
-    const createdAt = row.created_at || nowIso();
-    const beforeState = parseJsonWithWarning(row.before_state, "audit_hash_rechain.before_state", null);
-    const afterState = parseJsonWithWarning(row.after_state, "audit_hash_rechain.after_state", null);
-    const entryHash = computeAuditEntryHash(prevHash, {
-      actorType: row.actor_type,
-      actorId: row.actor_id,
-      action: row.action,
-      targetType: row.target_type,
-      targetId: row.target_id,
-      requestId: row.request_id,
-      idempotencyKey: row.idempotency_key,
-      beforeState,
-      afterState,
-      ip: row.ip_address,
-      createdAt
-    });
-    db.prepare(`UPDATE audit_logs SET prev_hash = ?, entry_hash = ? WHERE id = ?`).run(prevHash, entryHash, row.id);
-    prevHash = entryHash;
+  if (!auditRowsMatchHashVersion(rows, AUDIT_HASH_VERSION_LEGACY_V1)) {
+    throw new Error("Audit rowid chain verification failed; immutable audit rows were not rewritten");
   }
 });
 
@@ -2360,6 +2598,99 @@ function resolveAuditStoreId({ storeId = null, targetType = null, targetId = nul
   return null;
 }
 
+function computeAuditEpochAttestation(epoch) {
+  return sha256(JSON.stringify({
+    epoch_id: epoch.id,
+    start_rowid: Number(epoch.startRowid),
+    hash_version: epoch.hashVersion,
+    previous_epoch_id: epoch.previousEpochId || null,
+    previous_tail_hash: epoch.previousTailHash || null,
+    reason: epoch.reason,
+    created_at: epoch.createdAt,
+  }));
+}
+
+function insertAuditEpoch({
+  id = uuid(),
+  startRowid,
+  hashVersion,
+  previousEpochId = null,
+  previousTailHash = null,
+  reason,
+  createdAt = nowIso(),
+}) {
+  if (!AUDIT_HASH_VERSIONS.has(hashVersion)) {
+    throw new Error(`Unsupported audit epoch hash version: ${String(hashVersion || "")}`);
+  }
+  const epoch = {
+    id,
+    startRowid: Number(startRowid),
+    hashVersion,
+    previousEpochId,
+    previousTailHash,
+    reason,
+    createdAt,
+  };
+  const attestationHash = computeAuditEpochAttestation(epoch);
+  db.prepare(
+    `INSERT INTO audit_epochs
+     (id, start_rowid, hash_version, previous_epoch_id, previous_tail_hash, reason, attestation_hash, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    epoch.id,
+    epoch.startRowid,
+    epoch.hashVersion,
+    epoch.previousEpochId,
+    epoch.previousTailHash,
+    epoch.reason,
+    attestationHash,
+    epoch.createdAt,
+  );
+  return { ...epoch, attestationHash };
+}
+
+function auditEntryDataFromRow(row, context = "audit_epoch") {
+  return {
+    auditEpoch: row.audit_epoch || null,
+    storeId: row.store_id || null,
+    actorType: row.actor_type,
+    actorId: row.actor_id,
+    action: row.action,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    requestId: row.request_id,
+    idempotencyKey: row.idempotency_key,
+    beforeState: parseJsonWithWarning(row.before_state, `${context}.before_state`, null),
+    afterState: parseJsonWithWarning(row.after_state, `${context}.after_state`, null),
+    ip: row.ip_address,
+    createdAt: row.created_at,
+  };
+}
+
+function auditRowsMatchHashVersion(rows, hashVersion) {
+  let prevHash = null;
+  for (const row of rows) {
+    const expected = computeAuditEntryHash(
+      prevHash,
+      auditEntryDataFromRow(row, `audit_epoch_detect.${hashVersion}`),
+      hashVersion,
+    );
+    if (row.prev_hash !== prevHash || row.entry_hash !== expected) return false;
+    prevHash = row.entry_hash;
+  }
+  return true;
+}
+
+function computeAuditStoreAttributionAttestation({ auditLogId, storeId, method, sourceEntryHash, attributedAt }) {
+  return sha256(JSON.stringify({
+    audit_log_id: auditLogId,
+    store_id: storeId,
+    attribution_method: method,
+    source_entry_hash: sourceEntryHash,
+    attributed_at: attributedAt,
+  }));
+}
+
 runMigration("20260724_001_audit_store_scope", () => {
   const rows = db.prepare(`SELECT rowid, * FROM audit_logs WHERE store_id IS NULL ORDER BY rowid ASC`).all();
   for (const row of rows) {
@@ -2371,29 +2702,132 @@ runMigration("20260724_001_audit_store_scope", () => {
       beforeState,
       afterState,
     });
-    if (storeId) db.prepare(`UPDATE audit_logs SET store_id = ? WHERE id = ?`).run(storeId, row.id);
-  }
-  const rechainRows = db.prepare(`SELECT rowid, * FROM audit_logs ORDER BY rowid ASC`).all();
-  let prevHash = null;
-  for (const row of rechainRows) {
-    const beforeState = parseJsonWithWarning(row.before_state, "audit_store_scope.rechain.before_state", null);
-    const afterState = parseJsonWithWarning(row.after_state, "audit_store_scope.rechain.after_state", null);
-    const entryHash = computeAuditEntryHash(prevHash, {
-      storeId: row.store_id,
-      actorType: row.actor_type,
-      actorId: row.actor_id,
-      action: row.action,
-      targetType: row.target_type,
-      targetId: row.target_id,
-      requestId: row.request_id,
-      idempotencyKey: row.idempotency_key,
-      beforeState,
-      afterState,
-      ip: row.ip_address,
-      createdAt: row.created_at,
+    if (!storeId || !db.prepare(`SELECT 1 AS ok FROM stores WHERE id = ?`).get(storeId)?.ok) continue;
+    const method = "derived_from_ledger_and_audit_state_v1";
+    const attributedAt = nowIso();
+    const sourceEntryHash = String(row.entry_hash || "");
+    const attestationHash = computeAuditStoreAttributionAttestation({
+      auditLogId: row.id,
+      storeId,
+      method,
+      sourceEntryHash,
+      attributedAt,
     });
-    db.prepare(`UPDATE audit_logs SET prev_hash = ?, entry_hash = ? WHERE id = ?`).run(prevHash, entryHash, row.id);
-    prevHash = entryHash;
+    db.prepare(
+      `INSERT OR IGNORE INTO audit_log_store_attributions
+       (audit_log_id, store_id, attribution_method, source_entry_hash, attestation_hash, attributed_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(row.id, storeId, method, sourceEntryHash, attestationHash, attributedAt);
+  }
+});
+
+runMigration("20260725_001_audit_epoch_bridge", () => {
+  const existingEpoch = db.prepare(`SELECT id FROM audit_epochs ORDER BY start_rowid ASC LIMIT 1`).get();
+  if (existingEpoch) return;
+
+  const rows = db.prepare(`SELECT rowid, * FROM audit_logs ORDER BY rowid ASC`).all();
+  if (rows.length === 0) {
+    insertAuditEpoch({
+      startRowid: 1,
+      hashVersion: AUDIT_HASH_VERSION_EPOCH_V3,
+      reason: "epoch_aware_store_scoped_chain_initialized",
+    });
+    return;
+  }
+
+  let existingHashVersion = null;
+  if (auditRowsMatchHashVersion(rows, AUDIT_HASH_VERSION_LEGACY_V1)) {
+    existingHashVersion = AUDIT_HASH_VERSION_LEGACY_V1;
+  } else if (auditRowsMatchHashVersion(rows, AUDIT_HASH_VERSION_STORE_V2)) {
+    existingHashVersion = AUDIT_HASH_VERSION_STORE_V2;
+  }
+  if (!existingHashVersion) {
+    throw new Error("Existing audit chain does not match a supported immutable hash version");
+  }
+
+  const existingEpochRecord = insertAuditEpoch({
+    startRowid: Number(rows[0].rowid),
+    hashVersion: existingHashVersion,
+    reason: existingHashVersion === AUDIT_HASH_VERSION_LEGACY_V1
+      ? "legacy_chain_attested_without_history_rewrite"
+      : "previously_store_scoped_chain_attested_without_further_rewrite",
+  });
+  const tail = rows[rows.length - 1];
+  insertAuditEpoch({
+    startRowid: Number(tail.rowid) + 1,
+    hashVersion: AUDIT_HASH_VERSION_EPOCH_V3,
+    previousEpochId: existingEpochRecord.id,
+    previousTailHash: tail.entry_hash,
+    reason: "immutable_epoch_bridge_to_store_scoped_hashes",
+  });
+});
+
+runMigration("20260725_002_audit_scope_attested_precedence", () => {
+  // Recreate only the derived view so an attested immutable attribution cannot
+  // be shadowed by a mutable legacy audit_logs.store_id column. Audit rows and
+  // attribution evidence themselves are never removed or rewritten.
+  db.exec(`DROP VIEW IF EXISTS audit_logs_scoped`);
+  db.exec(`
+    CREATE VIEW audit_logs_scoped AS
+    SELECT a.id,
+           COALESCE(attribution.store_id, a.store_id) AS store_id,
+           CASE
+             WHEN attribution.store_id IS NOT NULL THEN 'attested'
+             WHEN a.store_id IS NOT NULL THEN 'embedded'
+             ELSE 'unattributed'
+           END AS store_id_source,
+           a.audit_epoch,
+           a.actor_type,
+           a.actor_id,
+           a.action,
+           a.target_type,
+           a.target_id,
+           a.request_id,
+           a.idempotency_key,
+           a.before_state,
+           a.after_state,
+           a.prev_hash,
+           a.entry_hash,
+           a.ip_address,
+           a.created_at
+    FROM audit_logs a
+    LEFT JOIN audit_log_store_attributions attribution ON attribution.audit_log_id = a.id;
+  `);
+});
+
+runMigration("20260725_003_audit_legacy_embedded_store_attestation", () => {
+  // Legacy V1/V2 hashes do not cover audit_logs.store_id. Preserve the
+  // historical embedded value in the immutable sidecar so scoped reads cannot
+  // be redirected by a later mutation of the legacy column. New epoch-aware
+  // rows already bind store_id into their hash and do not need a sidecar.
+  const rows = db.prepare(
+    `SELECT id, store_id, entry_hash
+     FROM audit_logs
+     WHERE audit_epoch IS NULL
+       AND store_id IS NOT NULL
+       AND trim(store_id) <> ''
+       AND entry_hash IS NOT NULL
+       AND trim(entry_hash) <> ''
+     ORDER BY rowid ASC`
+  ).all();
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO audit_log_store_attributions
+     (audit_log_id, store_id, attribution_method, source_entry_hash, attestation_hash, attributed_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  );
+  for (const row of rows) {
+    if (!db.prepare(`SELECT 1 AS ok FROM stores WHERE id = ?`).get(row.store_id)?.ok) continue;
+    const method = "embedded_legacy_store_id_v1";
+    const attributedAt = nowIso();
+    const sourceEntryHash = String(row.entry_hash);
+    const attestationHash = computeAuditStoreAttributionAttestation({
+      auditLogId: row.id,
+      storeId: row.store_id,
+      method,
+      sourceEntryHash,
+      attributedAt,
+    });
+    insert.run(row.id, row.store_id, method, sourceEntryHash, attestationHash, attributedAt);
   }
 });
 
@@ -2578,9 +3012,16 @@ const SETTLEMENT_EXPORT_HEADERS = [
   "block_timestamp",
   "detected_at",
   "audit_ref",
+  "refund_request_id",
+  "refund_case_id",
   "refund_status",
+  "refund_amount_jpyc_base",
   "refund_tx_hash",
   "refund_verified_at",
+  "legacy_invoice_attribution",
+  "legacy_refund_attribution",
+  "legacy_refund_reference_count",
+  "legacy_refund_references_json",
   "created_at",
   "updated_at",
   "settled_at",
@@ -2604,6 +3045,9 @@ function buildSettlementExportCsv(rows) {
       SETTLEMENT_EXPORT_HEADERS.map((header) => {
         if (header === "reason_code") {
           return escapeCsvCell(normalizeReviewReasonCode(row.reason_code || REVIEW_REASON_CODES.OTHER));
+        }
+        if (header === "legacy_refund_references_json") {
+          return escapeCsvCell(JSON.stringify(Array.isArray(row.legacy_refund_references) ? row.legacy_refund_references : []));
         }
         return escapeCsvCell(row[header]);
       }).join(",")
@@ -4167,22 +4611,37 @@ function evaluateStorePolicyGate(store) {
     privacy_hash: String(store?.privacy_hash || "").trim().toLowerCase(),
     refund_policy_hash: String(store?.refund_policy_hash || "").trim().toLowerCase(),
   };
+  const contentVerification = verifyPolicyContentHashes(
+    {
+      terms: store?.terms_content,
+      privacy: store?.privacy_content,
+      refund: store?.refund_policy_content,
+    },
+    hashes
+  );
   const missingKeys = Object.keys(values).filter((key) => !isPublishedPolicyUrl(values[key]));
   const missingVersionKeys = Object.keys(versions).filter((key) => !isPublishedPolicyVersion(versions[key]));
   const missingHashKeys = Object.keys(hashes).filter((key) => !isPublishedPolicyHash(hashes[key]));
   return {
-    ok: missingKeys.length === 0 && missingVersionKeys.length === 0 && missingHashKeys.length === 0,
+    ok: missingKeys.length === 0
+      && missingVersionKeys.length === 0
+      && missingHashKeys.length === 0
+      && contentVerification.ok,
     source_path: `store:${store?.id || "unknown"}`,
     values,
     versions,
     hashes,
+    content_verification: contentVerification,
     missing_keys: missingKeys,
     missing_version_keys: missingVersionKeys,
     missing_hash_keys: missingHashKeys,
+    content_verification_ok: contentVerification.ok,
     errors: [
       ...missingKeys.map((key) => `store policy ${key} must be a production https URL`),
       ...missingVersionKeys.map((key) => `store policy ${key} must be a published version`),
       ...missingHashKeys.map((key) => `store policy ${key} must be a SHA-256 content hash`),
+      ...contentVerification.missing_content_keys.map((key) => `store policy ${key} content is required for server-side hash verification`),
+      ...contentVerification.mismatch_hash_keys.map((key) => `store policy ${key} does not match the server-computed content hash`),
     ],
   };
 }
@@ -4194,6 +4653,7 @@ function buildPolicySnapshot(store) {
     urls: storeGate.values,
     versions: storeGate.versions,
     hashes: storeGate.hashes,
+    content_verification: storeGate.content_verification,
     published_at: nowIso(),
     source: "store",
   };
@@ -4203,20 +4663,38 @@ function evaluatePolicySnapshot(snapshot) {
   const values = snapshot?.urls && typeof snapshot.urls === "object" ? snapshot.urls : {};
   const versions = snapshot?.versions && typeof snapshot.versions === "object" ? snapshot.versions : {};
   const hashes = snapshot?.hashes && typeof snapshot.hashes === "object" ? snapshot.hashes : {};
+  const contentVerification = snapshot?.content_verification && typeof snapshot.content_verification === "object"
+    ? snapshot.content_verification
+    : {};
   const missingKeys = ["terms", "privacy", "refund"].filter((key) => !isPublishedPolicyUrl(values[key]));
   const missingVersionKeys = ["terms_version", "privacy_version", "refund_policy_version"]
     .filter((key) => !isPublishedPolicyVersion(versions[key]));
   const missingHashKeys = ["terms_hash", "privacy_hash", "refund_policy_hash"]
     .filter((key) => !isPublishedPolicyHash(hashes[key]));
+  const contentVerificationOk = contentVerification.ok === true
+    && contentVerification.canonicalization === POLICY_CONTENT_HASH_CANONICALIZATION
+    && ["terms_hash", "privacy_hash", "refund_policy_hash"].every(
+      (key) => String(contentVerification.computed_hashes?.[key] || "").toLowerCase() === String(hashes[key] || "").toLowerCase()
+    );
   return {
-    ok: missingKeys.length === 0 && missingVersionKeys.length === 0 && missingHashKeys.length === 0,
+    ok: missingKeys.length === 0
+      && missingVersionKeys.length === 0
+      && missingHashKeys.length === 0
+      && contentVerificationOk,
     values,
     versions,
     hashes,
+    content_verification: contentVerification,
     missing_keys: missingKeys,
     missing_version_keys: missingVersionKeys,
     missing_hash_keys: missingHashKeys,
-    errors: [...missingKeys, ...missingVersionKeys, ...missingHashKeys],
+    content_verification_ok: contentVerificationOk,
+    errors: [
+      ...missingKeys,
+      ...missingVersionKeys,
+      ...missingHashKeys,
+      ...(contentVerificationOk ? [] : ["content_verification"]),
+    ],
   };
 }
 
@@ -4568,7 +5046,8 @@ function evaluateCommercialRuntimeGate(metrics = null) {
       && CHAIN_ID === "137"
       && !!APPROVED_JPYC_TOKEN_CONTRACT
       && String(TOKEN_CONTRACT).toLowerCase() === APPROVED_JPYC_TOKEN_CONTRACT
-      && TOKEN_DECIMALS === JPYC_SCALE_DECIMALS,
+      && TOKEN_DECIMALS === APPROVED_TOKEN_DECIMALS
+      && JPYC_BASE_UNIT_SCALE === APPROVED_LEDGER_BASE_UNIT_SCALE,
     confirmation_policy_gate:
       !isPlaceholderLike(CONFIRMATIONS_POLICY_APPROVAL_REF)
       && REQUIRED_CONFIRMATIONS >= MIN_REQUIRED_CONFIRMATIONS,
@@ -4998,7 +5477,7 @@ async function verifyTransferOnChain({
   expectedToAddress = null,
   expectedFromAddress = null,
   expectedFromAddresses = null,
-  expectedAmountBase = null,
+  expectedAmountAtomic = null,
 }) {
   const parsedTxHash = parseTxHash(txHash);
   if (!parsedTxHash) {
@@ -5025,16 +5504,21 @@ async function verifyTransferOnChain({
     const confirmations = Math.max(0, latestBlock - Number(receipt.blockNumber || 0) + 1);
     const block = receipt.blockNumber != null ? await provider.getBlock(Number(receipt.blockNumber)) : null;
     const observedAt = block?.timestamp ? new Date(Number(block.timestamp) * 1000).toISOString() : nowIso();
+    const receiptBlockHash = String(receipt.blockHash || "").toLowerCase();
+    const canonicalBlockHash = String(block?.hash || "").toLowerCase();
+    const canonicalStatus = receiptBlockHash && canonicalBlockHash && receiptBlockHash === canonicalBlockHash
+      ? "canonical"
+      : "unknown";
 
     const transferLogs = getReceiptTransferLogs(receipt, expectedTokenContract);
     if (transferLogs.length === 0) {
-      return { ok: false, code: "WRONG_TOKEN", message: "approved token Transfer log not found", receipt, confirmations, observedAt };
+      return { ok: false, code: "WRONG_TOKEN", message: "approved token Transfer log not found", receipt, confirmations, observedAt, canonicalStatus };
     }
 
     const expectedTo = expectedToAddress ? normalizeAddress(expectedToAddress) : null;
     const toMatches = expectedTo ? transferLogs.filter((log) => log.to === expectedTo) : transferLogs;
     if (expectedTo && toMatches.length === 0) {
-      return { ok: false, code: "WRONG_RECIPIENT", message: "Transfer recipient does not match", receipt, confirmations, observedAt };
+      return { ok: false, code: "WRONG_RECIPIENT", message: "Transfer recipient does not match", receipt, confirmations, observedAt, canonicalStatus };
     }
 
     const expectedFromSet = new Set(
@@ -5047,20 +5531,38 @@ async function verifyTransferOnChain({
       ? toMatches.filter((log) => expectedFromSet.has(log.from))
       : toMatches;
     if (expectedFromSet.size > 0 && fromMatches.length === 0) {
-      return { ok: false, code: "WRONG_FROM_ADDRESS", message: "Transfer sender does not match", receipt, confirmations, observedAt };
+      return { ok: false, code: "WRONG_FROM_ADDRESS", message: "Transfer sender does not match", receipt, confirmations, observedAt, canonicalStatus };
     }
 
-    const amountMatches = expectedAmountBase
+    // A single receipt may contain several matching ERC-20 Transfer logs. Do
+    // not select the first exact-looking log and silently turn a split or
+    // duplicate transfer into a paid/refunded decision; preserve the evidence
+    // and require review instead.
+    if (fromMatches.length > 1) {
+      return {
+        ok: false,
+        code: "MULTIPLE_TRANSFERS",
+        message: "multiple approved-token transfers match the expected recipient/sender",
+        receipt,
+        confirmations,
+        observedAt,
+        canonicalStatus,
+        transfers: fromMatches,
+        transfer: fromMatches[0],
+      };
+    }
+
+    const amountMatches = expectedAmountAtomic
       ? fromMatches.filter((log) => {
           try {
-            return compareBaseUnits(log.amountBase, String(expectedAmountBase)) === 0;
+            return compareBaseUnits(log.amountBase, String(expectedAmountAtomic)) === 0;
           } catch (_error) {
             return false;
           }
         })
       : fromMatches;
 
-    if (expectedAmountBase && amountMatches.length === 0) {
+    if (expectedAmountAtomic && amountMatches.length === 0) {
       const candidate = fromMatches[0] || toMatches[0] || transferLogs[0];
       return {
         ok: false,
@@ -5069,6 +5571,7 @@ async function verifyTransferOnChain({
         receipt,
         confirmations,
         observedAt,
+        canonicalStatus,
         transfer: candidate,
       };
     }
@@ -5077,6 +5580,7 @@ async function verifyTransferOnChain({
       ok: true,
       confirmations,
       observedAt,
+      canonicalStatus,
       receipt,
       transfer: amountMatches[0] || fromMatches[0] || toMatches[0] || transferLogs[0],
     };
@@ -5201,7 +5705,13 @@ function registerPinFailure(terminalCode) {
 }
 
 function clearPinFailures(terminalCode) {
-  db.prepare(`DELETE FROM terminal_login_lockouts WHERE terminal_code = ?`).run(String(terminalCode));
+  // Preserve the lockout record for security/audit reconstruction; clearing a
+  // successful login is a state transition, not a hard delete.
+  db.prepare(
+    `UPDATE terminal_login_lockouts
+     SET failed_attempts = 0, locked_until = NULL, updated_at = ?
+     WHERE terminal_code = ?`
+  ).run(nowIso(), String(terminalCode));
 }
 
 function cleanupServiceReplayGuards() {
@@ -5304,6 +5814,61 @@ const ROLE_PERMISSIONS = {
     "audit.export.global"
   ])
 };
+
+const DIRECTLY_MANAGEABLE_STAFF_ROLES = new Set(["staff", "operator", "accounting"]);
+
+function parseStoredPermissionsOverride(rawValue) {
+  if (rawValue == null || rawValue === "") return { values: null, invalid: false };
+  try {
+    const parsed = typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
+    if (!Array.isArray(parsed)) return { values: null, invalid: true };
+    return { values: parsed.map((value) => String(value)), invalid: false };
+  } catch (_error) {
+    return { values: null, invalid: true };
+  }
+}
+
+function validateDirectStaffSecurityChange({ role, permissionsOverride }) {
+  if (!DIRECTLY_MANAGEABLE_STAFF_ROLES.has(String(role || ""))) {
+    return { ok: false, reason: "privileged_role_requires_independent_approval" };
+  }
+  if (permissionsOverride == null) return { ok: true };
+  if (!Array.isArray(permissionsOverride)) {
+    return { ok: false, reason: "permissions_override_invalid" };
+  }
+  const rolePermissions = ROLE_PERMISSIONS[String(role)] || new Set();
+  const grantsBeyondRole = permissionsOverride.some((permission) => !rolePermissions.has(String(permission)));
+  if (grantsBeyondRole) {
+    return { ok: false, reason: "permissions_override_grants_beyond_role" };
+  }
+  return { ok: true };
+}
+
+function rejectStaffSecurityChange(req, {
+  actorId,
+  targetId = "new",
+  attemptedAction,
+  reason,
+  code = "STAFF_SECURITY_APPROVAL_REQUIRED",
+  message = "Privileged staff security changes require independent approval",
+}) {
+  audit({
+    storeId: req.session.store_id,
+    actorType: "admin",
+    actorId,
+    action: "staff.security_change_rejected",
+    targetType: "staff",
+    targetId,
+    requestId: requestIdFromReq(req),
+    idempotencyKey: req.header("Idempotency-Key"),
+    afterState: {
+      attempted_action: attemptedAction,
+      reason,
+    },
+    ip: req.ip,
+  });
+  return { status: 403, body: { error: { code, message } } };
+}
 
 function isPlatformOperator(session) {
   return ["platform_ops", "platform_admin"].includes(String(session?.role || ""));
@@ -5448,7 +6013,7 @@ function isTransitionAllowed(from, to) {
     paid: new Set(["review_required"]),
     expired: new Set(["review_required"]),
     review_required: new Set(["review_required", "confirming", "paid", "cancelled"]),
-    cancelled: new Set([])
+    cancelled: new Set(["review_required"])
   };
   return transitions[from] && transitions[from].has(to);
 }
@@ -5592,6 +6157,19 @@ function sanitizeAuditLogRowForResponse(row) {
   };
 }
 
+function activeAuditEpochForNextRow() {
+  const nextRowid = Number(
+    db.prepare(`SELECT COALESCE(MAX(rowid), 0) + 1 AS next_rowid FROM audit_logs`).get()?.next_rowid || 1
+  );
+  const epoch = db.prepare(
+    `SELECT * FROM audit_epochs WHERE start_rowid <= ? ORDER BY start_rowid DESC LIMIT 1`
+  ).get(nextRowid);
+  if (!epoch || !AUDIT_HASH_VERSIONS.has(String(epoch.hash_version || ""))) {
+    throw new Error("No supported audit epoch is available for the next audit row");
+  }
+  return { ...epoch, next_rowid: nextRowid };
+}
+
 function audit({
   storeId,
   actorType,
@@ -5618,9 +6196,11 @@ function audit({
     beforeState: sanitizedBeforeState,
     afterState: sanitizedAfterState,
   });
+  const auditEpoch = activeAuditEpochForNextRow();
   const latest = db.prepare(`SELECT entry_hash FROM audit_logs ORDER BY rowid DESC LIMIT 1`).get();
   const prevHash = latest?.entry_hash || null;
   const entryHash = computeAuditEntryHash(prevHash, {
+    auditEpoch: auditEpoch.id,
     storeId: resolvedStoreId,
     actorType,
     actorId,
@@ -5633,14 +6213,15 @@ function audit({
     afterState: sanitizedAfterState,
     ip,
     createdAt
-  });
+  }, auditEpoch.hash_version);
   db.prepare(
     `INSERT INTO audit_logs
-    (id, store_id, actor_type, actor_id, action, target_type, target_id, request_id, idempotency_key, before_state, after_state, prev_hash, entry_hash, ip_address, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    (id, store_id, audit_epoch, actor_type, actor_id, action, target_type, target_id, request_id, idempotency_key, before_state, after_state, prev_hash, entry_hash, ip_address, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     uuid(),
     resolvedStoreId,
+    auditEpoch.id,
     actorType,
     actorId,
     action,
@@ -5806,7 +6387,253 @@ function getRefundFundingLineage(refundId) {
   return db.prepare(`SELECT * FROM refund_funding_lineage WHERE refund_request_id = ?`).get(String(refundId || "")) || null;
 }
 
+function getRefundFundingSweeps(refundId) {
+  return db
+    .prepare(
+      `SELECT * FROM refund_funding_sweeps
+       WHERE invoice_id = (SELECT invoice_id FROM refund_requests WHERE id = ?)
+         AND store_id = (SELECT store_id FROM invoices WHERE id = (SELECT invoice_id FROM refund_requests WHERE id = ?))
+       ORDER BY created_at ASC, id ASC`
+    )
+    .all(String(refundId || ""), String(refundId || ""));
+}
+
+function getRefundFundingAllocationParts(refundId = null, sweepId = null) {
+  const clauses = [];
+  const params = [];
+  if (refundId) {
+    clauses.push("refund_request_id = ?");
+    params.push(String(refundId));
+  }
+  if (sweepId) {
+    clauses.push("funding_sweep_id = ?");
+    params.push(String(sweepId));
+  }
+  if (clauses.length === 0) return [];
+  return db
+    .prepare(
+      `SELECT id, funding_sweep_id AS sweep_id, refund_request_id, amount_jpyc_base, idempotency_key, created_by, created_at
+       FROM refund_funding_allocation_parts
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY created_at ASC, id ASC`
+    )
+    .all(...params);
+}
+
+function getRefundFundingAllocationsForConservation(refundId, sweeps = null) {
+  const fundingSweeps = Array.isArray(sweeps) ? sweeps : getRefundFundingSweeps(refundId);
+  const allocationById = new Map();
+  for (const allocation of getRefundFundingAllocationParts(refundId)) {
+    allocationById.set(String(allocation.id), allocation);
+  }
+  for (const sweep of fundingSweeps) {
+    for (const allocation of getRefundFundingAllocationParts(null, sweep.id)) {
+      allocationById.set(String(allocation.id), allocation);
+    }
+  }
+  return [...allocationById.values()].sort((left, right) => {
+    const byCreatedAt = String(left.created_at || "").localeCompare(String(right.created_at || ""));
+    return byCreatedAt || String(left.id || "").localeCompare(String(right.id || ""));
+  });
+}
+
+function evaluateRefundFundingConservation(refund, sweeps = null, allocations = null) {
+  const refundId = String(refund?.id || "");
+  const fundingSweeps = Array.isArray(sweeps) ? sweeps : getRefundFundingSweeps(refundId);
+  const fundingAllocations = Array.isArray(allocations)
+    ? allocations
+    : getRefundFundingAllocationsForConservation(refundId, fundingSweeps);
+  const requestedAmount = parseBaseUnitOrZero(refund?.refund_amount_jpyc_base);
+  const sweepById = new Map(fundingSweeps.map((sweep) => [String(sweep.id), sweep]));
+  const totalsBySweep = new Map();
+  const violations = [];
+  let refundAllocated = 0n;
+
+  if (!refundId || requestedAmount <= 0n) {
+    violations.push({
+      code: "REFUND_FUNDING_ALLOCATION_INTEGRITY_ERROR",
+      message: "refund funding conservation requires a positive refund amount",
+    });
+  }
+
+  for (const allocation of fundingAllocations) {
+    const sweepId = String(allocation.sweep_id || "");
+    const amount = parseBaseUnitOrZero(allocation.amount_jpyc_base);
+    if (amount <= 0n) {
+      violations.push({
+        code: "REFUND_FUNDING_ALLOCATION_INTEGRITY_ERROR",
+        message: "refund funding allocation amount must be positive",
+        allocation_id: allocation.id || null,
+      });
+      continue;
+    }
+    if (!sweepById.has(sweepId)) {
+      violations.push({
+        code: "REFUND_FUNDING_ALLOCATION_INTEGRITY_ERROR",
+        message: "refund funding allocation references an unrelated sweep",
+        allocation_id: allocation.id || null,
+        sweep_id: sweepId || null,
+      });
+      continue;
+    }
+    totalsBySweep.set(sweepId, (totalsBySweep.get(sweepId) || 0n) + amount);
+    if (String(allocation.refund_request_id) === refundId) refundAllocated += amount;
+  }
+
+  const refundStoreId = String(
+    refund?.store_id
+      || db.prepare(`SELECT store_id FROM invoices WHERE id = ?`).get(refund?.invoice_id)?.store_id
+      || ""
+  );
+  for (const sweep of fundingSweeps) {
+    const sweepId = String(sweep.id);
+    const sweepAmount = parseBaseUnitOrZero(sweep.sweep_amount_jpyc_base);
+    const allocatedAmount = totalsBySweep.get(sweepId) || 0n;
+    if (sweepAmount <= 0n) {
+      violations.push({
+        code: "REFUND_FUNDING_ALLOCATION_INTEGRITY_ERROR",
+        message: "refund funding sweep amount must be positive",
+        sweep_id: sweepId,
+      });
+    }
+    if (allocatedAmount > sweepAmount) {
+      violations.push({
+        code: "REFUND_FUNDING_SWEEP_OVERALLOCATED",
+        message: "refund funding allocations exceed the verified sweep amount",
+        sweep_id: sweepId,
+        sweep_amount_jpyc_base: sweepAmount.toString(),
+        allocated_amount_jpyc_base: allocatedAmount.toString(),
+      });
+    }
+    if (allocatedAmount > 0n && String(sweep.status || "") !== "verified") {
+      violations.push({
+        code: "REFUND_FUNDING_SWEEP_NOT_VERIFIED",
+        message: "allocated refund funding sweep is not verified",
+        sweep_id: sweepId,
+        status: String(sweep.status || "") || null,
+      });
+    }
+  }
+
+  const refundSweepIds = new Set(
+    fundingAllocations
+      .filter((allocation) => String(allocation.refund_request_id) === refundId)
+      .map((allocation) => String(allocation.sweep_id))
+  );
+  for (const sweepId of refundSweepIds) {
+    const sweep = sweepById.get(sweepId);
+    const treasury = sweep
+      ? getRefundTreasuryConfig({ storeId: sweep.store_id, chainId: sweep.chain_id })
+      : null;
+    if (!sweep
+      || String(sweep.invoice_id) !== String(refund?.invoice_id || "")
+      || String(sweep.store_id) !== refundStoreId
+      || String(sweep.chain_id) !== String(refund?.refund_chain_id || "")
+      || !treasury
+      || normalizeAddress(sweep.treasury_address) !== treasury.address
+      || normalizeAddress(sweep.source_address) === treasury.address) {
+      violations.push({
+        code: "REFUND_FUNDING_LINEAGE_MISMATCH",
+        message: "refund funding sweep does not match the refund invoice, chain, or approved treasury",
+        sweep_id: sweepId,
+      });
+    }
+  }
+
+  if (refundAllocated > requestedAmount) {
+    violations.push({
+      code: "REFUND_FUNDING_REFUND_OVERALLOCATED",
+      message: "refund funding allocations exceed the requested refund amount",
+      refund_request_id: refundId,
+      refund_amount_jpyc_base: requestedAmount.toString(),
+      allocated_amount_jpyc_base: refundAllocated.toString(),
+    });
+  }
+
+  const conserved = violations.length === 0;
+  const fullyFunded = requestedAmount > 0n && refundAllocated === requestedAmount;
+  const refundRemaining = requestedAmount > refundAllocated ? requestedAmount - refundAllocated : 0n;
+  const refundAllocations = fundingAllocations.filter(
+    (allocation) => String(allocation.refund_request_id) === refundId
+  );
+  const snapshot = {
+    refund_request_id: refundId || null,
+    refund_amount_jpyc_base: requestedAmount.toString(),
+    allocated_amount_jpyc_base: refundAllocated.toString(),
+    remaining_amount_jpyc_base: refundRemaining.toString(),
+    refund_fully_funded: fullyFunded,
+    conserved,
+    violations,
+    refund_allocations: refundAllocations,
+    funding_sweeps: fundingSweeps.map((sweep) => {
+      const sweepAmount = parseBaseUnitOrZero(sweep.sweep_amount_jpyc_base);
+      const allocatedAmount = totalsBySweep.get(String(sweep.id)) || 0n;
+      return {
+        id: sweep.id,
+        status: sweep.status,
+        sweep_amount_jpyc_base: sweepAmount.toString(),
+        allocated_amount_jpyc_base: allocatedAmount.toString(),
+        remaining_amount_jpyc_base: (sweepAmount > allocatedAmount ? sweepAmount - allocatedAmount : 0n).toString(),
+        allocations: fundingAllocations.filter((allocation) => String(allocation.sweep_id) === String(sweep.id)),
+      };
+    }),
+  };
+  return {
+    conserved,
+    fullyFunded,
+    executionReady: conserved && fullyFunded,
+    requestedAmount,
+    refundAllocated,
+    totalsBySweep,
+    allocations: fundingAllocations,
+    snapshot,
+  };
+}
+
+function buildRefundFundingAuditState(refund, conservation) {
+  const {
+    funding_sweeps: fundingSweeps,
+    refund_allocations: refundAllocations,
+    ...summary
+  } = conservation.snapshot;
+  return {
+    refund,
+    funding_sweeps: fundingSweeps,
+    allocations: refundAllocations,
+    conservation: summary,
+  };
+}
+
+function listIntegrityHeldInvoices(storeId, range = null) {
+  const clauses = ["store_id = ?", "integrity_hold = 1"];
+  const params = [String(storeId || "")];
+  if (range?.fromUtc && range?.toUtc) {
+    clauses.push("created_at BETWEEN ? AND ?");
+    params.push(range.fromUtc, range.toUtc);
+  }
+  return db.prepare(`SELECT id, status, integrity_hold_reason, integrity_hold_at FROM invoices WHERE ${clauses.join(" AND ")} ORDER BY created_at ASC`).all(...params);
+}
+
+function integrityHoldApiResult(rows, action = "operation") {
+  return {
+    status: 409,
+    body: {
+      error: {
+        code: "INTEGRITY_HOLD_ACTIVE",
+        message: `${action} is blocked while payment integrity hold is active`,
+        details: { invoice_ids: rows.map((row) => row.id), holds: rows },
+      },
+    },
+  };
+}
+
 function hasVerifiedRefundFundingLineage(refund) {
+  const requestedAmount = parseBaseUnitOrZero(refund?.refund_amount_jpyc_base);
+  const v2Sweeps = getRefundFundingSweeps(refund?.id);
+  if (v2Sweeps.length > 0) {
+    return evaluateRefundFundingConservation(refund, v2Sweeps).executionReady;
+  }
+
   const lineage = getRefundFundingLineage(refund?.id);
   const acceptedStatuses = isProductionLikeRuntime() ? ["verified"] : ["recorded", "verified"];
   if (!lineage || !acceptedStatuses.includes(String(lineage.status || ""))) return false;
@@ -5819,10 +6646,21 @@ function hasVerifiedRefundFundingLineage(refund) {
   );
   if (String(lineage.store_id || "") !== refundStoreId) return false;
   const treasury = getRefundTreasuryConfig({ storeId: lineage.store_id, chainId: lineage.chain_id });
+  if (!treasury
+    || normalizeAddress(lineage.treasury_address) !== treasury.address
+    || normalizeAddress(lineage.source_address) === treasury.address) return false;
+  const legacyAllocations = db
+    .prepare(
+      `SELECT amount_jpyc_base
+       FROM refund_funding_allocations
+       WHERE funding_lineage_id = ? AND refund_request_id = ?`
+    )
+    .all(lineage.id, refund.id);
+  const allocated = legacyAllocations.reduce((total, allocation) => total + parseBaseUnitOrZero(allocation.amount_jpyc_base), 0n);
   return Boolean(
     treasury
-    && normalizeAddress(lineage.treasury_address) === treasury.address
-    && normalizeAddress(lineage.source_address) !== treasury.address
+    && allocated === requestedAmount
+    && allocated <= parseBaseUnitOrZero(lineage.sweep_amount_jpyc_base)
   );
 }
 
@@ -5846,6 +6684,17 @@ function buildRefundEvidenceResponse(refund) {
   if (!refund) return null;
   const auditRefs = refundAuditLogRefs(refund.id);
   const fundingLineage = getRefundFundingLineage(refund.id);
+  const fundingSweeps = getRefundFundingSweeps(refund.id);
+  const primaryFundingSweep = fundingSweeps[0] || null;
+  const fundingAllocations = fundingLineage
+    ? db.prepare(
+      `SELECT id, funding_lineage_id, refund_request_id, amount_jpyc_base, idempotency_key, created_by, created_at
+       FROM refund_funding_allocations
+       WHERE funding_lineage_id = ?
+       ORDER BY created_at ASC, id ASC`
+    ).all(fundingLineage.id)
+    : [];
+  const fundingAllocationParts = getRefundFundingAllocationParts(refund.id);
   return {
     refund_request_id: refund.id,
     refund_case_id: refund.refund_case_id || null,
@@ -5877,7 +6726,7 @@ function buildRefundEvidenceResponse(refund) {
     to_address: refund.to_address || refund.refund_to_address || null,
     expected_from_address: refund.expected_from_address || null,
     destination_approval_type: refund.destination_approval_type || "payer_default",
-    funding_lineage_id: refund.funding_lineage_id || fundingLineage?.id || null,
+    funding_lineage_id: refund.funding_lineage_id || fundingLineage?.id || primaryFundingSweep?.id || null,
     funding_lineage: fundingLineage
       ? {
           id: fundingLineage.id,
@@ -5891,8 +6740,42 @@ function buildRefundEvidenceResponse(refund) {
           evidence_note_path: fundingLineage.evidence_note_path || null,
           created_at: fundingLineage.created_at,
           updated_at: fundingLineage.updated_at,
+          allocations: fundingAllocations,
         }
-      : null,
+      : primaryFundingSweep
+        ? {
+            id: primaryFundingSweep.id,
+            source_address: primaryFundingSweep.source_address,
+            treasury_address: primaryFundingSweep.treasury_address,
+            chain_id: primaryFundingSweep.chain_id,
+            sweep_tx_hash: primaryFundingSweep.sweep_tx_hash,
+            sweep_tx_log_index: primaryFundingSweep.sweep_tx_log_index ?? null,
+            sweep_amount_jpyc_base: primaryFundingSweep.sweep_amount_jpyc_base,
+            status: primaryFundingSweep.status,
+            evidence_note_path: primaryFundingSweep.evidence_note_path || null,
+            created_at: primaryFundingSweep.created_at,
+            updated_at: primaryFundingSweep.updated_at,
+            allocations: fundingAllocationParts.filter((allocation) => allocation.sweep_id === primaryFundingSweep.id),
+          }
+        : null,
+    funding_allocations: fundingAllocations,
+    funding_sweeps: fundingSweeps.map((sweep) => ({
+      id: sweep.id,
+      invoice_id: sweep.invoice_id,
+      store_id: sweep.store_id,
+      source_address: sweep.source_address,
+      treasury_address: sweep.treasury_address,
+      chain_id: sweep.chain_id,
+      sweep_tx_hash: sweep.sweep_tx_hash,
+      sweep_tx_log_index: sweep.sweep_tx_log_index ?? null,
+      sweep_amount_jpyc_base: sweep.sweep_amount_jpyc_base,
+      status: sweep.status,
+      evidence_note_path: sweep.evidence_note_path || null,
+      created_at: sweep.created_at,
+      updated_at: sweep.updated_at,
+      allocations: fundingAllocationParts.filter((allocation) => allocation.sweep_id === sweep.id),
+    })),
+    funding_allocation_parts: fundingAllocationParts,
     executor_type: refund.executor_type || null,
     execution_ref: refund.execution_ref || null,
     block_number: refund.block_number || null,
@@ -5905,29 +6788,101 @@ function buildRefundEvidenceResponse(refund) {
 
 function verifyAuditChain() {
   const rows = db.prepare(`SELECT rowid, * FROM audit_logs ORDER BY rowid ASC`).all();
-  let prevHash = null;
-  for (const row of rows) {
-    const beforeState = parseJsonWithWarning(row.before_state, "audit_chain_verify.before_state", null);
-    const afterState = parseJsonWithWarning(row.after_state, "audit_chain_verify.after_state", null);
-    const expected = computeAuditEntryHash(prevHash, {
-      storeId: row.store_id,
-      actorType: row.actor_type,
-      actorId: row.actor_id,
-      action: row.action,
-      targetType: row.target_type,
-      targetId: row.target_id,
-      requestId: row.request_id,
-      idempotencyKey: row.idempotency_key,
-      beforeState,
-      afterState,
-      ip: row.ip_address,
-      createdAt: row.created_at
+  const epochs = db.prepare(`SELECT * FROM audit_epochs ORDER BY start_rowid ASC`).all();
+  if (epochs.length === 0) {
+    return { ok: false, total: rows.length, error: "AUDIT_EPOCH_MISSING" };
+  }
+
+  for (const [index, epoch] of epochs.entries()) {
+    const expectedAttestation = computeAuditEpochAttestation({
+      id: epoch.id,
+      startRowid: epoch.start_rowid,
+      hashVersion: epoch.hash_version,
+      previousEpochId: epoch.previous_epoch_id,
+      previousTailHash: epoch.previous_tail_hash,
+      reason: epoch.reason,
+      createdAt: epoch.created_at,
     });
+    if (epoch.attestation_hash !== expectedAttestation || !AUDIT_HASH_VERSIONS.has(epoch.hash_version)) {
+      return {
+        ok: false,
+        total: rows.length,
+        error: "AUDIT_EPOCH_ATTESTATION_INVALID",
+        broken_epoch: epoch.id,
+      };
+    }
+    if (index === 0) {
+      if (epoch.previous_epoch_id != null || epoch.previous_tail_hash != null) {
+        return {
+          ok: false,
+          total: rows.length,
+          error: "AUDIT_EPOCH_ROOT_INVALID",
+          broken_epoch: epoch.id,
+        };
+      }
+      continue;
+    }
+    const previousEpoch = epochs[index - 1];
+    const priorRow = db.prepare(
+      `SELECT entry_hash FROM audit_logs WHERE rowid < ? ORDER BY rowid DESC LIMIT 1`
+    ).get(epoch.start_rowid);
+    if (
+      epoch.previous_epoch_id !== previousEpoch.id
+      || epoch.previous_tail_hash !== (priorRow?.entry_hash || null)
+    ) {
+      return {
+        ok: false,
+        total: rows.length,
+        error: "AUDIT_EPOCH_BRIDGE_INVALID",
+        broken_epoch: epoch.id,
+        expected_previous_epoch_id: previousEpoch.id,
+        actual_previous_epoch_id: epoch.previous_epoch_id,
+        expected_previous_tail_hash: priorRow?.entry_hash || null,
+        actual_previous_tail_hash: epoch.previous_tail_hash,
+      };
+    }
+  }
+
+  let prevHash = null;
+  let epochIndex = 0;
+  for (const row of rows) {
+    while (
+      epochIndex + 1 < epochs.length
+      && Number(epochs[epochIndex + 1].start_rowid) <= Number(row.rowid)
+    ) {
+      epochIndex += 1;
+    }
+    const epoch = epochs[epochIndex];
+    if (!epoch || Number(row.rowid) < Number(epoch.start_rowid)) {
+      return {
+        ok: false,
+        total: rows.length,
+        error: "AUDIT_ROW_WITHOUT_EPOCH",
+        broken_at: row.id,
+      };
+    }
+    if (epoch.hash_version === AUDIT_HASH_VERSION_EPOCH_V3 && row.audit_epoch !== epoch.id) {
+      return {
+        ok: false,
+        total: rows.length,
+        error: "AUDIT_ROW_EPOCH_MISMATCH",
+        broken_at: row.id,
+        expected_epoch: epoch.id,
+        actual_epoch: row.audit_epoch,
+      };
+    }
+    const expected = computeAuditEntryHash(
+      prevHash,
+      auditEntryDataFromRow(row, "audit_chain_verify"),
+      epoch.hash_version,
+    );
     if (row.prev_hash !== prevHash || row.entry_hash !== expected) {
       return {
         ok: false,
         total: rows.length,
+        error: "AUDIT_HASH_CHAIN_INVALID",
         broken_at: row.id,
+        broken_epoch: epoch.id,
         expected_prev_hash: prevHash,
         actual_prev_hash: row.prev_hash,
         expected_entry_hash: expected,
@@ -5936,7 +6891,49 @@ function verifyAuditChain() {
     }
     prevHash = row.entry_hash;
   }
-  return { ok: true, total: rows.length, tail_hash: prevHash };
+
+  const attributions = db.prepare(
+    `SELECT attribution.*, audit.entry_hash
+     FROM audit_log_store_attributions attribution
+     JOIN audit_logs audit ON audit.id = attribution.audit_log_id
+     ORDER BY audit.rowid ASC`
+  ).all();
+  for (const attribution of attributions) {
+    const expected = computeAuditStoreAttributionAttestation({
+      auditLogId: attribution.audit_log_id,
+      storeId: attribution.store_id,
+      method: attribution.attribution_method,
+      sourceEntryHash: attribution.source_entry_hash,
+      attributedAt: attribution.attributed_at,
+    });
+    if (
+      attribution.attestation_hash !== expected
+      || attribution.source_entry_hash !== attribution.entry_hash
+    ) {
+      return {
+        ok: false,
+        total: rows.length,
+        error: "AUDIT_STORE_ATTRIBUTION_INVALID",
+        broken_at: attribution.audit_log_id,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    total: rows.length,
+    tail_hash: prevHash,
+    epoch_count: epochs.length,
+    attribution_count: attributions.length,
+    epochs: epochs.map((epoch) => ({
+      id: epoch.id,
+      start_rowid: epoch.start_rowid,
+      hash_version: epoch.hash_version,
+      previous_epoch_id: epoch.previous_epoch_id,
+      previous_tail_hash: epoch.previous_tail_hash,
+      attestation_hash: epoch.attestation_hash,
+    })),
+  };
 }
 
 function idempotent(req, res, endpoint, actorId, logicFn) {
@@ -6222,7 +7219,7 @@ function sendEvent(terminalId, event, payload) {
 
 function parseBaseUnitOrZero(value) {
   const raw = String(value ?? "").trim();
-  if (!raw || !/^-?\\d+$/.test(raw)) return 0n;
+  if (!raw || !/^-?\d+$/.test(raw)) return 0n;
   try {
     return BigInt(raw);
   } catch (_error) {
@@ -7559,6 +8556,78 @@ function ingestProviderSettlementRecord({
   return result;
 }
 
+function qualifyStoredPaymentEvents(invoice) {
+  const rows = db
+    .prepare(
+      `SELECT * FROM payment_events
+       WHERE invoice_id = ?
+       ORDER BY created_at ASC, rowid ASC`
+    )
+    .all(invoice.id);
+  const events = rows.map((row) => {
+    const rawPayload = parseJsonWithWarning(row.raw_payload, `payment_event.raw_payload:${row.id}`, {});
+    const nonExactTokenConversion = rawPayload?.amount_conversion_exact === false
+      || String(rawPayload?.amount_conversion_error || "").trim() === "non_exact_decimal_conversion";
+    return {
+      ...row,
+      amount_jpyc_base: String(row.amount_jpyc_base ?? "0"),
+      amount_conversion_exact: !nonExactTokenConversion,
+      amount_conversion_error: nonExactTokenConversion ? "non_exact_decimal_conversion" : null,
+      // Missing canonicality is not proof of finality.  Legacy rows remain
+      // auditable, but qualification must fail closed until the chain worker
+      // supplies an explicit canonical status.
+      canonical_status: row.canonical_status || "unknown",
+      block_timestamp: row.block_timestamp || row.observed_at || null,
+    };
+  });
+  const decision = decideQualifiedPaymentStatus(invoice, events, {
+    integrityHold: Number(invoice.integrity_hold || 0) === 1,
+    qualificationOptions: (event) => ({
+      canonicalStatus: event.canonical_status || "unknown",
+      blockTimestamp: event.block_timestamp || event.observed_at || null,
+    }),
+  });
+  for (const item of decision.qualifications || []) {
+    const qualification = item.qualification;
+    const recognitionStatus = item.event.amount_conversion_exact === false
+      ? "review_required"
+      : qualification.eligible
+      ? "eligible"
+      : qualification.reasonLabel === "awaiting_confirmations"
+        ? "pending"
+        : "review_required";
+    db.prepare(
+      `UPDATE payment_events
+       SET chain_verified = ?, token_verified = ?, recipient_verified = ?,
+           canonical_status = ?, within_expiry = ?, recognition_status = ?
+       WHERE id = ?`
+    ).run(
+      qualification.checks.chainMatches ? 1 : 0,
+      qualification.checks.tokenMatches ? 1 : 0,
+      qualification.checks.recipientMatches ? 1 : 0,
+      qualification.canonicalStatus,
+      qualification.checks.withinExpiry ? 1 : 0,
+      recognitionStatus,
+      item.event.id,
+    );
+  }
+  const eligibleRows = (decision.qualifications || [])
+    .filter((item) => item.qualification.eligible && item.event.amount_conversion_exact !== false)
+    .map((item) => item.event);
+  const totalPaidBase = eligibleRows
+    .reduce((total, row) => total + BigInt(String(row.amount_jpyc_base || "0")), 0n)
+    .toString();
+  const earliestBlockTimestamp = eligibleRows
+    .map((row) => String(row.block_timestamp || row.observed_at || "").trim())
+    .filter((value) => Number.isFinite(new Date(value).getTime()))
+    .sort((left, right) => new Date(left).getTime() - new Date(right).getTime())[0] || null;
+  return { ...decision, events, totalPaidBase, earliestBlockTimestamp };
+}
+
+function postPaymentMonitorUntil() {
+  return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+}
+
 function processPaymentEvent({
   invoice,
   event,
@@ -7569,8 +8638,17 @@ function processPaymentEvent({
   action,
   ip
 }) {
+  const nonExactTokenConversion = event.amount_conversion_exact === false
+    || String(event.amount_conversion_error || "").trim() === "non_exact_decimal_conversion";
+  const forcedChainInconsistencyReason = String(event.chain_inconsistency_reason || "").trim() === "multiple_matching_transfers"
+    ? "multiple_matching_transfers"
+    : null;
+  const integrityHoldReason = forcedChainInconsistencyReason
+    || (nonExactTokenConversion ? "non_exact_decimal_conversion" : null);
   const parsedAmountBaseResult = event.amount_jpyc_base != null
-    ? parsePositiveBaseUnitInteger(String(event.amount_jpyc_base), "amount_jpyc_base")
+    ? (nonExactTokenConversion && /^\d+$/.test(String(event.amount_jpyc_base).trim())
+      ? { value: String(event.amount_jpyc_base).trim() }
+      : parsePositiveBaseUnitInteger(String(event.amount_jpyc_base), "amount_jpyc_base"))
     : toBaseUnits(event.amount_jpyc);
   if (parsedAmountBaseResult.error) {
     return {
@@ -7581,14 +8659,21 @@ function processPaymentEvent({
   const parsedAmountBase = parsedAmountBaseResult.value;
   const parsedAmountDisplay = Number(formatJpyc(parsedAmountBase));
   const parsedConfirmations = Number(event.confirmations || 0);
+  const eventObservedAt = String(event.observed_at || nowIso());
+  const eventBlockTimestamp = String(event.block_timestamp || eventObservedAt);
+  const eventCanonicalStatus = String(event.canonical_status || "unknown");
+  const eventAmountAtomic = event.amount_atomic == null ? null : String(event.amount_atomic);
   const decision = db.transaction(() => {
     const peId = uuid();
     const paymentAttemptId = uuid();
     try {
       db.prepare(
         `INSERT INTO payment_events
-        (id, invoice_id, event_type, chain_id, tx_hash, log_index, block_number, confirmations, from_address, to_address, token_contract, amount_jpyc, amount_jpyc_base, observed_at, block_hash, block_timestamp, detected_at, raw_payload, created_at)
-        VALUES (?, ?, 'tx_detected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (id, invoice_id, event_type, chain_id, tx_hash, log_index, block_number, confirmations, from_address, to_address,
+         token_contract, amount_jpyc, amount_jpyc_base, amount_atomic, chain_verified, token_verified, recipient_verified,
+         canonical_status, within_expiry, recognition_status, reorg_id, observed_at, block_hash, block_timestamp, detected_at,
+         raw_payload, created_at)
+        VALUES (?, ?, 'tx_detected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, 0, 'pending', NULL, ?, ?, ?, ?, ?, ?)`
       ).run(
         peId,
         invoice.id,
@@ -7602,9 +8687,11 @@ function processPaymentEvent({
           String(event.token_contract),
           Number.isFinite(parsedAmountDisplay) ? parsedAmountDisplay : 0,
           parsedAmountBase,
-          String(event.observed_at || nowIso()),
+          eventAmountAtomic,
+          eventCanonicalStatus,
+          eventObservedAt,
           event.block_hash ? String(event.block_hash) : null,
-          event.block_timestamp ? String(event.block_timestamp) : null,
+          eventBlockTimestamp,
           String(event.detected_at || nowIso()),
           JSON.stringify(event),
           nowIso()
@@ -7638,7 +8725,7 @@ function processPaymentEvent({
           const previousInvoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
           const nextConfirmations = Math.max(Number(existingEvent.confirmations || 0), parsedConfirmations);
           const nextBlockHash = existingEvent.block_hash || event.block_hash || null;
-          const nextBlockTimestamp = existingEvent.block_timestamp || event.block_timestamp || null;
+          const nextBlockTimestamp = existingEvent.block_timestamp || event.block_timestamp || eventObservedAt;
           const nextDetectedAt = event.detected_at || existingEvent.detected_at || nowIso();
           const confirmationEvidenceAdvanced = nextConfirmations > Number(existingEvent.confirmations || 0);
           const blockHashEvidenceAdded = !existingEvent.block_hash && Boolean(event.block_hash);
@@ -7648,47 +8735,46 @@ function processPaymentEvent({
              SET confirmations = ?,
                  block_hash = COALESCE(block_hash, ?),
                  block_timestamp = COALESCE(block_timestamp, ?),
+                 amount_atomic = COALESCE(amount_atomic, ?),
+                 canonical_status = COALESCE(?, canonical_status, 'unknown'),
                  detected_at = ?,
                  raw_payload = ?
              WHERE id = ?`
-          ).run(nextConfirmations, nextBlockHash, nextBlockTimestamp, nextDetectedAt, JSON.stringify(event), existingEvent.id);
-          const paymentRows = db
-            .prepare(
-              `SELECT amount_jpyc_base, block_timestamp, observed_at, detected_at
-               FROM payment_events
-               WHERE invoice_id = ?
-               ORDER BY created_at ASC, rowid ASC`
-            )
-            .all(invoice.id);
-          let totalPaidBase = 0n;
-          let earliestBlockTimestamp = null;
-          for (const row of paymentRows) {
-            const amountRaw = String(row.amount_jpyc_base ?? "").trim();
-            if (/^\d+$/.test(amountRaw)) totalPaidBase += BigInt(amountRaw);
-            const candidate = String(row.block_timestamp || "").trim();
-            if (Number.isFinite(new Date(candidate).getTime())) {
-              if (!earliestBlockTimestamp || new Date(candidate).getTime() < new Date(earliestBlockTimestamp).getTime()) {
-                earliestBlockTimestamp = candidate;
-              }
-            }
+          ).run(
+            nextConfirmations,
+            nextBlockHash,
+            nextBlockTimestamp,
+            eventAmountAtomic,
+            eventCanonicalStatus,
+            nextDetectedAt,
+            JSON.stringify(event),
+            existingEvent.id
+          );
+          const qualified = qualifyStoredPaymentEvents(previousInvoice);
+          const totalPaidBase = BigInt(qualified.totalPaidBase || "0");
+          const earliestBlockTimestamp = qualified.earliestBlockTimestamp || nextBlockTimestamp;
+          const outcome = {
+            nextStatus: qualified.nextStatus,
+            reasonType: qualified.reasonType,
+            reasonLabel: qualified.reasonLabel,
+          };
+          if (nonExactTokenConversion) {
+            outcome.nextStatus = "review_required";
+            outcome.reasonType = REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
+            outcome.reasonLabel = "non_exact_decimal_conversion";
+            db.prepare(`UPDATE payment_events SET recognition_status = 'review_required' WHERE id = ?`).run(existingEvent.id);
           }
-          const recordedAmountBase = String(existingEvent.amount_jpyc_base || parsedAmountBase);
-          const currentAmountBase = BigInt(recordedAmountBase);
-          const previousTotalBase = totalPaidBase >= currentAmountBase
-            ? (totalPaidBase - currentAmountBase).toString()
-            : "0";
-          const outcome = decidePaymentStatus(previousInvoice, {
-            ...event,
-            confirmations: nextConfirmations,
-            amount_jpyc_base: recordedAmountBase,
-            amount_jpyc: formatJpyc(recordedAmountBase),
-          }, {
-            nowMs: nextDetectedAt ? new Date(nextDetectedAt).getTime() : Date.now(),
-            blockTimestamp: earliestBlockTimestamp || nextBlockTimestamp,
-            previousPaidAmountBase: previousTotalBase,
-            totalPaidAmountBase: totalPaidBase.toString(),
-            eventAlreadyRecorded: true,
-          });
+          if (forcedChainInconsistencyReason) {
+            outcome.nextStatus = "review_required";
+            outcome.reasonType = REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
+            outcome.reasonLabel = forcedChainInconsistencyReason;
+            db.prepare(`UPDATE payment_events SET recognition_status = 'review_required' WHERE id = ?`).run(existingEvent.id);
+          }
+          if (String(previousInvoice.status) === "cancelled") {
+            outcome.nextStatus = "review_required";
+            outcome.reasonType = REVIEW_REASON_CODES.LATE_PAYMENT;
+            outcome.reasonLabel = "payment_after_cancelled_invoice";
+          }
           if (isPaymentsDisabled() && outcome.nextStatus === "paid") {
             outcome.nextStatus = "review_required";
             outcome.reasonType = "payments_disabled";
@@ -7710,10 +8796,23 @@ function processPaymentEvent({
           }
           const refreshed = update.invoice || db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
           const totalPaidDisplay = Number(formatJpyc(totalPaidBase.toString()));
-          db.prepare(`UPDATE invoices SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?, paid_tx_hash = COALESCE(paid_tx_hash, ?), updated_at = ? WHERE id = ?`).run(
+          db.prepare(`UPDATE invoices
+                      SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?, paid_tx_hash = COALESCE(paid_tx_hash, ?),
+                          integrity_hold = CASE WHEN ? IS NOT NULL THEN 1 ELSE integrity_hold END,
+                          integrity_hold_reason = CASE WHEN ? IS NOT NULL THEN ? ELSE integrity_hold_reason END,
+                          integrity_hold_at = CASE WHEN ? IS NOT NULL THEN COALESCE(integrity_hold_at, ?) ELSE integrity_hold_at END,
+                          monitor_until = CASE WHEN ? = 'paid' THEN COALESCE(monitor_until, ?) ELSE monitor_until END,
+                          updated_at = ? WHERE id = ?`).run(
             Number.isFinite(totalPaidDisplay) ? totalPaidDisplay : 0,
             totalPaidBase.toString(),
             event.tx_hash,
+            integrityHoldReason,
+            integrityHoldReason,
+            integrityHoldReason,
+            integrityHoldReason,
+            nowIso(),
+            outcome.nextStatus,
+            postPaymentMonitorUntil(),
             nowIso(),
             invoice.id
           );
@@ -7785,37 +8884,31 @@ function processPaymentEvent({
       throw error;
     }
 
-    const paymentRows = db
-      .prepare(
-        `SELECT amount_jpyc_base, block_timestamp, observed_at, detected_at
-         FROM payment_events
-         WHERE invoice_id = ?
-         ORDER BY created_at ASC, rowid ASC`
-      )
-      .all(invoice.id);
-    let totalPaidBase = 0n;
-    let earliestBlockTimestamp = null;
-    for (const row of paymentRows) {
-      const amountRaw = String(row.amount_jpyc_base ?? "").trim();
-      if (/^\d+$/.test(amountRaw)) totalPaidBase += BigInt(amountRaw);
-      const candidate = String(row.block_timestamp || "").trim();
-      if (Number.isFinite(new Date(candidate).getTime())) {
-        if (!earliestBlockTimestamp || new Date(candidate).getTime() < new Date(earliestBlockTimestamp).getTime()) {
-          earliestBlockTimestamp = candidate;
-        }
-      }
+    const qualified = qualifyStoredPaymentEvents(invoice);
+    const totalPaidBase = BigInt(qualified.totalPaidBase || "0");
+    const earliestBlockTimestamp = qualified.earliestBlockTimestamp || eventBlockTimestamp;
+    const outcome = {
+      nextStatus: qualified.nextStatus,
+      reasonType: qualified.reasonType,
+      reasonLabel: qualified.reasonLabel,
+    };
+    if (nonExactTokenConversion) {
+      outcome.nextStatus = "review_required";
+      outcome.reasonType = REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
+      outcome.reasonLabel = "non_exact_decimal_conversion";
+      db.prepare(`UPDATE payment_events SET recognition_status = 'review_required' WHERE id = ?`).run(peId);
     }
-    const currentAmountBase = BigInt(parsedAmountBase);
-    const previousTotalBase = totalPaidBase >= currentAmountBase
-      ? (totalPaidBase - currentAmountBase).toString()
-      : "0";
-    const outcome = decidePaymentStatus(invoice, event, {
-      nowMs: event?.detected_at ? new Date(event.detected_at).getTime() : Date.now(),
-      blockTimestamp: earliestBlockTimestamp || event?.block_timestamp || null,
-      previousPaidAmountBase: previousTotalBase,
-      totalPaidAmountBase: totalPaidBase.toString(),
-      eventAlreadyRecorded: true,
-    });
+    if (forcedChainInconsistencyReason) {
+      outcome.nextStatus = "review_required";
+      outcome.reasonType = REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
+      outcome.reasonLabel = forcedChainInconsistencyReason;
+      db.prepare(`UPDATE payment_events SET recognition_status = 'review_required' WHERE id = ?`).run(peId);
+    }
+    if (String(invoice.status) === "cancelled") {
+      outcome.nextStatus = "review_required";
+      outcome.reasonType = REVIEW_REASON_CODES.LATE_PAYMENT;
+      outcome.reasonLabel = "payment_after_cancelled_invoice";
+    }
     if (isPaymentsDisabled() && outcome.nextStatus === "paid") {
       outcome.nextStatus = "review_required";
       outcome.reasonType = "payments_disabled";
@@ -7856,10 +8949,23 @@ function processPaymentEvent({
     }
 
     const totalPaidDisplay = Number(formatJpyc(totalPaidBase.toString()));
-    db.prepare(`UPDATE invoices SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?, paid_tx_hash = ?, updated_at = ? WHERE id = ?`).run(
+    db.prepare(`UPDATE invoices
+                SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?, paid_tx_hash = ?,
+                    integrity_hold = CASE WHEN ? IS NOT NULL THEN 1 ELSE integrity_hold END,
+                    integrity_hold_reason = CASE WHEN ? IS NOT NULL THEN ? ELSE integrity_hold_reason END,
+                    integrity_hold_at = CASE WHEN ? IS NOT NULL THEN COALESCE(integrity_hold_at, ?) ELSE integrity_hold_at END,
+                    monitor_until = CASE WHEN ? = 'paid' THEN COALESCE(monitor_until, ?) ELSE monitor_until END,
+                    updated_at = ? WHERE id = ?`).run(
       Number.isFinite(totalPaidDisplay) ? totalPaidDisplay : 0,
       totalPaidBase.toString(),
       event.tx_hash,
+      integrityHoldReason,
+      integrityHoldReason,
+      integrityHoldReason,
+      integrityHoldReason,
+      nowIso(),
+      outcome.nextStatus,
+      postPaymentMonitorUntil(),
       nowIso(),
       invoice.id
     );
@@ -7968,8 +9074,14 @@ function buildIngestEvent(payload) {
     ? null
     : parseTxHash(payload.block_hash);
   const amount = payload?.amount_jpyc;
+  const nonExactConversion = payload?.amount_conversion_exact === false
+    || String(payload?.amount_conversion_error || "").trim() === "non_exact_decimal_conversion";
   const amountBaseParsed = payload?.amount_jpyc_base != null
-    ? parsePositiveBaseUnitInteger(payload?.amount_jpyc_base, "amount_jpyc_base")
+    ? (nonExactConversion
+      ? (/^\d+$/.test(String(payload.amount_jpyc_base).trim())
+        ? { value: String(payload.amount_jpyc_base).trim() }
+        : { error: "amount_jpyc_base is invalid" })
+      : parsePositiveBaseUnitInteger(payload.amount_jpyc_base, "amount_jpyc_base"))
     : toBaseUnits(amount);
   const confirmations = Number(payload?.confirmations || 0);
   if (!payload?.invoice_id || !txHash || !payload?.chain_id || !payload?.token_contract || !payload?.to_address) {
@@ -7977,7 +9089,10 @@ function buildIngestEvent(payload) {
   }
   if (payload?.block_hash != null && !blockHash) return { error: "block_hash must be a 0x-prefixed 32-byte hash" };
   if (amountBaseParsed.error) return { error: "amount_jpyc is invalid" };
-  if (BigInt(amountBaseParsed.value) <= 0n) return { error: "amount_jpyc must be > 0" };
+  if (BigInt(amountBaseParsed.value) <= 0n && !nonExactConversion) return { error: "amount_jpyc must be > 0" };
+  if (nonExactConversion && !/^\d+$/.test(String(payload?.amount_atomic || ""))) {
+    return { error: "amount_atomic is required for non-exact token conversion" };
+  }
   if (!Number.isFinite(confirmations) || confirmations < 0) {
     return { error: "confirmations must be >= 0" };
   }
@@ -7994,6 +9109,10 @@ function buildIngestEvent(payload) {
       token_contract: String(payload.token_contract),
       amount_jpyc: amount ?? formatJpyc(amountBaseParsed.value),
       amount_jpyc_base: amountBaseParsed.value,
+      amount_atomic: payload.amount_atomic == null ? null : String(payload.amount_atomic),
+      amount_conversion_exact: nonExactConversion ? false : true,
+      amount_conversion_error: nonExactConversion ? String(payload.amount_conversion_error || "non_exact_decimal_conversion") : null,
+      canonical_status: payload.canonical_status || "unknown",
       observed_at: payload.observed_at || nowIso(),
       block_hash: blockHash,
       block_timestamp: payload.block_timestamp || null,
@@ -8009,22 +9128,44 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
   if ((rpcProvidersByChain.get(invoiceChainId) || []).length === 0) {
     return { error: { code: "RPC_UNAVAILABLE", message: "manual ingest verification requires RPC_URLS" } };
   }
+  const expectedAmount = convertLedgerBaseToTokenAtomicExact(String(invoice.amount_jpyc_base || "0"));
+  if (expectedAmount.error) {
+    return {
+      error: {
+        code: "AMOUNT_SCALE_INCOMPATIBLE",
+        message: "invoice amount cannot be represented exactly in token atomic units",
+      },
+    };
+  }
   const verification = await verifyTransferOnChain({
     txHash: payload?.tx_hash,
     chainId: invoiceChainId,
     expectedTokenContract: invoiceTokenContract,
     expectedToAddress: invoice.recipient_address,
-    expectedAmountBase: String(invoice.amount_jpyc_base || "0"),
+    expectedAmountAtomic: expectedAmount.value,
   });
 
   if (!verification.ok) {
-    if (verification.code === "WRONG_AMOUNT" && verification.transfer) {
+    if (verification.code === "MULTIPLE_TRANSFERS" && verification.transfer) {
       if (verification.confirmations < REQUIRED_CONFIRMATIONS) {
         return {
           pending: true,
           error: {
             code: "CONFIRMATIONS_PENDING",
             message: `transaction has ${verification.confirmations} confirmations; ${REQUIRED_CONFIRMATIONS} required`,
+          },
+        };
+      }
+      const matchingTransfers = Array.isArray(verification.transfers) ? verification.transfers : [verification.transfer];
+      const totalAmountAtomic = matchingTransfers
+        .reduce((total, transfer) => total + BigInt(String(transfer.amountBase)), 0n)
+        .toString();
+      const observedAmount = convertTokenAtomicToLedgerBase(totalAmountAtomic);
+      if (observedAmount.error) {
+        return {
+          error: {
+            code: "AMOUNT_SCALE_INCOMPATIBLE",
+            message: "on-chain token amount cannot be converted to ledger base units",
           },
         };
       }
@@ -8039,8 +9180,58 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
           from_address: verification.transfer.from,
           to_address: verification.transfer.to,
           token_contract: invoiceTokenContract,
-          amount_jpyc: formatJpyc(verification.transfer.amountBase),
-          amount_jpyc_base: verification.transfer.amountBase,
+          amount_jpyc: formatJpyc(observedAmount.value),
+          amount_jpyc_base: observedAmount.value,
+          amount_atomic: totalAmountAtomic,
+          amount_conversion_exact: observedAmount.exact,
+          amount_conversion_error: observedAmount.exact ? null : "non_exact_decimal_conversion",
+          chain_inconsistency_reason: "multiple_matching_transfers",
+          matching_transfers: matchingTransfers,
+          canonical_status: verification.canonicalStatus || "unknown",
+          observed_at: verification.observedAt,
+          block_hash: verification.receipt?.blockHash || null,
+          block_timestamp: verification.observedAt,
+          source: "manual_ingest",
+          verified_onchain: true,
+        },
+      };
+    }
+    if (verification.code === "WRONG_AMOUNT" && verification.transfer) {
+      if (verification.confirmations < REQUIRED_CONFIRMATIONS) {
+        return {
+          pending: true,
+          error: {
+            code: "CONFIRMATIONS_PENDING",
+            message: `transaction has ${verification.confirmations} confirmations; ${REQUIRED_CONFIRMATIONS} required`,
+          },
+        };
+      }
+      const observedAmount = convertTokenAtomicToLedgerBase(verification.transfer.amountBase);
+      if (observedAmount.error) {
+        return {
+          error: {
+            code: "AMOUNT_SCALE_INCOMPATIBLE",
+            message: "on-chain token amount cannot be converted to ledger base units",
+          },
+        };
+      }
+      return {
+        event: {
+          invoice_id: invoice.id,
+          chain_id: invoiceChainId,
+          tx_hash: parseTxHash(payload?.tx_hash),
+          log_index: verification.transfer.logIndex,
+          block_number: verification.transfer.blockNumber,
+          confirmations: verification.confirmations,
+          from_address: verification.transfer.from,
+          to_address: verification.transfer.to,
+          token_contract: invoiceTokenContract,
+          amount_jpyc: formatJpyc(observedAmount.value),
+          amount_jpyc_base: observedAmount.value,
+          amount_atomic: verification.transfer.amountBase,
+          amount_conversion_exact: observedAmount.exact,
+          amount_conversion_error: observedAmount.exact ? null : "non_exact_decimal_conversion",
+          canonical_status: verification.canonicalStatus || "unknown",
           observed_at: verification.observedAt,
           block_hash: verification.receipt?.blockHash || null,
           block_timestamp: verification.observedAt,
@@ -8067,6 +9258,16 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
     };
   }
 
+  const observedAmount = convertTokenAtomicToLedgerBase(verification.transfer.amountBase);
+  if (observedAmount.error) {
+    return {
+      error: {
+        code: "AMOUNT_SCALE_INCOMPATIBLE",
+        message: "on-chain token amount cannot be converted to ledger base units",
+      },
+    };
+  }
+
   return {
     event: {
       invoice_id: invoice.id,
@@ -8078,8 +9279,12 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
       from_address: verification.transfer.from,
       to_address: verification.transfer.to,
       token_contract: invoiceTokenContract,
-      amount_jpyc: formatJpyc(verification.transfer.amountBase),
-      amount_jpyc_base: verification.transfer.amountBase,
+      amount_jpyc: formatJpyc(observedAmount.value),
+      amount_jpyc_base: observedAmount.value,
+      amount_atomic: verification.transfer.amountBase,
+      amount_conversion_exact: observedAmount.exact,
+      amount_conversion_error: observedAmount.exact ? null : "non_exact_decimal_conversion",
+      canonical_status: verification.canonicalStatus || "unknown",
       observed_at: verification.observedAt,
       block_hash: verification.receipt?.blockHash || null,
       block_timestamp: verification.observedAt,
@@ -8210,6 +9415,15 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
   const expectedFromAddresses = isProductionLikeRuntime()
     ? [treasury?.address]
     : [refund.expected_from_address, hasLineage ? treasury?.address : null];
+  const expectedAmount = convertLedgerBaseToTokenAtomicExact(refund.refund_amount_jpyc_base);
+  if (expectedAmount.error) {
+    return {
+      error: {
+        code: "AMOUNT_SCALE_INCOMPATIBLE",
+        message: "refund amount cannot be represented exactly in token atomic units",
+      },
+    };
+  }
   const verification = await verifyTransferOnChain({
     txHash,
     chainId: String(refund.refund_chain_id || CHAIN_ID),
@@ -8217,10 +9431,25 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
     expectedToAddress: refund.refund_to_address,
     expectedFromAddress: null,
     expectedFromAddresses: expectedFromAddresses.filter(Boolean),
-    expectedAmountBase: refund.refund_amount_jpyc_base,
+    expectedAmountAtomic: expectedAmount.value,
   });
+  if (verification.ok && verification.canonicalStatus !== "canonical") {
+    return {
+      status: "verification_failed",
+      refundTxHash: txHash,
+      refundTxLogIndex: verification.transfer?.logIndex ?? null,
+      failureReason: "NON_CANONICAL",
+      fromAddress: verification.transfer?.from || null,
+      toAddress: verification.transfer?.to || refund.refund_to_address || null,
+      chainId: String(refund.refund_chain_id || CHAIN_ID),
+      tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
+      blockNumber: verification.transfer?.blockNumber ?? null,
+      blockTimestamp: verification.observedAt || nowIso(),
+      detectedAt: nowIso(),
+    };
+  }
   if (!verification.ok) {
-    if (verification.code === "WRONG_AMOUNT" || verification.code === "WRONG_FROM_ADDRESS" || verification.code === "WRONG_RECIPIENT") {
+    if (["WRONG_AMOUNT", "WRONG_FROM_ADDRESS", "WRONG_RECIPIENT", "MULTIPLE_TRANSFERS"].includes(verification.code)) {
       return {
         status: "verification_failed",
         refundTxHash: txHash,
@@ -8292,13 +9521,24 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
       || ""
   );
   try {
+    const expectedAmount = convertLedgerBaseToTokenAtomicExact(lineage.sweep_amount_jpyc_base);
+    if (expectedAmount.error) {
+      return {
+        status: "verification_failed",
+        failureReason: "AMOUNT_SCALE_INCOMPATIBLE",
+        evidence: {
+          code: "AMOUNT_SCALE_INCOMPATIBLE",
+          message: "sweep amount cannot be represented exactly in token atomic units",
+        },
+      };
+    }
     const verification = await verifyTransferOnChain({
       txHash: lineage.sweep_tx_hash,
       chainId: String(lineage.chain_id),
       expectedTokenContract: tokenContract,
       expectedToAddress: lineage.treasury_address,
       expectedFromAddress: lineage.source_address,
-      expectedAmountBase: lineage.sweep_amount_jpyc_base,
+      expectedAmountAtomic: expectedAmount.value,
     });
     if (!verification.ok) {
       const permanentFailureCodes = new Set([
@@ -8306,6 +9546,7 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
         "WRONG_RECIPIENT",
         "WRONG_FROM_ADDRESS",
         "WRONG_AMOUNT",
+        "MULTIPLE_TRANSFERS",
         "TX_REVERTED",
         "WRONG_CHAIN",
       ]);
@@ -8334,6 +9575,20 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
       };
     }
 
+    if (verification.canonicalStatus !== "canonical") {
+      return {
+        status: "verification_failed",
+        failureReason: "NON_CANONICAL",
+        evidence: {
+          code: "NON_CANONICAL",
+          confirmations: Number(verification.confirmations || 0),
+          observed_at: verification.observedAt || null,
+          canonical_status: verification.canonicalStatus || "unknown",
+          transfer: verification.transfer || null,
+        },
+      };
+    }
+
     if (Number(verification.confirmations || 0) < REQUIRED_CONFIRMATIONS) {
       return {
         status: "pending_verification",
@@ -8343,6 +9598,7 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
           confirmations: Number(verification.confirmations || 0),
           required_confirmations: REQUIRED_CONFIRMATIONS,
           observed_at: verification.observedAt || null,
+          canonical_status: verification.canonicalStatus || "unknown",
           transfer: verification.transfer || null,
         },
       };
@@ -8356,6 +9612,7 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
         confirmations: Number(verification.confirmations || 0),
         required_confirmations: REQUIRED_CONFIRMATIONS,
         observed_at: verification.observedAt || null,
+        canonical_status: verification.canonicalStatus || "unknown",
         transfer: verification.transfer || null,
       },
     };
@@ -8368,6 +9625,250 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
         message: String(error.message || error).slice(0, 240),
       },
     };
+  }
+}
+
+async function verifyRefundFundingSweepsV2(refund, sweeps, actorId, auditContext = null) {
+  const results = await Promise.all(
+    sweeps.map(async (sweep) => ({
+      sweep,
+      verification: String(sweep.status) === "verified"
+        ? { status: "verified", evidence: { code: "ALREADY_VERIFIED" } }
+        : await verifyRefundFundingLineageOnChain(refund, sweep),
+    }))
+  );
+  const requestedAmount = parseBaseUnitOrZero(refund.refund_amount_jpyc_base);
+  const timestamp = nowIso();
+  try {
+    const finalizeVerification = db.transaction(() => {
+      const currentRefund = db
+        .prepare(
+          `SELECT rr.*, i.store_id
+           FROM refund_requests rr
+           JOIN invoices i ON i.id = rr.invoice_id
+           WHERE rr.id = ?`
+        )
+        .get(refund.id);
+      if (!currentRefund) {
+        const error = new Error("refund request changed while funding verification was in progress");
+        error.code = "REFUND_FUNDING_LINEAGE_CONFLICT";
+        throw error;
+      }
+      const beforeSweeps = getRefundFundingSweeps(currentRefund.id);
+      const beforeConservation = evaluateRefundFundingConservation(
+        currentRefund,
+        beforeSweeps,
+        getRefundFundingAllocationsForConservation(currentRefund.id, beforeSweeps)
+      );
+
+      for (const { sweep, verification } of results) {
+        const currentSweep = db.prepare(`SELECT * FROM refund_funding_sweeps WHERE id = ?`).get(sweep.id);
+        if (!currentSweep) {
+          const error = new Error("funding sweep changed while verification was in progress");
+          error.code = "REFUND_FUNDING_SWEEP_CONFLICT";
+          error.details = { sweep_id: sweep.id };
+          throw error;
+        }
+        if (String(currentSweep.status) === "verified") continue;
+        if (String(currentSweep.status) !== String(sweep.status)
+          || String(currentSweep.updated_at || "") !== String(sweep.updated_at || "")) {
+          const error = new Error("funding sweep changed while verification was in progress");
+          error.code = "REFUND_FUNDING_SWEEP_CONFLICT";
+          error.details = { sweep_id: sweep.id, current_status: currentSweep.status };
+          throw error;
+        }
+        const existingEvidence = parseJsonWithWarning(
+          currentSweep.evidence_json,
+          "refund_funding_sweeps.verify.evidence",
+          {}
+        );
+        const evidence = {
+          ...(existingEvidence && typeof existingEvidence === "object" ? existingEvidence : {}),
+          verification: verification.evidence || {},
+          failure_reason: verification.failureReason || null,
+        };
+        const updated = db.prepare(
+          `UPDATE refund_funding_sweeps
+           SET status = ?, evidence_json = ?, updated_at = ?
+           WHERE id = ? AND status = ? AND updated_at = ?`
+        ).run(
+          verification.status,
+          JSON.stringify(sanitizeAuditState(evidence)),
+          timestamp,
+          currentSweep.id,
+          currentSweep.status,
+          currentSweep.updated_at
+        );
+        if (updated.changes !== 1) {
+          const error = new Error("funding sweep changed while verification was in progress");
+          error.code = "REFUND_FUNDING_SWEEP_CONFLICT";
+          error.details = { sweep_id: sweep.id };
+          throw error;
+        }
+      }
+
+      const freshSweeps = getRefundFundingSweeps(refund.id);
+      const existingAllocations = getRefundFundingAllocationsForConservation(refund.id, freshSweeps);
+      const initialConservation = evaluateRefundFundingConservation(
+        currentRefund,
+        freshSweeps,
+        existingAllocations
+      );
+      if (!initialConservation.conserved) {
+        const violation = initialConservation.snapshot.violations[0] || {};
+        const error = new Error(violation.message || "refund funding conservation check failed");
+        error.code = violation.code || "REFUND_FUNDING_ALLOCATION_INTEGRITY_ERROR";
+        error.details = violation;
+        throw error;
+      }
+      let allocatedTotal = initialConservation.refundAllocated;
+      const allocationsBySweep = new Map(initialConservation.totalsBySweep);
+      const refundSweepPairs = new Set(
+        existingAllocations
+          .filter((allocation) => String(allocation.refund_request_id) === String(refund.id))
+          .map((allocation) => String(allocation.sweep_id))
+      );
+      for (const sweep of freshSweeps) {
+        if (allocatedTotal >= requestedAmount || String(sweep.status) !== "verified") continue;
+        if (refundSweepPairs.has(String(sweep.id))) continue;
+        const sweepAmount = parseBaseUnitOrZero(sweep.sweep_amount_jpyc_base);
+        const available = sweepAmount - (allocationsBySweep.get(String(sweep.id)) || 0n);
+        const amount = available < requestedAmount - allocatedTotal ? available : requestedAmount - allocatedTotal;
+        if (amount <= 0n) continue;
+        const idempotencyKey = `refund-funding-v2:${refund.id}:${sweep.id}`;
+        const allocationPlan = planRefundFundingAllocation({
+          sweep: { id: sweep.id, status: "verified", verified_amount_jpyc_base: sweepAmount.toString() },
+          existingAllocations,
+          request: {
+            sweep_id: sweep.id,
+            refund_request_id: refund.id,
+            amount_jpyc_base: amount.toString(),
+            refund_amount_jpyc_base: requestedAmount.toString(),
+            idempotency_key: idempotencyKey,
+          },
+        });
+        if (!allocationPlan.ok) {
+          const error = new Error(allocationPlan.error?.message || "refund funding allocation was rejected");
+          error.code = allocationPlan.error?.code || "REFUND_FUNDING_ALLOCATION_REJECTED";
+          error.details = allocationPlan.error?.details || {};
+          throw error;
+        }
+        if (allocationPlan.decision === "create") {
+          const allocationId = uuid();
+          db.prepare(
+            `INSERT INTO refund_funding_allocation_parts
+             (id, funding_sweep_id, refund_request_id, amount_jpyc_base, idempotency_key, created_by, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(allocationId, sweep.id, refund.id, amount.toString(), idempotencyKey, actorId, timestamp);
+          existingAllocations.push({
+            id: allocationId,
+            sweep_id: sweep.id,
+            refund_request_id: refund.id,
+            amount_jpyc_base: amount.toString(),
+            idempotency_key: idempotencyKey,
+            created_by: actorId,
+            created_at: timestamp,
+          });
+          allocationsBySweep.set(
+            String(sweep.id),
+            (allocationsBySweep.get(String(sweep.id)) || 0n) + amount
+          );
+          refundSweepPairs.add(String(sweep.id));
+          allocatedTotal += amount;
+        }
+      }
+
+      const finalSweeps = getRefundFundingSweeps(refund.id);
+      const finalConservation = evaluateRefundFundingConservation(
+        currentRefund,
+        finalSweeps,
+        getRefundFundingAllocationsForConservation(refund.id, finalSweeps)
+      );
+      if (!finalConservation.conserved) {
+        const violation = finalConservation.snapshot.violations[0] || {};
+        const error = new Error(violation.message || "refund funding conservation check failed");
+        error.code = violation.code || "REFUND_FUNDING_ALLOCATION_INTEGRITY_ERROR";
+        error.details = violation;
+        throw error;
+      }
+      if (!finalConservation.fullyFunded) {
+        const errorDetails = {
+          refund_amount_jpyc_base: requestedAmount.toString(),
+          allocated_amount_jpyc_base: finalConservation.refundAllocated.toString(),
+          verification_results: results.map(({ sweep, verification }) => ({
+            sweep_id: sweep.id,
+            status: verification.status,
+            failure_reason: verification.failureReason || null,
+          })),
+        };
+        // Keep failed/pending sweep evidence and any valid partial allocation
+        // durable.  Rolling back here would make a raw-atomic mismatch look
+        // as if it had never been observed, weakening the refund audit trail
+        // and forcing the operator to resubmit the same evidence blindly.
+        const afterRefund = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
+        const beforeState = buildRefundFundingAuditState(currentRefund, beforeConservation);
+        const afterState = buildRefundFundingAuditState(afterRefund, finalConservation);
+        if (auditContext) {
+          audit({
+            storeId: currentRefund.store_id,
+            actorType: "admin",
+            actorId,
+            action: "refund.funding_sweeps_verification_incomplete",
+            targetType: "refund",
+            targetId: refund.id,
+            requestId: auditContext.requestId,
+            idempotencyKey: auditContext.idempotencyKey,
+            beforeState,
+            afterState: {
+              ...afterState,
+              verification_results: errorDetails.verification_results,
+            },
+            ip: auditContext.ip,
+          });
+        }
+        return {
+          incomplete: true,
+          afterRefund,
+          beforeState,
+          afterState,
+          error: {
+            code: "REFUND_FUNDING_UNDERALLOCATED",
+            message: "verified funding sweeps do not fully fund the requested refund",
+            details: errorDetails,
+          },
+        };
+      }
+
+      const afterRefund = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
+      const beforeState = buildRefundFundingAuditState(currentRefund, beforeConservation);
+      const afterState = buildRefundFundingAuditState(afterRefund, finalConservation);
+      if (auditContext) {
+        audit({
+          storeId: currentRefund.store_id,
+          actorType: "admin",
+          actorId,
+          action: "refund.funding_sweeps_verified",
+          targetType: "refund",
+          targetId: refund.id,
+          requestId: auditContext.requestId,
+          idempotencyKey: auditContext.idempotencyKey,
+          beforeState,
+          afterState,
+          ip: auditContext.ip,
+        });
+      }
+      return { afterRefund, beforeState, afterState };
+    });
+    const finalized = finalizeVerification.immediate();
+    if (finalized?.incomplete) {
+      const error = new Error(finalized.error?.message || "refund funding verification is incomplete");
+      error.code = finalized.error?.code || "REFUND_FUNDING_UNDERALLOCATED";
+      error.details = finalized.error?.details || {};
+      return { ok: false, results, error, finalized };
+    }
+    return { ok: true, results, ...finalized };
+  } catch (error) {
+    return { ok: false, results, error };
   }
 }
 
@@ -9032,6 +10533,7 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
     ...publicEntry,
     current_invoice: summarizeInvoiceForTerminalState(currentInvoiceContext.currentInvoice),
     terminal_invariant_broken: currentInvoiceContext.invariantBroken === true,
+    payments: getPaymentsDisableState({ storeId: terminal.store_id, terminalId: terminal.id }),
     supported_wallets: getSupportedWallets(ENV),
     started_at: ts,
     expires_at: expiresAt,
@@ -9177,6 +10679,14 @@ app.post("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
     if (!staffName || !["staff", "operator", "manager", "accounting", "admin"].includes(role) || !/^\d{4,8}$/.test(pin) || !["active", "inactive"].includes(status)) {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "Invalid staff payload" } } };
     }
+    const securityValidation = validateDirectStaffSecurityChange({ role, permissionsOverride });
+    if (!securityValidation.ok) {
+      return rejectStaffSecurityChange(req, {
+        actorId,
+        attemptedAction: "staff.create",
+        reason: securityValidation.reason,
+      });
+    }
     const id = uuid();
     const ts = nowIso();
     db.prepare(
@@ -9219,14 +10729,38 @@ app.patch("/api/v1/staff/:staffId", requirePermission("staff.manage"), (req, res
       .get(req.params.staffId, req.session.store_id);
     if (!before) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Staff not found" } } };
 
+    if (!DIRECTLY_MANAGEABLE_STAFF_ROLES.has(String(before.role || ""))) {
+      return rejectStaffSecurityChange(req, {
+        actorId,
+        targetId: before.id,
+        attemptedAction: "staff.update",
+        reason: "existing_privileged_role_requires_independent_approval",
+      });
+    }
+
     const nextName = req.body?.staff_name != null ? String(req.body.staff_name).trim() : before.staff_name;
     const nextRole = req.body?.role != null ? String(req.body.role) : before.role;
     const nextStatus = req.body?.status != null ? String(req.body.status) : before.status;
+    const storedOverride = parseStoredPermissionsOverride(before.permissions_override);
+    const nextOverrideValues = Array.isArray(req.body?.permissions_override)
+      ? req.body.permissions_override.map((value) => String(value))
+      : storedOverride.values;
     const nextOverride = Array.isArray(req.body?.permissions_override)
-      ? JSON.stringify(req.body.permissions_override.map((value) => String(value)))
+      ? JSON.stringify(nextOverrideValues)
       : before.permissions_override;
     if (!nextName || !["staff", "operator", "manager", "accounting", "admin"].includes(nextRole) || !["active", "inactive"].includes(nextStatus)) {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "Invalid staff update payload" } } };
+    }
+    const securityValidation = storedOverride.invalid
+      ? { ok: false, reason: "existing_permissions_override_invalid" }
+      : validateDirectStaffSecurityChange({ role: nextRole, permissionsOverride: nextOverrideValues });
+    if (!securityValidation.ok) {
+      return rejectStaffSecurityChange(req, {
+        actorId,
+        targetId: before.id,
+        attemptedAction: "staff.update",
+        reason: securityValidation.reason,
+      });
     }
     db.prepare(
       `UPDATE staff_users
@@ -9263,6 +10797,18 @@ app.post("/api/v1/staff/:staffId/pin:rotate", requirePermission("staff.manage"),
       .prepare(`SELECT * FROM staff_users WHERE id = ? AND store_id = ?`)
       .get(req.params.staffId, req.session.store_id);
     if (!before) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Staff not found" } } };
+    const storedOverride = parseStoredPermissionsOverride(before.permissions_override);
+    const privilegedTarget = !DIRECTLY_MANAGEABLE_STAFF_ROLES.has(String(before.role || ""))
+      || storedOverride.invalid
+      || !validateDirectStaffSecurityChange({ role: before.role, permissionsOverride: storedOverride.values }).ok;
+    if (privilegedTarget) {
+      return rejectStaffSecurityChange(req, {
+        actorId,
+        targetId: before.id,
+        attemptedAction: "staff.pin.rotate",
+        reason: "privileged_staff_pin_requires_independent_approval",
+      });
+    }
     db.prepare(`UPDATE staff_users SET pin_hash = ?, updated_at = ? WHERE id = ?`).run(hashPin(pin), nowIso(), before.id);
     const after = db.prepare(`SELECT * FROM staff_users WHERE id = ?`).get(before.id);
     audit({
@@ -10025,6 +11571,14 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
     invoice_no: invoice.invoice_no,
     status: invoice.status,
     status_reason: invoice.status_reason,
+    // Reorg detection runs in the chain-monitor process. Keep the hold and
+    // observation window in the authenticated invoice payload so the terminal
+    // can fail closed even when the worker updates SQLite without calling the
+    // API process directly.
+    monitor_until: invoice.monitor_until || null,
+    integrity_hold: Number(invoice.integrity_hold || 0) === 1,
+    integrity_hold_reason: invoice.integrity_hold_reason || null,
+    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
     amounts: {
       amount_jpy: invoice.amount_jpy,
       amount_jpyc: invoice.amount_jpyc,
@@ -10966,6 +12520,8 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
       }
     }
     if (!review) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Review not found" } } };
+    const heldInvoice = db.prepare(`SELECT id, integrity_hold, integrity_hold_reason, integrity_hold_at FROM invoices WHERE id = ? AND integrity_hold = 1`).get(review.invoice_id);
+    if (heldInvoice) return integrityHoldApiResult([heldInvoice], "refund request");
     const refundCaseResult = getOrCreateRefundCase({
       invoice: { id: review.invoice_id, store_id: req.session.store_id },
       relatedReviewCaseId: review.id || null,
@@ -11193,8 +12749,14 @@ app.post("/api/v1/refunds/:refundId/funding-lineage", requirePermission("refund.
       )
       .get(req.params.refundId, req.session.store_id);
     if (!refund) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
-    const existing = getRefundFundingLineage(refund.id);
-    if (existing) return { status: 200, body: buildRefundEvidenceResponse(db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id)) };
+    const existingSweep = db
+      .prepare(
+        `SELECT id FROM refund_funding_sweeps
+         WHERE invoice_id = ? AND sweep_tx_hash = ? AND chain_id = ?
+           AND COALESCE(sweep_tx_log_index, -1) = COALESCE(?, -1)`
+      )
+      .get(refund.invoice_id, parseTxHash(req.body?.sweep_tx_hash), String(req.body?.chain_id || refund.refund_chain_id || ""), req.body?.sweep_tx_log_index == null ? null : Number(req.body.sweep_tx_log_index));
+    if (existingSweep) return { status: 200, body: buildRefundEvidenceResponse(db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id)) };
 
     const sourceAddress = String(req.body?.source_address || "").trim();
     const treasuryAddress = String(req.body?.treasury_address || "").trim();
@@ -11214,6 +12776,9 @@ app.post("/api/v1/refunds/:refundId/funding-lineage", requirePermission("refund.
     if (chainId !== String(refund.refund_chain_id || refund.invoice_chain_id || "")) {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "funding lineage chain_id must match refund chain" } } };
     }
+    // A single sweep may be smaller than the refund. The v2 allocation ledger
+    // conserves each sweep independently and permits several sweeps to fund
+    // one refund; the execution gate requires the aggregate to be complete.
     const treasury = getRefundTreasuryConfig({ storeId: refund.store_id, chainId });
     if (!treasury) {
       return {
@@ -11246,31 +12811,35 @@ app.post("/api/v1/refunds/:refundId/funding-lineage", requirePermission("refund.
       };
     }
     const timestamp = nowIso();
-    const lineageId = uuid();
+    const sweepId = uuid();
     try {
-      db.prepare(
-        `INSERT INTO refund_funding_lineage
-         (id, refund_request_id, invoice_id, store_id, chain_id, source_address, treasury_address, sweep_tx_hash, sweep_tx_log_index,
-          sweep_amount_jpyc_base, status, evidence_note_path, evidence_json, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?, ?, ?)`
-      ).run(
-        lineageId,
-        refund.id,
-        refund.invoice_id,
-        refund.store_id,
-        chainId,
-        normalizeAddress(sourceAddress),
-        treasury.address,
-        sweepTxHash,
-        sweepTxLogIndex,
-        sweepAmount.value,
-        String(req.body?.evidence_note_path || "").trim() || null,
-        JSON.stringify(sanitizeAuditState(req.body?.evidence || {})),
-        actorId,
-        timestamp,
-        timestamp,
-      );
-      db.prepare(`UPDATE refund_requests SET funding_lineage_id = ?, updated_at = ? WHERE id = ?`).run(lineageId, timestamp, refund.id);
+      db.transaction(() => {
+        db.prepare(
+          `INSERT INTO refund_funding_sweeps
+           (id, invoice_id, store_id, chain_id, source_address, treasury_address, sweep_tx_hash, sweep_tx_log_index,
+            sweep_amount_jpyc_base, status, evidence_note_path, evidence_json, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?, ?, ?)`
+        ).run(
+          sweepId,
+          refund.invoice_id,
+          refund.store_id,
+          chainId,
+          normalizeAddress(sourceAddress),
+          treasury.address,
+          sweepTxHash,
+          sweepTxLogIndex,
+          sweepAmount.value,
+          String(req.body?.evidence_note_path || "").trim() || null,
+          JSON.stringify(sanitizeAuditState(req.body?.evidence || {})),
+          actorId,
+          timestamp,
+          timestamp,
+        );
+        // Keep the legacy foreign-key column untouched.  v2 sweep IDs are not
+        // rows in refund_funding_lineage; mixing the identifiers would violate
+        // the FK and make old evidence ambiguous.
+        db.prepare(`UPDATE refund_requests SET updated_at = ? WHERE id = ?`).run(timestamp, refund.id);
+      })();
     } catch (error) {
       if (String(error.message || "").includes("UNIQUE")) {
         return { status: 409, body: { error: { code: "DUPLICATE_REFUND_SWEEP", message: "sweep transaction is already linked" } } };
@@ -11288,7 +12857,7 @@ app.post("/api/v1/refunds/:refundId/funding-lineage", requirePermission("refund.
       requestId,
       idempotencyKey: idemKey,
       beforeState: refund,
-      afterState: { refund: after, funding_lineage: getRefundFundingLineage(refund.id) },
+      afterState: { refund: after, funding_sweeps: getRefundFundingSweeps(refund.id) },
       ip: req.ip,
     });
     return { status: 201, body: buildRefundEvidenceResponse(after) };
@@ -11309,6 +12878,27 @@ app.post("/api/v1/refunds/:refundId/funding-lineage/verify", requirePermission("
       )
       .get(req.params.refundId, req.session.store_id);
     if (!refund) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
+    const v2Sweeps = getRefundFundingSweeps(refund.id);
+    if (v2Sweeps.length > 0) {
+      const verified = await verifyRefundFundingSweepsV2(refund, v2Sweeps, actorId, {
+        requestId,
+        idempotencyKey: idemKey,
+        ip: req.ip,
+      });
+      if (!verified.ok) {
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: verified.error?.code || "REFUND_FUNDING_ALLOCATION_REJECTED",
+              message: verified.error?.message || "refund funding verification is incomplete",
+              details: verified.error?.details || {},
+            },
+          },
+        };
+      }
+      return { status: 200, body: buildRefundEvidenceResponse(verified.afterRefund) };
+    }
     const lineage = getRefundFundingLineage(refund.id);
     if (!lineage) {
       return {
@@ -11368,6 +12958,65 @@ app.post("/api/v1/refunds/:refundId/funding-lineage/verify", requirePermission("
         },
       };
     }
+    if (verification.status === "verified") {
+      const allocationIdempotencyKey = `refund-funding:${refund.id}:${lineage.id}`;
+      const existingAllocations = db
+        .prepare(
+          `SELECT funding_lineage_id AS sweep_id, refund_request_id, amount_jpyc_base, idempotency_key
+           FROM refund_funding_allocations
+           WHERE funding_lineage_id = ? OR refund_request_id = ? OR idempotency_key = ?`
+        )
+        .all(lineage.id, refund.id, allocationIdempotencyKey);
+      const allocationPlan = planRefundFundingAllocation({
+        sweep: {
+          id: lineage.id,
+          status: "verified",
+          verified_amount_jpyc_base: String(lineage.sweep_amount_jpyc_base || "0"),
+        },
+        existingAllocations,
+        request: {
+          sweep_id: lineage.id,
+          refund_request_id: refund.id,
+          amount_jpyc_base: String(refund.refund_amount_jpyc_base || "0"),
+          refund_amount_jpyc_base: String(refund.refund_amount_jpyc_base || "0"),
+          idempotency_key: allocationIdempotencyKey,
+        },
+      });
+      if (!allocationPlan.ok) {
+        db.prepare(
+          `UPDATE refund_funding_lineage
+           SET status = 'allocation_failed',
+               evidence_json = ?,
+               updated_at = ?
+           WHERE id = ?`
+        ).run(JSON.stringify(sanitizeAuditState({ ...evidence, allocation: allocationPlan })), timestamp, lineage.id);
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: allocationPlan.error?.code || "REFUND_FUNDING_ALLOCATION_REJECTED",
+              message: allocationPlan.error?.message || "refund funding allocation was rejected",
+              details: allocationPlan.error?.details || {},
+            },
+          },
+        };
+      }
+      if (allocationPlan.decision === "create") {
+        db.prepare(
+          `INSERT INTO refund_funding_allocations
+           (id, funding_lineage_id, refund_request_id, amount_jpyc_base, idempotency_key, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          uuid(),
+          lineage.id,
+          refund.id,
+          allocationPlan.allocation.amount_jpyc_base,
+          allocationIdempotencyKey,
+          actorId,
+          timestamp,
+        );
+      }
+    }
     const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
     audit({
       storeId: refund.store_id,
@@ -11399,6 +13048,8 @@ app.post("/api/v1/refunds/:refundId/approve", requirePermission("refund.approve"
       )
       .get(req.params.refundId, req.session.store_id);
     if (!refund) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
+    const approveHold = db.prepare(`SELECT id, integrity_hold, integrity_hold_reason, integrity_hold_at FROM invoices WHERE id = ? AND integrity_hold = 1`).get(refund.invoice_id);
+    if (approveHold) return integrityHoldApiResult([approveHold], "refund approval");
     if (refund.status !== "requested") {
       return { status: 409, body: { error: { code: "INVALID_STATE_TRANSITION", message: "Only requested refunds can be approved" } } };
     }
@@ -11466,6 +13117,8 @@ app.post("/api/v1/refunds/:refundId/execute", requirePermission("refund.execute"
       )
       .get(req.params.refundId, req.session.store_id);
     if (!refund) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
+    const executeHold = db.prepare(`SELECT id, integrity_hold, integrity_hold_reason, integrity_hold_at FROM invoices WHERE id = ? AND integrity_hold = 1`).get(refund.invoice_id);
+    if (executeHold) return integrityHoldApiResult([executeHold], "refund execution");
     if (!["approved", "failed"].includes(refund.status)) {
       return { status: 409, body: { error: { code: "INVALID_STATE_TRANSITION", message: "Refund must be approved or failed before execution" } } };
     }
@@ -11608,6 +13261,8 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
     if (!refund) {
       return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
     }
+    const verifyHold = db.prepare(`SELECT id, integrity_hold, integrity_hold_reason, integrity_hold_at FROM invoices WHERE id = ? AND integrity_hold = 1`).get(refund.invoice_id);
+    if (verifyHold) return integrityHoldApiResult([verifyHold], "refund verification");
     if (!["recorded", "pending_verification", "verification_failed", "failed"].includes(String(refund.status))) {
       return { status: 409, body: { error: { code: "INVALID_STATE_TRANSITION", message: "Refund is not awaiting verification" } } };
     }
@@ -11645,6 +13300,40 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         .get(refund.id, req.session.store_id);
       if (!current) {
         return { status: 404, body: { error: { code: "NOT_FOUND", message: "Refund request not found" } } };
+      }
+
+      const currentFundingSweeps = getRefundFundingSweeps(current.id);
+      const fundingConservation = currentFundingSweeps.length > 0
+        ? evaluateRefundFundingConservation(
+            current,
+            currentFundingSweeps,
+            getRefundFundingAllocationsForConservation(current.id, currentFundingSweeps)
+          )
+        : null;
+      const fundingReady = fundingConservation
+        ? fundingConservation.executionReady
+        : hasVerifiedRefundFundingLineage(current);
+      const fundingRequired = currentFundingSweeps.length > 0 || isProductionLikeRuntime();
+      if (verified.status === "succeeded" && fundingRequired && !fundingReady) {
+        const conservation = fundingConservation?.snapshot || null;
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: "REFUND_FUNDING_LINEAGE_REQUIRED",
+              message: "refund verification requires conserved verified sweep funding",
+              details: conservation
+                ? {
+                    refund_amount_jpyc_base: conservation.refund_amount_jpyc_base,
+                    allocated_amount_jpyc_base: conservation.allocated_amount_jpyc_base,
+                    refund_fully_funded: conservation.refund_fully_funded,
+                    conserved: conservation.conserved,
+                    violations: conservation.violations,
+                  }
+                : {},
+            },
+          },
+        };
       }
 
       const currentEvidenceMatchesResult = normalizeEvidenceHash(current.refund_tx_hash) === normalizeEvidenceHash(finalTxHash)
@@ -11733,6 +13422,12 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
 
       const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
       recordFinalRefundAccountingEvent(after, req.session.store_id);
+      const auditBeforeState = fundingConservation
+        ? buildRefundFundingAuditState(current, fundingConservation)
+        : current;
+      const auditAfterState = fundingConservation
+        ? buildRefundFundingAuditState(after, fundingConservation)
+        : after;
       audit({
         actorType: "admin",
         actorId,
@@ -11741,8 +13436,8 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         targetId: refund.id,
         requestId,
         idempotencyKey: idemKey,
-        beforeState: current,
-        afterState: after,
+        beforeState: auditBeforeState,
+        afterState: auditAfterState,
         ip: req.ip,
       });
       return { status: 200, body: buildRefundEvidenceResponse(after) };
@@ -11857,17 +13552,37 @@ app.patch("/api/v1/admin/stores/:storeId/customer-policies", requirePermission("
       terms_hash: String(req.body?.terms_hash || "").trim().toLowerCase(),
       privacy_hash: String(req.body?.privacy_hash || "").trim().toLowerCase(),
       refund_policy_hash: String(req.body?.refund_policy_hash || "").trim().toLowerCase(),
+      terms_content: typeof req.body?.contents?.terms === "string" ? req.body.contents.terms : "",
+      privacy_content: typeof req.body?.contents?.privacy === "string" ? req.body.contents.privacy : "",
+      refund_policy_content: typeof req.body?.contents?.refund === "string" ? req.body.contents.refund : "",
     };
     const invalidUrl = [values.terms_url, values.privacy_url, values.refund_policy_url].some((value) => !isPublishedPolicyUrl(value));
     const invalidVersion = [values.terms_version, values.privacy_version, values.refund_policy_version].some((value) => !isPublishedPolicyVersion(value));
     const invalidHash = [values.terms_hash, values.privacy_hash, values.refund_policy_hash].some((value) => !isPublishedPolicyHash(value));
-    if (invalidUrl || invalidVersion || invalidHash) {
+    const contentVerification = verifyPolicyContentHashes(
+      {
+        terms: values.terms_content,
+        privacy: values.privacy_content,
+        refund: values.refund_policy_content,
+      },
+      {
+        terms_hash: values.terms_hash,
+        privacy_hash: values.privacy_hash,
+        refund_policy_hash: values.refund_policy_hash,
+      }
+    );
+    if (invalidUrl || invalidVersion || invalidHash || !contentVerification.ok) {
       return {
         status: 400,
         body: {
           error: {
             code: "POLICY_PUBLICATION_INVALID",
-            message: "All policy URLs, published versions, and SHA-256 content hashes are required",
+            message: "All policy URLs, published versions, and server-computed SHA-256 policy content hashes are required",
+            details: {
+              content_canonicalization: contentVerification.canonicalization,
+              missing_content_keys: contentVerification.missing_content_keys,
+              mismatch_hash_keys: contentVerification.mismatch_hash_keys,
+            },
           },
         },
       };
@@ -11879,7 +13594,8 @@ app.patch("/api/v1/admin/stores/:storeId/customer-policies", requirePermission("
       `UPDATE stores
        SET terms_url = ?, privacy_url = ?, refund_policy_url = ?,
            terms_version = ?, privacy_version = ?, refund_policy_version = ?,
-           terms_hash = ?, privacy_hash = ?, refund_policy_hash = ?, updated_at = ?
+           terms_hash = ?, privacy_hash = ?, refund_policy_hash = ?,
+           terms_content = ?, privacy_content = ?, refund_policy_content = ?, updated_at = ?
        WHERE id = ?`
     ).run(
       values.terms_url,
@@ -11888,9 +13604,12 @@ app.patch("/api/v1/admin/stores/:storeId/customer-policies", requirePermission("
       values.terms_version,
       values.privacy_version,
       values.refund_policy_version,
-      values.terms_hash,
-      values.privacy_hash,
-      values.refund_policy_hash,
+      contentVerification.computed_hashes.terms_hash,
+      contentVerification.computed_hashes.privacy_hash,
+      contentVerification.computed_hashes.refund_policy_hash,
+      values.terms_content,
+      values.privacy_content,
+      values.refund_policy_content,
       nowIso(),
       store.id
     );
@@ -11923,11 +13642,11 @@ app.get("/api/v1/audit-logs", requirePermission("audit.read"), (req, res) => {
     const scopeSql = platformWide ? "" : " AND store_id = ?";
     const scopeArgs = platformWide ? [targetType, targetId, limit, offset] : [targetType, targetId, req.session.store_id, limit, offset];
     rows = db
-      .prepare(`SELECT * FROM audit_logs WHERE target_type = ? AND target_id = ?${scopeSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT * FROM audit_logs_scoped WHERE target_type = ? AND target_id = ?${scopeSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
       .all(...scopeArgs);
   } else {
     const scopeSql = platformWide ? "" : " WHERE store_id = ?";
-    rows = db.prepare(`SELECT * FROM audit_logs${scopeSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+    rows = db.prepare(`SELECT * FROM audit_logs_scoped${scopeSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
       .all(...(platformWide ? [limit, offset] : [req.session.store_id, limit, offset]));
   }
   const sanitizedRows = rows.map(sanitizeAuditLogRowForResponse);
@@ -11950,8 +13669,8 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
   const platformWide = isPlatformOperator(req.session);
   const totalCount = Number(
     platformWide
-      ? db.prepare(`SELECT COUNT(*) AS count FROM audit_logs`).get().count
-      : db.prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE store_id = ?`).get(req.session.store_id).count
+      ? db.prepare(`SELECT COUNT(*) AS count FROM audit_logs_scoped`).get().count
+      : db.prepare(`SELECT COUNT(*) AS count FROM audit_logs_scoped WHERE store_id = ?`).get(req.session.store_id).count
     || 0
   );
   const truncated = totalCount > limit || requestedLimit > limit;
@@ -11962,8 +13681,8 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
     );
   }
   const rows = platformWide
-    ? db.prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?`).all(limit)
-    : db.prepare(`SELECT * FROM audit_logs WHERE store_id = ? ORDER BY created_at DESC LIMIT ?`).all(req.session.store_id, limit);
+    ? db.prepare(`SELECT * FROM audit_logs_scoped ORDER BY created_at DESC LIMIT ?`).all(limit)
+    : db.prepare(`SELECT * FROM audit_logs_scoped WHERE store_id = ? ORDER BY created_at DESC LIMIT ?`).all(req.session.store_id, limit);
   const sanitizedRows = rows.map(sanitizeAuditLogRowForResponse);
   audit({
     storeId: platformWide ? null : req.session.store_id,
@@ -12254,6 +13973,8 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
         body: { error: { code: "VALIDATION_ERROR", message: "Invalid business_date for timezone", details: range.details } }
       };
     }
+    const integrityHeld = listIntegrityHeldInvoices(req.session.store_id, range);
+    if (integrityHeld.length > 0) return integrityHoldApiResult(integrityHeld, "daily close");
 
     let result;
     try {
@@ -12574,6 +14295,11 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
   if (range.error) {
     return jsonError(res, 400, "VALIDATION_ERROR", "Invalid business_date for timezone", range.details || {});
   }
+  const integrityHeld = listIntegrityHeldInvoices(req.session.store_id, range);
+  if (integrityHeld.length > 0) {
+    const blocked = integrityHoldApiResult(integrityHeld, "daily export");
+    return res.status(blocked.status).json(blocked.body);
+  }
 
   const rows = db
     .prepare(
@@ -12595,11 +14321,16 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
               i.updated_at,
               i.settled_at,
               r.reason_type AS reason_code,
+              r.id AS review_case_id,
               r.status AS review_status,
               r.block_timestamp,
               r.detected_at,
               r.audit_ref,
               rr.status AS refund_status,
+              rr.id AS refund_request_id,
+              rr.refund_case_id,
+              rr.review_case_id AS refund_review_case_id,
+              rr.refund_amount_jpyc_base,
               rr.refund_tx_hash,
               rr.verified_at AS refund_verified_at
        FROM invoices i
@@ -12611,19 +14342,22 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
     )
     .all(req.session.store_id, range.fromUtc, range.toUtc);
 
+  const legacyRows = normalizeLegacySettlementRows(rows);
+  const invoiceRows = legacyRows.invoice_rows;
+
   const totals = {
-    invoice_count: rows.length,
-    paid_count: rows.filter((row) => String(row.invoice_status) === "paid").length,
-    settled_count: rows.filter((row) => String(row.invoice_status) === "settled" || !!row.settled_at).length,
-    manual_review_count: rows.filter((row) => String(row.invoice_status) === "review_required").length,
-    cancelled_count: rows.filter((row) => String(row.invoice_status) === "cancelled").length,
-    expired_count: rows.filter((row) => String(row.invoice_status) === "expired").length,
-    refund_requested_count: rows.filter((row) => String(row.refund_status) === "requested").length,
-    refund_completed_count: rows.filter((row) => String(row.refund_status) === "succeeded").length,
+    invoice_count: invoiceRows.length,
+    paid_count: invoiceRows.filter((row) => String(row.invoice_status) === "paid").length,
+    settled_count: invoiceRows.filter((row) => String(row.invoice_status) === "settled" || !!row.settled_at).length,
+    manual_review_count: invoiceRows.filter((row) => String(row.invoice_status) === "review_required").length,
+    cancelled_count: invoiceRows.filter((row) => String(row.invoice_status) === "cancelled").length,
+    expired_count: invoiceRows.filter((row) => String(row.invoice_status) === "expired").length,
+    refund_requested_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "requested").length,
+    refund_completed_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "succeeded").length,
   };
   if (format === "csv") {
     res.setHeader("content-type", "text/csv; charset=utf-8");
-    return res.send(buildSettlementExportCsv(rows));
+    return res.send(buildSettlementExportCsv(invoiceRows));
   }
 
   return res.json({
@@ -12632,11 +14366,14 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
     period_start_utc: range.fromUtc,
     period_end_utc: range.toUtc,
     totals,
-    rows: rows.map((row) => ({
+    rows: legacyRows.detail_rows.map((row) => ({
       ...row,
       reason_code: normalizeReviewReasonCode(row.reason_code || REVIEW_REASON_CODES.OTHER),
       reason_label: reasonCodeLabelJa(row.reason_code || REVIEW_REASON_CODES.OTHER),
     })),
+    invoice_rows: invoiceRows,
+    refund_rows: legacyRows.refund_rows,
+    legacy_row_attribution: "invoice_primary_rows_are_used_for_totals_and_csv_refunds_are_aggregated_by_refund_request_id",
   });
 });
 
@@ -12658,6 +14395,11 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
   if (range.error) {
     return jsonError(res, 400, "VALIDATION_ERROR", "Invalid year_month for timezone", range.details || {});
   }
+  const integrityHeld = listIntegrityHeldInvoices(req.session.store_id, range);
+  if (integrityHeld.length > 0) {
+    const blocked = integrityHoldApiResult(integrityHeld, "monthly export");
+    return res.status(blocked.status).json(blocked.body);
+  }
 
   const rows = db
     .prepare(
@@ -12679,11 +14421,16 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
               i.updated_at,
               i.settled_at,
               r.reason_type AS reason_code,
+              r.id AS review_case_id,
               r.status AS review_status,
               r.block_timestamp,
               r.detected_at,
               r.audit_ref,
               rr.status AS refund_status,
+              rr.id AS refund_request_id,
+              rr.refund_case_id,
+              rr.review_case_id AS refund_review_case_id,
+              rr.refund_amount_jpyc_base,
               rr.refund_tx_hash,
               rr.verified_at AS refund_verified_at
        FROM invoices i
@@ -12695,21 +14442,24 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
     )
     .all(req.session.store_id, range.fromUtc, range.toUtc);
 
+  const legacyRows = normalizeLegacySettlementRows(rows);
+  const invoiceRows = legacyRows.invoice_rows;
+
   const totals = {
-    invoice_count: rows.length,
-    paid_count: rows.filter((row) => String(row.invoice_status) === "paid").length,
-    settled_count: rows.filter((row) => String(row.invoice_status) === "settled" || !!row.settled_at).length,
-    manual_review_count: rows.filter((row) => String(row.invoice_status) === "review_required").length,
-    cancelled_count: rows.filter((row) => String(row.invoice_status) === "cancelled").length,
-    expired_count: rows.filter((row) => String(row.invoice_status) === "expired").length,
-    refund_requested_count: rows.filter((row) => String(row.refund_status) === "requested").length,
-    refund_completed_count: rows.filter((row) => String(row.refund_status) === "succeeded").length,
+    invoice_count: invoiceRows.length,
+    paid_count: invoiceRows.filter((row) => String(row.invoice_status) === "paid").length,
+    settled_count: invoiceRows.filter((row) => String(row.invoice_status) === "settled" || !!row.settled_at).length,
+    manual_review_count: invoiceRows.filter((row) => String(row.invoice_status) === "review_required").length,
+    cancelled_count: invoiceRows.filter((row) => String(row.invoice_status) === "cancelled").length,
+    expired_count: invoiceRows.filter((row) => String(row.invoice_status) === "expired").length,
+    refund_requested_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "requested").length,
+    refund_completed_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "succeeded").length,
   };
 
   if (format === "csv") {
     res.setHeader("content-type", "text/csv; charset=utf-8");
     res.setHeader("content-disposition", `attachment; filename="settlement-monthly-${yearMonth}.csv"`);
-    return res.send(buildSettlementExportCsv(rows));
+    return res.send(buildSettlementExportCsv(invoiceRows));
   }
 
   return res.json({
@@ -12718,11 +14468,14 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
     period_start_utc: range.fromUtc,
     period_end_utc: range.toUtc,
     totals,
-    rows: rows.map((row) => ({
+    rows: legacyRows.detail_rows.map((row) => ({
       ...row,
       reason_code: normalizeReviewReasonCode(row.reason_code || REVIEW_REASON_CODES.OTHER),
       reason_label: reasonCodeLabelJa(row.reason_code || REVIEW_REASON_CODES.OTHER),
     })),
+    invoice_rows: invoiceRows,
+    refund_rows: legacyRows.refund_rows,
+    legacy_row_attribution: "invoice_primary_rows_are_used_for_totals_and_csv_refunds_are_aggregated_by_refund_request_id",
   });
 });
 
@@ -12748,6 +14501,8 @@ app.post("/api/v1/settlement-exports", requirePermission("settlement.export"), (
         body: { error: { code: "VALIDATION_ERROR", message: "Invalid business_date for timezone", details: range.details || {} } },
       };
     }
+    const integrityHeld = listIntegrityHeldInvoices(req.session.store_id, range);
+    if (integrityHeld.length > 0) return integrityHoldApiResult(integrityHeld, "settlement export");
 
     let result;
     try {
@@ -12933,6 +14688,10 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
   clientsByTerminal.set(terminalId, clients);
   logCorrelationEvent("sse.connected", invoice, {
     status: invoice.status,
+    monitor_until: invoice.monitor_until || null,
+    integrity_hold: Number(invoice.integrity_hold || 0) === 1,
+    integrity_hold_reason: invoice.integrity_hold_reason || null,
+    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
     status_version: invoice.updated_at,
     terminal_id: terminalId,
     store_id: invoice.store_id,
@@ -12958,14 +14717,52 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
       );
     }
   };
+  const buildStreamSnapshot = (row) => ({
+    invoiceId: row.id,
+    status: row.status,
+    status_reason: row.status_reason,
+    paid_tx_hash: row.paid_tx_hash,
+    monitor_until: row.monitor_until || null,
+    integrity_hold: Number(row.integrity_hold || 0) === 1,
+    integrity_hold_reason: row.integrity_hold_reason || null,
+    fulfillment_hold: Number(row.integrity_hold || 0) === 1 || row.status === "review_required",
+    status_version: row.updated_at || null,
+    last_event_id: req.header("last-event-id") || null,
+  });
+  let lastStreamSnapshot = JSON.stringify(buildStreamSnapshot(invoice));
+  const writeStreamSnapshotIfChanged = () => {
+    if (res.writableEnded) return;
+    try {
+      const latest = db
+        .prepare(
+          `SELECT id, status, status_reason, paid_tx_hash, monitor_until,
+                  integrity_hold, integrity_hold_reason, updated_at
+           FROM invoices
+           WHERE id = ? AND terminal_id = ?`
+        )
+        .get(invoiceId, terminalId);
+      if (!latest) return;
+      const payload = buildStreamSnapshot(latest);
+      const serialized = JSON.stringify(payload);
+      if (serialized === lastStreamSnapshot) return;
+      lastStreamSnapshot = serialized;
+      res.write(`event: invoice.updated\ndata: ${serialized}\n\n`);
+      res.write(`event: status_changed\ndata: ${serialized}\n\n`);
+    } catch (error) {
+      console.warn(
+        JSON.stringify({
+          ts: nowIso(),
+          level: "warn",
+          type: "sse.snapshot_refresh_failed",
+          terminal_id: terminalId,
+          invoice_id: invoiceId,
+          message: String(error.message || error),
+        })
+      );
+    }
+  };
   try {
-    const snapshotPayload = {
-      invoiceId: invoice.id,
-      status: invoice.status,
-      status_reason: invoice.status_reason,
-      paid_tx_hash: invoice.paid_tx_hash,
-      last_event_id: req.header("last-event-id") || null,
-    };
+    const snapshotPayload = buildStreamSnapshot(invoice);
     res.write(`event: snapshot\ndata: ${JSON.stringify(snapshotPayload)}\n\n`);
     res.write(`event: invoice.updated\ndata: ${JSON.stringify(snapshotPayload)}\n\n`);
   } catch (error) {
@@ -12973,9 +14770,15 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
   }
   writeHeartbeat();
   const heartbeatTimer = setInterval(writeHeartbeat, 30_000);
+  // chain-monitor is a separate process and updates SQLite directly. Poll the
+  // row while the stream is open so an integrity hold is pushed to the terminal
+  // without waiting for a user action or relying on the API process to emit an
+  // in-process event.
+  const snapshotTimer = setInterval(writeStreamSnapshotIfChanged, 2_000);
 
   const cleanup = () => {
     clearInterval(heartbeatTimer);
+    clearInterval(snapshotTimer);
     const set = clientsByTerminal.get(terminalId);
     if (!set) return;
     set.delete(client);
@@ -13038,9 +14841,10 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);
   const walletPayload = buildInvoiceWalletPayload(invoice, store);
   const providerSummary = buildProviderSummary(invoice);
+  const officialPaymentChain = getSupportedPaymentChain(invoice.chain_id);
   let policySnapshot = null;
   try {
-    policySnapshot = invoice.policy_snapshot_json ? JSON.parse(invoice.policy_snapshot_json) : buildPolicySnapshot(store);
+    policySnapshot = invoice.policy_snapshot_json ? JSON.parse(invoice.policy_snapshot_json) : null;
   } catch (_error) {
     policySnapshot = null;
   }
@@ -13053,6 +14857,10 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
     amount_jpyc: invoice.amount_jpyc,
     amount_jpyc_base: invoice.amount_jpyc_base,
     status: invoice.status,
+    monitor_until: invoice.monitor_until || null,
+    integrity_hold: Number(invoice.integrity_hold || 0) === 1,
+    integrity_hold_reason: invoice.integrity_hold_reason || null,
+    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
     status_version: invoice.updated_at,
     issued_at: invoice.created_at,
     created_at: invoice.created_at,
@@ -13063,8 +14871,9 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
     confirmed_at: paymentEvidenceTimestamps.confirmedAt,
     chain_recorded_at: paymentEvidenceTimestamps.chainRecordedAt,
     chain_id: invoice.chain_id,
-    native_symbol: getSupportedPaymentChain(invoice.chain_id)?.native_symbol || null,
+    native_symbol: officialPaymentChain?.native_symbol || null,
     token_contract: invoice.token_contract,
+    official_token_contract: officialPaymentChain?.token_contract || null,
     recipient_address: invoice.recipient_address,
     store_name: store?.name || "JPYC Store",
     policy_urls: policySnapshot?.urls || null,
@@ -13169,12 +14978,28 @@ app.post("/api/v1/public/invoices/:invoiceId/consent", (req, res) => {
   } catch (_error) {
     policySnapshot = null;
   }
-  const policyGate = policySnapshot ? evaluatePolicySnapshot(policySnapshot) : evaluatePolicyUrlsGate({ store });
+  const policyGate = policySnapshot
+    ? evaluatePolicySnapshot(policySnapshot)
+    : {
+        ok: false,
+        values: {},
+        versions: {},
+        hashes: {},
+        missing_keys: ["terms", "privacy", "refund"],
+        missing_version_keys: ["terms_version", "privacy_version", "refund_policy_version"],
+        missing_hash_keys: ["terms_hash", "privacy_hash", "refund_policy_hash"],
+        content_verification_ok: false,
+        snapshot_missing: true,
+      };
   if (!policyGate.ok) {
     return jsonError(res, 503, "POLICY_CONFIGURATION_NOT_READY", "Published customer policy configuration is not ready", {
       missing_keys: policyGate.missing_keys,
       missing_version_keys: policyGate.missing_version_keys,
       missing_hash_keys: policyGate.missing_hash_keys,
+      content_verification_ok: policyGate.content_verification_ok
+        ?? policyGate.content_verification?.ok
+        ?? false,
+      snapshot_missing: policyGate.snapshot_missing === true,
     });
   }
   const body = req.body || {};

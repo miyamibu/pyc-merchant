@@ -7,12 +7,19 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/jpyc-payment-terminal
-ExecStart=/usr/bin/env docker compose --project-name jpyc-terminal -f docker-compose.prod.yml up --build --remove-orphans
-ExecStop=/usr/bin/env docker compose --project-name jpyc-terminal -f docker-compose.prod.yml down
-ExecReload=/usr/bin/env docker compose --project-name jpyc-terminal -f docker-compose.prod.yml --profile multi-chain restart app worker worker-ethereum worker-avalanche nginx
+ExecStartPre=/usr/bin/env bash scripts/deploy/preflight.sh .env.production
+ExecStartPre=/usr/bin/env docker compose --env-file .env.production --project-name jpyc-terminal -f docker-compose.prod.yml config --quiet
+ExecStartPre=/usr/bin/env docker compose --env-file .env.production --project-name jpyc-terminal -f docker-compose.prod.yml pull app worker nginx
+ExecStartPre=/usr/bin/env node scripts/deploy/verify-release-image.mjs --env-file .env.production
+ExecStart=/usr/bin/env docker compose --env-file .env.production --project-name jpyc-terminal -f docker-compose.prod.yml up --no-build --pull never --remove-orphans
+ExecStop=/usr/bin/env docker compose --env-file .env.production --project-name jpyc-terminal -f docker-compose.prod.yml down
+ExecReload=/usr/bin/env docker compose --env-file .env.production --project-name jpyc-terminal -f docker-compose.prod.yml pull app worker nginx
+ExecReload=/usr/bin/env node scripts/deploy/verify-release-image.mjs --env-file .env.production
+ExecReload=/usr/bin/env docker compose --env-file .env.production --project-name jpyc-terminal -f docker-compose.prod.yml up -d --no-build --pull never --force-recreate app worker nginx
 Restart=always
 RestartSec=10
-TimeoutStartSec=0
+TimeoutStartSec=300
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

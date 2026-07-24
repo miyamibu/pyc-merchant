@@ -1,10 +1,27 @@
 import { mkdtempSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { randomInt } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
 let portCounter = 0;
+
+const PRODUCTION_WALLET_TEMPLATE = "wallet://pay?uri={{payment_uri_encoded}}";
+const PRODUCTION_WALLET_REGISTRY = JSON.stringify([{
+  adapter_id: "hashport-jpyc-test-v1",
+  wallet_name: "HashPort Wallet",
+  allowed_scheme: "wallet",
+  allowed_https_hosts: [],
+  template: PRODUCTION_WALLET_TEMPLATE,
+  template_sha256: createHash("sha256").update(PRODUCTION_WALLET_TEMPLATE, "utf8").digest("hex"),
+  approved_at: "2026-07-25T00:00:00.000Z",
+  approval_ref: "WALLET-TEST-2026-001",
+  tested_ios_versions: ["18.5"],
+  tested_android_versions: [],
+  tested_wallet_versions: ["1.0.0"],
+  revoked_at: null,
+}]);
 
 function randomPort() {
   portCounter = (portCounter + 1) % 50_000;
@@ -60,6 +77,11 @@ export function productionServerEnv(overrides = {}) {
     CHAIN_ID: "137",
     TOKEN_CONTRACT: tokenContract,
     APPROVED_JPYC_TOKEN_CONTRACT: tokenContract,
+    // Non-secret test pins keep production startup on the intended metadata gate.
+    // They are deliberately synthetic and are never used as production approval values.
+    APPROVED_TOKEN_NAME: "JPYC",
+    APPROVED_TOKEN_CODE_HASH: `0x${"1".repeat(64)}`,
+    APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH: `0x${"2".repeat(64)}`,
     JPYC_CONTRACT_APPROVAL_REF: "CAB-2026-001",
     LEGAL_GATE_APPROVAL_REF: "LEGAL-2026-001",
     AML_POLICY_APPROVAL_REF: "AML-2026-001",
@@ -74,7 +96,7 @@ export function productionServerEnv(overrides = {}) {
     REFUND_TREASURY_ADDRESS: "0xdddddddddddddddddddddddddddddddddddddddd",
     REFUND_TREASURY_APPROVAL_REF: "TREASURY-2026-001",
     RECIPIENT_ADDRESS: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    TOKEN_DECIMALS: "6",
+    TOKEN_DECIMALS: "18",
     JPYC_BASE_UNIT_SCALE: "1000000",
     REQUIRED_CONFIRMATIONS: "2",
     MIN_REQUIRED_CONFIRMATIONS: "2",
@@ -82,7 +104,8 @@ export function productionServerEnv(overrides = {}) {
     MIN_MONITOR_BACKSCAN_BLOCKS: "12",
     ENABLE_PUBLIC_PAYMENT_SIMULATION: "false",
     WALLET_ADAPTER_TYPE: "wallet_deeplink",
-    WALLET_DEEPLINK_TEMPLATE: "wallet://pay?uri={{payment_uri_encoded}}",
+    WALLET_DEEPLINK_TEMPLATE: PRODUCTION_WALLET_TEMPLATE,
+    WALLET_ADAPTER_REGISTRY_JSON: PRODUCTION_WALLET_REGISTRY,
     CHECKOUT_SESSION_IMPLEMENTED: "true",
     STAFF_PIN: "2468",
     TERMINAL_CODE: "TERM-900",
@@ -208,13 +231,17 @@ export async function getInvoice(baseUrl, token, invoiceId) {
 }
 
 export async function ingestManualPayment(baseUrl, token, payload, idem = `pay-${Date.now()}`) {
+  const eventPayload = {
+    canonical_status: "canonical",
+    ...payload,
+  };
   return apiRequest(baseUrl, "/api/v1/payments/events:ingest", {
     method: "POST",
     headers: authHeaders(token, {
       "content-type": "application/json",
       "idempotency-key": idem,
     }),
-    body: JSON.stringify(payload),
+    body: JSON.stringify(eventPayload),
   });
 }
 

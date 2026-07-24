@@ -42,6 +42,27 @@ test("protected path recursive delete is detected", () => {
   assert.ok(result.findings.some((finding) => finding.ruleId === "shell.protected-path-delete"));
 });
 
+test("unclassified SQL deletes fail closed", () => {
+  const rootDir = tempWorkspace();
+  writeFile(rootDir, "src/unknown-cleanup.mjs", `db.prepare(\`${joinParts("DELETE", "FROM", "unknown_cache")} WHERE id = ?\`).run(id);\n`);
+
+  const result = scanWorkspace(rootDir);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].ruleId, "sql.delete.unclassified-table");
+});
+
+test("isolated dead-letter test fixture cleanup remains allowed only under tests", () => {
+  const rootDir = tempWorkspace();
+  const statement = `db.prepare(\`${joinParts("DELETE", "FROM", "chain_dead_letters")}\`).run();\n`;
+  writeFile(rootDir, "tests/fixture-cleanup.test.mjs", statement);
+  writeFile(rootDir, "src/runtime-cleanup.mjs", statement);
+
+  const result = scanWorkspace(rootDir);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].file, "src/runtime-cleanup.mjs");
+  assert.equal(result.findings[0].ruleId, "sql.delete.unclassified-table");
+});
+
 test("destructive SQL schema drops are detected", () => {
   const rootDir = tempWorkspace();
   writeFile(rootDir, "migrations/001-danger.sql", `${joinParts("DROP", "TABLE", "audit_logs")};\n`);
