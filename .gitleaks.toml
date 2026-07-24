@@ -4,7 +4,7 @@ title = "JPYC payment terminal gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Ignore local-only protected data that is excluded from GitHub publication."
+description = "Ignore local-only protected data and exact known-public JPYC release identifiers."
 paths = [
   '''^data/''',
   '''^runtime/''',
@@ -18,4 +18,11 @@ paths = [
   '''(^|/)\.DS_Store$''',
   '''.*\.(db|sqlite|sqlite3)(-(wal|shm))?$''',
   '''.*\.(log|tmp)$''',
+]
+regexes = [
+  # Public JPYC contract addresses documented in official/release material.
+  '''0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29''',
+  '''0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB''',
+  # Public SHA-256 fingerprint for docs/21-chain-and-token-spec.md.
+  '''adb31b0716b913271d76c7b7e9b18a84cda1abf17a4c9f06504df588b85f107f''',
 ]
