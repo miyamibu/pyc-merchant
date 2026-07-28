@@ -182,9 +182,32 @@ test("backend P0 safety guards preserve audit secrecy, refund balance, and publi
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
-  const refundExport = await apiRequest(started.baseUrl, "/api/v1/settlement-exports", {
+  const blockedRefundExport = await apiRequest(started.baseUrl, "/api/v1/settlement-exports", {
     method: "POST",
     headers: jsonHeaders(adminToken, `refund-export-${Date.now()}`),
+    body: JSON.stringify({ business_date: businessDateJst, format: "json" }),
+  });
+  assert.equal(blockedRefundExport.status, 409);
+  assert.equal(blockedRefundExport.data.error.code, "SETTLEMENT_HARD_GATE_BLOCKED");
+
+  const resolvedReview = await apiRequest(
+    started.baseUrl,
+    `/api/v1/reviews/${encodeURIComponent(review.id)}`,
+    {
+      method: "PATCH",
+      headers: jsonHeaders(adminToken, `review-resolve-${Date.now()}`),
+      body: JSON.stringify({
+        status: "resolved",
+        disposition: "cancelled_no_sale",
+        resolution_note: "focused public invoice fixture",
+      }),
+    }
+  );
+  assert.equal(resolvedReview.status, 200);
+
+  const refundExport = await apiRequest(started.baseUrl, "/api/v1/settlement-exports", {
+    method: "POST",
+    headers: jsonHeaders(adminToken, `refund-export-after-review-${Date.now()}`),
     body: JSON.stringify({ business_date: businessDateJst, format: "json" }),
   });
   assert.equal(refundExport.status, 201);
@@ -211,17 +234,6 @@ test("backend P0 safety guards preserve audit secrecy, refund balance, and publi
   const downloadHash = createHash("sha256").update(downloadText).digest("hex");
   assert.equal(download.headers.get("x-content-sha256"), downloadHash);
   assert.equal(refundExport.data.content_hashes.json, downloadHash);
-
-  const resolvedReview = await apiRequest(
-    started.baseUrl,
-    `/api/v1/reviews/${encodeURIComponent(review.id)}`,
-    {
-      method: "PATCH",
-      headers: jsonHeaders(adminToken, `review-resolve-${Date.now()}`),
-      body: JSON.stringify({ status: "resolved", resolution_note: "focused public invoice fixture" }),
-    }
-  );
-  assert.equal(resolvedReview.status, 200);
 
   const publicInvoice = await createInvoice(started.baseUrl, adminToken, 777, `public-state-invoice-${Date.now()}`);
   assert.equal(publicInvoice.status, 201);

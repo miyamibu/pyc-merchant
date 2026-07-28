@@ -75,6 +75,7 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
     APP_PORT: String(port),
     APP_HOST: `http://127.0.0.1:${port}`,
     DB_PATH: dbPath,
+    WORKER_STATE_DB_PATH: path.join(tmp, "worker-state.db"),
     APP_SECRET: "s".repeat(48),
     SERVICE_INGEST_SECRET: "t".repeat(48),
     METRICS_SECRET: "u".repeat(48),
@@ -82,7 +83,10 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
     TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
     RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
     TOKEN_DECIMALS: "18",
+    LEDGER_DECIMALS: "6",
+    LEDGER_BASE_UNIT_SCALE: "1000000",
     JPYC_BASE_UNIT_SCALE: "1000000",
+    RECEIVE_ADDRESS_DEV_AUTO_VERIFY: "true",
     REQUIRED_CONFIRMATIONS: "2",
     MIN_REQUIRED_CONFIRMATIONS: "2",
     STAFF_PIN: "1234",
@@ -144,8 +148,8 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
 
         db.prepare(
           `INSERT INTO payment_events
-          (id, invoice_id, event_type, chain_id, tx_hash, log_index, block_number, confirmations, from_address, to_address, token_contract, amount_jpyc, amount_jpyc_base, observed_at, raw_payload, created_at)
-          VALUES (?, ?, 'tx_detected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (id, invoice_id, event_type, chain_id, tx_hash, log_index, block_number, confirmations, from_address, to_address, token_contract, amount_jpyc, amount_jpyc_base, observed_at, block_timestamp, raw_payload, created_at)
+          VALUES (?, ?, 'tx_detected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           `evt-${Date.now()}`,
           create1.data.invoice_id,
@@ -160,6 +164,7 @@ test("SR-03 expiry sweeper auto-expires stale invoices and audits changes", asyn
           1000,
           "1000000000",
           new Date().toISOString(),
+          "2020-01-02T00:00:00.000Z",
           JSON.stringify({ synthetic: true }),
           new Date().toISOString()
         );

@@ -64,6 +64,24 @@ test("review API and settlement CSV expose canonical reason_code", async (t) => 
   assert.equal(reviews.status, 200);
   assert.ok(Array.isArray(reviews.data.reviews));
   assert.ok(reviews.data.reviews.some((row) => row.reason_code === "OVERPAYMENT"));
+  const review = reviews.data.reviews.find((row) => row.reason_code === "OVERPAYMENT");
+  const resolved = await apiRequest(
+    started.baseUrl,
+    `/api/v1/reviews/${encodeURIComponent(review.id)}`,
+    {
+      method: "PATCH",
+      headers: authHeaders(admin.token, {
+        "content-type": "application/json",
+        "idempotency-key": `reason-code-resolve-${Date.now()}`,
+      }),
+      body: JSON.stringify({
+        status: "resolved",
+        disposition: "cancelled_no_sale",
+        resolution_note: "reason code export fixture resolved",
+      }),
+    },
+  );
+  assert.equal(resolved.status, 200);
 
   const businessDateJst = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 

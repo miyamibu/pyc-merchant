@@ -21,7 +21,8 @@ Extend the immutable settlement export with complete refund lineage and reproduc
 - Invalid or non-safe-integer refund base-unit values stop refund creation and export creation with `REFUND_LEDGER_INTEGRITY_ERROR`.
 - Rows are hashed and downloaded in the persisted deterministic order: invoice, payment session, rail, provider, then row ID.
 - Each new v2 row additively freezes the v1 40-field traceability set. The v2 refund manifest and totals remain authoritative for invoice-scoped refund aggregation.
-- Each new v2 row includes `accounting_event_refs`, the immutable IDs of payment-confirmed and refund-succeeded journal entries recognized on the export business date. A next-day refund therefore appears as an occurrence-date adjustment with a reference back to the original invoice.
+- Each new v2 row also freezes `amount_scale_version`, token/ledger decimals, the exact token atomic string, the ledger base-unit string, and the display amount. Accounting adapters must use `ledger_amount_base`; they must not derive it from JavaScript numbers or from the token atomic field.
+- Each new v2 row includes `accounting_event_refs`, the immutable IDs of payment-confirmed, refund-succeeded, and approved human-accounting-adjustment journal entries recognized for the invoice. A later adjustment therefore remains traceable through the original invoice without rewriting its payment state.
 - `settlement_export_rows.payload_json` stores the generated row payload. A later download reads this frozen payload rather than joining mutable operational tables.
 - Chain identity is explicit: `chain_id`, network, official funds-transfer JPYC contract, and recipient address are part of every new row.
 - JSON hashes cover the exact UTF-8 bytes of the canonical v2 payload and exclude self-referential content-hash fields and internal storage annotations.

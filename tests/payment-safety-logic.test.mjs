@@ -68,8 +68,8 @@ test("qualifyTransfer never treats a non-exact token conversion as eligible", ()
 
   assert.equal(result.eligible, false);
   assert.equal(result.checks.amountConversionExact, false);
-  assert.equal(result.reasonType, "CHAIN_INCONSISTENT");
-  assert.equal(result.reasonLabel, "non_exact_decimal_conversion");
+  assert.equal(result.reasonType, "LEDGER_INTEGRITY_ERROR");
+  assert.equal(result.reasonLabel, "LEDGER_INTEGRITY_ERROR");
   assert.equal(summarizeEligibleTransfers(baseInvoice, [transfer({
     amount_conversion_exact: false,
     amount_conversion_error: "non_exact_decimal_conversion",
@@ -103,6 +103,46 @@ test("qualifyTransfer accepts an explicit canonical block hash match and rejects
   assert.equal(missingEventHash.reasonLabel, "canonicality_unverified");
 });
 
+test("transfer identity is only normalized_chain_id:lowercase_tx_hash:normalized_log_index", () => {
+  const result = summarizeEligibleTransfers(baseInvoice, [
+    transfer({
+      id: "provider-a-event",
+      source: "provider-a",
+      chain_id: "0137",
+      tx_hash: "0xABC",
+      log_index: "00",
+    }),
+    transfer({
+      id: "provider-b-event",
+      source: "provider-b",
+      chain_id: "137",
+      tx_hash: "0xabc",
+      log_index: 0,
+    }),
+  ]);
+
+  assert.equal(result.qualifications[0].identity, "137:0xabc:0");
+  assert.equal(result.distinctTransferCount, 1);
+  assert.equal(result.observationCount, 2);
+  assert.equal(result.duplicateObservationCount, 1);
+  assert.equal(result.transferCount, 1);
+});
+
+test("missing identity fields hold instead of falling back to event.id or array position", () => {
+  for (const field of ["chain_id", "tx_hash", "log_index"]) {
+    const event = transfer({ id: `event-only-${field}` });
+    delete event[field];
+
+    const decision = decideQualifiedPaymentStatus(baseInvoice, [event]);
+
+    assert.equal(decision.nextStatus, "review_required", field);
+    assert.equal(decision.reasonType, "CHAIN_TRANSFER_IDENTITY_INCOMPLETE", field);
+    assert.equal(decision.reasonLabel, "CHAIN_TRANSFER_IDENTITY_INCOMPLETE", field);
+    assert.equal(decision.transferCount, 0, field);
+    assert.equal(decision.identityIncompleteObservationCount, 1, field);
+  }
+});
+
 test("qualifyTransfer reports mismatched transfer identity fields", () => {
   const wrongChain = qualifyTransfer(baseInvoice, transfer({ chain_id: "1" }));
   const wrongToken = qualifyTransfer(baseInvoice, transfer({ token_contract: "0xother" }));
@@ -129,6 +169,22 @@ test("qualifyTransfer uses each transfer block timestamp, never observed_at, for
   assert.equal(late.eligible, false);
   assert.equal(late.reasonLabel, "late_arrival_after_expiry");
   assert.equal(boundary.eligible, true);
+});
+
+test("missing block timestamp is TIMESTAMP_UNVERIFIED even when observed_at is before expiry", () => {
+  const result = qualifyTransfer(baseInvoice, transfer({
+    block_timestamp: undefined,
+    observed_at: "2026-07-25T11:00:00.000Z",
+  }));
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.checks.blockTimestampValid, false);
+  assert.equal(result.reasonType, "TIMESTAMP_UNVERIFIED");
+  assert.equal(result.reasonLabel, "TIMESTAMP_UNVERIFIED");
+  assert.equal(decideQualifiedPaymentStatus(baseInvoice, [transfer({
+    block_timestamp: undefined,
+    observed_at: "2026-07-25T11:00:00.000Z",
+  })]).reasonType, "TIMESTAMP_UNVERIFIED");
 });
 
 test("qualifyTransfer can recognize an in-expiry transfer after invoice expiry", () => {
@@ -198,6 +254,111 @@ test("decideQualifiedPaymentStatus routes mixed eligibility transfers to split r
   assert.equal(decision.eligibleTotalAmountBase, "700");
   assert.equal(decision.nextStatus, "review_required");
   assert.equal(decision.reasonType, "SPLIT_PAYMENT");
+});
+
+test("legacy auto-split option cannot bypass the unpaid multi-candidate hold", () => {
+  const autoSplitCompatibleLogic = makePaymentLogic({
+    jpycBaseUnitScale: 1,
+    requiredConfirmations: 2,
+    enableAutoSplitPayment: true,
+  });
+  const decision = autoSplitCompatibleLogic.decideQualifiedPaymentStatus(baseInvoice, [
+    transfer({ tx_hash: "0xsplit-a", log_index: 0, amount_jpyc_base: "300" }),
+    transfer({ tx_hash: "0xsplit-b", log_index: 1, amount_jpyc_base: "700" }),
+  ]);
+
+  assert.equal(decision.nextStatus, "review_required");
+  assert.equal(decision.reasonType, "SPLIT_PAYMENT");
+});
+
+test("wrong token, recipient, noncanonical, and provider observations do not inflate duplicate count", () => {
+  const paidInvoice = {
+    ...baseInvoice,
+    status: "paid",
+    paid_chain_id: "137",
+    paid_tx_hash: "0xprimary",
+    paid_log_index: 0,
+  };
+  const decision = decideQualifiedPaymentStatus(paidInvoice, [
+    transfer({ id: "primary", tx_hash: "0xprimary", log_index: 0 }),
+    transfer({
+      id: "wrong-token",
+      tx_hash: "0xwrong-token",
+      log_index: 1,
+      token_contract: "0xother",
+    }),
+    transfer({
+      id: "wrong-recipient",
+      tx_hash: "0xwrong-recipient",
+      log_index: 2,
+      to_address: "0xother",
+    }),
+    transfer({
+      id: "noncanonical",
+      tx_hash: "0xnoncanonical",
+      log_index: 3,
+      canonical_status: "noncanonical",
+    }),
+    transfer({
+      id: "provider-b",
+      source: "provider-b",
+      tx_hash: "0xPRIMARY",
+      log_index: "00",
+    }),
+  ]);
+
+  assert.equal(decision.nextStatus, "paid");
+  assert.equal(decision.reasonType, null);
+  assert.equal(decision.distinctTransferCount, 4);
+  assert.equal(decision.observationCount, 5);
+  assert.equal(decision.duplicateObservationCount, 1);
+  assert.equal(decision.candidateTransferCount, 1);
+  assert.equal(decision.multipleTransfers, false);
+});
+
+test("a distinct transfer after the recognized primary is DUPLICATE_PAYMENT", () => {
+  const paidInvoice = {
+    ...baseInvoice,
+    status: "paid",
+    paid_chain_id: "137",
+    paid_tx_hash: "0xprimary",
+    paid_log_index: 0,
+  };
+  const decision = decideQualifiedPaymentStatus(paidInvoice, [
+    transfer({ tx_hash: "0xprimary", log_index: 0 }),
+    transfer({ tx_hash: "0xsecondary", log_index: 1 }),
+  ]);
+
+  assert.equal(decision.nextStatus, "review_required");
+  assert.equal(decision.reasonType, "DUPLICATE_PAYMENT");
+  assert.equal(decision.candidateTransferCount, 2);
+});
+
+test("amount parse and token conversion failures are ledger holds, never zero recognition", () => {
+  const malformed = decideQualifiedPaymentStatus(baseInvoice, [
+    transfer({ amount_jpyc_base: "not-an-integer" }),
+  ]);
+  assert.equal(malformed.nextStatus, "review_required");
+  assert.equal(malformed.reasonType, "LEDGER_INTEGRITY_ERROR");
+  assert.equal(malformed.reasonLabel, "LEDGER_INTEGRITY_ERROR");
+  assert.equal(malformed.eligibleTotalAmountBase, "0");
+
+  const atomicLogic = makePaymentLogic({
+    ledgerDecimals: 6,
+    tokenDecimals: 18,
+    requiredConfirmations: 2,
+  });
+  const nonExact = atomicLogic.decideQualifiedPaymentStatus(
+    { ...baseInvoice, amount_jpyc_base: "1000" },
+    [transfer({
+      amount_jpyc_base: undefined,
+      amount_jpyc: undefined,
+      token_amount_atomic: "1000000000000001",
+    })]
+  );
+  assert.equal(nonExact.nextStatus, "review_required");
+  assert.equal(nonExact.reasonType, "LEDGER_INTEGRITY_ERROR");
+  assert.equal(nonExact.reasonLabel, "LEDGER_INTEGRITY_ERROR");
 });
 
 test("decideQualifiedPaymentStatus pays only one exact eligible transfer", () => {

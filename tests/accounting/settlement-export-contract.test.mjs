@@ -111,6 +111,17 @@ test("Settlement Export Contract v2 pins invoice-scoped refund manifest and prim
     assert.ok(schema.$defs.row.properties[field], `${field} must be defined in v2 rows`);
   }
   assert.ok(schema.$defs.row.required.includes("accounting_event_refs"));
+  for (const amountField of [
+    "amount_scale_version",
+    "token_decimals",
+    "ledger_decimals",
+    "token_amount_atomic",
+    "ledger_amount_base",
+    "display_amount",
+  ]) {
+    assert.ok(schema.$defs.row.required.includes(amountField), `${amountField} must be frozen in v2 rows`);
+    assert.ok(schema.$defs.row.properties[amountField], `${amountField} must be defined in v2 rows`);
+  }
   assert.deepEqual(schema.$defs.row.properties.accounting_event_refs, {
     type: "array",
     items: { type: "string", minLength: 1 },
@@ -177,6 +188,7 @@ test("settlement export docs state provider accepted/captured is not paid", () =
   assert.match(v2ContractDoc, /Every refund case linked to an invoice is frozen once in the top-level `refund_manifest`/);
   assert.match(v2ContractDoc, /`failed` and `verification_failed` remain reserved/);
   assert.match(v2ContractDoc, /legacy_export_missing/);
+  assert.match(v2ContractDoc, /approved human-accounting-adjustment journal entries/);
 });
 
 test("settlement export HTTP contract separates read-only GET from snapshot POST", () => {
@@ -197,6 +209,7 @@ test("settlement export HTTP contract separates read-only GET from snapshot POST
   assert.match(serverSource, /refund_references_json/);
   assert.match(serverSource, /accounting_event_refs_json/);
   assert.match(serverSource, /accounting_event_journal/);
+  assert.match(serverSource, /eventType: "accounting_adjustment"/);
   assert.match(serverSource, /legacy_refund_references_json/);
   assert.match(serverSource, /ACTIVE_INVOICES_BLOCK_CLOSE/);
   assert.match(serverSource, /settlement_id = \? AND store_id = \?/);

@@ -21,6 +21,7 @@ jobs:
       SERVICE_INGEST_SECRET: "ci-ingest-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       DB_PATH: "./data/ci.db"
+      WORKER_STATE_DB_PATH: "./runtime/worker-state/chain-137.db"
       # Syntax-only digest fixtures for production compose validation. They are
       # never published or accepted as production release identities.
       APP_IMAGE_REF: "registry.invalid/jpyc-terminal@sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -67,7 +68,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24.17.0
+          node-version-file: .node-version
           cache: npm
 
       - name: Install
@@ -109,7 +110,22 @@ jobs:
 
       - name: Smoke
         run: |
+          set -euo pipefail
           mkdir -p /tmp/jpyc-ci
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/jpyc-smoke.XXXXXX")"
+          mkdir -p "${SMOKE_ROOT}/backups"
+          export SMOKE_RUNTIME_DIR="${SMOKE_ROOT}"
+          export DB_PATH="${SMOKE_ROOT}/app.db"
+          export WORKER_STATE_DB_PATH="${SMOKE_ROOT}/worker-state.db"
+          export BACKUP_DIR="${SMOKE_ROOT}/backups"
+          export RECEIVE_ADDRESS_DEV_AUTO_VERIFY="true"
+          {
+            echo "SMOKE_RUNTIME_DIR=${SMOKE_RUNTIME_DIR}"
+            echo "DB_PATH=${DB_PATH}"
+            echo "WORKER_STATE_DB_PATH=${WORKER_STATE_DB_PATH}"
+            echo "BACKUP_DIR=${BACKUP_DIR}"
+          } >> "${GITHUB_ENV}"
+          # SQLite creates the per-smoke -wal and -shm files beside this DB.
           MAX_ACTIVE_INVOICES_PER_RECIPIENT=50 node src/server.mjs > /tmp/jpyc-ci/server.log 2>&1 &
           SERVER_PID=$!
           trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true' EXIT
@@ -140,12 +156,6 @@ jobs:
           mkdir -p /tmp/jpyc-ci
           IMAGE_TAG="jpyc-terminal-production:ci-${GITHUB_SHA}"
           docker build --build-arg "SOURCE_COMMIT=${GITHUB_SHA}" . --tag "${IMAGE_TAG}"
-          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE_TAG}")"
-          jq -n \
-            --arg source_sha "${GITHUB_SHA}" \
-            --arg local_image_id "${IMAGE_ID}" \
-            '{source_sha: $source_sha, local_image_id: $local_image_id, registry_digest: null, production_release_eligible: false}' \
-            > /tmp/jpyc-ci/build-metadata.json
 
       - name: Verify image source label
         run: |
@@ -154,6 +164,19 @@ jobs:
 
       - name: Docker compose config
         run: docker compose --env-file .env.production -f docker-compose.prod.yml config
+
+      # This CI-only release-input metadata is generated only after every
+      # required validation and image/compose check above has succeeded.
+      - name: Generate CI build metadata after required checks
+        if: success()
+        run: |
+          IMAGE_TAG="jpyc-terminal-production:ci-${GITHUB_SHA}"
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE_TAG}")"
+          jq -n \
+            --arg source_sha "${GITHUB_SHA}" \
+            --arg local_image_id "${IMAGE_ID}" \
+            '{source_sha: $source_sha, local_image_id: $local_image_id, registry_digest: null, production_release_eligible: false}' \
+            > /tmp/jpyc-ci/build-metadata.json
 
       - name: Upload CI build metadata
         uses: actions/upload-artifact@v4
@@ -175,6 +198,7 @@ jobs:
       SERVICE_INGEST_SECRET: "ci-ingest-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       METRICS_SECRET: "ci-metrics-secret-1234567890abcdefghijklmnopqrstuvwxyz"
       DB_PATH: "./docs/production/evidence/ci-validation.db"
+      WORKER_STATE_DB_PATH: "./docs/production/evidence/ci-worker-state.db"
       BACKUP_DIR: "./docs/production/evidence/ci-backups"
       APP_IMAGE_REF: "registry.invalid/jpyc-terminal@sha256:1111111111111111111111111111111111111111111111111111111111111111"
       NGINX_IMAGE_REF: "registry.invalid/nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -219,7 +243,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24.17.0
+          node-version-file: .node-version
           cache: npm
 
       - name: Install

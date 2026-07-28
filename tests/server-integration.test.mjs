@@ -215,7 +215,7 @@ test("server security integration flows", async (t) => {
     assert.equal(expireFourth.status, 200);
   });
 
-  await t.test("SR-11 settlement reports unresolved reviews and does not settle review_required invoices", async () => {
+  await t.test("SR-11 settlement hard gate blocks unresolved reviews without settling invoices", async () => {
     const paidInvoice = await createInvoice(started.baseUrl, admin.token, 1400, `inv-paid-${Date.now()}`);
     assert.equal(paidInvoice.status, 201);
     const paidIngest = await ingestManualPayment(
@@ -272,15 +272,13 @@ test("server security integration flows", async (t) => {
       }),
       body: JSON.stringify({ business_date: businessDateJst, admin_approval: true }),
     });
-    assert.equal(closeRes.status, 200);
-    assert.equal(closeRes.data.warning, "UNRESOLVED_REVIEWS");
-    assert.ok(Number(closeRes.data.review_count) >= 1);
-    assert.ok(Array.isArray(closeRes.data.review_invoice_ids));
-    assert.ok(closeRes.data.review_invoice_ids.includes(reviewInvoice.data.invoice_id));
+    assert.equal(closeRes.status, 409);
+    assert.equal(closeRes.data.error.code, "SETTLEMENT_HARD_GATE_BLOCKED");
+    assert.ok(closeRes.data.error.details.blockers.some((blocker) => blocker.code === "OPEN_REVIEW_INCIDENTS"));
 
     const paidRow = db.prepare(`SELECT settled_at FROM invoices WHERE id = ?`).get(paidInvoice.data.invoice_id);
     const reviewRow = db.prepare(`SELECT settled_at FROM invoices WHERE id = ?`).get(reviewInvoice.data.invoice_id);
-    assert.ok(paidRow.settled_at);
+    assert.equal(paidRow.settled_at, null);
     assert.equal(reviewRow.settled_at, null);
 
     const reviewInvoiceDetail = await getInvoice(started.baseUrl, admin.token, reviewInvoice.data.invoice_id);
@@ -523,6 +521,7 @@ test("server security integration flows", async (t) => {
         }),
         body: JSON.stringify({
           status: "resolved",
+          disposition: "cancelled_no_sale",
           resolution_note: "unlock recipient for duplicate tx hash test",
         }),
       }

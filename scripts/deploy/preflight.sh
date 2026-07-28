@@ -32,6 +32,7 @@ required_keys=(
   APP_PORT
   APP_HOST
   DB_PATH
+  WORKER_STATE_DB_PATH
   APP_SECRET
   SERVICE_INGEST_SECRET
   METRICS_SECRET
@@ -40,7 +41,8 @@ required_keys=(
   TOKEN_SYMBOL
   RECIPIENT_ADDRESS
   TOKEN_DECIMALS
-  JPYC_BASE_UNIT_SCALE
+  LEDGER_DECIMALS
+  LEDGER_BASE_UNIT_SCALE
   APPROVED_JPYC_TOKEN_CONTRACT
   JPYC_CONTRACT_APPROVAL_REF
   REQUIRED_CONFIRMATIONS
@@ -88,7 +90,13 @@ if [[ "${#missing[@]}" -gt 0 ]]; then
 fi
 
 if [[ "$ALLOW_EMPTY" != "--allow-empty" ]]; then
-  mkdir -p "$(dirname "${DB_PATH:-./runtime/data/app.db}")" "${BACKUP_DIR:-./runtime/backups}" ./runtime/logs
+  financial_db_resolved="$(cd "$(dirname "$DB_PATH")" && pwd)/$(basename "$DB_PATH")"
+  worker_state_db_resolved="$(cd "$(dirname "$WORKER_STATE_DB_PATH")" && pwd)/$(basename "$WORKER_STATE_DB_PATH")"
+  if [[ "$financial_db_resolved" == "$worker_state_db_resolved" ]]; then
+    echo "preflight failed: WORKER_STATE_DB_PATH must differ from DB_PATH" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$DB_PATH")" "$(dirname "$WORKER_STATE_DB_PATH")" "${BACKUP_DIR:-./runtime/backups}" ./runtime/logs
 fi
 node --check src/server.mjs >/dev/null
 node --check src/chain-monitor.mjs >/dev/null

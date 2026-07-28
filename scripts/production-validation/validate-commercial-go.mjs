@@ -419,7 +419,11 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const tokenContract = String(env.TOKEN_CONTRACT || "").trim().toLowerCase();
   const approvedTokenContract = String(env.APPROVED_JPYC_TOKEN_CONTRACT || "").trim().toLowerCase();
   const tokenDecimals = Number(env.TOKEN_DECIMALS || NaN);
-  const scaleDecimals = parseScaleDecimals(env.JPYC_BASE_UNIT_SCALE);
+  const ledgerBaseUnitScale = env.LEDGER_BASE_UNIT_SCALE || env.JPYC_BASE_UNIT_SCALE;
+  const scaleDecimals = parseScaleDecimals(ledgerBaseUnitScale);
+  const configuredLedgerDecimals = env.LEDGER_DECIMALS == null || String(env.LEDGER_DECIMALS).trim() === ""
+    ? null
+    : Number(env.LEDGER_DECIMALS);
   const approvedTokenName = String(env.APPROVED_TOKEN_NAME || "").trim();
   const approvedTokenCodeHash = String(env.APPROVED_TOKEN_CODE_HASH || "").trim().toLowerCase();
   const approvedImplementationCodeHash = String(env.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || "").trim().toLowerCase();
@@ -439,7 +443,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     && Number.isFinite(tokenDecimals)
     && scaleDecimals != null
     && tokenDecimals === APPROVED_TOKEN_DECIMALS
-    && String(env.JPYC_BASE_UNIT_SCALE || "").trim() === APPROVED_LEDGER_BASE_UNIT_SCALE
+    && String(ledgerBaseUnitScale || "").trim() === APPROVED_LEDGER_BASE_UNIT_SCALE
+    && (configuredLedgerDecimals == null || configuredLedgerDecimals === scaleDecimals)
     && tokenMetadataApprovalPinsGate;
 
   const requiredConfirmations = Number(env.REQUIRED_CONFIRMATIONS || 2);

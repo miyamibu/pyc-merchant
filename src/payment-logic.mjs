@@ -2,7 +2,13 @@
  * Pure payment decision logic — no DB, no env globals.
  * Instantiate with makePaymentLogic() so tests can control scale and confirmations.
  */
-import { compareBaseUnits, parseDecimalToBaseUnits, scaleToDecimals } from "./amounts.mjs";
+import {
+  compareBaseUnits,
+  parseDecimalToBaseUnits,
+  parseUnsignedIntegerString,
+  scaleToDecimals,
+  tokenAtomicToLedgerBase,
+} from "./amounts.mjs";
 import { REVIEW_REASON_CODES } from "./reason-codes.mjs";
 
 const ACTIVE_MONITORING_STATUSES = new Set([
@@ -12,6 +18,11 @@ const ACTIVE_MONITORING_STATUSES = new Set([
   "expired",
   "review_required",
 ]);
+
+const PAYMENT_CONTRACT_REASON_CODES = Object.freeze({
+  CHAIN_TRANSFER_IDENTITY_INCOMPLETE: "CHAIN_TRANSFER_IDENTITY_INCOMPLETE",
+  TIMESTAMP_UNVERIFIED: "TIMESTAMP_UNVERIFIED",
+});
 
 function normalizeCanonicalState(value) {
   if (value === true || value === 1) return true;
@@ -31,15 +42,45 @@ function normalizeBlockNumber(value) {
   return normalized;
 }
 
-function transferIdentity(event, index) {
-  const eventId = String(event?.id ?? "").trim();
-  if (eventId) return `id:${eventId}`;
-  const txHash = String(event?.tx_hash ?? event?.txHash ?? "").trim().toLowerCase();
-  const logIndexRaw = event?.log_index ?? event?.logIndex;
-  if (txHash && logIndexRaw != null && String(logIndexRaw).trim() !== "") {
-    return `log:${txHash}:${String(logIndexRaw).trim()}`;
-  }
-  return `input:${index}`;
+export function normalizeChainId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  if (/^[0-9]+$/.test(raw)) return BigInt(raw).toString();
+  return raw.toLowerCase();
+}
+
+function normalizeTxHash(value) {
+  const raw = String(value ?? "").trim();
+  return raw ? raw.toLowerCase() : null;
+}
+
+function normalizeLogIndex(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || !/^[0-9]+$/.test(raw)) return null;
+  return BigInt(raw).toString();
+}
+
+function transferIdentityParts(event = {}) {
+  const chainId = normalizeChainId(event?.chain_id ?? event?.chainId);
+  const txHash = normalizeTxHash(event?.tx_hash ?? event?.txHash);
+  const logIndex = normalizeLogIndex(event?.log_index ?? event?.logIndex);
+  const missingFields = [
+    chainId == null ? "chain_id" : null,
+    txHash == null ? "tx_hash" : null,
+    logIndex == null ? "log_index" : null,
+  ].filter(Boolean);
+  return {
+    complete: missingFields.length === 0,
+    missingFields,
+    chainId,
+    txHash,
+    logIndex,
+    identity: missingFields.length === 0 ? `${chainId}:${txHash}:${logIndex}` : null,
+  };
+}
+
+function transferIdentity(event) {
+  return transferIdentityParts(event).identity;
 }
 
 /**
@@ -191,12 +232,29 @@ export function deriveFulfillmentHold(input = {}) {
   };
 }
 
-export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 } = {}) {
+export function makePaymentLogic({
+  jpycBaseUnitScale,
+  ledgerBaseUnitScale,
+  ledgerDecimals: ledgerDecimalsInput,
+  tokenDecimals = 18,
+  requiredConfirmations = 2,
+  enableAutoSplitPayment = false,
+} = {}) {
   let appDecimals;
-  try {
-    appDecimals = scaleToDecimals(String(jpycBaseUnitScale));
-  } catch (_error) {
-    throw new Error("jpycBaseUnitScale must be an explicit power-of-10 positive integer");
+  if (ledgerDecimalsInput != null && ledgerDecimalsInput !== "") {
+    appDecimals = Number(ledgerDecimalsInput);
+    if (!Number.isInteger(appDecimals) || appDecimals < 0 || appDecimals > 36) {
+      throw new Error("ledgerDecimals must be an integer between 0 and 36");
+    }
+  } else {
+    try {
+      appDecimals = scaleToDecimals(String(jpycBaseUnitScale ?? ledgerBaseUnitScale));
+    } catch (_error) {
+      throw new Error("jpycBaseUnitScale must be an explicit power-of-10 positive integer");
+    }
+  }
+  if (!Number.isInteger(Number(tokenDecimals)) || Number(tokenDecimals) < 0 || Number(tokenDecimals) > 36) {
+    throw new Error("tokenDecimals must be an integer between 0 and 36");
   }
   if (!Number.isFinite(requiredConfirmations) || requiredConfirmations < 0 || !Number.isInteger(requiredConfirmations)) {
     throw new Error("requiredConfirmations must be a non-negative integer");
@@ -219,10 +277,111 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     return normalizeBaseAmount(null, amountJpyc);
   }
 
+  function normalizeAtomicBackedAmount({ atomicValue, ledgerValue, decimalFallback, label }) {
+    let atomic;
+    try {
+      atomic = parseUnsignedIntegerString(atomicValue, label).toString();
+    } catch (_error) {
+      return { error: "invalid_token_amount_atomic", exact: false, atomic: null };
+    }
+
+    const converted = tokenAtomicToLedgerBase(atomic, Number(tokenDecimals), appDecimals);
+    if (!converted.exact) {
+      return {
+        value: converted.value,
+        atomic,
+        exact: false,
+        error: "non_exact_decimal_conversion",
+      };
+    }
+
+    const explicitLedger = ledgerValue != null && String(ledgerValue).trim() !== ""
+      ? normalizeBaseAmount(ledgerValue, null)
+      : null;
+    if (explicitLedger?.error) {
+      return { error: "invalid_ledger_amount_base", exact: false, atomic };
+    }
+    if (explicitLedger && explicitLedger.value !== converted.value) {
+      return {
+        value: converted.value,
+        atomic,
+        exact: false,
+        error: "ledger_amount_mismatch",
+      };
+    }
+
+    if (!explicitLedger && decimalFallback != null && String(decimalFallback).trim() !== "") {
+      const parsedDecimal = normalizeBaseAmount(null, decimalFallback);
+      if (parsedDecimal.error) {
+        return { error: "invalid_amount", exact: false, atomic };
+      }
+      if (parsedDecimal.value !== converted.value) {
+        return {
+          value: converted.value,
+          atomic,
+          exact: false,
+          error: "ledger_amount_mismatch",
+        };
+      }
+    }
+
+    return { value: converted.value, atomic, exact: true, error: null };
+  }
+
+  function normalizeTransferAmount(event = {}) {
+    const atomicValue = event?.token_amount_atomic ?? event?.amount_atomic;
+    if (atomicValue != null && String(atomicValue).trim() !== "") {
+      const result = normalizeAtomicBackedAmount({
+        atomicValue,
+        ledgerValue: event?.ledger_amount_base ?? event?.amount_jpyc_base,
+        decimalFallback: event?.amount_jpyc,
+        label: "token_amount_atomic",
+      });
+      const declaredConversionError = String(event?.amount_conversion_error ?? "").trim();
+      const exact = result.exact !== false
+        && event?.amount_conversion_exact !== false
+        && !declaredConversionError;
+      return {
+        ...result,
+        exact,
+        error: result.error || (exact ? null : declaredConversionError || "non_exact_decimal_conversion"),
+      };
+    }
+    const result = normalizeBaseAmount(
+      event?.ledger_amount_base ?? event?.amount_jpyc_base,
+      event?.amount_jpyc
+    );
+    const declaredConversionError = String(event?.amount_conversion_error ?? "").trim();
+    const exact = event?.amount_conversion_exact !== false && !declaredConversionError;
+    return {
+      ...result,
+      atomic: null,
+      exact,
+      error: result.error || (exact ? null : declaredConversionError || "non_exact_decimal_conversion"),
+    };
+  }
+
+  function normalizeInvoiceAmount(invoice = {}) {
+    const atomicValue = invoice?.token_amount_atomic ?? invoice?.amount_atomic;
+    if (atomicValue != null && String(atomicValue).trim() !== "") {
+      return normalizeAtomicBackedAmount({
+        atomicValue,
+        ledgerValue: invoice?.ledger_amount_base ?? invoice?.amount_jpyc_base,
+        decimalFallback: invoice?.amount_jpyc,
+        label: "token_amount_atomic",
+      });
+    }
+    return normalizeBaseAmount(
+      invoice?.ledger_amount_base ?? invoice?.amount_jpyc_base,
+      invoice?.amount_jpyc
+    );
+  }
+
   function qualifyTransfer(invoice, event, options = {}) {
-    const amountBaseResult = normalizeBaseAmount(event?.amount_jpyc_base, event?.amount_jpyc);
-    const eventChainId = String(event?.chain_id ?? "").trim();
-    const invoiceChainId = String(invoice?.chain_id ?? "").trim();
+    const amountBaseResult = normalizeTransferAmount(event);
+    const identityInfo = transferIdentityParts(event);
+    const eventChainId = normalizeChainId(event?.chain_id ?? event?.chainId);
+    const invoiceChainId = normalizeChainId(invoice?.chain_id ?? invoice?.chainId);
     const eventTokenContract = String(event?.token_contract ?? "").trim().toLowerCase();
     const invoiceTokenContract = String(invoice?.token_contract ?? "").trim().toLowerCase();
     const eventRecipient = String(event?.to_address ?? "").trim().toLowerCase();
@@ -252,12 +411,12 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     }
 
     const confirmations = Number(event?.confirmations ?? 0);
-    const amountConversionExact = event?.amount_conversion_exact !== false
-      && String(event?.amount_conversion_error ?? "").trim() !== "non_exact_decimal_conversion";
+    const amountConversionExact = amountBaseResult.exact !== false
+      && !String(event?.amount_conversion_error ?? "").trim();
     const checks = {
       amountValid: !amountBaseResult.error,
       amountConversionExact,
-      chainMatches: eventChainId.length > 0 && invoiceChainId.length > 0 && eventChainId === invoiceChainId,
+      chainMatches: eventChainId != null && invoiceChainId != null && eventChainId === invoiceChainId,
       tokenMatches: eventTokenContract.length > 0
         && invoiceTokenContract.length > 0
         && eventTokenContract === invoiceTokenContract,
@@ -276,11 +435,22 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     };
 
     const failures = [];
-    if (!checks.amountValid) {
-      failures.push({ reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_event_amount" });
+    if (!identityInfo.complete) {
+      failures.push({
+        reasonType: PAYMENT_CONTRACT_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+        reasonLabel: PAYMENT_CONTRACT_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+      });
     }
-    if (!checks.amountConversionExact) {
-      failures.push({ reasonType: REVIEW_REASON_CODES.CHAIN_INCONSISTENT, reasonLabel: "non_exact_decimal_conversion" });
+    if (!checks.amountValid) {
+      failures.push({
+        reasonType: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+        reasonLabel: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+      });
+    } else if (!checks.amountConversionExact) {
+      failures.push({
+        reasonType: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+        reasonLabel: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+      });
     }
     if (!checks.chainMatches) {
       failures.push({ reasonType: REVIEW_REASON_CODES.CHAIN_INCONSISTENT, reasonLabel: "wrong_chain" });
@@ -299,7 +469,10 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     if (!checks.expiryValid) {
       failures.push({ reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_invoice_expiry" });
     } else if (!checks.blockTimestampValid) {
-      failures.push({ reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_block_timestamp" });
+      failures.push({
+        reasonType: PAYMENT_CONTRACT_REASON_CODES.TIMESTAMP_UNVERIFIED,
+        reasonLabel: PAYMENT_CONTRACT_REASON_CODES.TIMESTAMP_UNVERIFIED,
+      });
     } else if (!checks.withinExpiry) {
       failures.push({ reasonType: REVIEW_REASON_CODES.LATE_PAYMENT, reasonLabel: "late_arrival_after_expiry" });
     }
@@ -307,11 +480,27 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
       failures.push({ reasonType: null, reasonLabel: "awaiting_confirmations" });
     }
 
-    const eligible = Object.values(checks).every(Boolean);
+    const eligible = identityInfo.complete && Object.values(checks).every(Boolean);
+    const candidate = identityInfo.complete
+      && checks.amountValid
+      && checks.amountConversionExact
+      && checks.chainMatches
+      && checks.tokenMatches
+      && checks.recipientMatches
+      && checks.canonical
+      && checks.expiryValid
+      && checks.blockTimestampValid
+      && checks.withinExpiry;
     const primaryFailure = failures[0] || null;
     return {
       eligible,
-      amountBase: amountBaseResult.error ? null : amountBaseResult.value,
+      candidate,
+      identity: identityInfo.identity,
+      identityComplete: identityInfo.complete,
+      identityMissingFields: identityInfo.missingFields,
+      amountError: amountBaseResult.error || null,
+      amountBase: amountBaseResult.error ? null : (amountBaseResult.value ?? null),
+      amountAtomic: amountBaseResult.atomic,
       confirmations: Number.isFinite(confirmations) ? confirmations : null,
       blockTimestamp: Number.isFinite(blockTimestampMs) ? new Date(blockTimestampMs).toISOString() : null,
       canonicalStatus: canonicalState === true ? "canonical" : (canonicalState === false ? "noncanonical" : "unknown"),
@@ -322,60 +511,170 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     };
   }
 
+  function qualificationScore(item) {
+    const checks = item.qualification.checks;
+    return (checks.chainMatches ? 1_000_000 : 0)
+      + (checks.tokenMatches ? 100_000 : 0)
+      + (checks.recipientMatches ? 10_000 : 0)
+      + (checks.amountValid ? 1_000 : 0)
+      + (checks.amountConversionExact ? 500 : 0)
+      + (checks.canonical ? 100 : 0)
+      + (checks.blockTimestampValid ? 10 : 0)
+      + (checks.withinExpiry ? 5 : 0)
+      + (checks.confirmationsSatisfied ? 1 : 0);
+  }
+
   function summarizeEligibleTransfers(invoice, events = [], options = {}) {
     if (!Array.isArray(events)) throw new TypeError("events must be an array");
-    const uniqueEvents = new Map();
-    events.forEach((event, index) => {
-      uniqueEvents.set(transferIdentity(event, index), event);
-    });
     const qualificationOptions = typeof options.qualificationOptions === "function"
       ? options.qualificationOptions
       : () => options.qualificationOptions || {};
-    const qualifications = [...uniqueEvents.entries()].map(([identity, event], index) => ({
-      identity,
-      event,
-      qualification: qualifyTransfer(invoice, event, qualificationOptions(event, index) || {}),
-    }));
+    const observations = events.map((event, index) => {
+      const identityInfo = transferIdentityParts(event);
+      return {
+        event,
+        index,
+        identity: identityInfo.identity,
+        identityInfo,
+        qualification: qualifyTransfer(invoice, event, qualificationOptions(event, index) || {}),
+      };
+    });
+    const groups = new Map();
+    for (const observation of observations) {
+      if (!observation.identityInfo.complete) continue;
+      const group = groups.get(observation.identity) || {
+        identity: observation.identity,
+        firstIndex: observation.index,
+        observations: [],
+      };
+      group.observations.push(observation);
+      groups.set(observation.identity, group);
+    }
+
+    const distinctEntries = [...groups.values()].map((group) => {
+      const representative = group.observations.reduce((best, current) => (
+        qualificationScore(current) > qualificationScore(best) ? current : best
+      ));
+      return {
+        firstIndex: group.firstIndex,
+        identity: group.identity,
+        event: representative.event,
+        observationCount: group.observations.length,
+        amountIntegrityErrorCount: group.observations.filter((item) => item.qualification.amountError).length,
+        timestampUnverifiedCount: group.observations.filter(
+          (item) => !item.qualification.checks.blockTimestampValid
+        ).length,
+        qualification: representative.qualification,
+      };
+    });
+    const incompleteEntries = observations
+      .filter((observation) => !observation.identityInfo.complete)
+      .map((observation) => ({
+        firstIndex: observation.index,
+        identity: null,
+        event: observation.event,
+        observationCount: 1,
+        amountIntegrityErrorCount: observation.qualification.amountError ? 1 : 0,
+        timestampUnverifiedCount: observation.qualification.checks.blockTimestampValid ? 0 : 1,
+        qualification: observation.qualification,
+      }));
+    const qualifications = [...distinctEntries, ...incompleteEntries]
+      .sort((left, right) => left.firstIndex - right.firstIndex)
+      .map(({ firstIndex: _firstIndex, ...entry }) => entry);
     const eligibleTotalAmountBase = qualifications.reduce((total, item) => {
       if (!item.qualification.eligible) return total;
       return total + BigInt(item.qualification.amountBase);
     }, 0n).toString();
     const eligibleTransferCount = qualifications.filter((item) => item.qualification.eligible).length;
-    const pendingConfirmationCount = qualifications.filter((item) => {
-      const checks = item.qualification.checks;
-      return checks.amountValid
-        && checks.amountConversionExact
-        && checks.chainMatches
-        && checks.tokenMatches
-        && checks.recipientMatches
-        && checks.canonical
-        && checks.expiryValid
-        && checks.blockTimestampValid
-        && checks.withinExpiry
-        && !checks.confirmationsSatisfied;
-    }).length;
+    const candidateTransferCount = qualifications.filter((item) => item.qualification.candidate).length;
+    const distinctTransferCount = groups.size;
+    const identityIncompleteObservationCount = incompleteEntries.length;
+    const pendingConfirmationCount = qualifications.filter((item) => (
+      item.qualification.candidate && !item.qualification.eligible
+    )).length;
 
     return {
-      transferCount: qualifications.length,
+      transferCount: distinctTransferCount,
+      distinctTransferCount,
+      observationCount: events.length,
       eligibleTransferCount,
+      candidateTransferCount,
       ineligibleTransferCount: qualifications.length - eligibleTransferCount,
+      nonCandidateTransferCount: qualifications.length - candidateTransferCount,
       pendingConfirmationCount,
-      multipleTransfers: qualifications.length > 1,
-      duplicateObservationCount: events.length - qualifications.length,
+      multipleTransfers: candidateTransferCount > 1,
+      duplicateObservationCount: events.length - identityIncompleteObservationCount - distinctTransferCount,
+      identityIncompleteObservationCount,
+      amountIntegrityErrorCount: qualifications.reduce(
+        (total, item) => total + item.amountIntegrityErrorCount,
+        0
+      ),
+      timestampUnverifiedCount: qualifications.reduce(
+        (total, item) => total + item.timestampUnverifiedCount,
+        0
+      ),
       eligibleTotalAmountBase,
       qualifications,
     };
   }
 
+  function resolvePrimaryTransferIdentity(invoice = {}, options = {}) {
+    const explicitIdentity = options.primaryTransferIdentity
+      ?? invoice.primary_transfer_identity
+      ?? invoice.primaryTransferIdentity;
+    if (explicitIdentity != null && String(explicitIdentity).trim() !== "") {
+      return String(explicitIdentity).trim().toLowerCase();
+    }
+    const primaryTransfer = options.primaryTransfer ?? invoice.primary_transfer;
+    if (primaryTransfer && typeof primaryTransfer === "object") {
+      return transferIdentity(primaryTransfer);
+    }
+    return transferIdentity({
+      chain_id: options.primaryChainId ?? invoice.paid_chain_id ?? invoice.paidChainId ?? invoice.chain_id,
+      tx_hash: options.primaryTxHash ?? invoice.paid_tx_hash ?? invoice.paidTxHash,
+      log_index: options.primaryLogIndex ?? invoice.paid_log_index ?? invoice.paidLogIndex,
+    });
+  }
+
+  function isFinalInvoice(invoice = {}) {
+    const status = String(invoice?.status ?? "").trim().toLowerCase();
+    return ["paid", "settled"].includes(status)
+      || Boolean(invoice?.paid_tx_hash ?? invoice?.paidTxHash);
+  }
+
   function decideQualifiedPaymentStatus(invoice, events = [], options = {}) {
-    const invoiceBaseResult = normalizeBaseAmount(invoice?.amount_jpyc_base, invoice?.amount_jpyc);
+    const invoiceBaseResult = normalizeInvoiceAmount(invoice);
     const summary = summarizeEligibleTransfers(invoice, events, options);
     if (invoiceBaseResult.error) {
       return {
         ...summary,
         nextStatus: "review_required",
-        reasonType: REVIEW_REASON_CODES.OTHER,
-        reasonLabel: "invalid_invoice_amount",
+        reasonType: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+        reasonLabel: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+      };
+    }
+    if (summary.identityIncompleteObservationCount > 0) {
+      return {
+        ...summary,
+        nextStatus: "review_required",
+        reasonType: PAYMENT_CONTRACT_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+        reasonLabel: PAYMENT_CONTRACT_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+      };
+    }
+    if (summary.amountIntegrityErrorCount > 0) {
+      return {
+        ...summary,
+        nextStatus: "review_required",
+        reasonType: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+        reasonLabel: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+      };
+    }
+    if (summary.timestampUnverifiedCount > 0) {
+      return {
+        ...summary,
+        nextStatus: "review_required",
+        reasonType: PAYMENT_CONTRACT_REASON_CODES.TIMESTAMP_UNVERIFIED,
+        reasonLabel: PAYMENT_CONTRACT_REASON_CODES.TIMESTAMP_UNVERIFIED,
       };
     }
     if (options.integrityHold === true) {
@@ -387,14 +686,46 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
       };
     }
     if (String(invoice?.status || "").trim().toLowerCase() === "expired") {
+      const hasLateBlockTimestamp = summary.qualifications.some((item) => (
+        item.qualification.checks.expiryValid
+        && item.qualification.checks.blockTimestampValid
+        && !item.qualification.checks.withinExpiry
+      ));
+      if (hasLateBlockTimestamp) {
+        return {
+          ...summary,
+          nextStatus: "review_required",
+          reasonType: REVIEW_REASON_CODES.LATE_PAYMENT,
+          reasonLabel: "late_arrival_after_expiry",
+        };
+      }
       return {
         ...summary,
         nextStatus: "review_required",
-        reasonType: REVIEW_REASON_CODES.LATE_PAYMENT,
-        reasonLabel: "late_arrival_after_expiry",
+        reasonType: REVIEW_REASON_CODES.OTHER,
+        reasonLabel: "detected_after_expiry",
       };
     }
-    if (summary.multipleTransfers) {
+
+    const candidateItems = summary.qualifications.filter((item) => item.qualification.candidate);
+    const primaryTransferIdentity = resolvePrimaryTransferIdentity(invoice, options);
+    const finalInvoice = isFinalInvoice(invoice);
+    const newCandidateItems = primaryTransferIdentity
+      ? candidateItems.filter((item) => item.identity !== primaryTransferIdentity)
+      : candidateItems;
+    if (finalInvoice && (
+      newCandidateItems.length > 0
+      && (primaryTransferIdentity != null || candidateItems.length > 1)
+    )) {
+      return {
+        ...summary,
+        primaryTransferIdentity,
+        nextStatus: "review_required",
+        reasonType: REVIEW_REASON_CODES.DUPLICATE_PAYMENT,
+        reasonLabel: "duplicate_after_primary_transfer",
+      };
+    }
+    if (!finalInvoice && candidateItems.length > 1) {
       return {
         ...summary,
         nextStatus: "review_required",
@@ -402,7 +733,7 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
         reasonLabel: "multiple_transfers_require_review",
       };
     }
-    if (summary.transferCount === 0) {
+    if (summary.transferCount === 0 && summary.qualifications.length === 0) {
       return {
         ...summary,
         nextStatus: String(invoice?.status || "issued"),
@@ -410,8 +741,17 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
         reasonLabel: "no_transfer",
       };
     }
+    if (candidateItems.length === 0) {
+      const firstQualification = summary.qualifications[0]?.qualification;
+      return {
+        ...summary,
+        nextStatus: "review_required",
+        reasonType: firstQualification?.reasonType ?? REVIEW_REASON_CODES.OTHER,
+        reasonLabel: firstQualification?.reasonLabel ?? "no_eligible_transfer",
+      };
+    }
 
-    const onlyTransfer = summary.qualifications[0].qualification;
+    const onlyTransfer = candidateItems[0].qualification;
     if (!onlyTransfer.eligible) {
       const onlyAwaitingConfirmations = onlyTransfer.failures.length === 1
         && onlyTransfer.failures[0].reasonLabel === "awaiting_confirmations";
@@ -461,52 +801,65 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
     }
     return {
       ...summary,
+      primaryTransferIdentity,
       nextStatus: "paid",
       reasonType: null,
       reasonLabel: "confirmed_single_transfer",
     };
   }
 
-  function decidePaymentStatus(invoice, event, options = {}) {
-    const amountBaseResult = normalizeBaseAmount(event.amount_jpyc_base, event.amount_jpyc);
-    if (amountBaseResult.error) {
-      return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_event_amount" };
+  function decidePaymentStatus(invoice = {}, event = {}, options = {}) {
+    const amountBaseResult = normalizeTransferAmount(event);
+    const invoiceBaseResult = normalizeInvoiceAmount(invoice);
+    const previousPaidAmountProvided = options.previousPaidAmountBase != null
+      || (invoice.paid_amount_jpyc_base != null && String(invoice.paid_amount_jpyc_base).trim() !== "")
+      || (invoice.paid_amount_jpyc != null && String(invoice.paid_amount_jpyc).trim() !== "");
+    const previousPaidBaseResult = previousPaidAmountProvided
+      ? normalizeBaseAmount(
+        options.previousPaidAmountBase != null ? options.previousPaidAmountBase : invoice.paid_amount_jpyc_base,
+        invoice.paid_amount_jpyc
+      )
+      : { value: "0" };
+    const totalPaidBaseResult = options.totalPaidAmountBase == null
+      ? { value: null }
+      : normalizeBaseAmount(options.totalPaidAmountBase, null);
+    if (amountBaseResult.error || invoiceBaseResult.error || previousPaidBaseResult.error || totalPaidBaseResult.error) {
+      return {
+        nextStatus: "review_required",
+        reasonType: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+        reasonLabel: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+      };
     }
-    const invoiceBaseResult = normalizeBaseAmount(invoice.amount_jpyc_base, invoice.amount_jpyc);
-    if (invoiceBaseResult.error) {
-      return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_invoice_amount" };
+
+    const identityInfo = transferIdentityParts(event);
+    if (!identityInfo.complete) {
+      return {
+        nextStatus: "review_required",
+        reasonType: PAYMENT_CONTRACT_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+        reasonLabel: PAYMENT_CONTRACT_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+      };
     }
     const amountBase = amountBaseResult.value;
     const invoiceBase = invoiceBaseResult.value;
-    const previousPaidBaseResult = normalizeBaseAmount(
-      options.previousPaidAmountBase != null ? options.previousPaidAmountBase : invoice.paid_amount_jpyc_base,
-      invoice.paid_amount_jpyc
-    );
-    const previousPaidBase = previousPaidBaseResult.error ? "0" : previousPaidBaseResult.value;
-    const totalPaidBaseResult = normalizeBaseAmount(
-      options.totalPaidAmountBase,
-      null
-    );
-    const totalPaidBase = totalPaidBaseResult.error || options.totalPaidAmountBase == null
-      ? (BigInt(previousPaidBase) + BigInt(amountBase)).toString()
-      : totalPaidBaseResult.value;
-    const confirmations = Number(event.confirmations || 0);
-    const observedAtMs = options.blockTimestamp != null
-      ? new Date(options.blockTimestamp).getTime()
-      : (event?.block_timestamp
-        ? new Date(event.block_timestamp).getTime()
-        : (options.nowMs != null
-          ? Number(options.nowMs)
-          : (event?.observed_at ? new Date(event.observed_at).getTime() : Date.now())));
-    const expiryMs = new Date(invoice.expires_at).getTime();
+    const blockTimestampRaw = options.blockTimestamp ?? event?.block_timestamp ?? event?.blockTimestamp;
+    const blockTimestampMs = blockTimestampRaw == null || blockTimestampRaw === ""
+      ? Number.NaN
+      : new Date(blockTimestampRaw).getTime();
+    const expiryMs = invoice?.expires_at == null || invoice.expires_at === ""
+      ? Number.NaN
+      : new Date(invoice.expires_at).getTime();
 
     if (!Number.isFinite(expiryMs)) {
       return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_invoice_expiry" };
     }
-    if (!Number.isFinite(observedAtMs)) {
-      return { nextStatus: "review_required", reasonType: REVIEW_REASON_CODES.OTHER, reasonLabel: "invalid_observed_at" };
+    if (!Number.isFinite(blockTimestampMs)) {
+      return {
+        nextStatus: "review_required",
+        reasonType: PAYMENT_CONTRACT_REASON_CODES.TIMESTAMP_UNVERIFIED,
+        reasonLabel: PAYMENT_CONTRACT_REASON_CODES.TIMESTAMP_UNVERIFIED,
+      };
     }
-    if (observedAtMs > expiryMs) {
+    if (blockTimestampMs > expiryMs) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.LATE_PAYMENT,
@@ -514,41 +867,76 @@ export function makePaymentLogic({ jpycBaseUnitScale, requiredConfirmations = 2 
       };
     }
 
-    if (invoice.status === "expired") {
+    if (String(invoice.status ?? "").trim().toLowerCase() === "expired") {
       return {
         nextStatus: "review_required",
-        reasonType: REVIEW_REASON_CODES.LATE_PAYMENT,
-        reasonLabel: "late_arrival_after_expiry",
+        reasonType: REVIEW_REASON_CODES.OTHER,
+        reasonLabel: "detected_after_expiry",
       };
     }
-    if (String(event.chain_id) !== String(invoice.chain_id)) {
+    const eventChainId = normalizeChainId(event?.chain_id ?? event?.chainId);
+    const invoiceChainId = normalizeChainId(invoice?.chain_id ?? invoice?.chainId);
+    if (eventChainId == null || invoiceChainId == null || eventChainId !== invoiceChainId) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.CHAIN_INCONSISTENT,
         reasonLabel: "wrong_chain",
       };
     }
-    if (String(event.token_contract).toLowerCase() !== String(invoice.token_contract).toLowerCase()) {
+    if (String(event.token_contract ?? "").trim().toLowerCase()
+      !== String(invoice.token_contract ?? "").trim().toLowerCase()) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.UNKNOWN_TRANSFER,
         reasonLabel: "wrong_token",
       };
     }
-    if (String(event.to_address).toLowerCase() !== String(invoice.recipient_address).toLowerCase()) {
+    if (String(event.to_address ?? "").trim().toLowerCase()
+      !== String(invoice.recipient_address ?? "").trim().toLowerCase()) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.ADDRESS_MISMATCH,
         reasonLabel: "wrong_recipient",
       };
     }
-    if (invoice.status === "paid" && options.eventAlreadyRecorded !== true) {
+    const canonicalState = normalizeCanonicalState(
+      options.canonicalStatus
+      ?? options.canonical
+      ?? event?.canonical_status
+      ?? event?.canonical
+      ?? event?.is_canonical
+    );
+    if (canonicalState === false) {
+      return {
+        nextStatus: "review_required",
+        reasonType: REVIEW_REASON_CODES.CHAIN_INCONSISTENT,
+        reasonLabel: "non_canonical_transfer",
+      };
+    }
+    if (canonicalState == null) {
+      return {
+        nextStatus: "review_required",
+        reasonType: REVIEW_REASON_CODES.CHAIN_INCONSISTENT,
+        reasonLabel: "canonicality_unverified",
+      };
+    }
+
+    const primaryTransferIdentity = resolvePrimaryTransferIdentity(invoice, options);
+    const eventAlreadyRecorded = options.eventAlreadyRecorded === true
+      || (primaryTransferIdentity != null && identityInfo.identity === primaryTransferIdentity);
+    if (isFinalInvoice(invoice) && !eventAlreadyRecorded) {
       return {
         nextStatus: "review_required",
         reasonType: REVIEW_REASON_CODES.DUPLICATE_PAYMENT,
-        reasonLabel: "duplicate_after_paid",
+        reasonLabel: "duplicate_after_primary_transfer",
       };
     }
+
+    const previousPaidBase = previousPaidBaseResult.value;
+    const totalPaidBase = totalPaidBaseResult.value != null
+      ? totalPaidBaseResult.value
+      : (BigInt(previousPaidBase) + (eventAlreadyRecorded ? 0n : BigInt(amountBase))).toString();
+    const confirmations = Number(event.confirmations ?? 0);
     if (compareBaseUnits(totalPaidBase, invoiceBase) < 0) {
       if (compareBaseUnits(previousPaidBase, "0") > 0) {
         return {

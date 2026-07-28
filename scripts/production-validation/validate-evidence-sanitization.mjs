@@ -48,9 +48,16 @@ function summarizeViolations(violations) {
 }
 
 function buildSecretNeedles() {
+  const publicConfigurationKeys = new Set([
+    "TOKEN_CONTRACT",
+    "APPROVED_JPYC_TOKEN_CONTRACT",
+    "APPROVED_TOKEN_CODE_HASH",
+    "APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH",
+  ]);
   const needles = [];
   for (const [key, value] of Object.entries(process.env)) {
     if (!String(value || "").trim()) continue;
+    if (publicConfigurationKeys.has(key)) continue;
     if (/(?:secret|token|cookie)/i.test(key)) {
       needles.push({ key, value: String(value) });
     }

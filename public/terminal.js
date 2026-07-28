@@ -31,6 +31,8 @@ const REVIEW_REASON_PRIORITY_ORDER = Object.freeze({
   OVERPAYMENT: 0,
   UNKNOWN_TRANSFER: 0,
   CHAIN_INCONSISTENT: 0,
+  CHAIN_REORG: 0,
+  LEDGER_INTEGRITY_ERROR: 0,
   ADDRESS_MISMATCH: 0,
   LATE_PAYMENT: 1,
   UNDERPAYMENT: 2,
@@ -55,8 +57,31 @@ const ADDRESS_POOL_WARN_THRESHOLD = 5;
 const WORKER_STALE_WARN_SEC = 300;
 const OPS_AUTO_REFRESH_INTERVAL_MS = 60_000;
 const PROVIDER_RAIL_ENABLED = document.body?.dataset.providerRailEnabled === "true";
+const ADMIN_UI_PERMISSIONS = Object.freeze([
+  "review.read",
+  "review.update",
+  "accounting.adjustment.read",
+  "accounting.adjustment.create",
+  "accounting.adjustment.approve",
+  "refund.request",
+  "refund.view",
+  "refund.approve",
+  "refund.execute",
+  "settlement.close",
+  "settlement.export",
+  "audit.read",
+  "audit.export",
+  "monitor.read",
+]);
 const WALLET_SCOPED_CAPABILITY_PREFIX = /^(?:検証済み環境（[^）]*(?:iOS|Android)[^）]*ウォレット[^）]*）|起動導線あり(?:（[^）]*）)?|手動送金のみ|未検証(?:（[^）]*）)?):\s*/;
 const WALLET_BROAD_TESTED_PREFIX = /^実機検証済み:\s*(.+)$/;
+
+const storePaymentsControlTemplate = document.getElementById("storePaymentsControlTemplate");
+const STORE_PAYMENTS_CONTROL_MARKUP = storePaymentsControlTemplate?.innerHTML.trim() || "";
+storePaymentsControlTemplate?.remove();
+const adminOperationsTemplate = document.getElementById("adminOperationsTemplate");
+const ADMIN_OPERATIONS_MARKUP = adminOperationsTemplate?.innerHTML.trim() || "";
+adminOperationsTemplate?.remove();
 
 if (!PROVIDER_RAIL_ENABLED) {
   document.querySelectorAll("[data-provider-rail]").forEach((node) => node.remove());
@@ -90,13 +115,35 @@ function hasIntegrityHold(invoice) {
     || ["active", "hold", "integrity_hold"].includes(String(integrityHold || "").toLowerCase())
     || (integrityHold && typeof integrityHold === "object"
       && (integrityHold.active === true || ["active", "hold"].includes(String(integrityHold.status || "").toLowerCase())));
-  const fulfillmentDecision = String(
-    invoice.fulfillment_decision || invoice.provider_summary?.fulfillment_decision || ""
-  ).toLowerCase();
+  const rawFulfillmentDecision = invoice.fulfillment_decision;
+  const fulfillmentDecision = rawFulfillmentDecision && typeof rawFulfillmentDecision !== "object"
+    ? String(rawFulfillmentDecision).toLowerCase()
+    : "";
   const statusReason = String(invoice.status_reason || "").toLowerCase();
   return explicitHold
     || ["hold", "hold_fulfillment", "deny_fulfillment", "integrity_hold"].includes(fulfillmentDecision)
     || ["integrity_hold", "reorg_detected", "chain_reorg", "reorg_integrity_hold"].includes(statusReason);
+}
+
+function getAuthoritativeFulfillmentDecision(invoice) {
+  const raw = invoice?.fulfillment_decision;
+  const providerFallback = invoice?.provider_summary?.fulfillment_decision;
+  const candidate = raw && typeof raw === "object"
+    ? raw
+    : providerFallback && typeof providerFallback === "object"
+      ? providerFallback
+      : null;
+  if (!candidate) {
+    return {
+      decision: "hold",
+      reason_codes: ["FULFILLMENT_DECISION_UNAVAILABLE"],
+    };
+  }
+  const decision = String(candidate.decision || "").trim().toLowerCase();
+  return {
+    ...candidate,
+    decision: ["allow", "allow_fulfillment"].includes(decision) ? "allow" : "hold",
+  };
 }
 
 function effectiveOperatorStatus(invoice) {
@@ -304,6 +351,8 @@ const el = {
   autoResetSecInput: document.getElementById("autoResetSecInput"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
   opsWarnings: document.getElementById("opsWarnings"),
+  stickyStack: document.getElementById("stickyStack"),
+  storePaymentsMount: document.getElementById("storePaymentsMount"),
   storePaymentsControl: document.getElementById("storePaymentsControl"),
   storePaymentsStatusBadge: document.getElementById("storePaymentsStatusBadge"),
   storePaymentsStatusText: document.getElementById("storePaymentsStatusText"),
@@ -395,8 +444,20 @@ const el = {
   reviewRelatedInvoices: document.getElementById("reviewRelatedInvoices"),
   reviewIdInput: document.getElementById("reviewIdInput"),
   reviewNextStatus: document.getElementById("reviewNextStatus"),
+  reviewDisposition: document.getElementById("reviewDisposition"),
+  reviewIncidentId: document.getElementById("reviewIncidentId"),
   reviewNote: document.getElementById("reviewNote"),
+  reviewStepUpPin: document.getElementById("reviewStepUpPin"),
   updateReviewBtn: document.getElementById("updateReviewBtn"),
+  reviewAdjustmentInvoiceId: document.getElementById("reviewAdjustmentInvoiceId"),
+  reviewAdjustmentId: document.getElementById("reviewAdjustmentId"),
+  reviewAdjustmentType: document.getElementById("reviewAdjustmentType"),
+  reviewAdjustmentAmount: document.getElementById("reviewAdjustmentAmount"),
+  reviewAdjustmentReason: document.getElementById("reviewAdjustmentReason"),
+  reviewAdjustmentEvidenceRef: document.getElementById("reviewAdjustmentEvidenceRef"),
+  createAccountingAdjustmentBtn: document.getElementById("createAccountingAdjustmentBtn"),
+  approveAccountingAdjustmentBtn: document.getElementById("approveAccountingAdjustmentBtn"),
+  accountingAdjustmentStatus: document.getElementById("accountingAdjustmentStatus"),
   refundReviewCaseId: document.getElementById("refundReviewCaseId"),
   refundAmount: document.getElementById("refundAmount"),
   refundAddress: document.getElementById("refundAddress"),
@@ -427,9 +488,123 @@ const el = {
   auditLogPanel: document.getElementById("auditLogPanel"),
   auditLogList: document.getElementById("auditLogList"),
   closeSettlementHint: document.getElementById("closeSettlementHint"),
+  adminOperationsMount: document.getElementById("adminOperationsMount"),
   toastHost: document.getElementById("toastHost"),
   permissionNodes: Array.from(document.querySelectorAll("[data-permission], [data-permission-any]")),
 };
+
+const DYNAMIC_ELEMENT_SELECTORS = Object.freeze({
+  storePaymentsControl: "#storePaymentsControl",
+  storePaymentsStatusBadge: "#storePaymentsStatusBadge",
+  storePaymentsStatusText: "#storePaymentsStatusText",
+  storePaymentsRefreshBtn: "#storePaymentsRefreshBtn",
+  storePaymentsToggleBtn: "#storePaymentsToggleBtn",
+  refreshOpsSnapshotBtn: "#refreshOpsSnapshotBtn",
+  opsSnapshotState: "#opsSnapshotState",
+  opsOpenReviewCount: "#opsOpenReviewCount",
+  opsDeadLetterCount: "#opsDeadLetterCount",
+  opsSettlementStatus: "#opsSettlementStatus",
+  opsRecommendedAction: "#opsRecommendedAction",
+  opsPriorityReview: "#opsPriorityReview",
+  opsRefundCandidateCount: "#opsRefundCandidateCount",
+  opsSnapshotChecklist: "#opsSnapshotChecklist",
+  opsAddressPoolCount: "#opsAddressPoolCount",
+  opsWorkerStatus: "#opsWorkerStatus",
+  loadReviewsBtn: "#loadReviewsBtn",
+  reviewStatusFilter: "#reviewStatusFilter",
+  reviewSummaryChips: "#reviewSummaryChips",
+  reviewListState: "#reviewListState",
+  reviewsTableBody: "#reviewsTable tbody",
+  reviewDetailBadge: "#reviewDetailBadge",
+  reviewDetailSummary: "#reviewDetailSummary",
+  reviewDetailId: "#reviewDetailId",
+  reviewDetailInvoice: "#reviewDetailInvoice",
+  reviewDetailAmount: "#reviewDetailAmount",
+  reviewDetailTxHash: "#reviewDetailTxHash",
+  reviewDetailAction: "#reviewDetailAction",
+  reviewDetailRefundHint: "#reviewDetailRefundHint",
+  reviewDetailEvents: "#reviewDetailEvents",
+  reviewRelatedInvoices: "#reviewRelatedInvoices",
+  reviewIdInput: "#reviewIdInput",
+  reviewNextStatus: "#reviewNextStatus",
+  reviewDisposition: "#reviewDisposition",
+  reviewIncidentId: "#reviewIncidentId",
+  reviewNote: "#reviewNote",
+  reviewStepUpPin: "#reviewStepUpPin",
+  updateReviewBtn: "#updateReviewBtn",
+  reviewAdjustmentInvoiceId: "#reviewAdjustmentInvoiceId",
+  reviewAdjustmentId: "#reviewAdjustmentId",
+  reviewAdjustmentType: "#reviewAdjustmentType",
+  reviewAdjustmentAmount: "#reviewAdjustmentAmount",
+  reviewAdjustmentReason: "#reviewAdjustmentReason",
+  reviewAdjustmentEvidenceRef: "#reviewAdjustmentEvidenceRef",
+  createAccountingAdjustmentBtn: "#createAccountingAdjustmentBtn",
+  approveAccountingAdjustmentBtn: "#approveAccountingAdjustmentBtn",
+  accountingAdjustmentStatus: "#accountingAdjustmentStatus",
+  refundReviewCaseId: "#refundReviewCaseId",
+  refundAmount: "#refundAmount",
+  refundAddress: "#refundAddress",
+  refundChainId: "#refundChainId",
+  requestRefundBtn: "#requestRefundBtn",
+  refundIdInput: "#refundIdInput",
+  refundTxHashInput: "#refundTxHashInput",
+  refundExecutedWalletInput: "#refundExecutedWalletInput",
+  refundEvidenceNotePathInput: "#refundEvidenceNotePathInput",
+  refundCustomerNoteInput: "#refundCustomerNoteInput",
+  approveRefundBtn: "#approveRefundBtn",
+  executeRefundBtn: "#executeRefundBtn",
+  verifyRefundBtn: "#verifyRefundBtn",
+  executeRefundHint: "#executeRefundHint",
+  refundDraftHint: "#refundDraftHint",
+  refundEligibleHint: "#refundEligibleHint",
+  refundStepRequestBadge: "#refundStepRequestBadge",
+  refundStepApproveBadge: "#refundStepApproveBadge",
+  refundStepEvidenceBadge: "#refundStepEvidenceBadge",
+  businessDateInput: "#businessDateInput",
+  businessMonthInput: "#businessMonthInput",
+  closeSettlementBtn: "#closeSettlementBtn",
+  businessTimezoneText: "#businessTimezoneText",
+  settlementConfirmPanel: "#settlementConfirmPanel",
+  exportAuditCsvBtn: "#exportAuditCsvBtn",
+  exportMonthlyCsvBtn: "#exportMonthlyCsvBtn",
+  openAuditLogBtn: "#openAuditLogBtn",
+  auditLogPanel: "#auditLogPanel",
+  auditLogList: "#auditLogList",
+  closeSettlementHint: "#closeSettlementHint",
+});
+
+function refreshDynamicElementRefs() {
+  for (const [key, selector] of Object.entries(DYNAMIC_ELEMENT_SELECTORS)) {
+    el[key] = document.querySelector(selector);
+  }
+  el.permissionNodes = Array.from(document.querySelectorAll("[data-permission], [data-permission-any]"));
+}
+
+let screenWakeLock = null;
+
+async function releaseScreenWakeLock() {
+  if (!screenWakeLock) return;
+  const lock = screenWakeLock;
+  screenWakeLock = null;
+  try {
+    await lock.release();
+  } catch (_error) {
+    // Wake Lock is best-effort; rendering and payment state remain authoritative.
+  }
+}
+
+async function requestScreenWakeLock() {
+  if (!navigator.wakeLock || document.visibilityState !== "visible") return;
+  if (screenWakeLock && !screenWakeLock.released) return;
+  try {
+    screenWakeLock = await navigator.wakeLock.request("screen");
+    screenWakeLock.addEventListener("release", () => {
+      screenWakeLock = null;
+    }, { once: true });
+  } catch (_error) {
+    screenWakeLock = null;
+  }
+}
 
 function safeTimeZone(value) {
   const candidate = String(value || "").trim() || "Asia/Tokyo";
@@ -481,6 +656,40 @@ function hasPermission(permission) {
 
 function hasAnyPermission(permissions) {
   return permissions.some((permission) => hasPermission(permission));
+}
+
+function mountStorePaymentsControl() {
+  const mount = el.storePaymentsMount;
+  const shouldMount = Boolean(state.token && state.permissionsKnown && hasPermission("payments.control"));
+  if (!mount) return;
+  if (!shouldMount) {
+    mount.replaceChildren();
+    mount.dataset.eventsBound = "false";
+    refreshDynamicElementRefs();
+    return;
+  }
+  if (!mount.querySelector("#storePaymentsControl") && STORE_PAYMENTS_CONTROL_MARKUP) {
+    mount.insertAdjacentHTML("beforeend", STORE_PAYMENTS_CONTROL_MARKUP);
+    refreshDynamicElementRefs();
+    bindStorePaymentsEvents();
+  }
+}
+
+function mountAdminOperations() {
+  const mount = el.adminOperationsMount;
+  const shouldMount = Boolean(state.token && state.permissionsKnown && hasAnyPermission(ADMIN_UI_PERMISSIONS));
+  if (!mount) return;
+  if (!shouldMount) {
+    mount.replaceChildren();
+    mount.dataset.eventsBound = "false";
+    refreshDynamicElementRefs();
+    return;
+  }
+  if (!mount.querySelector("[data-admin-only]") && ADMIN_OPERATIONS_MARKUP) {
+    mount.insertAdjacentHTML("beforeend", ADMIN_OPERATIONS_MARKUP);
+    refreshDynamicElementRefs();
+    bindAdminEvents();
+  }
 }
 
 function requireUiPermission(permission, actionLabel) {
@@ -748,11 +957,7 @@ async function handleStorePaymentsToggle() {
 }
 
 function wouldAllowFulfillment(invoice) {
-  const status = effectiveOperatorStatus(invoice);
-  const providerDecision = PROVIDER_RAIL_ENABLED
-    ? String(invoice?.provider_summary?.fulfillment_decision || "").toLowerCase()
-    : "";
-  return ["paid", "settled"].includes(status) || providerDecision === "allow_fulfillment";
+  return getAuthoritativeFulfillmentDecision(invoice).decision === "allow";
 }
 
 function hasFreshFulfillmentObservation() {
@@ -781,9 +986,17 @@ function resolveFulfillmentDecisionModel(invoice) {
     };
   }
   const status = effectiveOperatorStatus(invoice);
-  const providerDecision = PROVIDER_RAIL_ENABLED
-    ? String(invoice?.provider_summary?.fulfillment_decision || "").toLowerCase()
-    : "";
+  const authoritativeDecision = getAuthoritativeFulfillmentDecision(invoice);
+  if (authoritativeDecision.decision !== "allow") {
+    const policy = getOperatorActionPolicy(status);
+    return {
+      decision: "hold",
+      badge: "サーバー判定が引渡しを保留中",
+      badgeClass: "s-red",
+      title: "サーバーの引渡し許可が確認できるまで渡さない",
+      body: `${authoritativeDecision.reason_codes?.join(", ") || "FULFILLMENT_DECISION_UNAVAILABLE"}。${policy.manager}`,
+    };
+  }
   if (isFulfillmentObservationUnavailable(invoice)) {
     return {
       decision: "hold",
@@ -793,23 +1006,12 @@ function resolveFulfillmentDecisionModel(invoice) {
       body: "リアルタイム更新または最新取得が止まっています。再取得が成功するまで商品を渡さず、必要なら店長へ連絡してください。",
     };
   }
-  if (providerDecision === "allow_fulfillment") {
-    return {
-      decision: "allow",
-      badge: "商品を渡してOK",
-      badgeClass: "s-green",
-      title: "店頭端末の引渡し許可を確認しました",
-      body: "商品を渡せます。JPYCの支払い確認と日次締めは別の記録として追跡されます。",
-    };
-  }
-  const policy = getOperatorActionPolicy(status);
-  const allow = ["paid", "settled"].includes(status);
   return {
-    decision: allow ? "allow" : "hold",
-    badge: allow ? "商品を渡してOK" : "商品はまだ渡さない",
-    badgeClass: allow ? "s-green" : status === "review_required" ? "s-red" : "s-yellow",
-    title: policy.handoff,
-    body: `${policy.next} ${policy.manager}`,
+    decision: "allow",
+    badge: "商品を渡してOK",
+    badgeClass: "s-green",
+    title: "店頭端末の引渡し許可を確認しました",
+    body: "商品を渡せます。JPYCの支払い確認と日次締めは別の記録として追跡されます。",
   };
 }
 
@@ -1426,7 +1628,7 @@ async function loadOpsSnapshot() {
   const canReadReviews = hasPermission("review.read");
   const canReadSettlement = hasPermission("settlement.close");
   const canReadMonitor = hasPermission("monitor.read");
-  if (!hasAnyPermission(["review.read", "settlement.close", "monitor.read"])) return;
+  if (!hasAnyPermission(["review.read", "settlement.close", "monitor.read"]) || !el.businessDateInput) return;
   const businessDate = /^\d{4}-\d{2}-\d{2}$/.test(String(el.businessDateInput.value || "").trim())
     ? String(el.businessDateInput.value || "").trim()
     : nowIsoDate();
@@ -1876,6 +2078,7 @@ function startSessionExpiryTimer() {
 }
 
 function setAuditLogRows(rows) {
+  if (!el.auditLogList) return;
   el.auditLogList.replaceChildren();
   const source = Array.isArray(rows) && rows.length > 0 ? rows : [null];
   for (const row of source) {
@@ -1955,42 +2158,53 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
   el.sessionText.textContent = reason;
   el.sessionExpiryText.textContent = "-";
   el.sessionPermissionText.textContent = "ログイン後、サーバーが返した実効権限に応じて操作を表示します。";
-  el.businessTimezoneText.textContent = state.storeTimezone;
-  el.businessDateInput.value = nowIsoDate();
-  el.businessMonthInput.value = nowIsoDate().slice(0, 7);
-  el.reviewsTableBody.replaceChildren();
-  renderReviewSummary([]);
-  renderReviewDetail(null);
-  el.reviewIdInput.value = "";
-  el.reviewNote.value = "";
-  setReviewListState("empty", "再ログイン後に確認待ち一覧を読み込めます。");
-  el.refundReviewCaseId.value = "";
-  el.refundAmount.value = "";
-  el.refundAddress.value = "";
-  el.refundChainId.value = "";
-  el.refundIdInput.value = "";
-  el.refundTxHashInput.value = "";
-  el.refundExecutedWalletInput.value = "";
-  el.refundEvidenceNotePathInput.value = "";
-  el.refundCustomerNoteInput.value = "";
-  el.refundEligibleHint.textContent = "レビューを選択すると、サーバーが返した返金可能額を表示します。";
-  el.executeRefundHint.classList.add("hidden");
-  el.executeRefundHint.textContent = "";
-  el.settlementConfirmPanel.classList.add("hidden");
-  el.closeSettlementHint.classList.add("hidden");
-  el.closeSettlementHint.textContent = "";
-  el.auditLogPanel.classList.add("hidden");
-  setAuditLogRows([]);
-  el.opsOpenReviewCount.textContent = "-";
-  el.opsDeadLetterCount.textContent = "-";
-  el.opsSettlementStatus.textContent = "-";
-  el.opsRecommendedAction.textContent = "-";
-  el.opsPriorityReview.textContent = "-";
-  el.opsRefundCandidateCount.textContent = "-";
-  el.opsAddressPoolCount.textContent = "-";
-  el.opsWorkerStatus.textContent = "-";
-  el.opsSnapshotState.textContent = "再ログイン後に実効権限の範囲で運用サマリーを表示します。";
-  setChecklist(el.opsSnapshotChecklist, ["担当者を交代する場合は、次のスタッフでログインしてください。"]);
+  if (el.businessTimezoneText && el.reviewsTableBody) {
+    el.businessTimezoneText.textContent = state.storeTimezone;
+    el.businessDateInput.value = nowIsoDate();
+    el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+    el.reviewsTableBody.replaceChildren();
+    renderReviewSummary([]);
+    renderReviewDetail(null);
+    el.reviewIdInput.value = "";
+    el.reviewDisposition.value = "";
+    el.reviewIncidentId.value = "";
+    el.reviewNote.value = "";
+    el.reviewStepUpPin.value = "";
+    el.reviewAdjustmentInvoiceId.value = "";
+    el.reviewAdjustmentId.value = "";
+    el.reviewAdjustmentAmount.value = "";
+    el.reviewAdjustmentReason.value = "";
+    el.reviewAdjustmentEvidenceRef.value = "";
+    el.accountingAdjustmentStatus.textContent = "再ログイン後に確認待ち一覧を読み込めます。";
+    setReviewListState("empty", "再ログイン後に確認待ち一覧を読み込めます。");
+    el.refundReviewCaseId.value = "";
+    el.refundAmount.value = "";
+    el.refundAddress.value = "";
+    el.refundChainId.value = "";
+    el.refundIdInput.value = "";
+    el.refundTxHashInput.value = "";
+    el.refundExecutedWalletInput.value = "";
+    el.refundEvidenceNotePathInput.value = "";
+    el.refundCustomerNoteInput.value = "";
+    el.refundEligibleHint.textContent = "レビューを選択すると、サーバーが返した返金可能額を表示します。";
+    el.executeRefundHint.classList.add("hidden");
+    el.executeRefundHint.textContent = "";
+    el.settlementConfirmPanel.classList.add("hidden");
+    el.closeSettlementHint.classList.add("hidden");
+    el.closeSettlementHint.textContent = "";
+    el.auditLogPanel.classList.add("hidden");
+    setAuditLogRows([]);
+    el.opsOpenReviewCount.textContent = "-";
+    el.opsDeadLetterCount.textContent = "-";
+    el.opsSettlementStatus.textContent = "-";
+    el.opsRecommendedAction.textContent = "-";
+    el.opsPriorityReview.textContent = "-";
+    el.opsRefundCandidateCount.textContent = "-";
+    el.opsAddressPoolCount.textContent = "-";
+    el.opsWorkerStatus.textContent = "-";
+    el.opsSnapshotState.textContent = "再ログイン後に実効権限の範囲で運用サマリーを表示します。";
+    setChecklist(el.opsSnapshotChecklist, ["担当者を交代する場合は、次のスタッフでログインしてください。"]);
+  }
   renderOpsWarningsList(["ログイン後に運用状態を確認します"]);
   setLoggedInUi(false);
   if (logoutRetryToken) {
@@ -2252,13 +2466,20 @@ function setInvoiceStatusPill(statusRaw) {
 }
 
 function clearQr() {
+  const rect = el.qrCanvas.getBoundingClientRect?.();
+  const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || 420, rect?.height || 420)));
+  const dpr = Math.min(Math.max(Number(window.devicePixelRatio) || 1, 1), 3);
+  el.qrCanvas.width = Math.round(cssSize * dpr);
+  el.qrCanvas.height = Math.round(cssSize * dpr);
   const ctx = el.qrCanvas.getContext("2d");
-  ctx.clearRect(0, 0, el.qrCanvas.width, el.qrCanvas.height);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssSize, cssSize);
   ctx.fillStyle = "#f4f6fb";
-  ctx.fillRect(0, 0, el.qrCanvas.width, el.qrCanvas.height);
+  ctx.fillRect(0, 0, cssSize, cssSize);
   ctx.fillStyle = "#5a6a82";
   ctx.font = "16px sans-serif";
   ctx.fillText("QRなし", 16, 30);
+  if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
 }
 
 function drawQr(value) {
@@ -2271,22 +2492,30 @@ function drawQr(value) {
   qr.make();
 
   const moduleCount = qr.getModuleCount();
+  const quietZoneModules = 4;
+  const totalModules = moduleCount + quietZoneModules * 2;
+  const rect = el.qrCanvas.getBoundingClientRect?.();
+  const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || 420, rect?.height || 420)));
+  const dpr = Math.min(Math.max(Number(window.devicePixelRatio) || 1, 1), 3);
+  el.qrCanvas.width = Math.round(cssSize * dpr);
+  el.qrCanvas.height = Math.round(cssSize * dpr);
   const ctx = el.qrCanvas.getContext("2d");
-  const size = Math.min(el.qrCanvas.width, el.qrCanvas.height);
-  const tile = size / moduleCount;
+  const tile = Math.max(1, Math.floor(cssSize / totalModules));
+  const renderedSize = tile * totalModules;
+  const offset = Math.floor((cssSize - renderedSize) / 2);
 
-  ctx.clearRect(0, 0, size, size);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, cssSize, cssSize);
   ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, size, size);
+  ctx.fillRect(0, 0, cssSize, cssSize);
   ctx.fillStyle = "#132036";
   for (let row = 0; row < moduleCount; row += 1) {
     for (let col = 0; col < moduleCount; col += 1) {
       if (qr.isDark(row, col)) {
-        const x = Math.round(col * tile);
-        const y = Math.round(row * tile);
-        const w = Math.ceil((col + 1) * tile) - x;
-        const h = Math.ceil((row + 1) * tile) - y;
-        ctx.fillRect(x, y, w, h);
+        const x = offset + (col + quietZoneModules) * tile;
+        const y = offset + (row + quietZoneModules) * tile;
+        ctx.fillRect(x, y, tile, tile);
       }
     }
   }
@@ -2307,6 +2536,7 @@ function renderCustomerFacingDisplay(invoice) {
   if (!tapOnly) {
     if (state.fixedQrUrl) {
       drawQr(state.fixedQrUrl);
+      if (typeof requestScreenWakeLock === "function") void requestScreenWakeLock();
       el.fixedQrUrlLink.textContent = state.fixedQrUrl;
       el.fixedQrUrlLink.href = state.fixedQrUrl;
     } else {
@@ -2318,6 +2548,8 @@ function renderCustomerFacingDisplay(invoice) {
       "このQRは端末ごとの固定入口です。お客様画面は、その時点の current invoice に一度だけ解決されます。";
     return;
   }
+
+  if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
 
   if (hasIntegrityHold(invoice)) {
     el.tapModeBadge.textContent = "記録整合性を確認中";
@@ -2755,6 +2987,9 @@ function formatRole(role) {
 }
 
 function applyPermissionVisibility() {
+  mountStorePaymentsControl();
+  mountAdminOperations();
+  refreshDynamicElementRefs();
   for (const node of el.permissionNodes) {
     const requiredPermission = String(node.dataset.permission || "").trim();
     const anyPermissions = String(node.dataset.permissionAny || "").trim().split(/\s+/).filter(Boolean);
@@ -2773,6 +3008,7 @@ function applyPermissionVisibility() {
 }
 
 function setReviewListState(kind, message) {
+  if (!el.reviewListState) return;
   el.reviewListState.className = `${kind}-state`;
   el.reviewListState.textContent = message;
 }
@@ -2798,12 +3034,14 @@ function reviewReasonLabel(reason) {
     CHAIN_INCONSISTENT: "チェーン不一致",
     UNKNOWN_TRANSFER: "送金条件不一致",
     ADDRESS_MISMATCH: "送金先不一致",
+    LEDGER_INTEGRITY_ERROR: "会計台帳の整合性確認が必要",
     OTHER: "確認が必要な支払い",
   };
   return map[code] || code || "-";
 }
 
 function renderReviewSummary(rows) {
+  if (!el.reviewSummaryChips) return;
   const counts = { open: 0, in_progress: 0, resolved: 0, rejected: 0 };
   let highestPriorityCount = 0;
   let refundCandidateCount = 0;
@@ -2884,6 +3122,7 @@ function applyRefundDraftFromReview(review, suggestion, events) {
 }
 
 function renderReviewDetail(detail = null) {
+  if (!el.reviewDetailBadge) return;
   state.selectedReviewDetail = detail;
   const review = detail?.review || null;
   const events = Array.isArray(detail?.events) ? detail.events : [];
@@ -2901,6 +3140,8 @@ function renderReviewDetail(detail = null) {
       "返金が必要そうな場合は、候補額をここに表示し、下の返金記録フォームにも下書きします。";
     el.reviewDetailEvents.textContent = "レビューを選ぶと、その支払いに紐づく直近イベントをここへ表示します。";
     el.reviewRelatedInvoices.textContent = "レビューを選ぶと、同じ会計で再発行された関連請求をここへ表示します。";
+    el.reviewAdjustmentInvoiceId.value = "";
+    el.accountingAdjustmentStatus.textContent = "レビューを選択すると対象請求を表示します。";
     el.refundDraftHint.textContent =
       "レビューを選択すると、返金候補額・支払い元アドレス・チェーンIDを返金フォームへ下書きします。";
     el.refundEligibleHint.textContent = "レビューを選択すると、サーバーが返した返金可能額を表示します。";
@@ -2917,6 +3158,8 @@ function renderReviewDetail(detail = null) {
     `${reviewReasonLabel(review.reason_type)} / ${formatJpy(review.amount_jpy)} / 請求状態 ${reviewStatusLabel(review.invoice_status || review.status)} / 経過 ${ageMinutes}分`;
   el.reviewDetailId.textContent = review.id || "-";
   el.reviewDetailInvoice.textContent = review.invoice_no || review.invoice_id || "-";
+  el.reviewAdjustmentInvoiceId.value = review.invoice_id || "";
+  el.accountingAdjustmentStatus.textContent = `対象請求 ${review.invoice_id || "-"}。支払い状態は会計調整では変更されません。`;
   el.reviewDetailAmount.textContent = `${formatJpy(review.amount_jpy)} / 受取 ${formatJpyc(review.paid_amount_jpyc)}`;
   el.reviewDetailTxHash.textContent = review.paid_tx_hash || "-";
   el.reviewDetailAction.textContent = `${suggestion.action}（推奨ステータス: ${nextStatusLabel}）`;
@@ -2962,6 +3205,10 @@ function renderReviewDetail(detail = null) {
     el.reviewRelatedInvoices.textContent = "期限後入金の確認時に、同じ会計の関連請求を表示します。";
   }
 
+  const incidents = Array.isArray(review.incidents) ? review.incidents : [];
+  const openIncident = incidents.find((incident) => ["open", "in_progress"].includes(String(incident.status || "")));
+  el.reviewIncidentId.value = openIncident?.id || "";
+  el.reviewDisposition.value = String(review.disposition || "");
   applyRefundDraftFromReview(review, suggestion, events);
   el.reviewNextStatus.value = suggestion.suggestedNextStatus || review.status;
 }
@@ -3119,9 +3366,11 @@ async function handleLogin() {
     el.sessionPermissionText.textContent = state.permissionsKnown
       ? `実効権限 ${state.effectivePermissions.size}件（許可された操作のみ表示）`
       : "実効権限を確認できないため、管理・返金・締め・監査・監視操作を非表示にしています。";
-    el.businessTimezoneText.textContent = state.storeTimezone;
-    el.businessDateInput.value = nowIsoDate();
-    el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+    if (el.businessTimezoneText) {
+      el.businessTimezoneText.textContent = state.storeTimezone;
+      el.businessDateInput.value = nowIsoDate();
+      el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+    }
     startSessionExpiryTimer();
     setNetworkStatus("認証済み");
     renderCustomerFacingQr();
@@ -3435,7 +3684,7 @@ async function handleResumeQr() {
 }
 
 async function loadReviews() {
-  if (!hasPermission("review.read")) return;
+  if (!hasPermission("review.read") || !el.reviewStatusFilter || !el.reviewsTableBody) return;
   const requestSequence = state.reviewListSequence + 1;
   state.reviewListSequence = requestSequence;
   const status = String(el.reviewStatusFilter.value || "");
@@ -3496,6 +3745,91 @@ async function loadReviews() {
   }
 }
 
+async function stepUpForAccountingAdjustment() {
+  const stepUpPin = String(el.reviewStepUpPin.value || "").trim();
+  if (!/^\d{4,8}$/.test(stepUpPin)) {
+    throw new Error("会計調整には4-8桁のstep-up PINが必要です");
+  }
+  await requestJson("/api/v1/terminal-sessions/current/step-up", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "idempotency-key": idempotencyKey("accounting-adjustment-step-up"),
+    },
+    body: JSON.stringify({ staff_pin: stepUpPin }),
+  });
+}
+
+async function handleCreateAccountingAdjustment() {
+  if (!requireUiPermission("accounting.adjustment.create", "会計調整の作成")) return;
+  const invoiceId = String(el.reviewAdjustmentInvoiceId.value || "").trim();
+  const reviewCaseId = String(el.reviewIdInput.value || "").trim();
+  const adjustmentType = String(el.reviewAdjustmentType.value || "").trim();
+  const amount = String(el.reviewAdjustmentAmount.value || "").trim();
+  const reason = String(el.reviewAdjustmentReason.value || "").trim();
+  const evidenceRef = String(el.reviewAdjustmentEvidenceRef.value || "").trim();
+  if (!invoiceId || !reviewCaseId || !/^\d+$/.test(amount) || BigInt(amount || "0") <= 0n || reason.length < 10 || !evidenceRef) {
+    showToast("請求・レビュー・正の調整額・10文字以上の理由・証拠参照を入力してください", true);
+    return;
+  }
+  try {
+    await stepUpForAccountingAdjustment();
+    const data = await requestJson("/api/v1/accounting-adjustments", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey("accounting-adjustment-create"),
+      },
+      body: JSON.stringify({
+        invoice_id: invoiceId,
+        review_case_id: reviewCaseId,
+        adjustment_type: adjustmentType,
+        amount_jpyc_base: amount,
+        reason,
+        evidence: { evidence_ref: evidenceRef },
+      }),
+    });
+    const adjustment = data?.accounting_adjustment;
+    if (!adjustment?.id) throw new Error("会計調整IDを取得できませんでした");
+    el.reviewAdjustmentId.value = adjustment.id;
+    el.accountingAdjustmentStatus.textContent = `作成済み・承認待ち: ${adjustment.id}`;
+    showToast("会計調整を作成しました。別スタッフのstep-up承認が必要です");
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    showToast(String(error.message || error), true);
+  } finally {
+    el.reviewStepUpPin.value = "";
+  }
+}
+
+async function handleApproveAccountingAdjustment() {
+  if (!requireUiPermission("accounting.adjustment.approve", "会計調整の承認")) return;
+  const adjustmentId = String(el.reviewAdjustmentId.value || "").trim();
+  if (!adjustmentId) {
+    showToast("承認する会計調整IDを入力してください", true);
+    return;
+  }
+  try {
+    await stepUpForAccountingAdjustment();
+    const data = await requestJson(`/api/v1/accounting-adjustments/${encodeURIComponent(adjustmentId)}/approve`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey("accounting-adjustment-approve"),
+      },
+      body: "{}",
+    });
+    const adjustment = data?.accounting_adjustment;
+    el.accountingAdjustmentStatus.textContent = `承認済み: ${adjustment?.id || adjustmentId}（別staff）`;
+    showToast("会計調整を承認しました。必要ならレビュー処分で承認済みIDを指定してください");
+  } catch (error) {
+    if (isIgnoredRequestError(error)) return;
+    showToast(String(error.message || error), true);
+  } finally {
+    el.reviewStepUpPin.value = "";
+  }
+}
+
 async function handleUpdateReview() {
   if (!requireUiPermission("review.update", "レビュー更新")) return;
   const reviewId = String(el.reviewIdInput.value || "").trim();
@@ -3503,6 +3837,16 @@ async function handleUpdateReview() {
     showToast("レビューIDを入力してください", true);
     return;
   }
+  const disposition = String(el.reviewDisposition.value || "").trim();
+  const reviewUpdateBody = {
+    status: el.reviewNextStatus.value,
+    resolution_note: String(el.reviewNote.value || "").trim() || null,
+    disposition: disposition || undefined,
+    incident_id: String(el.reviewIncidentId.value || "").trim() || undefined,
+    accounting_adjustment_id: disposition === "accounting_adjustment"
+      ? String(el.reviewAdjustmentId.value || "").trim() || undefined
+      : undefined,
+  };
   try {
     await requestJson(`/api/v1/reviews/${encodeURIComponent(reviewId)}`, {
       method: "PATCH",
@@ -3510,10 +3854,7 @@ async function handleUpdateReview() {
         "content-type": "application/json",
         "idempotency-key": idempotencyKey("review-update"),
       },
-      body: JSON.stringify({
-        status: el.reviewNextStatus.value,
-        resolution_note: String(el.reviewNote.value || "").trim() || null,
-      }),
+      body: JSON.stringify(reviewUpdateBody),
     });
     showToast("レビューを更新しました");
     await loadReviews();
@@ -3521,6 +3862,8 @@ async function handleUpdateReview() {
   } catch (error) {
     if (isIgnoredRequestError(error)) return;
     showToast(String(error.message || error), true);
+  } finally {
+    el.reviewNote.focus();
   }
 }
 
@@ -4117,11 +4460,83 @@ function loadTerminalSettings() {
   renderAmountPresetButtons();
 }
 
+function bindStorePaymentsEvents() {
+  if (
+    !el.storePaymentsMount
+    || el.storePaymentsMount.dataset.eventsBound === "true"
+    || !el.storePaymentsRefreshBtn
+    || !el.storePaymentsToggleBtn
+  ) return;
+  el.storePaymentsRefreshBtn.addEventListener("click", () => void loadStorePaymentsState());
+  el.storePaymentsToggleBtn.addEventListener("click", () => void handleStorePaymentsToggle());
+  el.storePaymentsMount.dataset.eventsBound = "true";
+}
+
+function bindAdminEvents() {
+  if (
+    !el.adminOperationsMount
+    || el.adminOperationsMount.dataset.eventsBound === "true"
+    || !el.loadReviewsBtn
+    || !el.reviewStatusFilter
+    || !el.updateReviewBtn
+  ) return;
+  el.loadReviewsBtn.addEventListener("click", () => void loadReviews());
+  el.reviewStatusFilter.addEventListener("change", () => void loadReviews());
+  el.updateReviewBtn.addEventListener("click", () => void handleUpdateReview());
+  el.createAccountingAdjustmentBtn.addEventListener("click", () => void handleCreateAccountingAdjustment());
+  el.approveAccountingAdjustmentBtn.addEventListener("click", () => void handleApproveAccountingAdjustment());
+
+  el.requestRefundBtn.addEventListener("click", () => void handleRequestRefund());
+  for (const input of [
+    el.refundReviewCaseId,
+    el.refundAmount,
+    el.refundAddress,
+    el.refundChainId,
+    el.refundEvidenceNotePathInput,
+    el.refundCustomerNoteInput,
+  ]) {
+    input.addEventListener("input", handleRefundDraftChanged);
+  }
+  el.refundIdInput.addEventListener("input", () => {
+    clearPendingRefundExecute();
+    state.refundReadSequence += 1;
+    state.refundReadRequestId = "";
+    state.currentRefund = null;
+    updateRefundStepState();
+  });
+  for (const input of [el.refundTxHashInput, el.refundExecutedWalletInput]) {
+    input.addEventListener("input", clearPendingRefundExecute);
+  }
+  el.refundIdInput.addEventListener("change", () => {
+    const refundId = String(el.refundIdInput.value || "").trim();
+    if (refundId && hasPermission("refund.view")) {
+      void readBackRefund(refundId).catch((error) => {
+        if (isIgnoredRequestError(error)) return;
+        showToast(String(error.message || error), true);
+      });
+    }
+  });
+  el.approveRefundBtn.addEventListener("click", () => void handleApproveRefund());
+  el.executeRefundBtn.addEventListener("click", () => void handleExecuteRefund());
+  el.verifyRefundBtn.addEventListener("click", () => void handleVerifyRefund());
+
+  el.closeSettlementBtn.addEventListener("click", () => void handleCloseSettlement());
+  el.exportAuditCsvBtn.addEventListener("click", () => void handleExportAuditCsv());
+  el.exportMonthlyCsvBtn.addEventListener("click", () => void handleExportMonthlyCsv());
+  el.openAuditLogBtn.addEventListener("click", () => void handleOpenAuditLog());
+  el.refreshOpsSnapshotBtn.addEventListener("click", () => void loadOpsSnapshot());
+  el.businessDateInput.addEventListener("change", () => {
+    state.pendingSettlementClose = "";
+    if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
+    if (!hasPermission("settlement.close")) return;
+    void loadOpsSnapshot();
+  });
+  el.adminOperationsMount.dataset.eventsBound = "true";
+}
+
 function bindEvents() {
   el.loginBtn.addEventListener("click", () => void handleLogin());
   el.logoutBtn.addEventListener("click", () => void handleLogout());
-  el.storePaymentsRefreshBtn.addEventListener("click", () => void loadStorePaymentsState());
-  el.storePaymentsToggleBtn.addEventListener("click", () => void handleStorePaymentsToggle());
   el.amountPresetList.addEventListener("click", (event) => {
     const actionButton = event.target.closest("[data-preset-action]");
     if (!actionButton) return;
@@ -4168,67 +4583,29 @@ function bindEvents() {
     el.resumeQrBtn.addEventListener("click", () => void handleResumeQr());
   }
 
-  el.loadReviewsBtn.addEventListener("click", () => void loadReviews());
-  el.reviewStatusFilter.addEventListener("change", () => void loadReviews());
-  el.updateReviewBtn.addEventListener("click", () => void handleUpdateReview());
-
-  el.requestRefundBtn.addEventListener("click", () => void handleRequestRefund());
-  for (const input of [
-    el.refundReviewCaseId,
-    el.refundAmount,
-    el.refundAddress,
-    el.refundChainId,
-    el.refundEvidenceNotePathInput,
-    el.refundCustomerNoteInput,
-  ]) {
-    input.addEventListener("input", handleRefundDraftChanged);
-  }
-  el.refundIdInput.addEventListener("input", () => {
-    clearPendingRefundExecute();
-    state.refundReadSequence += 1;
-    state.refundReadRequestId = "";
-    state.currentRefund = null;
-    updateRefundStepState();
-  });
-  for (const input of [el.refundTxHashInput, el.refundExecutedWalletInput]) {
-    input.addEventListener("input", clearPendingRefundExecute);
-  }
-  el.refundIdInput.addEventListener("change", () => {
-    const refundId = String(el.refundIdInput.value || "").trim();
-    if (refundId && hasPermission("refund.view")) {
-      void readBackRefund(refundId).catch((error) => {
-        if (isIgnoredRequestError(error)) return;
-        showToast(String(error.message || error), true);
-      });
-    }
-  });
-  el.approveRefundBtn.addEventListener("click", () => void handleApproveRefund());
-  el.executeRefundBtn.addEventListener("click", () => void handleExecuteRefund());
-  el.verifyRefundBtn.addEventListener("click", () => void handleVerifyRefund());
-
-  el.closeSettlementBtn.addEventListener("click", () => void handleCloseSettlement());
-  el.exportAuditCsvBtn.addEventListener("click", () => void handleExportAuditCsv());
-  el.exportMonthlyCsvBtn.addEventListener("click", () => void handleExportMonthlyCsv());
-  el.openAuditLogBtn.addEventListener("click", () => void handleOpenAuditLog());
   el.saveSettingsBtn.addEventListener("click", saveTerminalSettings);
-  el.refreshOpsSnapshotBtn.addEventListener("click", () => void loadOpsSnapshot());
-  el.businessDateInput.addEventListener("change", () => {
-    state.pendingSettlementClose = "";
-    if (el.settlementConfirmPanel) el.settlementConfirmPanel.classList.add("hidden");
-    if (!hasPermission("settlement.close")) return;
-    void loadOpsSnapshot();
-  });
 
   window.addEventListener("beforeunload", () => {
     closeSse();
     stopFallbackPolling();
     stopOpsAutoRefresh();
     stopSessionExpiryTimer();
+    if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
   });
   window.addEventListener("pageshow", refreshFulfillmentObservationAfterResume);
   window.addEventListener("online", refreshFulfillmentObservationAfterResume);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") refreshFulfillmentObservationAfterResume();
+    if (document.visibilityState === "visible") {
+      refreshFulfillmentObservationAfterResume();
+      if (state.fixedQrUrl && !el.qrCanvas.classList.contains("hidden") && typeof requestScreenWakeLock === "function") {
+        void requestScreenWakeLock();
+      }
+    } else {
+      if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
+    }
+  });
+  window.addEventListener("resize", () => {
+    if (state.fixedQrUrl && !el.qrCanvas.classList.contains("hidden")) drawQr(state.fixedQrUrl);
   });
 }
 
@@ -4244,17 +4621,19 @@ function init() {
   renderReviewSummary([]);
   setReviewListState("empty", "ログイン後に確認待ち一覧を読み込めます。");
   renderReviewDetail(null);
-  el.opsSnapshotState.textContent = "ログイン後に review / settlement / monitor を集約し、優先確認項目を表示します。";
-  el.opsOpenReviewCount.textContent = "-";
-  el.opsDeadLetterCount.textContent = "-";
-  el.opsSettlementStatus.textContent = "-";
-  el.opsRecommendedAction.textContent = "-";
-  el.opsPriorityReview.textContent = "-";
-  el.opsRefundCandidateCount.textContent = "-";
-  setChecklist(el.opsSnapshotChecklist, ["小規模現場向けに、必要な運用項目だけをコンパクトに表示します。"]);
-  el.businessDateInput.value = nowIsoDate();
-  el.businessMonthInput.value = nowIsoDate().slice(0, 7);
-  el.businessTimezoneText.textContent = state.storeTimezone;
+  if (el.opsSnapshotState) {
+    el.opsSnapshotState.textContent = "ログイン後に review / settlement / monitor を集約し、優先確認項目を表示します。";
+    el.opsOpenReviewCount.textContent = "-";
+    el.opsDeadLetterCount.textContent = "-";
+    el.opsSettlementStatus.textContent = "-";
+    el.opsRecommendedAction.textContent = "-";
+    el.opsPriorityReview.textContent = "-";
+    el.opsRefundCandidateCount.textContent = "-";
+    setChecklist(el.opsSnapshotChecklist, ["小規模現場向けに、必要な運用項目だけをコンパクトに表示します。"]);
+    el.businessDateInput.value = nowIsoDate();
+    el.businessMonthInput.value = nowIsoDate().slice(0, 7);
+    el.businessTimezoneText.textContent = state.storeTimezone;
+  }
   setNetworkStatus("未接続");
   updateRefundStepState();
   renderDiagnostics();

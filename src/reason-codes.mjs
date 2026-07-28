@@ -7,6 +7,12 @@ export const REVIEW_REASON_CODES = Object.freeze({
   UNKNOWN_TRANSFER: "UNKNOWN_TRANSFER",
   ADDRESS_MISMATCH: "ADDRESS_MISMATCH",
   CHAIN_INCONSISTENT: "CHAIN_INCONSISTENT",
+  CHAIN_REORG: "CHAIN_REORG",
+  LEDGER_INTEGRITY_ERROR: "LEDGER_INTEGRITY_ERROR",
+  CHAIN_TRANSFER_IDENTITY_INCOMPLETE: "CHAIN_TRANSFER_IDENTITY_INCOMPLETE",
+  TIMESTAMP_UNVERIFIED: "TIMESTAMP_UNVERIFIED",
+  DETECTED_AFTER_EXPIRY: "DETECTED_AFTER_EXPIRY",
+  CROSS_INVOICE_TRANSFER_COLLISION: "CROSS_INVOICE_TRANSFER_COLLISION",
   OTHER: "OTHER",
 });
 
@@ -23,6 +29,13 @@ export const LEGACY_REVIEW_REASON_CODE_MAP = Object.freeze({
   late_payment: REVIEW_REASON_CODES.LATE_PAYMENT,
   wrong_chain: REVIEW_REASON_CODES.CHAIN_INCONSISTENT,
   chain_inconsistent: REVIEW_REASON_CODES.CHAIN_INCONSISTENT,
+  chain_reorg: REVIEW_REASON_CODES.CHAIN_REORG,
+  chain_reorg_detected: REVIEW_REASON_CODES.CHAIN_REORG,
+  ledger_integrity_error: REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR,
+  chain_transfer_identity_incomplete: REVIEW_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE,
+  timestamp_unverified: REVIEW_REASON_CODES.TIMESTAMP_UNVERIFIED,
+  detected_after_expiry: REVIEW_REASON_CODES.DETECTED_AFTER_EXPIRY,
+  cross_invoice_transfer_collision: REVIEW_REASON_CODES.CROSS_INVOICE_TRANSFER_COLLISION,
   wrong_token: REVIEW_REASON_CODES.UNKNOWN_TRANSFER,
   unknown_transfer: REVIEW_REASON_CODES.UNKNOWN_TRANSFER,
   wrong_recipient: REVIEW_REASON_CODES.ADDRESS_MISMATCH,
@@ -70,6 +83,12 @@ export function reasonCodeLabelJa(reasonCodeRaw) {
     [REVIEW_REASON_CODES.UNKNOWN_TRANSFER]: "請求との照合が必要です",
     [REVIEW_REASON_CODES.ADDRESS_MISMATCH]: "送金先が請求内容と一致しません",
     [REVIEW_REASON_CODES.CHAIN_INCONSISTENT]: "チェーンまたはトークンが一致しません",
+    [REVIEW_REASON_CODES.CHAIN_REORG]: "チェーン再編成により再確認が必要です",
+    [REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR]: "会計台帳の整合性確認が必要です",
+    [REVIEW_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE]: "送金識別情報が不足しているため確定できません",
+    [REVIEW_REASON_CODES.TIMESTAMP_UNVERIFIED]: "ブロック時刻を検証できないため確定できません",
+    [REVIEW_REASON_CODES.DETECTED_AFTER_EXPIRY]: "期限後に検知されたため提供可否の確認が必要です",
+    [REVIEW_REASON_CODES.CROSS_INVOICE_TRANSFER_COLLISION]: "同じチェーン送金が複数請求に関連付いています",
     [REVIEW_REASON_CODES.OTHER]: "確認が必要な支払い",
   };
   return labels[code] || labels[REVIEW_REASON_CODES.OTHER];
@@ -86,6 +105,12 @@ export function suggestedReviewAction(reasonCodeRaw) {
     [REVIEW_REASON_CODES.UNKNOWN_TRANSFER]: "送金元・送金先・金額の照合を実施してください",
     [REVIEW_REASON_CODES.ADDRESS_MISMATCH]: "請求先アドレスとの不一致を確認してください",
     [REVIEW_REASON_CODES.CHAIN_INCONSISTENT]: "チェーンとトークンを確認し、誤送金対応を実施してください",
+    [REVIEW_REASON_CODES.CHAIN_REORG]: "再編成後の正規チェーン記録を再確認するまで提供・返金・締めを停止してください",
+    [REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR]: "元の台帳値を変更せず、管理者が会計証跡を照合してください",
+    [REVIEW_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE]: "chain_id・tx_hash・log_indexを再取得するまで確定・提供・締めを停止してください",
+    [REVIEW_REASON_CODES.TIMESTAMP_UNVERIFIED]: "検証済みブロック時刻を取得するまで期限判定を行わないでください",
+    [REVIEW_REASON_CODES.DETECTED_AFTER_EXPIRY]: "ブロック時刻と検知時刻を照合し、提供可否を手動確認してください",
+    [REVIEW_REASON_CODES.CROSS_INVOICE_TRANSFER_COLLISION]: "関連する全請求を保留し、送金と請求の紐付けを再確認してください",
     [REVIEW_REASON_CODES.OTHER]: "管理者確認が必要です",
   };
   return actions[code] || actions[REVIEW_REASON_CODES.OTHER];

@@ -136,6 +136,17 @@
 - 全条件を満たした場合だけ `200 { ok: true, recorded_at }` を返し、公開版3点と同意時刻を監査ログへ記録する。
 - 公開エンドポイントの運用前検証（`scripts/deploy/healthcheck.sh` と `scripts/deploy/check-public-host.sh`）は、HTTPS/443以外を拒否し、全A/AAAA解決結果を検査して内部・予約・IPv4埋め込み・NAT64/6to4/Teredo等をfail-closedで拒否する。接続時は検査済みアドレスへlookupを固定し、同一originのHTTPSリダイレクトだけを許可する。`check-public-host.sh` は公開入口トークンと署名付き決済URLを必須とし、readyzのJSON内容も検証する。これは外部DNS・TLS・配信先が実際に公開されていることの代替ではなく、公開後に外部証跡として実行する。
 
+### `POST /api/v1/public/invoices/:invoiceId/payment-recovery`
+- 役割: 顧客が送金済みの `chain_id` と `tx_hash` を提出し、Ethereum / Avalanche の read-only recovery monitor に確認を依頼する。
+- invoice固有の `sig` / `exp` / `nonce` が必要で、ウォレット送金・返金・資産移動は実行しない。
+- `chain_id` は `1` または `43114` に限定する。RPCが未設定、receipt未取得、またはTransferを安全に判定できない場合は `unverified_report` または `customer_reported_wrong_chain|customer_reported_wrong_token` として保存し、「自動検知済み」と表示しない。
+- 承認済みJPYCを請求先へ送ったことをRPC証跡で確認できた場合だけ、請求チェーンとの不一致を `verified_wrong_chain`、同一チェーンで別ERC-20を請求先へ送った場合を `verified_wrong_token` とする。
+- レスポンスの `verification.rpc_verified` / `receipt_found` / `canonical_status` / `confirmations` は確認強度を示す。未検証の申告を支払い完了へ遷移させない。
+
+### `POST /api/v1/payment-recovery/reports`
+- 役割: 端末スタッフが invoice に紐づく同じ read-only recovery report を登録する。
+- `invoice.read` と端末セッションを要求する。保存先は `payment_recovery_reports` と監査ログであり、invoiceの支払い状態を直接変更しない。
+
 ### `GET /healthz`
 - 役割: liveness check。
 - 用途: Docker HEALTHCHECK、reverse proxy upstream 監視、一次切り分け。
@@ -149,6 +160,28 @@
 - 役割: runtime metrics / JSON diagnostics の取得。
 - 用途: Prometheus scrape、運用ダッシュボード、`format=json` による一次切り分け。
 - 認証: `Authorization: Bearer <METRICS_SECRET>`
+
+## Chain worker internal API
+
+次の endpoint は公開APIではなく、`SERVICE_INGEST_SECRET` による signed service request（timestamp + jti + payload hash）専用である。worker は financial DB を直接開かず、候補/evidence の読み取りと financial write をこのAPI境界で行う。
+
+### `POST /api/v1/internal/chain/candidates:read`
+- worker が監視対象 invoice の候補を取得する read-only endpoint。
+- request: `{ "chain_id": "137", "token_contract": "0x..." }`
+- response: `schema_version`、`chain_id`、`token_contract`、`invoices[]`。
+- chain/token が app の承認済み設定と一致しない場合は拒否する。
+
+### `POST /api/v1/internal/chain/payment-evidence:read`
+- worker が reorg/canonicality 再検証に必要な payment event evidence を取得する read-only endpoint。
+- request: `{ "chain_id": "137", "from_block": 1, "to_block": 12 }`。block range は上限付き。
+- response: `schema_version`、block range、`events[]`（invoice id、block/tx/log identity、block hash）。
+
+### Existing signed financial writes
+- `POST /api/v1/internal/payments/events:ingest`
+- `POST /api/v1/internal/chain/reorgs:ingest`
+- `POST /api/v1/internal/chain/reconciliation:ingest`
+
+上記 write endpoint の署名検証・idempotency・監査記録は既存契約を維持する。read endpoint は financial table を更新せず、write endpoint だけが financial state transition を確定する。
 
 ## Wallet launch payload contract
 公開請求APIと invoice API が返す wallet payload は次を基準にする。
@@ -260,6 +293,18 @@ ethereum:<TOKEN_CONTRACT>@137/transfer?address=<RECEIVE_ADDRESS>&uint256=<EXPECT
 - 申告hashとサーバー計算hashが1つでも不一致、または本文不足の場合は `400 POLICY_PUBLICATION_INVALID` とし、store設定や同意証跡を更新しない。
 - invoiceのpolicy snapshotには本文ではなく、サーバー計算hashとcanonicalization証跡を保存する。
 - 発行時 `policy_snapshot_json` を持たないinvoiceは、後日のstore policyへfallbackしない。公開invoice APIはpolicyを `null` とし、同意APIは `snapshot_missing: true` でfail-closedにする。
+
+## Human Accounting Adjustment endpoints
+- `POST /api/v1/accounting-adjustments`
+  - `accounting.adjustment.create` が必要。
+  - `invoice_id`、`adjustment_type`（`manual_acceptance` / `loss_accepted` / `goodwill` / `write_off`）、正の`amount_jpyc_base`、10文字以上の`reason`、`evidence.evidence_ref`を必須とする。
+  - 作成者のfresh step-upを要求し、`status=pending`で保存する。`review_case_id`を指定した場合は同一請求のレビューへ紐付ける。
+- `POST /api/v1/accounting-adjustments/:id/approve`
+  - `accounting.adjustment.approve`が必要。
+  - 承認者のfresh step-upと作成者とは異なるactive staffを要求し、`status=approved`へ遷移する。
+  - `accounting_event_journal`と監査ログへ証拠・理由・作成者・承認者・請求の支払い状態スナップショットを記録する。
+- 上記の作成・承認とレビュー更新は`invoices.status`および`invoices.paid_tx_hash`を変更しない。`accepted_as_paid`で未払い請求を`paid`にする経路はない。
+- 承認済みIDを指定した`PATCH /api/v1/reviews/:reviewId`の`disposition=accounting_adjustment`だけが、人手調整済みとしてレビュー処分を記録する。
 
 ## Settlement Export endpoints and versioning
 

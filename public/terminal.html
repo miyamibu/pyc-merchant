@@ -17,49 +17,54 @@
       <a class="btn btn-secondary btn-compact dev-only-link" href="/prototype.html">アニメーションを見る</a>
     </header>
 
-    <section
-      id="fulfillmentDecisionBanner"
-      class="fulfillment-banner mt-16"
-      data-decision="hold"
-      role="status"
-      aria-live="polite"
-      aria-atomic="true"
-      aria-labelledby="fulfillmentDecisionTitle"
-    >
-      <span id="fulfillmentDecisionBadge" class="status-pill s-yellow">商品はまだ渡さない</span>
-      <div class="stack gap-tight">
-        <h2 id="fulfillmentDecisionTitle" class="title title-md">会計状態を確認中です</h2>
-        <p id="fulfillmentDecisionBody" class="helper-text">サーバーの判定を確認できるまで、商品引渡しと追加送金の案内を止めてください。</p>
-      </div>
-    </section>
-
-    <aside
-      id="storePaymentsControl"
-      class="store-payments-control hidden"
-      data-permission="payments.control"
-      data-state="unknown"
-      aria-labelledby="storePaymentsControlTitle"
-    >
-      <div class="stack gap-tight">
-        <div class="row row-between">
-          <h2 id="storePaymentsControlTitle" class="title title-md">店舗決済コントロール</h2>
-          <span id="storePaymentsStatusBadge" class="status-pill s-gray">状態未確認</span>
+    <div id="stickyStack" class="sticky-stack mt-16" aria-label="会計状態と店舗決済の安全操作">
+      <section
+        id="fulfillmentDecisionBanner"
+        class="fulfillment-banner"
+        data-decision="hold"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-labelledby="fulfillmentDecisionTitle"
+      >
+        <span id="fulfillmentDecisionBadge" class="status-pill s-yellow">商品はまだ渡さない</span>
+        <div class="stack gap-tight">
+          <h2 id="fulfillmentDecisionTitle" class="title title-md">会計状態を確認中です</h2>
+          <p id="fulfillmentDecisionBody" class="helper-text">サーバーの判定を確認できるまで、商品引渡しと追加送金の案内を止めてください。</p>
         </div>
-        <p id="storePaymentsStatusText" class="helper-text" role="status" aria-live="polite" aria-atomic="true">
-          状態が不明なときも、店舗の新規決済停止は実行できます。
-        </p>
-        <p class="small">この操作は現在の店舗だけが対象で、全体停止の解除や変更はできません。操作は監査ログに記録されます。</p>
-      </div>
-      <div class="store-payments-control-actions">
-        <button id="storePaymentsRefreshBtn" class="btn btn-secondary btn-compact" type="button">状態を再確認</button>
-        <button
-          id="storePaymentsToggleBtn"
-          class="btn btn-danger"
-          type="button"
-          aria-describedby="storePaymentsStatusText"
-        >店舗の新規決済を停止</button>
-      </div>
-    </aside>
+      </section>
+      <div id="storePaymentsMount" class="sticky-stack-slot"></div>
+    </div>
+
+    <template id="storePaymentsControlTemplate">
+      <aside
+        id="storePaymentsControl"
+        class="store-payments-control hidden"
+        data-permission="payments.control"
+        data-state="unknown"
+        aria-labelledby="storePaymentsControlTitle"
+      >
+        <div class="stack gap-tight">
+          <div class="row row-between">
+            <h2 id="storePaymentsControlTitle" class="title title-md">店舗決済コントロール</h2>
+            <span id="storePaymentsStatusBadge" class="status-pill s-gray">状態未確認</span>
+          </div>
+          <p id="storePaymentsStatusText" class="helper-text" role="status" aria-live="polite" aria-atomic="true">
+            状態が不明なときも、店舗の新規決済停止は実行できます。
+          </p>
+          <p class="small">この操作は現在の店舗だけが対象で、全体停止の解除や変更はできません。操作は監査ログに記録されます。</p>
+        </div>
+        <div class="store-payments-control-actions">
+          <button id="storePaymentsRefreshBtn" class="btn btn-secondary btn-compact" type="button">状態を再確認</button>
+          <button
+            id="storePaymentsToggleBtn"
+            class="btn btn-danger"
+            type="button"
+            aria-describedby="storePaymentsStatusText"
+          >店舗の新規決済を停止</button>
+        </div>
+      </aside>
+    </template>
 
     <main class="grid-main mt-16">
       <section class="card stack col-4 terminal-session-card" aria-labelledby="sessionSectionTitle">
@@ -274,6 +279,7 @@
         </section>
       </section>
 
+      <template id="adminOperationsTemplate">
       <section class="card stack col-12" data-admin-only="true" data-permission-any="review.read settlement.close monitor.read" aria-labelledby="opsSnapshotTitle">
         <div class="section-header">
           <h2 id="opsSnapshotTitle" class="title title-lg">本日の運用サマリー</h2>
@@ -407,11 +413,74 @@
               </select>
             </label>
           </div>
+          <div class="row">
+            <label class="field-flex-1" for="reviewDisposition">
+              処分
+              <select id="reviewDisposition">
+                <option value="">サーバー推奨に任せる</option>
+                <option value="accounting_adjustment">会計調整済み（承認済みIDが必要）</option>
+                <option value="cancelled_no_sale">売上にしない</option>
+              </select>
+            </label>
+            <label class="field-flex-1" for="reviewIncidentId">
+              対象incident ID（任意）
+              <input id="reviewIncidentId" autocomplete="off" />
+            </label>
+          </div>
           <label for="reviewNote">
             対応メモ
             <textarea id="reviewNote"></textarea>
           </label>
+          <div class="row">
+            <label class="field-flex-1" for="reviewStepUpPin">
+              会計調整のstep-up PIN（作成/承認時）
+              <input id="reviewStepUpPin" type="password" inputmode="numeric" autocomplete="one-time-code" />
+            </label>
+          </div>
+          <p class="helper-text">レビュー更新は請求の支払い状態を変更しません。人手判断は下の会計調整を作成・別スタッフ承認してから、承認済みIDを指定してください。</p>
           <button id="updateReviewBtn" class="btn btn-primary" data-permission="review.update">レビューを更新</button>
+        </div>
+        <div class="panel stack" data-permission-any="accounting.adjustment.read accounting.adjustment.create accounting.adjustment.approve">
+          <h3 class="title title-md">会計調整（支払い状態は変更しない）</h3>
+          <p class="helper-text">manual_acceptance / loss_accepted / goodwill / write_off は、請求の <code>status</code> と <code>paid_tx_hash</code> を変更せず、二者step-upと証拠参照を会計台帳へ記録します。</p>
+          <div class="row">
+            <label class="field-flex-1" for="reviewAdjustmentInvoiceId">
+              対象請求ID
+              <input id="reviewAdjustmentInvoiceId" class="mono" readonly />
+            </label>
+            <label class="field-flex-1" for="reviewAdjustmentId">
+              会計調整ID（承認後にレビューへ指定）
+              <input id="reviewAdjustmentId" class="mono" autocomplete="off" />
+            </label>
+          </div>
+          <div class="row">
+            <label class="field-flex-1" for="reviewAdjustmentType">
+              調整種別
+              <select id="reviewAdjustmentType">
+                <option value="manual_acceptance">manual_acceptance（人手受入）</option>
+                <option value="loss_accepted">loss_accepted（損失受入）</option>
+                <option value="goodwill">goodwill（顧客配慮）</option>
+                <option value="write_off">write_off（償却）</option>
+              </select>
+            </label>
+            <label class="field-flex-1" for="reviewAdjustmentAmount">
+              調整額（JPYC base units）
+              <input id="reviewAdjustmentAmount" type="number" min="1" step="1" inputmode="numeric" />
+            </label>
+          </div>
+          <label for="reviewAdjustmentReason">
+            理由（10文字以上）
+            <textarea id="reviewAdjustmentReason"></textarea>
+          </label>
+          <label for="reviewAdjustmentEvidenceRef">
+            証拠参照（チケット/保管先/証跡ID）
+            <input id="reviewAdjustmentEvidenceRef" autocomplete="off" placeholder="例: ops-case-2026-001" />
+          </label>
+          <div class="inline-action-group">
+            <button id="createAccountingAdjustmentBtn" class="btn btn-primary" data-permission="accounting.adjustment.create" type="button">会計調整を作成</button>
+            <button id="approveAccountingAdjustmentBtn" class="btn btn-secondary" data-permission="accounting.adjustment.approve" type="button">別スタッフとして承認</button>
+          </div>
+          <p id="accountingAdjustmentStatus" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">レビューを選択すると対象請求を表示します。</p>
         </div>
       </section>
 
@@ -534,6 +603,8 @@
           </div>
         </div>
       </section>
+      </template>
+      <div id="adminOperationsMount" class="admin-operations-mount"></div>
     </main>
 
     <div id="toastHost" class="toast-host" role="status" aria-live="polite" aria-atomic="true"></div>

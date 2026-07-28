@@ -14,6 +14,7 @@
 ## Permission Model
 - `invoice.create`, `invoice.read`
 - `review.read`, `review.update`
+- `accounting.adjustment.read`, `accounting.adjustment.create`, `accounting.adjustment.approve`
 - `refund.request`, `refund.approve`, `refund.execute`
 - `payment.ingest.manual`
 - `settlement.close`
@@ -27,6 +28,9 @@
 ## Two-Person Rules
 - `requested_by !== approved_by`
 - (設定有効時) `approved_by !== executed_by`
+- 会計調整は作成APIと承認APIを分離し、作成者・承認者それぞれにfresh step-upを要求する。
+- 会計調整の承認者は作成者と異なるactive staffでなければならない。
+- `manual_acceptance` / `loss_accepted` / `goodwill` / `write_off` は理由と`evidence.evidence_ref`が必須で、`invoice.status`と`invoice.paid_tx_hash`を変更しない。
 
 ## Negative expectations
 - `staff` は `review.update` / `audit.export` / `payments.control` / `staff.manage` / `terminal.manage` を持たない。

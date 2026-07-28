@@ -2,6 +2,19 @@ const query = new URLSearchParams(location.search);
 const terminalToken = query.get("token");
 const POLL_INTERVAL_MS = 3000;
 const REQUEST_TIMEOUT_MS = 8000;
+function getAnonymousDeviceId() {
+  const storageKey = "jpyc_terminal_anonymous_device_id_v1";
+  try {
+    const existing = String(window.localStorage.getItem(storageKey) || "").trim();
+    if (existing.length >= 8) return existing;
+    const created = globalThis.crypto?.randomUUID?.() || `device-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    window.localStorage.setItem(storageKey, created);
+    return created;
+  } catch (_error) {
+    return globalThis.crypto?.randomUUID?.() || `device-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+}
+const ANONYMOUS_DEVICE_ID = getAnonymousDeviceId();
 
 const state = {
   pollTimer: null,
@@ -12,6 +25,8 @@ const state = {
   opening: false,
   requestController: null,
   requestSequence: 0,
+  claim: null,
+  claimFingerprint: "",
 };
 
 const el = {
@@ -27,6 +42,73 @@ const el = {
   openInvoiceBtn: document.getElementById("openInvoiceBtn"),
   refreshEntryBtn: document.getElementById("refreshEntryBtn"),
 };
+
+const TERMINAL_ENTRY_ERROR_CATALOG = Object.freeze({
+  ENTRY_REFRESH_FAILED: {
+    message: "会計状態を確認できません。通信状態を確認して、もう一度更新してください。",
+    supportCode: "CUST-ENTRY-REFRESH",
+  },
+  ENTRY_TIMEOUT: {
+    message: "会計状態の確認がタイムアウトしました。通信状態を確認して、もう一度更新してください。",
+    supportCode: "CUST-ENTRY-TIMEOUT",
+  },
+  ENTRY_CLAIM_FAILED: {
+    message: "この会計を確保できません。会計状態を更新して、もう一度確認してください。",
+    supportCode: "CUST-ENTRY-CLAIM",
+  },
+  ENTRY_CONSUME_FAILED: {
+    message: "この会計を確定できません。会計状態を更新して、もう一度確認してください。",
+    supportCode: "CUST-ENTRY-CONSUME",
+  },
+  CHECKOUT_ALREADY_CLAIMED: {
+    message: "この会計は別の端末で確認中です。追加操作をせず、店舗スタッフへお声がけください。",
+    supportCode: "CUST-ENTRY-CLAIM-CONFLICT",
+  },
+  CHECKOUT_CLAIM_STALE: {
+    message: "会計内容が更新されました。会計状態を更新して、表示内容を確認してください。",
+    supportCode: "CUST-ENTRY-STALE",
+  },
+  CHECKOUT_CLAIM_EXPIRED: {
+    message: "確認の有効時間が過ぎました。会計状態を更新して、もう一度確認してください。",
+    supportCode: "CUST-ENTRY-EXPIRED",
+  },
+  CHECKOUT_CLAIM_DEVICE_MISMATCH: {
+    message: "この端末では会計を確定できません。店舗スタッフへお声がけください。",
+    supportCode: "CUST-ENTRY-DEVICE",
+  },
+  RATE_LIMITED: {
+    message: "確認操作が集中しています。少し待ってから、もう一度お試しください。",
+    supportCode: "CUST-ENTRY-RATE-LIMIT",
+  },
+  NOT_FOUND: {
+    message: "この端末入口は現在利用できません。店舗スタッフへお声がけください。",
+    supportCode: "CUST-ENTRY-NOT-FOUND",
+  },
+  PAY_DESTINATION_INVALID: {
+    message: "安全確認に失敗したため、支払い画面を開けませんでした。店舗スタッフへお声がけください。",
+    supportCode: "CUST-ENTRY-DESTINATION",
+  },
+});
+
+function terminalEntryError(customerCode) {
+  const error = new Error(String(customerCode || "ENTRY_REFRESH_FAILED"));
+  error.customerCode = String(customerCode || "ENTRY_REFRESH_FAILED").toUpperCase();
+  return error;
+}
+
+function terminalEntryErrorFromResponse(payload, fallbackCode) {
+  const fallback = String(fallbackCode || "ENTRY_REFRESH_FAILED").toUpperCase();
+  const serverCode = String(payload?.error?.code || "").trim().toUpperCase();
+  const error = terminalEntryError(TERMINAL_ENTRY_ERROR_CATALOG[serverCode] ? serverCode : fallback);
+  return error;
+}
+
+function customerFacingTerminalError(error, fallbackCode = "ENTRY_REFRESH_FAILED") {
+  const fallback = String(fallbackCode || "ENTRY_REFRESH_FAILED").toUpperCase();
+  const code = String(error?.customerCode || "").toUpperCase();
+  const entry = TERMINAL_ENTRY_ERROR_CATALOG[code] || TERMINAL_ENTRY_ERROR_CATALOG[fallback] || TERMINAL_ENTRY_ERROR_CATALOG.ENTRY_REFRESH_FAILED;
+  return `${entry.message}（問い合わせコード: ${entry.supportCode}）`;
+}
 
 function announce(message) {
   el.liveStatus.textContent = message || "";
@@ -63,11 +145,13 @@ function startPolling() {
 function clearReadyState() {
   state.readyEntry = null;
   state.requiresReconfirmation = false;
+  state.claim = null;
+  state.claimFingerprint = "";
   el.entryReadyPanel.classList.add("hidden");
   el.entryAmountText.textContent = "-";
   el.entryInvoiceText.textContent = "-";
   el.openInvoiceBtn.disabled = true;
-  el.openInvoiceBtn.textContent = "この会計を開く";
+  el.openInvoiceBtn.textContent = "この会計を確認して進む";
 }
 
 function shortInvoiceReference(invoice) {
@@ -79,14 +163,24 @@ function shortInvoiceReference(invoice) {
 
 function readyFingerprint(entry) {
   const invoice = entry?.active_invoice || {};
-  return [entry?.store_name, invoice.invoice_id, invoice.invoice_no, invoice.amount_jpy, entry?.pay_url]
+  return [
+    entry?.store_name,
+    invoice.invoice_id,
+    invoice.invoice_no,
+    invoice.amount_jpy,
+    invoice.amount_scale_version,
+    invoice.token_amount_atomic,
+    invoice.ledger_amount_base,
+    invoice.invoice_version,
+    entry?.pay_url,
+  ]
     .map((value) => String(value || ""))
     .join("|");
 }
 
 async function requestEntryState() {
   if (!terminalToken) {
-    throw new Error("端末入口QRの情報が見つかりません");
+    throw terminalEntryError("ENTRY_REFRESH_FAILED");
   }
   const requestSequence = state.requestSequence + 1;
   state.requestSequence = requestSequence;
@@ -102,17 +196,61 @@ async function requestEntryState() {
     const payload = await response.json().catch(() => ({}));
     if (requestSequence !== state.requestSequence) throw new DOMException("旧い応答を破棄しました", "AbortError");
     if (!response.ok) {
-      const message = payload?.error?.message || "会計状態の取得に失敗しました";
-      throw new Error(message);
+      throw terminalEntryErrorFromResponse(payload, "ENTRY_REFRESH_FAILED");
     }
     return payload;
   } catch (error) {
-    if (error?.name === "AbortError") throw new Error("会計状態の確認がタイムアウトしました。通信状態を確認して更新してください");
+    if (error?.name === "AbortError") throw terminalEntryError("ENTRY_TIMEOUT");
     throw error;
   } finally {
     clearTimeout(timeoutId);
     if (requestSequence === state.requestSequence) state.requestController = null;
   }
+}
+
+async function claimCurrentInvoice(entry) {
+  const invoice = entry?.active_invoice || {};
+  const nonce = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const response = await fetch(`/api/v1/public/terminal-entry/${encodeURIComponent(terminalToken)}/claim`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      anonymous_device_id: ANONYMOUS_DEVICE_ID,
+      nonce,
+      invoice_version: invoice.invoice_version,
+      amount_scale_version: invoice.amount_scale_version,
+      token_amount_atomic: invoice.token_amount_atomic,
+      ledger_amount_base: invoice.ledger_amount_base,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw terminalEntryErrorFromResponse(payload, "ENTRY_CLAIM_FAILED");
+  }
+  return payload;
+}
+
+async function consumeCheckoutClaim(entry, claim) {
+  const invoice = entry?.active_invoice || {};
+  const response = await fetch(
+    `/api/v1/public/terminal-entry/${encodeURIComponent(terminalToken)}/claim/${encodeURIComponent(claim.claim_id)}/consume`,
+    {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        anonymous_device_id: ANONYMOUS_DEVICE_ID,
+        invoice_version: invoice.invoice_version,
+        amount_scale_version: invoice.amount_scale_version,
+        token_amount_atomic: invoice.token_amount_atomic,
+        ledger_amount_base: invoice.ledger_amount_base,
+      }),
+    },
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw terminalEntryErrorFromResponse(payload, "ENTRY_CONSUME_FAILED");
+  return payload;
 }
 
 function isExpectedPayDestination(destination) {
@@ -174,6 +312,10 @@ function renderTapPresented(entry) {
 function renderReady(entry, { changed = false, requireReconfirmation = changed } = {}) {
   const invoice = entry.active_invoice || {};
   const fingerprint = readyFingerprint(entry);
+  if (state.claim && state.claimFingerprint !== fingerprint) {
+    state.claim = null;
+    state.claimFingerprint = "";
+  }
   const changedSinceConfirmation = Boolean(
     state.presentedFingerprint && fingerprint !== state.presentedFingerprint
   );
@@ -187,13 +329,17 @@ function renderReady(entry, { changed = false, requireReconfirmation = changed }
   el.headlineText.textContent = contentChanged ? "会計内容が更新されました。" : "お支払いに進めます。";
   el.bodyText.textContent = contentChanged
     ? "安全のため移動を止めました。店舗・金額・会計番号をもう一度確認してください。"
-    : "店舗・金額・会計番号を確認し、内容が正しければ「この会計を開く」を押してください。";
+    : "店舗・金額・会計番号を確認し、内容が正しければ確認ボタンを押してください。";
   const amount = Number(invoice.amount_jpy);
   el.entryAmountText.textContent = Number.isFinite(amount) ? `¥${amount.toLocaleString("ja-JP")}` : "-";
   el.entryInvoiceText.textContent = shortInvoiceReference(invoice);
   el.entryReadyPanel.classList.remove("hidden");
   el.openInvoiceBtn.disabled = !entry.pay_url || state.opening;
-  el.openInvoiceBtn.textContent = mustReconfirm ? "変更内容を確認" : "この会計を開く";
+  el.openInvoiceBtn.textContent = mustReconfirm
+    ? "変更内容を確認"
+    : state.claim?.invoice_id === invoice.invoice_id
+      ? "確認して支払い画面へ"
+      : "この会計を確認して進む";
   setHelp([
     "表示された店舗・金額・会計番号がご自身の会計か確認してください。",
     "確認ボタンを押す直前にも最新状態を照合します。",
@@ -227,7 +373,7 @@ async function refreshEntryState({ silent = false } = {}) {
     setBadge("再確認中", "s-yellow");
     el.storeText.textContent = "-";
     el.headlineText.textContent = "会計状態を再確認しています。";
-    el.bodyText.textContent = String(error.message || error);
+    el.bodyText.textContent = customerFacingTerminalError(error, "ENTRY_REFRESH_FAILED");
     if (!silent) {
       setHelp([
         "通信状態を確認して、会計状態を更新してください。",
@@ -250,7 +396,7 @@ async function handleOpenInvoice() {
     state.requiresReconfirmation = false;
     renderReady(selectedEntry);
     el.headlineText.textContent = "更新後の会計内容を確認しました。";
-    el.bodyText.textContent = "表示中の店舗・金額・会計番号が正しければ「この会計を開く」を押してください。";
+    el.bodyText.textContent = "表示中の店舗・金額・会計番号が正しければ確認ボタンを押してください。";
     announce("更新後の会計内容を確認しました。もう一度ボタンを押すと最新状態を照合して開きます。");
     return;
   }
@@ -268,9 +414,23 @@ async function handleOpenInvoice() {
       renderReady(latestEntry, { changed: true, requireReconfirmation: true });
       return;
     }
-    const destination = new URL(latestEntry.pay_url, window.location.origin);
+    const latestFingerprint = readyFingerprint(latestEntry);
+    if (!state.claim || state.claim.invoice_id !== latestEntry.active_invoice?.invoice_id) {
+      const claim = await claimCurrentInvoice(latestEntry);
+      state.claim = claim;
+      state.claimFingerprint = latestFingerprint;
+      state.readyEntry = latestEntry;
+      renderReady(latestEntry);
+      el.headlineText.textContent = "会計内容を確保しました。";
+      el.bodyText.textContent = "店舗・金額・会計番号をもう一度確認してから、支払い画面へ進んでください。";
+      el.openInvoiceBtn.textContent = "確認して支払い画面へ";
+      announce("会計内容を確保しました。もう一度確認して支払い画面へ進んでください。");
+      return;
+    }
+    const consumed = await consumeCheckoutClaim(latestEntry, state.claim);
+    const destination = new URL(consumed.pay_url, window.location.origin);
     if (!isExpectedPayDestination(destination)) {
-      throw new Error("安全のため、この会計ページを開けませんでした");
+      throw terminalEntryError("PAY_DESTINATION_INVALID");
     }
     state.opening = true;
     stopPolling();
@@ -284,13 +444,14 @@ async function handleOpenInvoice() {
     clearReadyState();
     setBadge("再確認が必要", "s-yellow");
     el.headlineText.textContent = "会計ページを開けませんでした。";
-    el.bodyText.textContent = String(error.message || error);
+    el.bodyText.textContent = customerFacingTerminalError(error, "ENTRY_CONSUME_FAILED");
     announce("会計ページを開けませんでした。会計状態を更新してください。");
     startPolling();
   } finally {
     state.refreshInFlight = false;
     if (!state.opening) {
       el.refreshEntryBtn.disabled = false;
+      el.openInvoiceBtn.disabled = !state.readyEntry?.pay_url;
     }
   }
 }

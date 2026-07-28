@@ -16,11 +16,15 @@ const baseInvoice = {
 
 const baseEvent = {
   chain_id: "137",
+  tx_hash: "0xlegacy-tx",
+  log_index: 0,
   token_contract: "0xjpyc",
   to_address: "0xrecipient",
   amount_jpyc: 1200,
   amount_jpyc_base: "1200",
   confirmations: 3,
+  canonical_status: "canonical",
+  block_timestamp: "2026-01-01T00:00:00.000Z",
   observed_at: "2026-01-01T00:00:00.000Z",
 };
 
@@ -82,10 +86,11 @@ test("cumulative split payments reach paid only when the recorded total matches"
 
 // --- decidePaymentStatus: review_required branches ---
 
-test("expired invoice → LATE_PAYMENT", () => {
+test("expired invoice with in-expiry block timestamp → DETECTED_AFTER_EXPIRY review", () => {
   const r = decidePaymentStatus({ ...baseInvoice, status: "expired" }, baseEvent);
   assert.equal(r.nextStatus, "review_required");
-  assert.equal(r.reasonType, "LATE_PAYMENT");
+  assert.equal(r.reasonType, "OTHER");
+  assert.equal(r.reasonLabel, "detected_after_expiry");
 });
 
 test("wrong chain_id → CHAIN_INCONSISTENT", () => {
@@ -134,12 +139,13 @@ test("already paid invoice → DUPLICATE_PAYMENT", () => {
 
 // --- priority ordering: expired is checked before chain/token ---
 
-test("expired invoice skips chain check", () => {
+test("expired invoice skips chain check after timestamp classification", () => {
   const r = decidePaymentStatus(
     { ...baseInvoice, status: "expired" },
     { ...baseEvent, chain_id: "1" }
   );
-  assert.equal(r.reasonType, "LATE_PAYMENT");
+  assert.equal(r.reasonType, "OTHER");
+  assert.equal(r.reasonLabel, "detected_after_expiry");
 });
 
 // --- _base fallback: when amount_jpyc_base is null, derives from amount_jpyc ---
@@ -155,7 +161,11 @@ test("falls back to amount_jpyc when _base is null (shortage)", () => {
 test("past expires_at exact payment -> late_arrival review_required", () => {
   const r = decidePaymentStatus(
     { ...baseInvoice, expires_at: "2024-01-01T00:00:00.000Z" },
-    { ...baseEvent, observed_at: "2024-01-01T00:00:01.000Z" }
+    {
+      ...baseEvent,
+      block_timestamp: "2024-01-01T00:00:01.000Z",
+      observed_at: "2024-01-01T00:00:01.000Z",
+    }
   );
   assert.equal(r.nextStatus, "review_required");
   assert.equal(r.reasonType, "LATE_PAYMENT");
@@ -177,6 +187,27 @@ test("invalid expires_at -> invalid_invoice_expiry review_required", () => {
   );
   assert.equal(r.nextStatus, "review_required");
   assert.equal(r.reasonType, "OTHER");
+});
+
+test("legacy single-event decision also holds incomplete identity, unverified timestamp, and ledger errors", () => {
+  const missingIdentity = { ...baseEvent };
+  delete missingIdentity.log_index;
+  assert.equal(
+    decidePaymentStatus(baseInvoice, missingIdentity).reasonType,
+    "CHAIN_TRANSFER_IDENTITY_INCOMPLETE"
+  );
+
+  const missingTimestamp = { ...baseEvent, block_timestamp: undefined };
+  assert.equal(
+    decidePaymentStatus(baseInvoice, missingTimestamp).reasonType,
+    "TIMESTAMP_UNVERIFIED"
+  );
+
+  const malformedAmount = { ...baseEvent, amount_jpyc_base: "not-an-integer" };
+  assert.equal(
+    decidePaymentStatus(baseInvoice, malformedAmount).reasonType,
+    "LEDGER_INTEGRITY_ERROR"
+  );
 });
 
 // --- reorg detection condition (pure logic mirror) ---

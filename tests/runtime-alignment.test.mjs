@@ -18,7 +18,8 @@ test("runtime alignment pins Node 24.17.0 across local metadata, CI, and Docker"
   assert.equal(read(".node-version").trim(), "24.17.0");
 
   const ci = read(".github/workflows/ci.yml");
-  assert.match(ci, /node-version:\s*24\.17\.0/);
+  assert.equal((ci.match(/node-version-file:\s*\.node-version/g) || []).length, 2);
+  assert.doesNotMatch(ci, /node-version:\s*20(?:\.\d+)?/);
 
   const dockerfile = read("Dockerfile");
   assert.match(dockerfile, /FROM node@sha256:032e78d7e54e352129831743737e3a83171d9cc5b5896f411649c597ce0b11ea AS deps/);

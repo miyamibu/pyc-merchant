@@ -7,6 +7,22 @@ function randomPort() {
   return 47000 + Math.floor(Math.random() * 10000);
 }
 
+const VALIDATION_WALLET_TEMPLATE = "hashport://pay?uri={{payment_uri_encoded}}";
+const VALIDATION_WALLET_REGISTRY = JSON.stringify([{
+  adapter_id: "hashport-jpyc-validation-v1",
+  wallet_name: "HashPort Wallet",
+  allowed_scheme: "hashport",
+  allowed_https_hosts: [],
+  template: VALIDATION_WALLET_TEMPLATE,
+  template_sha256: "1ecf7086f29836a142a2bcbea5a7dde2109c4d31d5b381122794649b237be5db",
+  approved_at: "2026-07-25T00:00:00.000Z",
+  approval_ref: "WALLET-VALIDATION-001",
+  tested_ios_versions: ["18.5"],
+  tested_android_versions: [],
+  tested_wallet_versions: ["1.0.0"],
+  revoked_at: null,
+}]);
+
 export function createValidationEnv(overrides = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "jpyc-production-validation-"));
   const port = overrides.APP_PORT ? Number(overrides.APP_PORT) : randomPort();
@@ -15,6 +31,7 @@ export function createValidationEnv(overrides = {}) {
     APP_PORT: String(port),
     APP_HOST: `http://127.0.0.1:${port}`,
     DB_PATH: path.join(root, "app.db"),
+    WORKER_STATE_DB_PATH: path.join(root, "worker-state.db"),
     APP_SECRET: "a".repeat(48),
     SERVICE_INGEST_SECRET: "b".repeat(48),
     METRICS_SECRET: "c".repeat(48),
@@ -24,9 +41,13 @@ export function createValidationEnv(overrides = {}) {
     APPROVED_JPYC_TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
     JPYC_CONTRACT_APPROVAL_REF: "CAB-VALIDATION-001",
     RECIPIENT_ADDRESS: "0x2222222222222222222222222222222222222222",
+    // This is a development-only validation fixture. Production keeps the
+    // receive-address pool fail-closed until an approved manifest is imported.
+    RECEIVE_ADDRESS_DEV_AUTO_VERIFY: "true",
     TOKEN_SYMBOL: "JPYC",
     TOKEN_DECIMALS: "18",
-    JPYC_BASE_UNIT_SCALE: "1000000",
+    LEDGER_DECIMALS: "6",
+    LEDGER_BASE_UNIT_SCALE: "1000000",
     REQUIRED_CONFIRMATIONS: "2",
     MIN_REQUIRED_CONFIRMATIONS: "2",
     MONITOR_BACKSCAN_BLOCKS: "12",
@@ -37,6 +58,7 @@ export function createValidationEnv(overrides = {}) {
     WALLET_ADAPTER_TYPE: "wallet_deeplink",
     WALLET_HELP_URL: "https://support.walletconnect.com/",
     HASHPORT_WALLET_DEEPLINK_TEMPLATE: "hashport://pay?uri={{payment_uri_encoded}}",
+    WALLET_ADAPTER_REGISTRY_JSON: VALIDATION_WALLET_REGISTRY,
     SUPPORTED_WALLETS: "HashPort Wallet,WalletConnect,Injected Wallet",
     STAFF_PIN: "2468",
     SECOND_ADMIN_PIN: "8642",

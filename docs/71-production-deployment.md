@@ -24,13 +24,16 @@
 - `cloudflared`: 直公開できない場合の tunnel agent
 - 永続領域: `./runtime`
   - `./runtime/data/app.db`
+  - `./runtime/worker-state/chain-137.db`（worker operational state）
   - `./runtime/backups/`
   - `./runtime/logs/`
+
+`DB_PATH` と `WORKER_STATE_DB_PATH` は同じ SQLite ファイルを指してはいけない。app は `runtime/data` を read/write、worker state を read-only でマウントし、worker は `runtime/worker-state` だけを read/write でマウントする。worker は financial tables を直接開かず、候補/evidence の signed internal read API と、既存の signed financial write API を使う。
 
 ## Environment files
 - repo には [`.env.production.example`](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/.env.production.example) のみ置く。
 - 実運用では `.env.production` を別途配置し、秘密値を注入する。
-- `APP_ENV=production`、`APP_HOST=https://pay.miyamibu.xyz`、`PAY_BASE_URL=https://pay.miyamibu.xyz`、`PUBLIC_BASE_URL=https://pay.miyamibu.xyz`、`CORS_ALLOW_ORIGINS=https://pay.miyamibu.xyz`、`DB_PATH=./runtime/data/app.db` を基本形とする。
+- `APP_ENV=production`、`APP_HOST=https://pay.miyamibu.xyz`、`PAY_BASE_URL=https://pay.miyamibu.xyz`、`PUBLIC_BASE_URL=https://pay.miyamibu.xyz`、`CORS_ALLOW_ORIGINS=https://pay.miyamibu.xyz`、`DB_PATH=./runtime/data/app.db`、`WORKER_STATE_DB_PATH=./runtime/worker-state/chain-137.db` を基本形とする。
 
 ## Public URL policy
 - final public URL は早い段階で `https://pay.miyamibu.xyz` に固定する。
@@ -62,7 +65,7 @@
 ## Install steps
 1. リポジトリを `/opt/jpyc-payment-terminal` に配置する。
 2. `.env.production` を配置する。
-3. `mkdir -p runtime/data runtime/backups runtime/logs deploy/nginx/certs` を実行する。
+3. `mkdir -p runtime/data runtime/worker-state runtime/backups runtime/logs deploy/nginx/certs` を実行する。
 4. `bash scripts/deploy/preflight.sh .env.production` を実行する。
 5. `docker compose -f docker-compose.prod.yml up -d --build` を実行する。
 6. `bash scripts/deploy/healthcheck.sh https://pay.miyamibu.xyz/healthz` を実行する。

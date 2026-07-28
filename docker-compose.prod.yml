@@ -22,7 +22,7 @@ x-worker-healthcheck: &worker-healthcheck
     - -e
     - >-
       const Database=require('better-sqlite3');
-      const db=new Database(process.env.DB_PATH||'./runtime/data/app.db',{readonly:true,fileMustExist:true});
+      const db=new Database(process.env.WORKER_STATE_DB_PATH||'./runtime/worker-state/chain-137.db',{readonly:true,fileMustExist:true});
       const key='worker:'+(process.env.CHAIN_ID||'137')+':last_cycle_at';
       const row=db.prepare('SELECT value FROM chain_monitor_state WHERE key = ?').get(key);
       db.close();
@@ -45,11 +45,15 @@ services:
       APP_BIND_HOST: "0.0.0.0"
       INTERNAL_APP_ORIGIN: "http://app:4173"
       COMMERCIAL_EVIDENCE_ROOT: "/app/release-evidence"
+      DB_PATH: "/app/runtime/data/app.db"
+      WORKER_STATE_DB_PATH: "/app/runtime/worker-state/chain-137.db"
     command: ["node", "src/server.mjs"]
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./runtime:/app/runtime
+      - ./runtime/data:/app/runtime/data
+      - ./runtime/backups:/app/runtime/backups
+      - ./runtime/worker-state:/app/runtime/worker-state:ro
       - ./docs/production/evidence:/app/release-evidence:ro
       - ./artifacts/release:/app/artifacts/release:ro
     healthcheck:
@@ -68,10 +72,11 @@ services:
     environment:
       CHAIN_ID: "137"
       INTERNAL_APP_ORIGIN: "http://app:4173"
+      WORKER_STATE_DB_PATH: "/app/runtime/worker-state/chain-137.db"
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./runtime:/app/runtime
+      - ./runtime/worker-state:/app/runtime/worker-state
       - ./docs/production/evidence:/app/release-evidence:ro
       - ./artifacts/release:/app/artifacts/release:ro
     depends_on:
@@ -89,10 +94,11 @@ services:
     environment:
       CHAIN_ID: "1"
       INTERNAL_APP_ORIGIN: "http://app:4173"
+      WORKER_STATE_DB_PATH: "/app/runtime/worker-state/chain-1.db"
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./runtime:/app/runtime
+      - ./runtime/worker-state:/app/runtime/worker-state
       - ./docs/production/evidence:/app/release-evidence:ro
       - ./artifacts/release:/app/artifacts/release:ro
     depends_on:
@@ -110,10 +116,11 @@ services:
     environment:
       CHAIN_ID: "43114"
       INTERNAL_APP_ORIGIN: "http://app:4173"
+      WORKER_STATE_DB_PATH: "/app/runtime/worker-state/chain-43114.db"
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./runtime:/app/runtime
+      - ./runtime/worker-state:/app/runtime/worker-state
       - ./docs/production/evidence:/app/release-evidence:ro
       - ./artifacts/release:/app/artifacts/release:ro
     depends_on:

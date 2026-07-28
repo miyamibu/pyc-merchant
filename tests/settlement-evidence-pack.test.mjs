@@ -100,7 +100,9 @@ test("settlement evidence pack script emits required files and columns", async (
     }),
     body: JSON.stringify({ business_date: businessDateJst, admin_approval: true }),
   });
-  assert.equal(close.status, 200);
+  assert.equal(close.status, 409);
+  assert.equal(close.data.error.code, "SETTLEMENT_HARD_GATE_BLOCKED");
+  assert.ok(close.data.error.details.blockers.some((blocker) => blocker.code === "OPEN_REVIEW_INCIDENTS"));
 
   const outDir = mkdtempSync(path.join(tmpdir(), "jpyc-settlement-pack-"));
   const result = await runNode("scripts/production-validation/generate-settlement-evidence-pack.mjs", [

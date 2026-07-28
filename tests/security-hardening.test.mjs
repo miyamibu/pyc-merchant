@@ -93,6 +93,7 @@ test("receive address reissue keeps old QR on late-arrival review path and scope
       tx_hash: randomTxHash("old-qr-late"),
       from_address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       observed_at: new Date(Date.now() + 1000).toISOString(),
+      block_timestamp: new Date(Date.parse(first.data.expires_at) + 1000).toISOString(),
     },
     `old-qr-late-${Date.now()}`
   );

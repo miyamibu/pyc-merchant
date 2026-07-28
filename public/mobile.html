@@ -182,9 +182,13 @@
         </div>
         <p id="manualRiskText" class="helper-text">手動送金する場合は、金額・送金先・チェーンを必ず目視で照合してください。</p>
       </section>
-      <div id="methodPanel" class="panel hidden" role="status" aria-live="polite" aria-atomic="true">
-        <p id="methodPanelText" class="helper-text">支払い方法を読み込み中です。</p>
-      </div>
+      <dialog id="methodPanel" class="bottom-sheet" aria-labelledby="methodPanelTitle">
+        <div class="section-header">
+          <h2 id="methodPanelTitle" class="title title-md">手動送金の案内</h2>
+          <button id="closeMethodsBtn" type="button" class="btn btn-ghost btn-compact" aria-label="支払い方法を閉じる">閉じる</button>
+        </div>
+        <p id="methodPanelText" class="helper-text" role="status" aria-live="polite" aria-atomic="true">支払い方法を読み込み中です。</p>
+      </dialog>
       <section id="customerActionCard" class="panel stack" aria-labelledby="customerActionTitleHeading">
         <div class="section-header">
           <h3 id="customerActionTitleHeading" class="title title-md">いまの状況と次の行動</h3>
@@ -195,6 +199,28 @@
         <ul id="customerActionList" class="warning-list compact-list">
           <li>ウォレットを開く準備ができるまでお待ちください。</li>
         </ul>
+        <details id="paymentRecoveryDetails" class="details">
+          <summary>送金済み取引を確認する</summary>
+          <div class="details-content stack">
+            <p class="helper-text">誤チェーン・誤トークンの可能性がある場合だけ、送金したチェーンと取引番号を入力してください。これは確認依頼であり、追加送金は行いません。</p>
+            <label class="info-label" for="recoveryChainId">送金したチェーン</label>
+            <select id="recoveryChainId" class="input">
+              <option value="1">Ethereum</option>
+              <option value="43114">Avalanche C-Chain</option>
+            </select>
+            <label class="info-label" for="recoveryTxHash">取引番号（tx hash）</label>
+            <input id="recoveryTxHash" class="input mono" inputmode="text" autocomplete="off" spellcheck="false" placeholder="0x..." aria-describedby="recoveryHint" />
+            <label class="info-label" for="recoveryIssue">申告内容（任意）</label>
+            <select id="recoveryIssue" class="input">
+              <option value="">未確定</option>
+              <option value="wrong_chain">誤チェーンかもしれない</option>
+              <option value="wrong_token">誤トークンかもしれない</option>
+            </select>
+            <p id="recoveryHint" class="helper-text">取引番号はウォレットの送金履歴からコピーしてください。シードフレーズや秘密鍵は入力しないでください。</p>
+            <button id="submitRecoveryBtn" type="button" class="btn btn-secondary btn-compact">送金済み取引を確認依頼する</button>
+            <p id="recoveryStatus" class="helper-text" role="status" aria-live="polite" aria-atomic="true"></p>
+          </div>
+        </details>
       </section>
       <section id="walletSupportCard" class="panel stack" aria-labelledby="walletSupportTitle">
         <div class="section-header">

@@ -247,6 +247,22 @@ test("Settlement Export v1 compatibility and v2 refund integrity", async (t) => 
        VALUES (?, ?, 'provider_external', 'mock_provider', 'created', 'none', ?, ?)`
     ).run(providerPaymentSessionId, invoice.data.invoice_id, ts, ts);
 
+    const resolvedReview = await apiRequest(
+      started.baseUrl,
+      `/api/v1/reviews/${encodeURIComponent(review.id)}`,
+      {
+        method: "PATCH",
+        headers: jsonHeaders(token, `v2-review-resolve-${Date.now()}`),
+        body: JSON.stringify({
+          status: "rejected",
+          disposition: "cancelled_no_sale",
+          resolution_status: "cancelled",
+          resolution_note: "refund evidence recorded before settlement export",
+        }),
+      }
+    );
+    assert.equal(resolvedReview.status, 200);
+
     const created = await apiRequest(started.baseUrl, "/api/v1/settlement-exports", {
       method: "POST",
       headers: jsonHeaders(token, `v2-export-${Date.now()}`),

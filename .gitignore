@@ -12,6 +12,7 @@ runtime/
 artifacts/
 deliverables/
 output/
+.playwright-cli/
 .codex/
 docs/production/evidence/*
 !docs/production/evidence/.gitkeep

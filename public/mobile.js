@@ -76,6 +76,7 @@ const state = {
   refreshSequence: 0,
   refreshController: null,
   refreshInProgress: false,
+  recoverySubmitting: false,
   serverClockOffsetMs: null,
   launchInProgress: false,
   blockingWarning: "",
@@ -99,10 +100,17 @@ const el = {
   uxStateDetail: document.getElementById("uxStateDetail"),
   methodPanel: document.getElementById("methodPanel"),
   methodPanelText: document.getElementById("methodPanelText"),
+  closeMethodsBtn: document.getElementById("closeMethodsBtn"),
   customerActionBadge: document.getElementById("customerActionBadge"),
   customerActionTitle: document.getElementById("customerActionTitle"),
   customerActionBody: document.getElementById("customerActionBody"),
   customerActionList: document.getElementById("customerActionList"),
+  paymentRecoveryDetails: document.getElementById("paymentRecoveryDetails"),
+  recoveryChainId: document.getElementById("recoveryChainId"),
+  recoveryTxHash: document.getElementById("recoveryTxHash"),
+  recoveryIssue: document.getElementById("recoveryIssue"),
+  submitRecoveryBtn: document.getElementById("submitRecoveryBtn"),
+  recoveryStatus: document.getElementById("recoveryStatus"),
   walletAvailabilityBadge: document.getElementById("walletAvailabilityBadge"),
   walletSupportTitle: document.getElementById("walletSupportTitle"),
   supportedWalletChips: document.getElementById("supportedWalletChips"),
@@ -151,6 +159,56 @@ const el = {
   consentPrivacyLink: document.getElementById("consentPrivacyLink"),
   consentRefundLink: document.getElementById("consentRefundLink"),
 };
+
+const CUSTOMER_ERROR_CATALOG = Object.freeze({
+  INVOICE_REFRESH_FAILED: {
+    message: "請求の最新状態を確認できません。追加送金せず、再取得してください。",
+    action: "支払い操作を止めて再取得する",
+    supportCode: "CUST-INVOICE-REFRESH",
+  },
+  CONSENT_RECORD_FAILED: {
+    message: "同意の記録を確認できません。再送が成功するまで支払い操作はできません。",
+    action: "内容を確認して再送する",
+    supportCode: "CUST-CONSENT",
+  },
+  WALLET_LAUNCH_FAILED: {
+    message: "ウォレットを開けません。支払い情報を確認して手動送金案内を利用してください。",
+    action: "ウォレットまたは手動送金案内を確認する",
+    supportCode: "CUST-WALLET",
+  },
+  COPY_FAILED: {
+    message: "コピーできませんでした。画面の支払い情報を確認してください。",
+    action: "再試行する",
+    supportCode: "CUST-COPY",
+  },
+  INVOICE_NOT_PAYABLE: {
+    message: "この請求では現在支払い操作を受け付けていません。",
+    action: "店舗スタッフへ確認する",
+    supportCode: "CUST-NOT-PAYABLE",
+  },
+  PAYMENT_DETECTED: {
+    message: "送金を受け付けました。追加送金せず、確認が完了するまでお待ちください。",
+    action: "そのまま待つ",
+    supportCode: "CUST-PAYMENT-DETECTED",
+  },
+  INTEGRITY_HOLD: {
+    message: "支払い記録を確認しています。追加送金せず、店舗スタッフへお声がけください。",
+    action: "店舗スタッフへ確認する",
+    supportCode: "CUST-INTEGRITY-HOLD",
+  },
+});
+
+function customerFacingError(error, fallbackCode = "INVOICE_REFRESH_FAILED") {
+  const code = String(error?.customerCode || error?.code || fallbackCode).toUpperCase();
+  const entry = CUSTOMER_ERROR_CATALOG[code] || CUSTOMER_ERROR_CATALOG[fallbackCode] || CUSTOMER_ERROR_CATALOG.INVOICE_REFRESH_FAILED;
+  return `${entry.message}（問い合わせコード: ${entry.supportCode}）`;
+}
+
+function customerErrorFromResponse(payload, fallbackCode) {
+  const error = new Error(fallbackCode);
+  error.customerCode = String(payload?.error?.code || fallbackCode).toUpperCase();
+  return error;
+}
 
 function announce(message) {
   const next = message || "";
@@ -612,6 +670,7 @@ function stopObservationFreshnessTimer() {
 function renderInvoiceObservationState() {
   if (!state.invoice) return;
   renderCustomerAction(state.invoice);
+  renderPaymentRecovery(state.invoice);
   renderReceiptCard(state.invoice);
   renderStatus(state.invoice);
   applyPaymentActionGate(state.invoice);
@@ -669,6 +728,11 @@ function signedPayPath() {
 function signedConsentPath() {
   if (!invoiceId || !sig || !exp || !nonce) return null;
   return `/api/v1/public/invoices/${encodeURIComponent(invoiceId)}/consent?sig=${encodeURIComponent(sig)}&exp=${encodeURIComponent(exp)}&nonce=${encodeURIComponent(nonce)}`;
+}
+
+function signedRecoveryPath() {
+  if (!invoiceId || !sig || !exp || !nonce) return null;
+  return `/api/v1/public/invoices/${encodeURIComponent(invoiceId)}/payment-recovery?sig=${encodeURIComponent(sig)}&exp=${encodeURIComponent(exp)}&nonce=${encodeURIComponent(nonce)}`;
 }
 
 function initPolicyLinks() {
@@ -730,7 +794,7 @@ async function recordConsent() {
     }
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
-      throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+      throw customerErrorFromResponse(payload, "CONSENT_RECORD_FAILED");
     }
     state.consentRecordStatus = "recorded";
     state.consentRecordError = "";
@@ -743,7 +807,7 @@ async function recordConsent() {
   } catch (error) {
     if (error?.name === "AbortError" || consentSequence !== state.consentSequence) return false;
     state.consentRecordStatus = "failed";
-    state.consentRecordError = `同意記録をサーバーへ送信できませんでした。再送が成功するまで支払い操作はできません。（${String(error.message || error)}）`;
+    state.consentRecordError = customerFacingError(error, "CONSENT_RECORD_FAILED");
     renderConsentRecordState();
     applyPaymentActionGate(state.invoice);
     return false;
@@ -868,15 +932,13 @@ function buildPaymentMethodHint(invoice) {
     return "ウォレットアプリを開いて、支払い先と金額を確認して送金してください。";
   }
   if (adapter.reason) {
-    return `ウォレット連携は現在利用できません（${adapter.reason}）。「支払い情報をコピー」または手動送金案内をご利用ください。`;
+    return "ウォレット連携は現在利用できません。「支払い情報をコピー」または手動送金案内をご利用ください。";
   }
   return "支払い情報をコピーするか、手動送金案内を確認して送金してください。";
 }
 
 function manualRiskMessage(invoice) {
-  const adapter = invoice?.wallet_adapter || {};
-  const reason = adapter.reason ? `（理由: ${adapter.reason}）` : "";
-  return `ウォレット自動起動が利用できません${reason}。手動送金では、ウォレット画面のネットワーク・トークン・送金先・金額をこの画面と必ず目視照合してください。`;
+  return "ウォレット自動起動が利用できません。手動送金では、ウォレット画面のネットワーク・トークン・送金先・金額をこの画面と必ず目視照合してください。";
 }
 
 function showManualRiskWarning(invoice) {
@@ -914,7 +976,7 @@ function renderWalletSupport(invoice) {
     el.walletSupportText.textContent = "表示したOS・ウォレット版は検証記録の範囲であり、この端末の動作保証ではありません。起動しない場合は支払い情報コピーか手動送金案内をご利用ください。";
   } else if (adapter.reason) {
     el.walletAvailabilityBadge.textContent = "手動案内";
-    el.walletSupportText.textContent = `自動起動が使えないため、手動送金をご案内します（${adapter.reason}）。`;
+    el.walletSupportText.textContent = "自動起動が使えないため、手動送金をご案内します。";
   } else {
     el.walletAvailabilityBadge.textContent = "コピー送金";
     el.walletSupportText.textContent = "支払い情報をコピーして、お使いのウォレットから送金してください。";
@@ -923,7 +985,61 @@ function renderWalletSupport(invoice) {
   setHelperLink(el.walletHelpLink, invoice?.wallet_help_url || "", "ウォレット案内を開く");
 }
 
+function renderPaymentRecovery(invoice) {
+  if (!el.paymentRecoveryDetails) return;
+  const report = invoice?.payment_recovery || null;
+  const status = String(report?.status || "");
+  const labels = {
+    verified_wrong_chain: "誤チェーンを確認済み",
+    verified_wrong_token: "誤トークンを確認済み",
+    customer_reported_wrong_chain: "誤チェーンの申告を受付済み",
+    customer_reported_wrong_token: "誤トークンの申告を受付済み",
+    unverified_report: "確認依頼を受付済み（未検証）",
+    verified_match: "指定チェーンの取引を確認済み",
+  };
+  if (el.recoveryStatus) {
+    el.recoveryStatus.textContent = status
+      ? `${labels[status] || "確認依頼を受付済み"}。追加送金は行わず、店舗スタッフの案内をお待ちください。`
+      : "送金済み取引の確認が必要な場合に入力してください。";
+  }
+  if (el.submitRecoveryBtn) {
+    el.submitRecoveryBtn.disabled = state.recoverySubmitting || !signedRecoveryPath();
+    el.submitRecoveryBtn.textContent = state.recoverySubmitting
+      ? "確認依頼を送信中"
+      : "送金済み取引を確認依頼する";
+  }
+}
+
 function renderCustomerAction(invoice) {
+  const recoveryStatus = String(invoice?.payment_recovery?.status || "");
+  if ([
+    "verified_wrong_chain",
+    "verified_wrong_token",
+    "customer_reported_wrong_chain",
+    "customer_reported_wrong_token",
+    "unverified_report",
+  ].includes(recoveryStatus)) {
+    const verified = recoveryStatus.startsWith("verified_");
+    el.customerActionBadge.textContent = verified ? "要確認" : "申告受付済み";
+    el.customerActionTitle.textContent = verified
+      ? "送金内容を確認しました。商品は渡さずスタッフへ"
+      : "送金内容の確認依頼を受け付けました";
+    el.customerActionBody.textContent = verified
+      ? "誤チェーン・誤トークンの可能性を確認済みです。追加送金や自分での資産移動は行わず、店舗スタッフの案内をお待ちください。"
+      : "この申告だけではオンチェーン確認済みではありません。追加送金せず、店舗スタッフの確認をお待ちください。";
+    el.customerActionList.innerHTML = "";
+    for (const item of [
+      "追加送金や再送信は行わないでください。",
+      "シードフレーズや秘密鍵を誰にも渡さないでください。",
+      "この画面を店舗スタッフへ見せてください。",
+    ]) {
+      const li = document.createElement("li");
+      li.textContent = item;
+      el.customerActionList.appendChild(li);
+    }
+    state.manualActionHint = el.customerActionBody.textContent;
+    return;
+  }
   if (hasIntegrityHold(invoice)) {
     el.customerActionBadge.textContent = "要確認";
     el.customerActionTitle.textContent = "支払い記録を確認中です。追加送金はしないでください";
@@ -1171,15 +1287,23 @@ function renderPaymentVerification(invoice) {
 }
 
 function getReceiptEvidence(invoice) {
+  const signedReceipt = invoice?.receipt && typeof invoice.receipt === "object"
+    ? invoice.receipt
+    : null;
   const txHash = String(invoice?.paid_tx_hash || "").trim();
   const chainRecordedAt = String(invoice?.chain_recorded_at || "").trim();
   const confirmedAt = String(invoice?.confirmed_at || "").trim();
   const confirmedAtMs = confirmedAt ? new Date(confirmedAt).getTime() : NaN;
   return {
+    signedReceipt,
     txHash,
     chainRecordedAt,
     confirmedAt,
-    complete: Boolean(txHash) && Number.isFinite(confirmedAtMs),
+    complete: Boolean(signedReceipt?.signature)
+      && Boolean(signedReceipt?.kid)
+      && Boolean(signedReceipt?.content_sha256)
+      && Boolean(signedReceipt?.tx_hash)
+      && Number.isFinite(confirmedAtMs),
   };
 }
 
@@ -1205,8 +1329,8 @@ function renderReceiptCard(invoice) {
   el.receiptChainRecordedAt.textContent = evidence.chainRecordedAt ? formatDateTime(evidence.chainRecordedAt) : "チェーン時刻なし";
   el.receiptConfirmedAt.textContent = evidence.complete ? formatDateTime(evidence.confirmedAt) : "サーバー確認待ち";
   el.receiptEvidenceNotice.textContent = evidence.complete
-    ? "取引番号とサーバー台帳への記録日時を確認済みです。チェーン記録日時とは別に表示しています。"
-    : "請求状態は完了ですが、取引番号またはサーバー確認日時を取得できていないため、これは確認書ではありません。";
+    ? `サーバー署名付きreceiptを発行済みです（${evidence.signedReceipt.kid}）。取引番号とチェーン記録日時を確認できます。`
+    : "請求状態は完了ですが、サーバー署名付きreceiptがまだ発行されていないため、これは確認書ではありません。";
   el.copyReceiptBtn.textContent = evidence.complete ? "確認書をコピー" : "状況メモをコピー";
   el.copyReceiptBtn.setAttribute("aria-label", evidence.complete ? "お支払い確認書をコピー" : "証跡確認中のお支払い状況をコピー");
 }
@@ -1267,6 +1391,7 @@ function renderInvoice(invoice) {
   updateRemainingAnnouncement(invoice.expires_at);
 
   renderCustomerAction(invoice);
+  renderPaymentRecovery(invoice);
   renderWalletSupport(invoice);
   renderPaymentConditions(invoice);
   renderPaymentVerification(invoice);
@@ -1326,8 +1451,20 @@ async function copyText(text) {
 }
 
 function setMethodPanel(visible, message) {
-  el.methodPanel.classList.toggle("hidden", !visible);
+  const panel = el.methodPanel;
+  if (!panel) return;
+  if (typeof panel.showModal === "function") {
+    if (visible && !panel.open) panel.showModal();
+    if (!visible && panel.open) panel.close();
+    panel.classList.toggle("hidden", !visible);
+  } else {
+    panel.classList.toggle("hidden", !visible);
+  }
   if (message) el.methodPanelText.textContent = message;
+}
+
+function isMethodPanelOpen() {
+  return Boolean(el.methodPanel && (el.methodPanel.open || !el.methodPanel.classList.contains("hidden")));
 }
 
 function explainPaymentGate(gate = evaluatePaymentActionGate()) {
@@ -1362,6 +1499,47 @@ function launchWalletOnce(invoice) {
     announce("ウォレットが開かなかった場合の手動送金案内を表示しました");
   }, WALLET_RECOVERY_DELAY_MS);
   return true;
+}
+
+async function submitPaymentRecovery() {
+  const path = signedRecoveryPath();
+  const txHash = String(el.recoveryTxHash?.value || "").trim().toLowerCase();
+  const chainId = String(el.recoveryChainId?.value || "").trim();
+  const reportedIssue = String(el.recoveryIssue?.value || "").trim();
+  if (!path || !/^(?:0x)?[0-9a-f]{64}$/.test(txHash) || !["1", "43114"].includes(chainId)) {
+    if (el.recoveryStatus) el.recoveryStatus.textContent = "チェーンと0xから始まる64桁の取引番号を入力してください。";
+    announce("チェーンと取引番号を確認してください");
+    return;
+  }
+  state.recoverySubmitting = true;
+  renderPaymentRecovery(state.invoice);
+  try {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chain_id: chainId,
+        tx_hash: txHash.startsWith("0x") ? txHash : `0x${txHash}`,
+        reported_issue: reportedIssue || undefined,
+      }),
+      cache: "no-store",
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw customerErrorFromResponse(data, "INVOICE_REFRESH_FAILED");
+    if (el.recoveryStatus) {
+      el.recoveryStatus.textContent = data.status === "unverified_report"
+        ? "確認依頼を受付しました。現在は未検証です。追加送金せず、店舗スタッフの案内をお待ちください。"
+        : "確認依頼を受付しました。追加送金せず、店舗スタッフの案内をお待ちください。";
+    }
+    announce("送金済み取引の確認依頼を受付しました");
+    await loadInvoice({ silent: true, force: true });
+  } catch (error) {
+    if (el.recoveryStatus) el.recoveryStatus.textContent = customerFacingError(error, "INVOICE_REFRESH_FAILED");
+    showError(customerFacingError(error, "INVOICE_REFRESH_FAILED"));
+  } finally {
+    state.recoverySubmitting = false;
+    renderPaymentRecovery(state.invoice);
+  }
 }
 
 async function refreshAfterBrowserRecovery() {
@@ -1440,7 +1618,7 @@ async function handleCopyInfo() {
     setMethodPanel(true, "支払い情報をコピーしました。ウォレットで内容を確認して送金してください。");
     announce("支払い情報をコピーしました");
   } catch (error) {
-    showError(String(error.message || error));
+    showError(customerFacingError(error, "COPY_FAILED"));
   }
 }
 
@@ -1456,7 +1634,7 @@ async function handleCopyAddress() {
     await copyText(getCopyFallback(invoice).copy_receive_address || getReceiveAddress(invoice) || "");
     announce("支払い先をコピーしました");
   } catch (error) {
-    showError(String(error.message || error));
+    showError(customerFacingError(error, "COPY_FAILED"));
   }
 }
 
@@ -1472,7 +1650,7 @@ async function handleCopyTokenContract() {
     await copyText(getOfficialTokenContract(invoice));
     announce("公式JPYCコントラクトをコピーしました");
   } catch (error) {
-    showError(String(error.message || error));
+    showError(customerFacingError(error, "COPY_FAILED"));
   }
 }
 
@@ -1488,7 +1666,7 @@ async function handleCopyAmount() {
     await copyText(`${toNumber(invoice.amount_jpyc).toLocaleString("ja-JP")} ${getTokenSymbol(invoice)}`);
     announce("金額をコピーしました");
   } catch (error) {
-    showError(String(error.message || error));
+    showError(customerFacingError(error, "COPY_FAILED"));
   }
 }
 
@@ -1504,7 +1682,7 @@ async function handleCopyInvoice() {
     await copyText(invoice.invoice_no || invoice.invoice_id || "");
     announce("請求IDをコピーしました");
   } catch (error) {
-    showError(String(error.message || error));
+    showError(customerFacingError(error, "COPY_FAILED"));
   }
 }
 
@@ -1515,7 +1693,7 @@ async function handleShowMethods() {
   }
   const invoice = await getFreshPayableInvoiceForAction();
   if (!invoice) return;
-  const visible = el.methodPanel.classList.contains("hidden");
+  const visible = !isMethodPanelOpen();
   setMethodPanel(visible, visible ? buildManualPaymentInstructions(invoice, { includeHelp: true }) : "");
   if (visible && !buildWalletLaunchTarget(invoice)) showManualRiskWarning(invoice);
   announce(visible ? "支払い方法を表示しました" : "支払い方法を閉じました");
@@ -1543,12 +1721,18 @@ async function handleCopyReceipt() {
       `取引番号: ${evidence.txHash || "サーバー確認待ち"}`,
       `チェーン記録日時: ${evidence.chainRecordedAt ? formatDateTime(evidence.chainRecordedAt) : "チェーン時刻なし"}`,
       `サーバー確認日時: ${evidence.complete ? formatDateTime(evidence.confirmedAt) : "サーバー確認待ち"}`,
+      ...(evidence.complete ? [
+        `receipt_version: ${evidence.signedReceipt.receipt_version}`,
+        `receipt_content_sha256: ${evidence.signedReceipt.content_sha256}`,
+        `receipt_signature: ${evidence.signedReceipt.signature}`,
+        `receipt_kid: ${evidence.signedReceipt.kid}`,
+      ] : []),
       `コピー日時: ${copyTimestamp}`,
     ];
     await copyText(lines.join("\n"));
     announce(evidence.complete ? "お支払い確認書をコピーしました" : "証跡確認中のお支払い状況をコピーしました");
   } catch (error) {
-    showError(String(error.message || error));
+    showError(customerFacingError(error, "COPY_FAILED"));
   }
 }
 
@@ -1576,8 +1760,7 @@ async function loadInvoice(options = {}) {
     const data = await response.json().catch(() => ({}));
     if (requestSequence !== state.refreshSequence) return { ok: false, stale: true };
     if (!response.ok) {
-      const message = data?.error?.message || "請求情報を取得できませんでした。";
-      throw new Error(message);
+      throw customerErrorFromResponse(data, "INVOICE_REFRESH_FAILED");
     }
     if (String(data.invoice_id || "") !== String(invoiceId || "")) {
       throw new Error("請求IDが一致しない応答を受け取りました。");
@@ -1599,7 +1782,7 @@ async function loadInvoice(options = {}) {
     state.refreshInProgress = false;
     failClosedInvoiceObservation();
     setBlockingWarning("請求の最新状態を確認できないため、送金・手動送金・コピー操作を停止しています。再取得してください。");
-    state.transientError = `請求情報の読み込みに失敗しました。${String(error.message || error)}`;
+    state.transientError = customerFacingError(error, "INVOICE_REFRESH_FAILED");
     renderErrorBanner();
     setMethodPanel(false, "");
     if (!silent) announce("請求情報の取得に失敗しました");
@@ -1637,12 +1820,15 @@ function bindEvents() {
   if (el.goToConsentBtn) el.goToConsentBtn.addEventListener("click", focusConsentGate);
   el.walletPayBtn.addEventListener("click", () => void handleWalletPay());
   el.showMethodsBtn.addEventListener("click", () => void handleShowMethods());
+  if (el.closeMethodsBtn) el.closeMethodsBtn.addEventListener("click", () => setMethodPanel(false, ""));
+  if (el.methodPanel) el.methodPanel.addEventListener("cancel", () => setMethodPanel(false, ""));
   el.copyInfoBtn.addEventListener("click", () => void handleCopyInfo());
   el.copyAddressBtn.addEventListener("click", () => void handleCopyAddress());
   el.copyTokenContractBtn.addEventListener("click", () => void handleCopyTokenContract());
   el.copyAmountBtn.addEventListener("click", () => void handleCopyAmount());
   el.copyInvoiceBtn.addEventListener("click", () => void handleCopyInvoice());
   el.copyReceiptBtn.addEventListener("click", () => void handleCopyReceipt());
+  if (el.submitRecoveryBtn) el.submitRecoveryBtn.addEventListener("click", () => void submitPaymentRecovery());
   el.refreshBtn.addEventListener("click", () => {
     setLaunchInProgress(false);
     void loadInvoice({ silent: false, force: true });

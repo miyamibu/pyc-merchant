@@ -31,7 +31,8 @@ async function loadMonitorModule() {
   const env = {
     APP_ENV: "development",
     APP_HOST: "http://127.0.0.1:49998",
-    DB_PATH: path.join(dir, "monitor.db"),
+    DB_PATH: path.join(dir, "financial.db"),
+    WORKER_STATE_DB_PATH: path.join(dir, "worker-state.db"),
     CHAIN_ID: "137",
     TOKEN_CONTRACT,
     TOKEN_DECIMALS: "18",
@@ -47,36 +48,56 @@ async function loadMonitorModule() {
   });
 }
 
-function createInvoiceTable(db) {
-  db.exec(`
-    CREATE TABLE invoices (
-      id TEXT PRIMARY KEY,
-      amount_jpyc REAL NOT NULL,
-      amount_jpyc_base TEXT NOT NULL,
-      recipient_address TEXT NOT NULL,
-      status TEXT NOT NULL,
-      chain_id TEXT NOT NULL,
-      token_contract TEXT NOT NULL,
-      monitor_until TEXT,
-      integrity_hold INTEGER NOT NULL DEFAULT 0,
-      last_reconciled_block INTEGER
-    )
-  `);
-}
-
 test("cancelled and reissued-old receive addresses remain chain-monitor candidates", async (t) => {
   const mod = await loadMonitorModule();
   t.after(() => mod.db.close());
-  createInvoiceTable(mod.db);
-  const insert = mod.db.prepare(
-    `INSERT INTO invoices
-     (id, amount_jpyc, amount_jpyc_base, recipient_address, status, chain_id, token_contract)
-     VALUES (?, ?, ?, ?, ?, '137', ?)`
-  );
-  insert.run("invoice-cancelled-old", 1500, "1500000000", OLD_ADDRESS, "cancelled", TOKEN_CONTRACT);
-  insert.run("invoice-reissued-new", 1500, "1500000000", NEW_ADDRESS, "issued", TOKEN_CONTRACT);
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    assert.match(String(url), /\/api\/v1\/internal\/chain\/candidates:read$/);
+    const body = JSON.parse(options.body);
+    assert.equal(body.chain_id, "137");
+    assert.equal(body.token_contract, TOKEN_CONTRACT.toLowerCase());
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        schema_version: 1,
+        invoices: [
+          {
+            id: "invoice-cancelled-old",
+            amount_jpyc: 1500,
+            amount_jpyc_base: "1500000000",
+            recipient_address: OLD_ADDRESS,
+            status: "cancelled",
+            chain_id: "137",
+            token_contract: TOKEN_CONTRACT,
+            monitor_until: null,
+            integrity_hold: 0,
+            last_reconciled_block: null,
+          },
+          {
+            id: "invoice-reissued-new",
+            amount_jpyc: 1500,
+            amount_jpyc_base: "1500000000",
+            recipient_address: NEW_ADDRESS,
+            status: "issued",
+            chain_id: "137",
+            token_contract: TOKEN_CONTRACT,
+            monitor_until: null,
+            integrity_hold: 0,
+            last_reconciled_block: null,
+          },
+        ],
+      }),
+    };
+  };
 
-  const candidates = mod.getCandidateInvoices();
+  let candidates;
+  try {
+    candidates = await mod.getCandidateInvoices();
+  } finally {
+    global.fetch = originalFetch;
+  }
   assert.deepEqual(
     new Set(candidates.map((invoice) => invoice.id)),
     new Set(["invoice-cancelled-old", "invoice-reissued-new"])

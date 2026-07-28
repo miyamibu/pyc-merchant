@@ -28,7 +28,8 @@ async function loadMonitorModule(extraEnv = {}) {
   const env = {
     APP_ENV: "development",
     APP_HOST: "http://127.0.0.1:49999",
-    DB_PATH: path.join(dir, "monitor.db"),
+    DB_PATH: path.join(dir, "financial.db"),
+    WORKER_STATE_DB_PATH: path.join(dir, "worker-state.db"),
     CHAIN_ID: "137",
     TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
     TOKEN_DECIMALS: "6",

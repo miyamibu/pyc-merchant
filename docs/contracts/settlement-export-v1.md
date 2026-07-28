@@ -25,6 +25,7 @@ Canonical contract summary for `Settlement Export Contract v1`.
 - A paid row carries `primary_tx_hash` or at least one `payment_attempt_ids` entry. Review, on-chain refund, provider, and other business-impacting states preserve the conditional references defined by the schema.
 - Vendor adapters are downstream transforms and must preserve the required lineage fields.
 - Existing stored legacy-v1 bytes are not rewritten. New operational snapshots use v2, which carries these lineage fields additively together with the v2 refund manifest.
+- Amount-scale fields are additive v2 fields only; v1 stored bytes and the v1 schema remain frozen. v2 records the token atomic string separately from the ledger base-unit string.
 - Legacy daily/monthly operational exports retain joined detail rows plus deterministic invoice-primary and refund-primary projections. Totals and CSV use one invoice-primary row per invoice, refund counters use one refund-primary row per `refund_request_id`, and the single invoice CSV row carries all refund references in `legacy_refund_references_json`. Stored formal snapshot bytes remain unchanged.
 
 The narrative specification lives in:

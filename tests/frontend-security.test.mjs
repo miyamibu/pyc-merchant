@@ -180,7 +180,7 @@ test("terminal staff/admin IA and review empty/loading/error placeholders are pr
   assert.match(terminalEntryJs, /public\/terminal-entry/);
   assert.match(terminalEntryJs, /会計がまだ立っていない/);
   assert.match(terminalEntryJs, /店頭端末でお支払いをご案内しています/);
-  assert.match(terminalEntryHtml, /id="openInvoiceBtn"[^>]*>この会計を開く</);
+  assert.match(terminalEntryHtml, /id="openInvoiceBtn"[^>]*>この会計を確認して進む</);
   assert.match(terminalEntryJs, /async function handleOpenInvoice/);
   assert.match(terminalEntryJs, /window\.location\.replace/);
   assert.match(server, /DIAGNOSTIC_MODE_ENABLED/);

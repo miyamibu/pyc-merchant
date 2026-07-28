@@ -250,7 +250,11 @@ test("paid receipt requires server transaction hash and confirmation time", () =
   assert.match(receipt, /invoice\?\.paid_tx_hash/);
   assert.match(receipt, /invoice\?\.chain_recorded_at/);
   assert.match(receipt, /invoice\?\.confirmed_at/);
-  assert.match(receipt, /complete: Boolean\(txHash\) && Number\.isFinite\(confirmedAtMs\)/);
+  assert.match(receipt, /complete: Boolean\(signedReceipt\?\.signature\)/);
+  assert.match(receipt, /Boolean\(signedReceipt\?\.kid\)/);
+  assert.match(receipt, /Boolean\(signedReceipt\?\.content_sha256\)/);
+  assert.match(receipt, /Boolean\(signedReceipt\?\.tx_hash\)/);
+  assert.match(receipt, /Number\.isFinite\(confirmedAtMs\)/);
   assert.match(receipt, /hasFreshInvoiceObservation\(invoice\)/);
   assert.match(receipt, /copyReceiptBtn\.disabled = !isPaid/);
   assert.match(receipt, /evidence\.complete \? "\u304a\u652f\u6255\u3044\u78ba\u8a8d\u66f8" : "\u304a\u652f\u6255\u3044\u72b6\u6cc1\u30e1\u30e2"/);

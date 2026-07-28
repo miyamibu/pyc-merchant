@@ -386,7 +386,7 @@ test("provider captured with tx_hash stays non-paid until existing payment inges
   assert.equal(paid.data.status, "paid");
 });
 
-test("provider amount mismatch routes to review and settlement remains exception_pending", async (t) => {
+test("provider amount mismatch routes to review and settlement hard gate blocks", async (t) => {
   const ctx = await startProviderTestServer();
   t.after(async () => {
     ctx.db.close();
@@ -422,11 +422,9 @@ test("provider amount mismatch routes to review and settlement remains exception
     }),
     body: JSON.stringify({ business_date: businessDateJst(), admin_approval: true }),
   });
-  assert.equal(closeRes.status, 200);
-  const row = ctx.db
-    .prepare(`SELECT * FROM settlement_export_rows WHERE export_run_id = ? AND invoice_id = ?`)
-    .get(closeRes.data.export_run_id, created.data.invoice_id);
-  assert.equal(row.accounting_status, "exception_pending");
+  assert.equal(closeRes.status, 409);
+  assert.equal(closeRes.data.error.code, "SETTLEMENT_HARD_GATE_BLOCKED");
+  assert.ok(closeRes.data.error.details.blockers.some((blocker) => blocker.code === "OPEN_REVIEW_INCIDENTS"));
 });
 
 test("provider batch settlement does not auto-pay and daily close separates wallet cash from provider receivable", async (t) => {

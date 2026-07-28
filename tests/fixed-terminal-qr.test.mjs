@@ -62,6 +62,59 @@ test("fixed terminal QR waits, resolves to the current invoice once, and blocks 
   assert.equal(readyState.data.active_invoice.invoice_id, created.data.invoice_id);
   assert.equal(readyState.data.pay_url, created.data.payment_url);
 
+  const claimPayload = readyState.data.active_invoice;
+  const claimBody = {
+    anonymous_device_id: "device-fixed-qr-test-001",
+    nonce: "nonce-fixed-qr-test-0001",
+    invoice_version: claimPayload.invoice_version,
+    amount_scale_version: claimPayload.amount_scale_version,
+    token_amount_atomic: claimPayload.token_amount_atomic,
+    ledger_amount_base: claimPayload.ledger_amount_base,
+  };
+  const claim = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(claimBody) }
+  );
+  assert.equal(claim.status, 201);
+  assert.equal(claim.data.invoice_id, created.data.invoice_id);
+  assert.equal(claim.data.claim_status, "claimed");
+  assert.equal(claim.data.pay_url, undefined);
+
+  const consumedClaim = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim/${encodeURIComponent(claim.data.claim_id)}/consume`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(claimBody) }
+  );
+  assert.equal(consumedClaim.status, 201);
+  assert.equal(consumedClaim.data.claim_status, "consumed");
+  assert.equal(consumedClaim.data.pay_url, created.data.payment_url);
+
+  const replayClaim = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(claimBody) }
+  );
+  assert.equal(replayClaim.status, 201);
+  assert.equal(replayClaim.data.claim_id, claim.data.claim_id);
+  assert.equal(replayClaim.data.claim_status, "consumed");
+
+  const conflictingClaim = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...claimBody,
+        anonymous_device_id: "device-fixed-qr-test-002",
+        nonce: "nonce-fixed-qr-test-0002",
+      }),
+    }
+  );
+  assert.equal(conflictingClaim.status, 409);
+  assert.equal(conflictingClaim.data.error.code, "CHECKOUT_ALREADY_CLAIMED");
+
   const directEntry = await fetch(`${started.baseUrl}/t/${encodeURIComponent(admin.publicEntryToken)}`, {
     redirect: "manual",
   });
@@ -176,6 +229,7 @@ test("reissue swaps the terminal current invoice pointer and late payment on the
       tx_hash: randomTxHash("fixed-old-late"),
       from_address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       observed_at: new Date(Date.now() + 1000).toISOString(),
+      block_timestamp: new Date(Date.parse(original.data.expires_at) + 1000).toISOString(),
     },
     `fixed-old-late-${Date.now()}`
   );
@@ -195,4 +249,71 @@ test("reissue swaps the terminal current invoice pointer and late payment on the
 
   const pointerAfterLate = db.prepare(`SELECT current_invoice_id FROM terminals WHERE id = ?`).get(admin.terminalId);
   assert.equal(pointerAfterLate.current_invoice_id, reissued.data.invoice_id);
+});
+
+test("fixed QR claim is invalidated when the invoice version changes before consume", async (t) => {
+  const env = baseServerEnv();
+  const started = await startServerProcess(CWD, env);
+  const db = new Database(env.DB_PATH);
+  t.after(async () => {
+    db.close();
+    await stopServerProcess(started.proc);
+  });
+
+  const admin = await loginAs(started.baseUrl, {
+    terminalCode: env.TERMINAL_CODE,
+    pin: env.STAFF_PIN,
+    staffName: "Demo Staff",
+  });
+  const created = await createInvoice(started.baseUrl, admin.token, 1550, `fixed-claim-version-${Date.now()}`);
+  assert.equal(created.status, 201);
+  const entry = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}`
+  );
+  assert.equal(entry.status, 200);
+  const current = entry.data.active_invoice;
+  const claimBody = {
+    anonymous_device_id: "device-fixed-qr-version-001",
+    nonce: "nonce-fixed-qr-version-0001",
+    invoice_version: current.invoice_version,
+    amount_scale_version: current.amount_scale_version,
+    token_amount_atomic: current.token_amount_atomic,
+    ledger_amount_base: current.ledger_amount_base,
+  };
+  const claim = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(claimBody) }
+  );
+  assert.equal(claim.status, 201);
+  db.prepare("UPDATE invoices SET invoice_version = COALESCE(invoice_version, 1) + 1, updated_at = ? WHERE id = ?").run(new Date().toISOString(), created.data.invoice_id);
+
+  const currentEntry = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}`
+  );
+  assert.equal(currentEntry.status, 200);
+  const currentBody = {
+    ...claimBody,
+    invoice_version: currentEntry.data.active_invoice.invoice_version,
+    amount_scale_version: currentEntry.data.active_invoice.amount_scale_version,
+    token_amount_atomic: currentEntry.data.active_invoice.token_amount_atomic,
+    ledger_amount_base: currentEntry.data.active_invoice.ledger_amount_base,
+  };
+  const staleClaimWithLatestValues = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim/${encodeURIComponent(claim.data.claim_id)}/consume`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(currentBody) }
+  );
+  assert.equal(staleClaimWithLatestValues.status, 409);
+  assert.equal(staleClaimWithLatestValues.data.error.code, "CHECKOUT_CLAIM_STALE");
+
+  const consumed = await apiRequest(
+    started.baseUrl,
+    `/api/v1/public/terminal-entry/${encodeURIComponent(admin.publicEntryToken)}/claim/${encodeURIComponent(claim.data.claim_id)}/consume`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(claimBody) }
+  );
+  assert.equal(consumed.status, 409);
+  assert.equal(consumed.data.error.code, "CHECKOUT_CLAIM_STALE");
 });

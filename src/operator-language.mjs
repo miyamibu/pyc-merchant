@@ -134,6 +134,11 @@ export const REVIEW_REASON_ACTION_POLICY = Object.freeze({
     suggestedAction: "対応ネットワーク外の可能性があるため、自動確定せず管理者判断に回します。",
     safeExit: "診断証跡を保存し、返金可否を別途判断します。",
   },
+  LEDGER_INTEGRITY_ERROR: {
+    title: "会計台帳の整合性を確認してください",
+    suggestedAction: "元の台帳値を変更せず、支払い証跡と会計記録を管理者が照合します。",
+    safeExit: "整合性確認が終わるまで商品引渡し・返金・締めを進めません。",
+  },
 });
 
 export function normalizeReviewReason(reason) {

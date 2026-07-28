@@ -158,15 +158,32 @@ test("refund evidence registry enforces two-person rule and keeps recorded state
     }),
   });
   assert.equal(blockedClose.status, 409);
-  assert.equal(blockedClose.data.error.code, "UNRESOLVED_REFUNDS");
-  assert.match(blockedClose.data.error.message, /締めできません。未完了の返金証跡を先に処理してください。/);
-  assert.ok(blockedClose.data.error.unresolved_refunds.some((row) => row.refund_case_id === request.data.refund_request_id));
+  assert.equal(blockedClose.data.error.code, "SETTLEMENT_HARD_GATE_BLOCKED");
+  assert.ok(blockedClose.data.error.details.blockers.some((blocker) => blocker.code === "OPEN_REVIEW_INCIDENTS"));
 
   db.prepare(`UPDATE refund_requests SET status = 'succeeded', verified_at = ?, updated_at = ? WHERE id = ?`).run(
     new Date().toISOString(),
     new Date().toISOString(),
     request.data.refund_request_id
   );
+  const resolvedReview = await apiRequest(
+    started.baseUrl,
+    `/api/v1/reviews/${encodeURIComponent(detail.data.review_case_id)}`,
+    {
+      method: "PATCH",
+      headers: authHeaders(requester.token, {
+        "content-type": "application/json",
+        "idempotency-key": `refund-review-resolve-${Date.now()}`,
+      }),
+      body: JSON.stringify({
+        status: "rejected",
+        disposition: "cancelled_no_sale",
+        resolution_status: "cancelled",
+        resolution_note: "refund evidence was recorded before close",
+      }),
+    }
+  );
+  assert.equal(resolvedReview.status, 200);
   const closeAfterResolvedRefund = await apiRequest(started.baseUrl, "/api/v1/settlements/daily:close", {
     method: "POST",
     headers: authHeaders(requester.token, {

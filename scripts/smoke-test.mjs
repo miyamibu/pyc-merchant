@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,7 +8,7 @@ const BASE_URL = process.env.BASE_URL || "http://127.0.0.1:4173";
 const TERMINAL_CODE = process.env.TERMINAL_CODE || "TERM-001";
 const STAFF_PIN = process.env.STAFF_PIN || "1234";
 const SECOND_ADMIN_PIN = process.env.SECOND_ADMIN_PIN || "5678";
-const SECOND_ADMIN_NAME = process.env.SECOND_ADMIN_NAME || "Smoke Approver";
+const SECOND_ADMIN_STAFF_NAME = "Demo Approver";
 const CHAIN_ID = process.env.CHAIN_ID || "137";
 const TOKEN_CONTRACT = process.env.TOKEN_CONTRACT || "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 const RECIPIENT = process.env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222";
@@ -44,13 +44,20 @@ async function canReachHealth(targetBaseUrl = ACTIVE_BASE_URL) {
 function buildServerEnv(targetBaseUrl) {
   const url = new URL(targetBaseUrl);
   const env = { ...process.env };
+  const smokeRoot = env.SMOKE_RUNTIME_DIR || mkdtempSync(path.join(tmpdir(), "jpyc-smoke-"));
   env.APP_PORT = env.APP_PORT || (url.port || "4173");
   env.APP_HOST = env.APP_HOST || targetBaseUrl;
   env.APP_BIND_HOST = env.APP_BIND_HOST || (["localhost", "127.0.0.1", "::1"].includes(url.hostname) ? url.hostname : "127.0.0.1");
-  env.DB_PATH = env.DB_PATH || path.join(mkdtempSync(path.join(tmpdir(), "jpyc-smoke-")), "app.db");
+  env.DB_PATH = env.DB_PATH || path.join(smokeRoot, "app.db");
+  env.BACKUP_DIR = env.BACKUP_DIR || path.join(smokeRoot, "backups");
+  mkdirSync(path.dirname(path.resolve(process.cwd(), env.DB_PATH)), { recursive: true });
+  mkdirSync(path.resolve(process.cwd(), env.BACKUP_DIR), { recursive: true });
   env.APP_SECRET = env.APP_SECRET || crypto.randomBytes(32).toString("hex");
   env.SERVICE_INGEST_SECRET = env.SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET;
   env.METRICS_SECRET = env.METRICS_SECRET || crypto.randomBytes(32).toString("hex");
+  env.TERMINAL_CODE = env.TERMINAL_CODE || TERMINAL_CODE;
+  env.STAFF_PIN = env.STAFF_PIN || STAFF_PIN;
+  env.SECOND_ADMIN_PIN = env.SECOND_ADMIN_PIN || SECOND_ADMIN_PIN;
   env.CHAIN_ID = env.CHAIN_ID || CHAIN_ID;
   env.ENABLED_PAYMENT_CHAIN_IDS = env.ENABLED_PAYMENT_CHAIN_IDS || "1,43114,137";
   env.TOKEN_CONTRACT = env.TOKEN_CONTRACT || TOKEN_CONTRACT;
@@ -58,7 +65,9 @@ function buildServerEnv(targetBaseUrl) {
   env.JPYC_CONTRACT_APPROVAL_REF = env.JPYC_CONTRACT_APPROVAL_REF || "SMOKE-JPYC-CONTRACT-001";
   env.RECIPIENT_ADDRESS = env.RECIPIENT_ADDRESS || RECIPIENT;
   env.TOKEN_DECIMALS = env.TOKEN_DECIMALS || "18";
-  env.JPYC_BASE_UNIT_SCALE = env.JPYC_BASE_UNIT_SCALE || "1000000";
+  env.LEDGER_DECIMALS = env.LEDGER_DECIMALS || "6";
+  env.LEDGER_BASE_UNIT_SCALE = env.LEDGER_BASE_UNIT_SCALE || env.JPYC_BASE_UNIT_SCALE || "1000000";
+  env.RECEIVE_ADDRESS_DEV_AUTO_VERIFY = env.RECEIVE_ADDRESS_DEV_AUTO_VERIFY || "true";
   env.REQUIRED_CONFIRMATIONS = env.REQUIRED_CONFIRMATIONS || "2";
   env.MIN_REQUIRED_CONFIRMATIONS = env.MIN_REQUIRED_CONFIRMATIONS || "2";
   env.MAX_ACTIVE_INVOICES_PER_RECIPIENT = env.MAX_ACTIVE_INVOICES_PER_RECIPIENT || "50";
@@ -127,6 +136,20 @@ function assert(condition, message, payload) {
 
 function createNonce() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function businessDateForStoreTimezone(date, timeZone) {
+  const instant = date instanceof Date ? date : new Date(date);
+  const zone = String(timeZone || "").trim();
+  if (!zone || !Number.isFinite(instant.getTime())) throw new Error("invalid store timezone or date");
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const values = Object.fromEntries(parts.filter(({ type }) => type !== "literal").map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
 }
 
 function randomTxHash(seed = "") {
@@ -218,6 +241,7 @@ async function ingestPayment(authorization, idempotencyKey, link, amountJpyc, mo
   const chainId = mode === "wrong_chain" ? "1" : CHAIN_ID;
   const tokenContract = mode === "wrong_token" ? "0xdeadbeef" : TOKEN_CONTRACT;
   const amount = mode === "overpay" ? amountJpyc + 200 : amountJpyc;
+  const observedAt = new Date().toISOString();
   return request("/api/v1/payments/events:ingest", {
     method: "POST",
     headers: {
@@ -232,6 +256,12 @@ async function ingestPayment(authorization, idempotencyKey, link, amountJpyc, mo
       token_contract: tokenContract,
       to_address: RECIPIENT,
       confirmations: 2,
+      log_index: 0,
+      block_number: 123,
+      block_hash: `0x${"b".repeat(64)}`,
+      block_timestamp: observedAt,
+      detected_at: observedAt,
+      canonical_status: "canonical",
       tx_hash: randomTxHash(`${mode}-${link.invoiceId}`),
       from_address: CUSTOMER_ADDRESS
     })
@@ -247,7 +277,6 @@ async function getInvoiceStatus(authorization, invoiceId) {
 async function main() {
   const autoServer = await ensureServer();
   const nonce = createNonce();
-  const approverName = `${SECOND_ADMIN_NAME} ${nonce}`;
   const summary = {};
   try {
     const health = await request("/healthz");
@@ -269,26 +298,56 @@ async function main() {
       terminalId: initialLogin.login.data.terminalId
     };
 
-  const createApprover = await request("/api/v1/staff", {
+  const rejectedAdminCreation = await request("/api/v1/staff", {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization,
-      "idempotency-key": `smoke-create-approver-${nonce}`
+      "idempotency-key": `smoke-reject-admin-create-${nonce}`
     },
     body: JSON.stringify({
-      staff_name: approverName,
+      staff_name: `Smoke Admin Candidate ${nonce}`,
       role: "admin",
-      pin: SECOND_ADMIN_PIN,
+      pin: "7789",
       status: "active"
     })
   });
-  assert([201, 409].includes(createApprover.status) || createApprover.status === 200, "failed to prepare second approver account", createApprover);
-  const approverLogin = await loginAs(SECOND_ADMIN_PIN, approverName);
+  assert(rejectedAdminCreation.status === 403, "direct admin staff creation should be rejected", rejectedAdminCreation);
+  assert(
+    rejectedAdminCreation.data?.error?.code === "STAFF_SECURITY_APPROVAL_REQUIRED",
+    "direct admin staff creation returned the wrong rejection code",
+    rejectedAdminCreation,
+  );
+
+  const allowedStaffCreation = await request("/api/v1/staff", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization,
+      "idempotency-key": `smoke-allow-staff-create-${nonce}`
+    },
+    body: JSON.stringify({
+      staff_name: `Smoke Staff ${nonce}`,
+      role: "staff",
+      pin: "7788",
+      status: "active"
+    })
+  });
+  assert(allowedStaffCreation.status === 201, "direct creation of an allowed staff role failed", allowedStaffCreation);
+  assert(allowedStaffCreation.data?.staff?.role === "staff", "allowed staff role creation returned the wrong role", allowedStaffCreation);
+
+  const approverLogin = await loginAs(SECOND_ADMIN_PIN, SECOND_ADMIN_STAFF_NAME);
   approverAuthorization = approverLogin.authorization;
   summary.approver = {
+    staffName: approverLogin.login.data.staff_name,
     role: approverLogin.login.data.role,
     terminalId: approverLogin.login.data.terminalId
+  };
+  summary.staffSecurity = {
+    directAdminCreateStatus: rejectedAdminCreation.status,
+    directAdminCreateCode: rejectedAdminCreation.data?.error?.code,
+    allowedRole: allowedStaffCreation.data.staff.role,
+    allowedRoleCreateStatus: allowedStaffCreation.status,
   };
 
   const internalIngestWithoutSignature = await request("/api/v1/internal/payments/events:ingest", {
@@ -325,6 +384,12 @@ async function main() {
     token_contract: TOKEN_CONTRACT,
     to_address: RECIPIENT,
     confirmations: 2,
+    log_index: 0,
+    block_number: 123,
+    block_hash: `0x${"b".repeat(64)}`,
+    block_timestamp: new Date().toISOString(),
+    detected_at: new Date().toISOString(),
+    canonical_status: "canonical",
     tx_hash: randomTxHash("internal-signed"),
     from_address: "0xservice-customer"
   };
@@ -549,7 +614,10 @@ async function main() {
   });
   assert(cancelResult.status === 200, "cancel invoice failed", cancelResult);
   const cancelPay = await ingestPayment(authorization, `smoke-pay-cancelled-${nonce}`, cancelledInvoice, 1300, "exact");
-  assert(cancelPay.status === 409, "cancelled invoice accepted payment", cancelPay);
+  assert([200, 409].includes(cancelPay.status), "cancelled invoice payment response was unexpected", cancelPay);
+  if (cancelPay.status === 200) {
+    assert(cancelPay.data.status === "review_required", "cancelled invoice payment was not retained for review", cancelPay);
+  }
   summary.cancelledCase = { cancelStatus: cancelResult.status, payStatus: cancelPay.status };
 
   const lateInvoice = await createInvoice(authorization, `smoke-invoice-late-${nonce}`, 1400);
@@ -576,7 +644,18 @@ async function main() {
   assert(overpayStatus.data.status === "review_required", "overpay did not become review_required", overpayStatus);
   summary.overpay = { decision: overpay.data.decision, invoiceStatus: overpayStatus.data.status };
 
-  const businessDate = new Date().toISOString().slice(0, 10);
+  const settlementPreview = await request("/api/v1/settlements/daily:preview", {
+    headers: { authorization },
+  });
+  assert(settlementPreview.status === 200, "settlement preview failed", settlementPreview);
+  const storeTimezone = String(settlementPreview.data?.timezone || "").trim();
+  assert(storeTimezone, "settlement preview did not expose the store timezone", settlementPreview);
+  const businessDate = businessDateForStoreTimezone(new Date(), storeTimezone);
+  assert(
+    businessDate === String(settlementPreview.data?.business_date || ""),
+    "smoke business date does not match the store timezone",
+    { businessDate, previewBusinessDate: settlementPreview.data?.business_date, storeTimezone },
+  );
   const settlement = await request("/api/v1/settlements/daily:close", {
     method: "POST",
     headers: {
@@ -589,6 +668,20 @@ async function main() {
   if (settlement.status === 409 && settlement.data?.error?.code === "UNRESOLVED_REFUNDS") {
     summary.settlement = {
       blockedByRefundEvidence: true,
+      first: settlement.data,
+    };
+  } else if (settlement.status === 409 && settlement.data?.error?.code === "SETTLEMENT_HARD_GATE_BLOCKED") {
+    const blockers = Array.isArray(settlement.data?.error?.details?.blockers)
+      ? settlement.data.error.details.blockers
+      : [];
+    assert(
+      blockers.some((blocker) => blocker?.code === "OPEN_REVIEW_INCIDENTS"),
+      "settlement hard gate did not expose the open review incident blocker",
+      settlement,
+    );
+    summary.settlement = {
+      blockedByHardGate: true,
+      blockerCodes: blockers.map((blocker) => blocker.code),
       first: settlement.data,
     };
   } else {
@@ -626,6 +719,8 @@ async function main() {
   assert(sessionList.status === 200, "terminal session list failed", sessionList);
   assert(Array.isArray(sessionList.data.sessions), "terminal session list payload invalid", sessionList);
   const approverSessionId = approverLogin.login.data.sessionId;
+  const approverSession = sessionList.data.sessions.find((session) => session.id === approverSessionId);
+  assert(approverSession?.staff_user_id === "staff-002", "smoke approver is not the seeded staff-002 fixture", sessionList);
   const forceRevoke = await request(`/api/v1/terminal-sessions/${approverSessionId}/revoke`, {
     method: "POST",
     headers: {
@@ -642,6 +737,7 @@ async function main() {
   assert(approverAfterRevoke.status === 401, "revoked session should be unauthorized", approverAfterRevoke);
   summary.sessionAdmin = {
     listed: sessionList.data.sessions.length,
+    approverStaffUserId: approverSession.staff_user_id,
     forceRevokeStatus: forceRevoke.status,
     approverAfterRevokeStatus: approverAfterRevoke.status
   };

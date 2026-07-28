@@ -95,8 +95,10 @@ test("env examples separate 18-decimal token atomic units from the 1e6 accountin
   for (const fileName of [".env.example", ".env.production.example"]) {
     const content = fs.readFileSync(path.join(ROOT, fileName), "utf8");
     const decimals = content.match(/^TOKEN_DECIMALS=(\d+)$/m)?.[1];
-    const scale = content.match(/^JPYC_BASE_UNIT_SCALE=(\d+)$/m)?.[1];
+    const ledgerDecimals = content.match(/^LEDGER_DECIMALS=(\d+)$/m)?.[1];
+    const scale = content.match(/^LEDGER_BASE_UNIT_SCALE=(\d+)$/m)?.[1];
     assert.equal(decimals, "18", `${fileName} TOKEN_DECIMALS must match the on-chain JPYC atomic unit`);
-    assert.equal(scale, "1000000", `${fileName} JPYC_BASE_UNIT_SCALE must stay at 1_000_000`);
+    assert.equal(ledgerDecimals, "6", `${fileName} LEDGER_DECIMALS must match the accounting unit`);
+    assert.equal(scale, "1000000", `${fileName} LEDGER_BASE_UNIT_SCALE must stay at 1_000_000`);
   }
 });

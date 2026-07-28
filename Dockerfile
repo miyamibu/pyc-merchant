@@ -22,7 +22,7 @@ COPY scripts ./scripts
 
 RUN groupadd --system appuser \
   && useradd --system --gid appuser --create-home --home-dir /home/appuser appuser \
-  && mkdir -p /app/runtime/data /app/runtime/backups /app/runtime/logs \
+  && mkdir -p /app/runtime/data /app/runtime/worker-state /app/runtime/backups /app/runtime/logs \
   && chown -R appuser:appuser /app /home/appuser
 
 USER appuser

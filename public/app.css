@@ -271,14 +271,28 @@ label {
   box-shadow: var(--shadow-card);
 }
 
-.fulfillment-banner {
+.sticky-stack {
   position: sticky;
-  top: calc(env(safe-area-inset-top) + var(--space-2));
-  z-index: 30;
+  top: max(var(--space-2), env(safe-area-inset-top));
+  z-index: 40;
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
+  scroll-margin-top: max(var(--space-4), env(safe-area-inset-top));
+}
+
+.sticky-stack-slot,
+.admin-operations-mount {
+  display: contents;
+}
+
+.fulfillment-banner {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: var(--space-4);
+  min-width: 0;
   padding: var(--space-3) var(--space-4);
   border: 2px solid #dec58d;
   border-radius: var(--radius-md);
@@ -297,15 +311,12 @@ label {
 }
 
 .store-payments-control {
-  position: sticky;
-  top: calc(env(safe-area-inset-top) + 96px);
-  z-index: 40;
-  margin: var(--space-4) 0 0 auto;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
   align-items: center;
   gap: var(--space-3);
-  width: min(520px, calc(100vw - var(--space-8)));
+  min-width: 0;
+  width: 100%;
   padding: var(--space-3);
   border: 2px solid #e2b1ad;
   border-radius: var(--radius-md);
@@ -326,12 +337,14 @@ label {
 .store-payments-control .title,
 .store-payments-control p {
   margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .store-payments-control-actions {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
   gap: var(--space-2);
-  min-width: 176px;
+  min-width: 0;
 }
 
 .panel {
@@ -1134,6 +1147,22 @@ tbody tr:last-child td {
   padding: var(--space-3);
   display: grid;
   gap: var(--space-2);
+}
+
+.bottom-sheet {
+  width: min(100% - 24px, 640px);
+  max-width: 640px;
+  margin: auto auto 0;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: var(--color-surface);
+  color: var(--color-text);
+  box-shadow: 0 -16px 36px rgba(12, 22, 40, 0.2);
+}
+
+.bottom-sheet::backdrop {
+  background: rgba(12, 22, 40, 0.42);
 }
 
 .helper-link {
@@ -2010,15 +2039,11 @@ tbody tr:last-child td {
   }
 
   .store-payments-control {
-    top: calc(env(safe-area-inset-top) + 156px);
-    margin: var(--space-3) 0 0;
-    width: auto;
     grid-template-columns: 1fr;
   }
 
   .store-payments-control-actions {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    min-width: 0;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
   }
 
   .section-header {

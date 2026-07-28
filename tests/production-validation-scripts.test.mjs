@@ -41,6 +41,8 @@ test("validate-production-config passes template preflight with explicitly allow
       APP_HOST: "https://terminal.example.com",
       PUBLIC_BASE_URL: "https://terminal.example.com",
       PAY_BASE_URL: "https://terminal.example.com",
+      DB_PATH: "./runtime/data/app.db",
+      WORKER_STATE_DB_PATH: "./runtime/worker-state/chain-137.db",
       CORS_ALLOW_ORIGINS: "https://terminal.example.com",
       CHAIN_ID: "137",
       TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
@@ -71,6 +73,8 @@ test("validate-production-config rejects RPC skip for non-template production va
       APP_HOST: "https://terminal.example.com",
       PUBLIC_BASE_URL: "https://terminal.example.com",
       PAY_BASE_URL: "https://terminal.example.com",
+      DB_PATH: "./runtime/data/app.db",
+      WORKER_STATE_DB_PATH: "./runtime/worker-state/chain-137.db",
       CORS_ALLOW_ORIGINS: "https://terminal.example.com",
       CHAIN_ID: "137",
       TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
@@ -86,6 +90,27 @@ test("validate-production-config rejects RPC skip for non-template production va
   assert.notEqual(result.code, 0);
   const payload = JSON.parse(result.stdout);
   assert.match(JSON.stringify(payload), /--skip-rpc is not allowed/);
+});
+
+test("validate-production-config rejects a shared financial and worker state DB path", async () => {
+  const result = await runNode(
+    "scripts/production-validation/validate-production-config.mjs",
+    ["--skip-rpc"],
+    {
+      APP_ENV: "production",
+      APP_BIND_HOST: "127.0.0.1",
+      TRUST_PROXY: "true",
+      TRUST_PROXY_HOPS: "1",
+      APP_HOST: "https://terminal.example.com",
+      PUBLIC_BASE_URL: "https://terminal.example.com",
+      PAY_BASE_URL: "https://terminal.example.com",
+      DB_PATH: "./runtime/data/app.db",
+      WORKER_STATE_DB_PATH: "./runtime/data/app.db",
+      CORS_ALLOW_ORIGINS: "https://terminal.example.com",
+    }
+  );
+  assert.notEqual(result.code, 0);
+  assert.match(result.stdout, /WORKER_STATE_DB_PATH must differ from DB_PATH/);
 });
 
 test("validate-production-config verifies token metadata on every configured RPC endpoint", async (t) => {
@@ -157,6 +182,8 @@ test("validate-production-config fails on chain drift", async () => {
       APP_HOST: "https://terminal.example.com",
       PUBLIC_BASE_URL: "https://terminal.example.com",
       PAY_BASE_URL: "https://terminal.example.com",
+      DB_PATH: "./runtime/data/app.db",
+      WORKER_STATE_DB_PATH: "./runtime/worker-state/chain-137.db",
       CHAIN_ID: "10",
       TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
       APPROVED_JPYC_TOKEN_CONTRACT: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
@@ -180,6 +207,20 @@ test("validate-evidence-sanitization rejects leaked bearer token", async () => {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, false);
   assert.equal(payload.violation_count, 1);
+});
+
+test("validate-evidence-sanitization permits public token contract configuration", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "jpyc-evidence-public-config-test-"));
+  const contract = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
+  fs.writeFileSync(path.join(dir, "public-config.json"), JSON.stringify({ token_contract: contract }), "utf8");
+  const result = await runNode("scripts/production-validation/validate-evidence-sanitization.mjs", ["--evidence-dir", dir], {
+    TOKEN_CONTRACT: contract,
+    APPROVED_JPYC_TOKEN_CONTRACT: contract,
+  });
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.violation_count, 0);
 });
 
 test("run-commercial-validate-safe writes reports under a safe output base", async () => {

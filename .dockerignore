@@ -10,6 +10,12 @@ pnpm-debug.log*
 .env.*
 data
 runtime
+artifacts
+deliverables
+output
+.playwright-cli
+.codex
+.codex-audit
 docs/production/evidence
 deploy/nginx/certs
 *.db

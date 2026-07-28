@@ -49,15 +49,24 @@ test("authorized store users always have a scoped audited payment stop control",
   const css = read("public/app.css");
   const server = read("src/server.mjs");
 
-  assert.match(html, /id="storePaymentsControl"[^>]*[\s\S]*?data-permission="payments\.control"/);
+  assert.match(html, /id="stickyStack"[^>]*class="sticky-stack[^"]*"[\s\S]*id="fulfillmentDecisionBanner"[\s\S]*id="storePaymentsMount"/);
+  assert.match(html, /<template id="storePaymentsControlTemplate">[\s\S]*id="storePaymentsControl"[^>]*[\s\S]*?data-permission="payments\.control"/);
   assert.match(html, /id="storePaymentsToggleBtn"/);
   assert.match(html, /全体停止の解除や変更はできません/);
   assert.match(html, /操作は監査ログに記録されます/);
+  const stickyStackCss = css.match(/\.sticky-stack\s*\{([\s\S]*?)\n\}/);
+  assert.ok(stickyStackCss);
+  assert.match(stickyStackCss[1], /position:\s*sticky/);
+  assert.match(stickyStackCss[1], /top:\s*max\([^;]*env\(safe-area-inset-top\)/);
   const storeControlCss = css.match(/\.store-payments-control\s*\{([\s\S]*?)\n\}/);
   assert.ok(storeControlCss);
-  assert.match(storeControlCss[1], /position:\s*sticky/);
-  assert.doesNotMatch(storeControlCss[1], /position:\s*fixed/);
+  assert.doesNotMatch(storeControlCss[1], /position:\s*(?:sticky|fixed)/);
+  assert.doesNotMatch(storeControlCss[1], /top:\s*[^;]+/);
+  assert.match(storeControlCss[1], /repeat\(auto-fit, minmax\(min\(100%/);
+  assert.match(css, /\.sticky-stack-slot,[\s\S]*?\.admin-operations-mount\s*\{[\s\S]*?display:\s*contents/);
   assert.match(js, /requireUiPermission\("payments\.control"/);
+  assert.match(js, /function mountStorePaymentsControl/);
+  assert.match(js, /function bindStorePaymentsEvents/);
   assert.match(js, /\/api\/v1\/admin\/stores\/\$\{encodeURIComponent\(state\.storeId\)\}\/payments\/\$\{action\}/);
   assert.doesNotMatch(js, /\/api\/v1\/admin\/payments\/(?:disable|enable)/);
   assert.match(js, /const action = storeDisabled \? "enable" : "disable"/);
@@ -66,6 +75,35 @@ test("authorized store users always have a scoped audited payment stop control",
   assert.match(server, /payments: getPaymentsDisableState\(\{ storeId: terminal\.store_id, terminalId: terminal\.id \}\)/);
   assert.match(server, /payments\.store_disabled/);
   assert.match(server, /payments\.store_enabled/);
+});
+
+test("terminal keeps staff actions in the base DOM and only materializes gated management DOM after authorization", () => {
+  const html = read("public/terminal.html");
+  const js = read("public/terminal.js");
+  const storeTemplate = html.match(/<template id="storePaymentsControlTemplate">[\s\S]*?<\/template>/);
+  const adminTemplate = html.match(/<template id="adminOperationsTemplate">[\s\S]*?<\/template>/);
+  assert.ok(storeTemplate, "store payment control must be held in a removable template");
+  assert.ok(adminTemplate, "admin operations must be held in a removable template");
+
+  const baseHtml = html
+    .replace(storeTemplate[0], "")
+    .replace(adminTemplate[0], "");
+  assert.match(baseHtml, /id="createInvoiceBtn"[^>]*data-permission="invoice\.create"/);
+  assert.match(baseHtml, /id="refreshBtn"[^>]*data-permission="invoice\.read"/);
+  assert.doesNotMatch(baseHtml, /data-admin-only=/);
+  assert.doesNotMatch(baseHtml, /id="storePaymentsControl"/);
+  assert.match(adminTemplate[0], /data-admin-only="true"/);
+  assert.match(adminTemplate[0], /id="loadReviewsBtn"/);
+  assert.match(adminTemplate[0], /id="closeSettlementBtn"/);
+
+  assert.match(js, /storePaymentsControlTemplate\?\.remove\(\)/);
+  assert.match(js, /adminOperationsTemplate\?\.remove\(\)/);
+  assert.match(js, /function mountAdminOperations/);
+  assert.match(js, /state\.token && state\.permissionsKnown && hasAnyPermission\(ADMIN_UI_PERMISSIONS\)/);
+  assert.match(js, /mount\.replaceChildren\(\)/);
+  assert.match(js, /function bindAdminEvents/);
+  assert.match(js, /el\.adminOperationsMount\.dataset\.eventsBound/);
+  assert.match(js, /refreshDynamicElementRefs\(\)/);
 });
 
 test("terminal removes disabled provider rail controls before binding events", () => {
@@ -101,7 +139,10 @@ test("terminal keeps fulfillment decision visible and fails closed on integrity 
   assert.match(js, /if \(hasIntegrityHold\(invoice\)\) return "integrity_hold"/);
   assert.match(js, /記録整合性を確認中・渡さない/);
   assert.match(js, /renderFulfillmentDecisionBanner\(invoice\)/);
-  assert.match(css, /\.fulfillment-banner\s*\{[\s\S]*?position:\s*sticky/);
+  const fulfillmentCss = css.match(/\.fulfillment-banner\s*\{([\s\S]*?)\n\}/);
+  assert.ok(fulfillmentCss);
+  assert.doesNotMatch(fulfillmentCss[1], /position:\s*(?:sticky|fixed)/);
+  assert.match(css, /\.sticky-stack\s*\{[\s\S]*?position:\s*sticky/);
   assert.match(css, /\.fulfillment-banner\[data-decision="allow"\]/);
 });
 
@@ -121,7 +162,7 @@ test("paid terminal invoices stay observable for post-payment reorg holds", () =
   assert.match(js, /function hasFreshFulfillmentObservation/);
   assert.match(js, /function isFulfillmentObservationUnavailable/);
   assert.match(js, /wouldAllowFulfillment\(invoice\)/);
-  assert.match(js, /providerDecision === "allow_fulfillment"/);
+  assert.match(js, /getAuthoritativeFulfillmentDecision\(invoice\)/);
   assert.match(js, /function failClosedFulfillmentObservation/);
   assert.match(js, /state\.fulfillmentFreshnessTimer = setTimeout/);
   assert.match(js, /setInvoiceStatusPill\(state\.invoiceStatus\)/);
@@ -143,7 +184,10 @@ test("terminal refreshes fulfillment evidence after iPad/Safari resume events", 
 
 test("terminal fulfillment allow paths require a fresh observation", () => {
   const js = read("public/terminal.js");
-  const source = extractSourceBlock(js, "function wouldAllowFulfillment", "function renderFulfillmentDecisionBanner");
+  const source = [
+    extractSourceBlock(js, "function getAuthoritativeFulfillmentDecision", "function effectiveOperatorStatus"),
+    extractSourceBlock(js, "function wouldAllowFulfillment", "function renderFulfillmentDecisionBanner"),
+  ].join("\n");
   const state = {
     lastInvoiceRefreshAt: new Date(Date.now() - 1_000).toISOString(),
     fulfillmentObservationValid: true,
@@ -164,22 +208,32 @@ test("terminal fulfillment allow paths require a fresh observation", () => {
   });
   vm.runInContext(`${source}\nthis.resolveForTest = resolveFulfillmentDecisionModel;`, context);
 
-  assert.equal(context.resolveForTest({ status: "paid" }).decision, "allow");
+  assert.equal(context.resolveForTest({
+    status: "paid",
+    fulfillment_decision: { decision: "allow_fulfillment", reason_codes: [] },
+  }).decision, "allow");
   assert.equal(context.resolveForTest({
     status: "payment_detected",
-    provider_summary: { fulfillment_decision: "allow_fulfillment" },
+    provider_summary: { fulfillment_decision: { decision: "allow_fulfillment", reason_codes: [] } },
   }).decision, "allow");
 
   state.fulfillmentObservationValid = false;
-  assert.equal(context.resolveForTest({ status: "paid" }).decision, "hold");
+  assert.equal(context.resolveForTest({
+    status: "paid",
+    fulfillment_decision: { decision: "allow_fulfillment", reason_codes: [] },
+  }).decision, "hold");
   assert.equal(context.resolveForTest({
     status: "payment_detected",
-    provider_summary: { fulfillment_decision: "allow_fulfillment" },
+    provider_summary: { fulfillment_decision: { decision: "allow_fulfillment", reason_codes: [] } },
   }).decision, "hold");
 
   state.fulfillmentObservationValid = true;
   state.lastInvoiceRefreshAt = new Date(Date.now() - 30_001).toISOString();
-  assert.equal(context.resolveForTest({ status: "settled" }).decision, "hold");
+  assert.equal(context.resolveForTest({
+    status: "settled",
+    fulfillment_decision: { decision: "allow_fulfillment", reason_codes: [] },
+  }).decision, "hold");
+  assert.equal(context.resolveForTest({ status: "paid" }).decision, "hold");
 });
 
 test("terminal integrity hold overrides every provider fulfillment surface", () => {
@@ -333,7 +387,7 @@ test("fixed terminal entry requires explicit confirmation and rechecks before na
   assert.match(html, /id="entryReadyPanel"/);
   assert.match(html, /id="entryAmountText"/);
   assert.match(html, /id="entryInvoiceText"/);
-  assert.match(html, /id="openInvoiceBtn"[^>]*>この会計を開く</);
+  assert.match(html, /id="openInvoiceBtn"[^>]*>この会計を確認して進む</);
   assert.match(html, /id="refreshEntryBtn"/);
   assert.match(js, /async function handleOpenInvoice/);
   assert.match(js, /const latestEntry = await requestEntryState\(\)/);
@@ -366,6 +420,44 @@ test("fixed terminal entry accepts only the canonical same-origin signed pay pat
     "https://user:secret@merchant.example.jp/pay?ref=a",
   ]) {
     assert.equal(isExpected(new URL(candidate)), false, candidate);
+  }
+});
+
+test("fixed terminal entry maps server errors to a safe customer catalog", () => {
+  const js = read("public/terminal-entry.js");
+  assert.doesNotMatch(js, /payload\?\.error\?\.message/);
+  assert.doesNotMatch(js, /error\.message/);
+  const source = extractSourceBlock(js, "const TERMINAL_ENTRY_ERROR_CATALOG", "function announce");
+  const context = vm.createContext({ Error, Object, String });
+  vm.runInContext(
+    `${source}\nthis.fromResponse = terminalEntryErrorFromResponse;\nthis.toCustomerText = customerFacingTerminalError;`,
+    context,
+  );
+
+  const rawDetails = {
+    code: "INTERNAL_ERROR",
+    message: "sqlite:///var/lib/jpyc/app.db RPC https://rpc.internal.example stack leaked",
+    details: { stack: "Error: secret at /srv/jpyc/src/server.mjs:42" },
+  };
+  const mappedUnknown = context.toCustomerText(
+    context.fromResponse({ error: rawDetails }, "ENTRY_REFRESH_FAILED"),
+    "ENTRY_REFRESH_FAILED",
+  );
+  const mappedKnown = context.toCustomerText(
+    context.fromResponse({
+      error: {
+        code: "CHECKOUT_CLAIM_STALE",
+        message: rawDetails.message,
+        details: rawDetails.details,
+      },
+    }, "ENTRY_CLAIM_FAILED"),
+    "ENTRY_CLAIM_FAILED",
+  );
+  for (const text of [mappedUnknown, mappedKnown]) {
+    assert.match(text, /問い合わせコード:/);
+    for (const secret of ["sqlite", "app.db", "rpc.internal.example", "/srv/jpyc", "secret at"]) {
+      assert.equal(text.includes(secret), false, `customer error exposed ${secret}`);
+    }
   }
 });
 
@@ -849,7 +941,7 @@ test("fixed entry poll change requires one acknowledgement before navigation", a
   responses.push(readyA);
   vm.runInContext(source, context);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(getElement("openInvoiceBtn").textContent, "この会計を開く");
+  assert.equal(getElement("openInvoiceBtn").textContent, "この会計を確認して進む");
 
   responses.push(readyB);
   await vm.runInContext("refreshEntryState()", context);
@@ -858,10 +950,17 @@ test("fixed entry poll change requires one acknowledgement before navigation", a
 
   await vm.runInContext("handleOpenInvoice()", context);
   assert.equal(navigations.length, 0);
-  assert.equal(getElement("openInvoiceBtn").textContent, "この会計を開く");
+  assert.equal(getElement("openInvoiceBtn").textContent, "この会計を確認して進む");
   assert.equal(vm.runInContext("state.requiresReconfirmation", context), false);
 
   responses.push(readyB);
+  responses.push({ claim_id: "claim-b", claim_status: "claimed", invoice_id: "invoice-b" });
+  await vm.runInContext("handleOpenInvoice()", context);
+  assert.equal(navigations.length, 0);
+  assert.equal(getElement("openInvoiceBtn").textContent, "確認して支払い画面へ");
+
+  responses.push(readyB);
+  responses.push({ claim_status: "consumed", invoice_id: "invoice-b", pay_url: "/pay?ref=invoice-b" });
   await vm.runInContext("handleOpenInvoice()", context);
   assert.deepEqual(navigations, ["https://merchant.example/pay?ref=invoice-b"]);
 });

@@ -25,8 +25,11 @@
   - reverse proxy
 - shared runtime dir
   - `./runtime/data/app.db`
+  - `./runtime/worker-state/chain-137.db`
   - `./runtime/backups`
   - `./runtime/logs`
+
+`DB_PATH` は app の financial DB、`WORKER_STATE_DB_PATH` は worker の operational state DB として分離する。compose の app は worker state を read-only、worker は state directory を read/write でマウントし、worker に financial DB の volume を与えない。
 
 ## Operational rules
 - secrets と approval ref は `.env.production` から供給する。

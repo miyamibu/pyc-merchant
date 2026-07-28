@@ -6,11 +6,11 @@ import express from "express";
 import Database from "better-sqlite3";
 import bcrypt from "bcryptjs";
 import cors from "cors";
-import { Interface, JsonRpcProvider, verifyMessage } from "ethers";
+import { Interface, JsonRpcProvider, id as keccak256Utf8, verifyMessage } from "ethers";
 import helmet from "helmet";
 import { DateTime } from "luxon";
 import { buildWalletLaunchPayload, createWalletAdapter, getSupportedWallets } from "./wallet-adapter.mjs";
-import { makePaymentLogic } from "./payment-logic.mjs";
+import { makePaymentLogic, normalizeChainId } from "./payment-logic.mjs";
 import {
   REVIEW_REASON_CODES,
   isRefundCandidateReasonCode,
@@ -22,8 +22,11 @@ import {
   compareBaseUnits,
   convertBaseUnitsBetweenDecimals,
   formatBaseUnitsForDisplay,
+  AMOUNT_SCALE_VERSION as DEFAULT_AMOUNT_SCALE_VERSION,
   parseDecimalToBaseUnits,
+  requireExactLedgerAmountBaseFromTokenAtomic as requireExactLedgerAmountBaseFromTokenAtomicFixed,
   scaleToDecimals,
+  tokenAmountAtomicFromLedgerBase as tokenAmountAtomicFromLedgerBaseFixed,
 } from "./amounts.mjs";
 import {
   FULFILLMENT_DECISIONS,
@@ -70,6 +73,7 @@ import {
   OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
   getSupportedPaymentChain,
   listEnabledPaymentChains,
+  listSupportedPaymentChains,
   networkLabelForChainId,
   normalizeJpycPolicyAddress,
   parseEnabledPaymentChainIds,
@@ -79,6 +83,19 @@ import {
 } from "./jpyc-contract-policy.mjs";
 import { validateCommercialEvidence } from "../scripts/production-validation/validate-commercial-evidence.mjs";
 import { APPROVED_LEDGER_BASE_UNIT_SCALE, APPROVED_TOKEN_DECIMALS } from "./token-metadata.mjs";
+import { assessChainRuntimeRegistry } from "./chain-runtime-registry.mjs";
+import {
+  buildReceiveAddressControlMessage,
+  isReceiveAddressAllocatable,
+  validateReceiveAddressControl,
+  validateReceiveAddressManifest,
+} from "./address-control.mjs";
+import { deriveInvoiceStateAxes } from "./state-axes.mjs";
+import {
+  classifyRecoveryReport,
+  normalizeRecoveryReportInput,
+  READ_ONLY_RECOVERY_CHAIN_IDS,
+} from "./payment-recovery.mjs";
 
 const CWD = process.cwd();
 const DEFAULTS = {
@@ -92,7 +109,11 @@ const DEFAULTS = {
   PAY_BASE_URL: "",
   PUBLIC_BASE_URL: "",
   APP_SECRET: "__REPLACE_WITH_LONG_RANDOM_SECRET__",
+  PAYMENT_RECEIPT_ACTIVE_KID: "app-secret-v1",
+  PAYMENT_RECEIPT_KEY_RING: "",
+  PAYMENT_RECEIPT_VERIFY_ONLY_KIDS: "",
   DB_PATH: "./data/app.db",
+  WORKER_STATE_DB_PATH: "",
   CHAIN_ID: "137",
   ENABLED_PAYMENT_CHAIN_IDS: "137",
   TOKEN_DECIMALS: "18",
@@ -142,10 +163,12 @@ const DEFAULTS = {
   ENABLE_PUBLIC_PAYMENT_SIMULATION: "false",
   DEMO_CONTROLS_ENABLED: "false",
   ALLOW_MANUAL_PAYMENT_INGEST: "false",
+  RECEIVE_ADDRESS_DEV_AUTO_VERIFY: "false",
   ENABLE_PROVIDER_RAIL_MOCK: "false",
   MANUAL_INGEST_APPROVAL_REF: "",
   COMMERCIAL_GO_MODE: "false",
   DEPLOYMENT_STAGE: "",
+  TEST_CRASH_FAULT_INJECTION: "",
   COMMERCIAL_EVIDENCE_ROOT: "./docs/production/evidence",
   COMMERCIAL_EVIDENCE_DIR: "",
   RELEASE_ID: "",
@@ -163,7 +186,12 @@ const DEFAULTS = {
   PIN_LOCKOUT_MAX_ATTEMPTS: "5",
   PIN_LOCKOUT_SEC: "900",
   SSE_TOKEN_MAX_TTL_SEC: "900",
-  JPYC_BASE_UNIT_SCALE: "",
+  LEDGER_DECIMALS: "6",
+  LEDGER_BASE_UNIT_SCALE: "1000000",
+  ENABLE_AUTO_SPLIT_PAYMENT: "false",
+  DETECTION_CONFIRMATIONS: "0",
+  FULFILLMENT_REQUIRED_CONFIRMATIONS: "2",
+  ACCOUNTING_FINALITY_CONFIRMATIONS: "2",
   MIN_REQUIRED_CONFIRMATIONS: "2",
   METRICS_SECRET: "__REPLACE_WITH_METRICS_SECRET__",
   WORKER_STALE_SEC: "180",
@@ -173,6 +201,10 @@ const DEFAULTS = {
   REQUIRED_CONFIRMATIONS: "2",
   SETTLEMENT_BLOCK_ON_UNRESOLVED_REVIEWS: "false",
   SETTLEMENT_UNRESOLVED_REVIEW_POLICY: "",
+  NOTIFICATION_OUTBOX_LEASE_SEC: "30",
+  NOTIFICATION_OUTBOX_MAX_ATTEMPTS: "5",
+  NOTIFICATION_OUTBOX_RETRY_BASE_SEC: "5",
+  REVIEW_STEP_UP_SEC: "300",
   PAYMENTS_DISABLED: "false",
   MAX_ACTIVE_INVOICES_PER_RECIPIENT: "1",
   MAX_INVOICE_AMOUNT_JPY: "100000000",
@@ -239,6 +271,9 @@ function isWeakSecretValue(value) {
 function loadEnv() {
   const envPath = path.join(CWD, ".env");
   const values = { ...DEFAULTS };
+  // Read the pre-v1 name only as a migration aid; all runtime semantics use
+  // the explicit ledger names below. New deployments must not set this key.
+  const legacyLedgerScaleKey = ["JPYC", "BASE", "UNIT", "SCALE"].join("_");
   if (fs.existsSync(envPath)) {
     const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
     for (const line of lines) {
@@ -254,6 +289,9 @@ function loadEnv() {
       values[key] = value;
     }
   }
+  if (typeof process.env[legacyLedgerScaleKey] === "string" && process.env[legacyLedgerScaleKey].length > 0) {
+    values[legacyLedgerScaleKey] = process.env[legacyLedgerScaleKey];
+  }
   return values;
 }
 
@@ -266,8 +304,56 @@ const APP_HOST = ENV.APP_HOST || ENV.PAY_BASE_URL || ENV.PUBLIC_BASE_URL || DEFA
 const APP_BIND_HOST = String(ENV.APP_BIND_HOST || DEFAULTS.APP_BIND_HOST || "").trim();
 const INTERNAL_APP_ORIGIN = String(ENV.INTERNAL_APP_ORIGIN || DEFAULTS.INTERNAL_APP_ORIGIN || "").trim();
 const APP_SECRET = ENV.APP_SECRET || DEFAULTS.APP_SECRET;
+const PAYMENT_RECEIPT_ACTIVE_KID = String(
+  ENV.PAYMENT_RECEIPT_ACTIVE_KID || DEFAULTS.PAYMENT_RECEIPT_ACTIVE_KID
+).trim();
+const PAYMENT_RECEIPT_KEY_RING_RAW = String(
+  ENV.PAYMENT_RECEIPT_KEY_RING || DEFAULTS.PAYMENT_RECEIPT_KEY_RING || ""
+).trim();
+const PAYMENT_RECEIPT_VERIFY_ONLY_KIDS = new Set(
+  String(ENV.PAYMENT_RECEIPT_VERIFY_ONLY_KIDS || DEFAULTS.PAYMENT_RECEIPT_VERIFY_ONLY_KIDS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
+function parsePaymentReceiptKeyRing(rawValue) {
+  const keys = new Map();
+  const errors = [];
+  for (const entry of String(rawValue || "").split(",").map((value) => value.trim()).filter(Boolean)) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) {
+      errors.push("invalid_entry");
+      continue;
+    }
+    const kid = entry.slice(0, separator).trim();
+    const secret = entry.slice(separator + 1).trim();
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(kid) || secret.length < 32) {
+      errors.push(`invalid_key:${kid || "missing"}`);
+      continue;
+    }
+    if (keys.has(kid)) {
+      errors.push(`duplicate_kid:${kid}`);
+      continue;
+    }
+    keys.set(kid, secret);
+  }
+  // Development/test compatibility remains deterministic while production
+  // requires the explicit ring below. APP_SECRET is never stored in the DB.
+  if (keys.size === 0 && APP_SECRET && !isPlaceholderLike(APP_SECRET)) {
+    keys.set("app-secret-v1", APP_SECRET);
+  }
+  return { keys, errors };
+}
+const PAYMENT_RECEIPT_KEY_RING = parsePaymentReceiptKeyRing(PAYMENT_RECEIPT_KEY_RING_RAW);
 const DB_PATH = path.resolve(CWD, ENV.DB_PATH || DEFAULTS.DB_PATH);
-const CHAIN_ID = String(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID).trim();
+const CHAIN_ID = normalizeChainId(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID)
+  || normalizeChainId(DEFAULTS.CHAIN_ID)
+  || "137";
+const WORKER_STATE_DB_PATH_CONFIGURED = String(ENV.WORKER_STATE_DB_PATH || "").trim();
+const WORKER_STATE_DB_PATH = path.resolve(
+  CWD,
+  WORKER_STATE_DB_PATH_CONFIGURED || `./runtime/worker-state/chain-${CHAIN_ID}.db`
+);
 const ENABLED_PAYMENT_CHAIN_IDS = parseEnabledPaymentChainIds(
   ENV.ENABLED_PAYMENT_CHAIN_IDS || DEFAULTS.ENABLED_PAYMENT_CHAIN_IDS
 );
@@ -331,6 +417,10 @@ const DEMO_CONTROLS_ENABLED = parseFlag(ENV.DEMO_CONTROLS_ENABLED ?? DEFAULTS.DE
 const ENABLE_REOWN = parseFlag(ENV.ENABLE_REOWN ?? DEFAULTS.ENABLE_REOWN, false);
 const REOWN_PROJECT_ID = String(ENV.REOWN_PROJECT_ID || DEFAULTS.REOWN_PROJECT_ID || "");
 const ALLOW_MANUAL_PAYMENT_INGEST = parseFlag(ENV.ALLOW_MANUAL_PAYMENT_INGEST ?? DEFAULTS.ALLOW_MANUAL_PAYMENT_INGEST, false);
+const RECEIVE_ADDRESS_DEV_AUTO_VERIFY = parseFlag(
+  ENV.RECEIVE_ADDRESS_DEV_AUTO_VERIFY ?? DEFAULTS.RECEIVE_ADDRESS_DEV_AUTO_VERIFY,
+  false
+);
 const ENABLE_PROVIDER_RAIL_MOCK = parseFlag(ENV.ENABLE_PROVIDER_RAIL_MOCK ?? DEFAULTS.ENABLE_PROVIDER_RAIL_MOCK, false);
 const MANUAL_INGEST_APPROVAL_REF = String(ENV.MANUAL_INGEST_APPROVAL_REF || DEFAULTS.MANUAL_INGEST_APPROVAL_REF || "");
 const COMMERCIAL_GO_MODE = parseFlag(ENV.COMMERCIAL_GO_MODE ?? DEFAULTS.COMMERCIAL_GO_MODE, IS_PRODUCTION);
@@ -338,6 +428,42 @@ const DEPLOYMENT_STAGE = String(
   ENV.DEPLOYMENT_STAGE || DEFAULTS.DEPLOYMENT_STAGE || (IS_PRODUCTION ? "commercial" : "development")
 ).trim().toLowerCase();
 const PRODUCTION_LIKE_RUNTIME = IS_PRODUCTION || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE) || COMMERCIAL_GO_MODE;
+const TEST_CRASH_FAULT_INJECTION = String(
+  ENV.TEST_CRASH_FAULT_INJECTION || DEFAULTS.TEST_CRASH_FAULT_INJECTION || ""
+).trim().toLowerCase();
+const TEST_CRASH_FAULT_INJECTION_POINTS = new Set([
+  "payment_transaction_before_commit",
+  "payment_commit_before_outbox_dispatch",
+  "payment_outbox_after_lease_claim",
+]);
+if (TEST_CRASH_FAULT_INJECTION && !TEST_CRASH_FAULT_INJECTION_POINTS.has(TEST_CRASH_FAULT_INJECTION)) {
+  console.error("FATAL: TEST_CRASH_FAULT_INJECTION is not a recognized test-only fault point.");
+  process.exit(1);
+}
+if (TEST_CRASH_FAULT_INJECTION && PRODUCTION_LIKE_RUNTIME) {
+  console.error("FATAL: TEST_CRASH_FAULT_INJECTION is disabled in production-like runtime.");
+  process.exit(1);
+}
+if (PRODUCTION_LIKE_RUNTIME && !WORKER_STATE_DB_PATH_CONFIGURED) {
+  console.error("FATAL: WORKER_STATE_DB_PATH must be explicitly configured for production-like app/worker separation.");
+  process.exit(1);
+}
+if (PRODUCTION_LIKE_RUNTIME && WORKER_STATE_DB_PATH === DB_PATH) {
+  console.error("FATAL: WORKER_STATE_DB_PATH must not equal DB_PATH.");
+  process.exit(1);
+}
+if (PAYMENT_RECEIPT_KEY_RING.errors.length > 0) {
+  console.error("FATAL: PAYMENT_RECEIPT_KEY_RING contains invalid or duplicate key entries.");
+  process.exit(1);
+}
+if (PRODUCTION_LIKE_RUNTIME && !PAYMENT_RECEIPT_KEY_RING_RAW) {
+  console.error("FATAL: PAYMENT_RECEIPT_KEY_RING must be explicitly configured for production-like signed receipts.");
+  process.exit(1);
+}
+if (!PAYMENT_RECEIPT_KEY_RING.keys.has(PAYMENT_RECEIPT_ACTIVE_KID)) {
+  console.error("FATAL: PAYMENT_RECEIPT_ACTIVE_KID is not present in PAYMENT_RECEIPT_KEY_RING.");
+  process.exit(1);
+}
 const COMMERCIAL_EVIDENCE_ROOT = path.resolve(CWD, ENV.COMMERCIAL_EVIDENCE_ROOT || DEFAULTS.COMMERCIAL_EVIDENCE_ROOT);
 const COMMERCIAL_EVIDENCE_DIR = String(ENV.COMMERCIAL_EVIDENCE_DIR || DEFAULTS.COMMERCIAL_EVIDENCE_DIR || "").trim();
 const RELEASE_ID = String(ENV.RELEASE_ID || DEFAULTS.RELEASE_ID || "").trim();
@@ -359,18 +485,61 @@ const SERVICE_AUTH_MAX_SKEW_SEC = Number(ENV.SERVICE_AUTH_MAX_SKEW_SEC || DEFAUL
 const SERVICE_AUTH_MAX_FUTURE_SEC = Number(ENV.SERVICE_AUTH_MAX_FUTURE_SEC || DEFAULTS.SERVICE_AUTH_MAX_FUTURE_SEC);
 const SERVICE_REPLAY_GUARD_TTL_SEC = Number(ENV.SERVICE_REPLAY_GUARD_TTL_SEC || DEFAULTS.SERVICE_REPLAY_GUARD_TTL_SEC);
 const IDEMPOTENCY_TTL_SEC = Number(ENV.IDEMPOTENCY_TTL_SEC || DEFAULTS.IDEMPOTENCY_TTL_SEC);
+const IDEMPOTENCY_LEASE_SEC = Math.max(5, Math.min(300, IDEMPOTENCY_TTL_SEC));
+const NOTIFICATION_OUTBOX_LEASE_SEC = Math.max(5, Number(
+  ENV.NOTIFICATION_OUTBOX_LEASE_SEC || DEFAULTS.NOTIFICATION_OUTBOX_LEASE_SEC
+));
+const NOTIFICATION_OUTBOX_MAX_ATTEMPTS = Math.max(1, Number(
+  ENV.NOTIFICATION_OUTBOX_MAX_ATTEMPTS || DEFAULTS.NOTIFICATION_OUTBOX_MAX_ATTEMPTS
+));
+const NOTIFICATION_OUTBOX_RETRY_BASE_SEC = Math.max(1, Number(
+  ENV.NOTIFICATION_OUTBOX_RETRY_BASE_SEC || DEFAULTS.NOTIFICATION_OUTBOX_RETRY_BASE_SEC
+));
+
+function triggerTestCrashFaultInjection(point) {
+  if (TEST_CRASH_FAULT_INJECTION !== point) return;
+  console.error(JSON.stringify({
+    ts: nowIso(),
+    level: "error",
+    type: "test_only.crash_fault_injection",
+    point,
+    pid: process.pid,
+  }));
+  process.kill(process.pid, "SIGKILL");
+}
+
+const REVIEW_STEP_UP_SEC = Math.max(60, Number(
+  ENV.REVIEW_STEP_UP_SEC || DEFAULTS.REVIEW_STEP_UP_SEC
+));
 const PIN_LOCKOUT_MAX_ATTEMPTS = Number(ENV.PIN_LOCKOUT_MAX_ATTEMPTS || DEFAULTS.PIN_LOCKOUT_MAX_ATTEMPTS);
 const PIN_LOCKOUT_SEC = Number(ENV.PIN_LOCKOUT_SEC || DEFAULTS.PIN_LOCKOUT_SEC);
 const SSE_TOKEN_MAX_TTL_SEC = Number(ENV.SSE_TOKEN_MAX_TTL_SEC || DEFAULTS.SSE_TOKEN_MAX_TTL_SEC);
-const JPYC_BASE_UNIT_SCALE = String(ENV.JPYC_BASE_UNIT_SCALE || DEFAULTS.JPYC_BASE_UNIT_SCALE || "");
-let JPYC_SCALE_DECIMALS = null;
+const legacyLedgerScaleKey = ["JPYC", "BASE", "UNIT", "SCALE"].join("_");
+const LEDGER_BASE_UNIT_SCALE = String(
+  ENV.LEDGER_BASE_UNIT_SCALE || ENV[legacyLedgerScaleKey] || DEFAULTS.LEDGER_BASE_UNIT_SCALE || ""
+);
+const LEDGER_DECIMALS = Number(ENV.LEDGER_DECIMALS || scaleToDecimals(LEDGER_BASE_UNIT_SCALE));
+let LEDGER_SCALE_DECIMALS = null;
 try {
-  JPYC_SCALE_DECIMALS = scaleToDecimals(JPYC_BASE_UNIT_SCALE);
+  LEDGER_SCALE_DECIMALS = scaleToDecimals(LEDGER_BASE_UNIT_SCALE);
 } catch (_error) {
-  console.error("FATAL: JPYC_BASE_UNIT_SCALE must be a power-of-10 positive integer.");
+  console.error("FATAL: LEDGER_BASE_UNIT_SCALE must be a power-of-10 positive integer.");
   process.exit(1);
 }
+if (!Number.isInteger(LEDGER_DECIMALS) || LEDGER_DECIMALS < 0 || LEDGER_DECIMALS > 36
+  || LEDGER_DECIMALS !== LEDGER_SCALE_DECIMALS) {
+  console.error("FATAL: LEDGER_DECIMALS must match LEDGER_BASE_UNIT_SCALE.");
+  process.exit(1);
+}
+const AMOUNT_SCALE_VERSION = TOKEN_DECIMALS === APPROVED_TOKEN_DECIMALS
+  && LEDGER_BASE_UNIT_SCALE === APPROVED_LEDGER_BASE_UNIT_SCALE
+  ? DEFAULT_AMOUNT_SCALE_VERSION
+  : `token-${TOKEN_DECIMALS}-ledger-${LEDGER_DECIMALS}-v1`;
 const METRICS_SECRET = String(ENV.METRICS_SECRET || DEFAULTS.METRICS_SECRET);
+const ENABLE_AUTO_SPLIT_PAYMENT = parseFlag(
+  ENV.ENABLE_AUTO_SPLIT_PAYMENT ?? DEFAULTS.ENABLE_AUTO_SPLIT_PAYMENT,
+  false
+);
 const WORKER_STALE_SEC = Number(ENV.WORKER_STALE_SEC || DEFAULTS.WORKER_STALE_SEC);
 const REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR =
   parseFlag(ENV.REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR ?? DEFAULTS.REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR, true);
@@ -386,7 +555,30 @@ if (PRODUCTION_LIKE_RUNTIME && INTERNAL_APP_ORIGIN && INTERNAL_APP_ORIGIN === AP
   console.error("FATAL: INTERNAL_APP_ORIGIN must not equal the public APP_HOST.");
   process.exit(1);
 }
-const REQUIRED_CONFIRMATIONS = Number(ENV.REQUIRED_CONFIRMATIONS || DEFAULTS.REQUIRED_CONFIRMATIONS);
+const LEGACY_REQUIRED_CONFIRMATIONS = Number(ENV.REQUIRED_CONFIRMATIONS || DEFAULTS.REQUIRED_CONFIRMATIONS);
+const DETECTION_CONFIRMATIONS = Number(ENV.DETECTION_CONFIRMATIONS || DEFAULTS.DETECTION_CONFIRMATIONS);
+const explicitFulfillmentConfirmations = process.env.FULFILLMENT_REQUIRED_CONFIRMATIONS
+  || process.env.REQUIRED_CONFIRMATIONS
+  || null;
+const explicitAccountingConfirmations = process.env.ACCOUNTING_FINALITY_CONFIRMATIONS
+  || process.env.FULFILLMENT_REQUIRED_CONFIRMATIONS
+  || process.env.REQUIRED_CONFIRMATIONS
+  || null;
+const FULFILLMENT_REQUIRED_CONFIRMATIONS = Number(
+  explicitFulfillmentConfirmations
+    || ENV.FULFILLMENT_REQUIRED_CONFIRMATIONS
+    || ENV.REQUIRED_CONFIRMATIONS
+    || DEFAULTS.FULFILLMENT_REQUIRED_CONFIRMATIONS
+);
+const ACCOUNTING_FINALITY_CONFIRMATIONS = Number(
+  explicitAccountingConfirmations
+    || ENV.ACCOUNTING_FINALITY_CONFIRMATIONS
+    || ENV.FULFILLMENT_REQUIRED_CONFIRMATIONS
+    || ENV.REQUIRED_CONFIRMATIONS
+    || DEFAULTS.ACCOUNTING_FINALITY_CONFIRMATIONS
+);
+// Backward-compatible alias for code paths and clients that still use the old name.
+const REQUIRED_CONFIRMATIONS = FULFILLMENT_REQUIRED_CONFIRMATIONS;
 const MIN_REQUIRED_CONFIRMATIONS = Number(ENV.MIN_REQUIRED_CONFIRMATIONS || DEFAULTS.MIN_REQUIRED_CONFIRMATIONS);
 const MONITOR_LOG_CHUNK_SIZE = Number(ENV.MONITOR_LOG_CHUNK_SIZE || DEFAULTS.MONITOR_LOG_CHUNK_SIZE);
 const SETTLEMENT_BLOCK_ON_UNRESOLVED_REVIEWS = parseFlag(
@@ -414,13 +606,25 @@ const MIN_MONITOR_BACKSCAN_BLOCKS = Number(ENV.MIN_MONITOR_BACKSCAN_BLOCKS || DE
 const TOKEN_CONTRACT_NORMALIZED = normalizeJpycPolicyAddress(TOKEN_CONTRACT);
 const APPROVED_JPYC_TOKEN_CONTRACT_NORMALIZED = normalizeJpycPolicyAddress(APPROVED_JPYC_TOKEN_CONTRACT);
 const APPROVED_TOKEN_CONTRACT = OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER;
+
+function tokenAmountAtomicFromLedgerBase(value) {
+  return tokenAmountAtomicFromLedgerBaseFixed(value, TOKEN_DECIMALS, LEDGER_DECIMALS);
+}
+
+function requireExactLedgerAmountBaseFromTokenAtomic(value) {
+  return requireExactLedgerAmountBaseFromTokenAtomicFixed(value, TOKEN_DECIMALS, LEDGER_DECIMALS);
+}
+
 const {
   toBaseUnits,
   decidePaymentStatus,
   decideQualifiedPaymentStatus,
 } = makePaymentLogic({
-  jpycBaseUnitScale: JPYC_BASE_UNIT_SCALE,
+  ledgerBaseUnitScale: LEDGER_BASE_UNIT_SCALE,
+  tokenDecimals: TOKEN_DECIMALS,
+  ledgerDecimals: LEDGER_DECIMALS,
   requiredConfirmations: REQUIRED_CONFIRMATIONS,
+  enableAutoSplitPayment: ENABLE_AUTO_SPLIT_PAYMENT,
 });
 
 const INSECURE_SECRETS = new Set([
@@ -479,8 +683,22 @@ if (!Number.isFinite(WORKER_STALE_SEC) || WORKER_STALE_SEC <= 0) {
   console.error("FATAL: WORKER_STALE_SEC must be a positive integer.");
   process.exit(1);
 }
-if (!Number.isFinite(REQUIRED_CONFIRMATIONS) || REQUIRED_CONFIRMATIONS < 0 || !Number.isInteger(REQUIRED_CONFIRMATIONS)) {
-  console.error("FATAL: REQUIRED_CONFIRMATIONS must be a non-negative integer.");
+for (const [name, value] of [
+  ["DETECTION_CONFIRMATIONS", DETECTION_CONFIRMATIONS],
+  ["FULFILLMENT_REQUIRED_CONFIRMATIONS", FULFILLMENT_REQUIRED_CONFIRMATIONS],
+  ["ACCOUNTING_FINALITY_CONFIRMATIONS", ACCOUNTING_FINALITY_CONFIRMATIONS],
+]) {
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    console.error(`FATAL: ${name} must be a non-negative integer.`);
+    process.exit(1);
+  }
+}
+if (FULFILLMENT_REQUIRED_CONFIRMATIONS < DETECTION_CONFIRMATIONS) {
+  console.error("FATAL: FULFILLMENT_REQUIRED_CONFIRMATIONS must be >= DETECTION_CONFIRMATIONS.");
+  process.exit(1);
+}
+if (ACCOUNTING_FINALITY_CONFIRMATIONS < FULFILLMENT_REQUIRED_CONFIRMATIONS) {
+  console.error("FATAL: ACCOUNTING_FINALITY_CONFIRMATIONS must be >= FULFILLMENT_REQUIRED_CONFIRMATIONS.");
   process.exit(1);
 }
 
@@ -550,15 +768,15 @@ if (!Number.isFinite(AML_HIGH_VALUE_THRESHOLD_JPY) || AML_HIGH_VALUE_THRESHOLD_J
 }
 try {
   const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
-  const scaleBigInt = BigInt(JPYC_BASE_UNIT_SCALE);
+  const scaleBigInt = BigInt(LEDGER_BASE_UNIT_SCALE);
   const maxInvoiceBase = BigInt(MAX_INVOICE_AMOUNT_JPY) * scaleBigInt;
   const dailyStoreCapBase = BigInt(DAILY_STORE_AMOUNT_CAP_JPY) * scaleBigInt;
   if (maxInvoiceBase > maxSafe) {
-    console.error("FATAL: MAX_INVOICE_AMOUNT_JPY * JPYC_BASE_UNIT_SCALE exceeds Number.MAX_SAFE_INTEGER.");
+    console.error("FATAL: MAX_INVOICE_AMOUNT_JPY * LEDGER_BASE_UNIT_SCALE exceeds Number.MAX_SAFE_INTEGER.");
     process.exit(1);
   }
   if (dailyStoreCapBase > maxSafe) {
-    console.error("FATAL: DAILY_STORE_AMOUNT_CAP_JPY * JPYC_BASE_UNIT_SCALE exceeds Number.MAX_SAFE_INTEGER.");
+    console.error("FATAL: DAILY_STORE_AMOUNT_CAP_JPY * LEDGER_BASE_UNIT_SCALE exceeds Number.MAX_SAFE_INTEGER.");
     process.exit(1);
   }
 } catch (_error) {
@@ -633,8 +851,8 @@ if (IS_PRODUCTION) {
     console.error("FATAL: production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS.");
     process.exit(1);
   }
-  if (REQUIRED_CONFIRMATIONS < 1 || REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
-    console.error("FATAL: REQUIRED_CONFIRMATIONS is below policy minimum in production.");
+  if (FULFILLMENT_REQUIRED_CONFIRMATIONS < 1 || FULFILLMENT_REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
+    console.error("FATAL: FULFILLMENT_REQUIRED_CONFIRMATIONS is below policy minimum in production.");
     process.exit(1);
   }
   if (MONITOR_BACKSCAN_BLOCKS < MIN_MONITOR_BACKSCAN_BLOCKS) {
@@ -679,7 +897,7 @@ if (IS_PRODUCTION) {
   assertApprovedRef("APPI_DISCLOSURE_PROCEDURE_REF", APPI_DISCLOSURE_PROCEDURE_REF);
   assertApprovedRef("CONFIRMATIONS_POLICY_APPROVAL_REF", CONFIRMATIONS_POLICY_APPROVAL_REF);
   assertApprovedRef("BACKSCAN_POLICY_APPROVAL_REF", BACKSCAN_POLICY_APPROVAL_REF);
-  if (TOKEN_DECIMALS !== APPROVED_TOKEN_DECIMALS || JPYC_BASE_UNIT_SCALE !== APPROVED_LEDGER_BASE_UNIT_SCALE) {
+  if (TOKEN_DECIMALS !== APPROVED_TOKEN_DECIMALS || LEDGER_BASE_UNIT_SCALE !== APPROVED_LEDGER_BASE_UNIT_SCALE) {
     console.error("FATAL: production requires token atomic decimals=18 and ledger base scale=1000000.");
     process.exit(1);
   }
@@ -706,6 +924,9 @@ fs.mkdirSync(path.join(CWD, "public"), { recursive: true });
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
+db.pragma("synchronous = FULL");
+db.pragma("fullfsync = ON");
 db.pragma("foreign_keys = ON");
 
 db.exec(`
@@ -882,6 +1103,25 @@ CREATE TABLE IF NOT EXISTS payment_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_events_dedupe
 ON payment_events(chain_id, tx_hash, COALESCE(log_index, -1), event_type);
 
+CREATE TABLE IF NOT EXISTS payment_notification_outbox (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  payment_event_id TEXT REFERENCES payment_events(id),
+  notification_type TEXT NOT NULL,
+  audience TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT NOT NULL,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(payment_event_id, notification_type, audience)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_notification_outbox_pending
+ON payment_notification_outbox(status, available_at, created_at);
+
 CREATE TABLE IF NOT EXISTS payment_attempts (
   id TEXT PRIMARY KEY,
   invoice_id TEXT NOT NULL REFERENCES invoices(id),
@@ -896,6 +1136,55 @@ CREATE TABLE IF NOT EXISTS payment_attempts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_attempts_chain_tx_log
 ON payment_attempts(chain_id, tx_hash, COALESCE(log_index, -1));
+
+-- Chain identity is global.  The legacy payment_events/payment_attempts tables
+-- remain as invoice-scoped compatibility projections, while these tables keep
+-- one canonical transfer and every provider observation append-only.
+CREATE TABLE IF NOT EXISTS blockchain_transfers (
+  id TEXT PRIMARY KEY,
+  chain_id TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index INTEGER NOT NULL,
+  token_contract TEXT,
+  from_address TEXT,
+  to_address TEXT,
+  token_amount_atomic TEXT,
+  block_number INTEGER,
+  block_hash TEXT,
+  block_timestamp TEXT,
+  canonical_status TEXT NOT NULL DEFAULT 'unknown',
+  integrity_status TEXT NOT NULL DEFAULT 'ok',
+  first_observed_at TEXT NOT NULL,
+  latest_observed_at TEXT NOT NULL,
+  UNIQUE(chain_id, tx_hash, log_index)
+);
+
+CREATE TABLE IF NOT EXISTS transfer_observations (
+  id TEXT PRIMARY KEY,
+  blockchain_transfer_id TEXT NOT NULL REFERENCES blockchain_transfers(id),
+  provider_id TEXT NOT NULL,
+  observed_tip_number INTEGER,
+  observed_tip_hash TEXT,
+  receipt_status TEXT,
+  confirmations INTEGER,
+  raw_payload_hash TEXT NOT NULL,
+  raw_payload_json TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_observations_transfer_time
+ON transfer_observations(blockchain_transfer_id, observed_at, id);
+
+CREATE TABLE IF NOT EXISTS invoice_transfer_links (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  blockchain_transfer_id TEXT NOT NULL REFERENCES blockchain_transfers(id),
+  relation_type TEXT NOT NULL DEFAULT 'observed',
+  recognition_status TEXT NOT NULL DEFAULT 'pending',
+  linked_at TEXT NOT NULL,
+  UNIQUE(invoice_id, blockchain_transfer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_invoice_transfer_links_transfer
+ON invoice_transfer_links(blockchain_transfer_id, linked_at, id);
 
 CREATE TABLE IF NOT EXISTS receive_addresses (
   id TEXT PRIMARY KEY,
@@ -943,6 +1232,118 @@ CREATE TABLE IF NOT EXISTS review_cases (
   resolved_at TEXT
 );
 
+-- New incident model.  review_cases is retained as a compatibility projection
+-- for existing clients; a single invoice may have many rows here.
+CREATE TABLE IF NOT EXISTS review_incidents (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  invoice_version INTEGER,
+  incident_type TEXT NOT NULL,
+  evidence_fingerprint TEXT NOT NULL,
+  primary_reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  resolution_status TEXT NOT NULL DEFAULT 'pending',
+  disposition TEXT,
+  created_at TEXT NOT NULL,
+  resolved_at TEXT,
+  UNIQUE(invoice_id, incident_type, evidence_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_review_incidents_invoice_time
+ON review_incidents(invoice_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS review_incident_reasons (
+  id TEXT PRIMARY KEY,
+  review_incident_id TEXT NOT NULL REFERENCES review_incidents(id),
+  reason_code TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_incident_transfers (
+  review_incident_id TEXT NOT NULL REFERENCES review_incidents(id),
+  blockchain_transfer_id TEXT NOT NULL REFERENCES blockchain_transfers(id),
+  relation_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(review_incident_id, blockchain_transfer_id, relation_type)
+);
+
+CREATE TABLE IF NOT EXISTS review_incident_events (
+  id TEXT PRIMARY KEY,
+  review_incident_id TEXT NOT NULL REFERENCES review_incidents(id),
+  event_type TEXT NOT NULL,
+  actor_id TEXT,
+  payload_hash TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS accounting_adjustments (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  related_review_case_id TEXT REFERENCES review_cases(id),
+  adjustment_type TEXT NOT NULL,
+  amount_jpyc_base TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_session_id TEXT,
+  created_step_up_at TEXT,
+  approved_by TEXT,
+  approved_session_id TEXT,
+  approved_step_up_at TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  approved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_accounting_adjustments_invoice_status
+ON accounting_adjustments(invoice_id, status, created_at, id);
+
+CREATE TABLE IF NOT EXISTS payment_receipt_keys (
+  kid TEXT PRIMARY KEY,
+  signature_algorithm TEXT NOT NULL,
+  status TEXT NOT NULL,
+  key_fingerprint TEXT NOT NULL,
+  activated_at TEXT NOT NULL,
+  expires_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payment_receipts (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL UNIQUE REFERENCES invoices(id),
+  receipt_version TEXT NOT NULL,
+  kid TEXT NOT NULL,
+  signature_algorithm TEXT NOT NULL,
+  content_json TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  signed_message TEXT NOT NULL,
+  issued_at TEXT NOT NULL,
+  revoked_at TEXT,
+  revocation_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_payment_receipts_invoice_status
+ON payment_receipts(invoice_id, revoked_at, issued_at);
+
+CREATE TABLE IF NOT EXISTS refund_destination_challenges (
+  id TEXT PRIMARY KEY,
+  merchant_id TEXT,
+  store_id TEXT NOT NULL REFERENCES stores(id),
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  payer_address TEXT NOT NULL,
+  refund_to_address TEXT NOT NULL,
+  refund_amount_base TEXT NOT NULL,
+  chain_id TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  nonce_hash TEXT NOT NULL UNIQUE,
+  issued_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  signature_type TEXT,
+  signature_hash TEXT
+);
+
 CREATE TABLE IF NOT EXISTS refund_cases (
   id TEXT PRIMARY KEY,
   invoice_id TEXT NOT NULL REFERENCES invoices(id),
@@ -974,6 +1375,7 @@ CREATE TABLE IF NOT EXISTS refund_requests (
   refund_chain_id TEXT NOT NULL,
   refund_tx_hash TEXT,
   refund_tx_log_index INTEGER,
+  blockchain_transfer_id TEXT,
   expected_from_address TEXT,
   customer_approval_signature TEXT,
   destination_approval_type TEXT,
@@ -991,6 +1393,12 @@ CREATE TABLE IF NOT EXISTS refund_requests (
   token_contract TEXT,
   block_number INTEGER,
   block_timestamp TEXT,
+  finality_confirmations INTEGER NOT NULL DEFAULT 0,
+  finality_required_confirmations INTEGER NOT NULL DEFAULT 0,
+  canonical_status TEXT NOT NULL DEFAULT 'unknown',
+  reorg_hold INTEGER NOT NULL DEFAULT 0,
+  reorg_hold_at TEXT,
+  finalized_at TEXT,
   detected_at TEXT,
   audit_log TEXT,
   verified_at TEXT,
@@ -1012,6 +1420,13 @@ CREATE TABLE IF NOT EXISTS refund_funding_lineage (
   sweep_tx_log_index INTEGER,
   sweep_amount_jpyc_base INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'recorded',
+  block_hash TEXT,
+  canonical_status TEXT NOT NULL DEFAULT 'unknown',
+  confirmations INTEGER NOT NULL DEFAULT 0,
+  finality_required_confirmations INTEGER NOT NULL DEFAULT 0,
+  finalized_at TEXT,
+  reorg_hold INTEGER NOT NULL DEFAULT 0,
+  reorg_hold_at TEXT,
   evidence_note_path TEXT,
   evidence_json TEXT,
   created_by TEXT NOT NULL,
@@ -1048,6 +1463,13 @@ CREATE TABLE IF NOT EXISTS refund_funding_sweeps (
   sweep_tx_log_index INTEGER,
   sweep_amount_jpyc_base INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'recorded',
+  block_hash TEXT,
+  canonical_status TEXT NOT NULL DEFAULT 'unknown',
+  confirmations INTEGER NOT NULL DEFAULT 0,
+  finality_required_confirmations INTEGER NOT NULL DEFAULT 0,
+  finalized_at TEXT,
+  reorg_hold INTEGER NOT NULL DEFAULT 0,
+  reorg_hold_at TEXT,
   evidence_note_path TEXT,
   evidence_json TEXT,
   created_by TEXT NOT NULL,
@@ -1399,53 +1821,28 @@ CREATE TABLE IF NOT EXISTS terminal_login_lockouts (
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS chain_unmatched_events (
+CREATE TABLE IF NOT EXISTS payment_recovery_reports (
   id TEXT PRIMARY KEY,
-  chain_id TEXT NOT NULL,
-  token_contract TEXT NOT NULL,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  reporter_type TEXT NOT NULL,
+  reporter_id TEXT,
+  requested_chain_id TEXT NOT NULL,
   tx_hash TEXT NOT NULL,
-  log_index INTEGER NOT NULL,
-  block_number INTEGER,
-  to_address TEXT,
-  amount_jpyc REAL NOT NULL,
-  amount_jpyc_base INTEGER NOT NULL DEFAULT 0,
-  reason TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_chain_unmatched_events
-ON chain_unmatched_events(chain_id, tx_hash, log_index);
-CREATE INDEX IF NOT EXISTS idx_chain_unmatched_events_chain_token_created_at
-ON chain_unmatched_events(chain_id, token_contract, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS chain_dead_letters (
-  id TEXT PRIMARY KEY,
-  chain_id TEXT NOT NULL,
-  tx_hash TEXT NOT NULL,
-  log_index INTEGER,
-  invoice_id TEXT,
-  payload_json TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  retry_count INTEGER NOT NULL DEFAULT 0,
-  observation_count INTEGER NOT NULL DEFAULT 0,
-  retry_attempt_count INTEGER NOT NULL DEFAULT 0,
-  consecutive_retry_failures INTEGER NOT NULL DEFAULT 0,
-  last_observed_at TEXT,
-  last_attempted_at TEXT,
-  last_error TEXT,
-  next_retry_at TEXT,
-  resolved_at TEXT,
-  created_at TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_chain_dead_letters_dedupe
-ON chain_dead_letters(chain_id, tx_hash, COALESCE(log_index, -1), COALESCE(invoice_id, ''));
-
-CREATE TABLE IF NOT EXISTS chain_monitor_state (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
+  reported_issue TEXT,
+  status TEXT NOT NULL,
+  verified_chain_id TEXT,
+  rpc_verified INTEGER NOT NULL DEFAULT 0,
+  receipt_found INTEGER NOT NULL DEFAULT 0,
+  canonical_status TEXT,
+  confirmations INTEGER,
+  evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_payment_recovery_reports_invoice
+ON payment_recovery_reports(invoice_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_recovery_reports_dedupe
+ON payment_recovery_reports(invoice_id, requested_chain_id, tx_hash, reporter_type);
 
 CREATE TABLE IF NOT EXISTS chain_reorgs (
   id TEXT PRIMARY KEY,
@@ -1458,7 +1855,12 @@ CREATE TABLE IF NOT EXISTS chain_reorgs (
   status TEXT NOT NULL DEFAULT 'unresolved',
   detected_at TEXT NOT NULL,
   resolved_at TEXT,
-  resolution_note TEXT
+  resolution_note TEXT,
+  revalidation_status TEXT NOT NULL DEFAULT 'unverified',
+  revalidation_evidence_json TEXT,
+  revalidation_reference TEXT,
+  revalidated_at TEXT,
+  revalidation_failure_reason TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_chain_reorgs_fingerprint
 ON chain_reorgs(
@@ -1471,16 +1873,6 @@ ON chain_reorgs(
 );
 CREATE INDEX IF NOT EXISTS idx_chain_reorgs_status_detected_at
 ON chain_reorgs(chain_id, status, detected_at DESC);
-
-CREATE TABLE IF NOT EXISTS chain_rpc_failovers (
-  id TEXT PRIMARY KEY,
-  chain_id TEXT,
-  provider_url TEXT NOT NULL,
-  provider_url_hash TEXT,
-  label TEXT NOT NULL,
-  error_message TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS rate_limit_events (
   id TEXT PRIMARY KEY,
@@ -1514,22 +1906,59 @@ addColumnIfMissing("invoices", "business_date", "business_date TEXT");
 addColumnIfMissing("invoices", "settlement_id", "settlement_id TEXT");
 addColumnIfMissing("invoices", "amount_jpyc_base", "amount_jpyc_base INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("invoices", "paid_amount_jpyc_base", "paid_amount_jpyc_base INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("invoices", "amount_scale_version", "amount_scale_version TEXT");
+addColumnIfMissing("invoices", "token_decimals", "token_decimals INTEGER");
+addColumnIfMissing("invoices", "ledger_decimals", "ledger_decimals INTEGER");
+addColumnIfMissing("invoices", "token_amount_atomic", "token_amount_atomic TEXT");
+addColumnIfMissing("invoices", "ledger_amount_base", "ledger_amount_base TEXT");
+addColumnIfMissing("invoices", "display_amount", "display_amount TEXT");
+addColumnIfMissing("invoices", "payment_status", "payment_status TEXT NOT NULL DEFAULT 'issued'");
+addColumnIfMissing("invoices", "fulfillment_status", "fulfillment_status TEXT NOT NULL DEFAULT 'hold'");
+addColumnIfMissing("invoices", "review_status", "review_status TEXT NOT NULL DEFAULT 'none'");
+addColumnIfMissing("invoices", "integrity_status", "integrity_status TEXT NOT NULL DEFAULT 'ok'");
+addColumnIfMissing("invoices", "accounting_status", "accounting_status TEXT NOT NULL DEFAULT 'unrecognized'");
+addColumnIfMissing("invoices", "refund_status", "refund_status TEXT NOT NULL DEFAULT 'none'");
+addColumnIfMissing("invoices", "monitoring_status", "monitoring_status TEXT NOT NULL DEFAULT 'inactive'");
+addColumnIfMissing("invoices", "last_reconciled_at", "last_reconciled_at TEXT");
+addColumnIfMissing("invoices", "invoice_version", "invoice_version INTEGER NOT NULL DEFAULT 1");
+addColumnIfMissing("invoices", "version", "version INTEGER NOT NULL DEFAULT 1");
 addColumnIfMissing("invoices", "checkout_session_id", "checkout_session_id TEXT");
 addColumnIfMissing("invoices", "reissued_from_invoice_id", "reissued_from_invoice_id TEXT");
 addColumnIfMissing("invoices", "reissue_root_invoice_id", "reissue_root_invoice_id TEXT");
+addColumnIfMissing("invoices", "primary_recognized_transfer_id", "primary_recognized_transfer_id TEXT");
+addColumnIfMissing("invoices", "latest_observed_transfer_id", "latest_observed_transfer_id TEXT");
+addColumnIfMissing("invoices", "recognized_at", "recognized_at TEXT");
+addColumnIfMissing("invoices", "recognition_policy_version", "recognition_policy_version TEXT");
 addColumnIfMissing("invoices", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("invoices", "operator_id", "operator_id TEXT");
 addColumnIfMissing("invoices", "event_id", "event_id TEXT");
 addColumnIfMissing("invoices", "booth_id", "booth_id TEXT");
 addColumnIfMissing("payment_events", "amount_jpyc_base", "amount_jpyc_base INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "amount_scale_version", "amount_scale_version TEXT");
+addColumnIfMissing("payment_events", "token_decimals", "token_decimals INTEGER");
+addColumnIfMissing("payment_events", "ledger_decimals", "ledger_decimals INTEGER");
+addColumnIfMissing("payment_events", "token_amount_atomic", "token_amount_atomic TEXT");
+addColumnIfMissing("payment_events", "ledger_amount_base", "ledger_amount_base TEXT");
+addColumnIfMissing("payment_events", "display_amount", "display_amount TEXT");
+addColumnIfMissing("payment_events", "detection_confirmations", "detection_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "fulfillment_required_confirmations", "fulfillment_required_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "accounting_finality_confirmations", "accounting_finality_confirmations INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("payment_events", "block_hash", "block_hash TEXT");
 addColumnIfMissing("payment_events", "block_timestamp", "block_timestamp TEXT");
 addColumnIfMissing("payment_events", "detected_at", "detected_at TEXT");
 addColumnIfMissing("payment_attempts", "source", "source TEXT NOT NULL DEFAULT 'unknown'");
 addColumnIfMissing("payment_attempts", "verified_onchain", "verified_onchain INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("refund_requests", "refund_amount_jpyc_base", "refund_amount_jpyc_base INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_requests", "amount_scale_version", "amount_scale_version TEXT");
+addColumnIfMissing("refund_requests", "token_decimals", "token_decimals INTEGER");
+addColumnIfMissing("refund_requests", "ledger_decimals", "ledger_decimals INTEGER");
+addColumnIfMissing("refund_requests", "token_amount_atomic", "token_amount_atomic TEXT");
+addColumnIfMissing("refund_requests", "ledger_amount_base", "ledger_amount_base TEXT");
+addColumnIfMissing("refund_requests", "display_amount", "display_amount TEXT");
 addColumnIfMissing("refund_requests", "refund_eligible_jpyc_base", "refund_eligible_jpyc_base INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("refund_requests", "refund_tx_log_index", "refund_tx_log_index INTEGER");
+addColumnIfMissing("refund_requests", "blockchain_transfer_id", "blockchain_transfer_id TEXT");
+addColumnIfMissing("review_incidents", "invoice_version", "invoice_version INTEGER");
 addColumnIfMissing("refund_requests", "original_invoice_id", "original_invoice_id TEXT");
 addColumnIfMissing("refund_requests", "checkout_session_id", "checkout_session_id TEXT");
 addColumnIfMissing("refund_requests", "expected_from_address", "expected_from_address TEXT");
@@ -1555,20 +1984,58 @@ addColumnIfMissing("refund_requests", "chain_id", "chain_id TEXT");
 addColumnIfMissing("refund_requests", "token_contract", "token_contract TEXT");
 addColumnIfMissing("refund_requests", "block_number", "block_number INTEGER");
 addColumnIfMissing("refund_requests", "block_timestamp", "block_timestamp TEXT");
+addColumnIfMissing("refund_requests", "finality_confirmations", "finality_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_requests", "finality_required_confirmations", "finality_required_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_requests", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
+addColumnIfMissing("refund_requests", "reorg_hold", "reorg_hold INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_requests", "reorg_hold_at", "reorg_hold_at TEXT");
+addColumnIfMissing("refund_requests", "finalized_at", "finalized_at TEXT");
+addColumnIfMissing("payment_notification_outbox", "last_error", "last_error TEXT");
+addColumnIfMissing("payment_notification_outbox", "sent_at", "sent_at TEXT");
+addColumnIfMissing("payment_notification_outbox", "dead_lettered_at", "dead_lettered_at TEXT");
 addColumnIfMissing("refund_requests", "detected_at", "detected_at TEXT");
 addColumnIfMissing("refund_requests", "audit_log", "audit_log TEXT");
 addColumnIfMissing("settlements", "total_paid_jpyc_base", "total_paid_jpyc_base INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("accounting_adjustments", "related_review_case_id", "related_review_case_id TEXT");
+addColumnIfMissing("accounting_adjustments", "created_session_id", "created_session_id TEXT");
+addColumnIfMissing("accounting_adjustments", "created_step_up_at", "created_step_up_at TEXT");
+addColumnIfMissing("accounting_adjustments", "approved_session_id", "approved_session_id TEXT");
+addColumnIfMissing("accounting_adjustments", "approved_step_up_at", "approved_step_up_at TEXT");
+db.exec(`CREATE INDEX IF NOT EXISTS idx_accounting_adjustments_invoice_status
+         ON accounting_adjustments(invoice_id, status, created_at, id)`);
 addColumnIfMissing("settlements", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("settlements", "event_id", "event_id TEXT");
 addColumnIfMissing("settlements", "booth_id", "booth_id TEXT");
 addColumnIfMissing("settlements", "unresolved_review_policy", "unresolved_review_policy TEXT");
 addColumnIfMissing("settlements", "unresolved_review_note", "unresolved_review_note TEXT");
+addColumnIfMissing("settlements", "audit_root", "audit_root TEXT");
+addColumnIfMissing("settlements", "snapshot_hash", "snapshot_hash TEXT");
+addColumnIfMissing("settlements", "close_status", "close_status TEXT NOT NULL DEFAULT 'open'");
 addColumnIfMissing("settlement_export_rows", "payload_json", "payload_json TEXT");
+addColumnIfMissing("settlement_export_rows", "amount_scale_version", "amount_scale_version TEXT");
+addColumnIfMissing("settlement_export_rows", "token_decimals", "token_decimals INTEGER");
+addColumnIfMissing("settlement_export_rows", "ledger_decimals", "ledger_decimals INTEGER");
+addColumnIfMissing("settlement_export_rows", "token_amount_atomic", "token_amount_atomic TEXT");
+addColumnIfMissing("settlement_export_rows", "ledger_amount_base", "ledger_amount_base TEXT");
+addColumnIfMissing("settlement_export_rows", "display_amount", "display_amount TEXT");
 addColumnIfMissing("audit_logs", "prev_hash", "prev_hash TEXT");
 addColumnIfMissing("audit_logs", "entry_hash", "entry_hash TEXT");
 addColumnIfMissing("audit_logs", "store_id", "store_id TEXT");
 addColumnIfMissing("audit_logs", "audit_epoch", "audit_epoch TEXT");
+addColumnIfMissing("audit_epochs", "previous_epoch_root", "previous_epoch_root TEXT");
+addColumnIfMissing("audit_epochs", "entry_hash", "entry_hash TEXT");
+addColumnIfMissing("audit_epochs", "epoch_root", "epoch_root TEXT");
+addColumnIfMissing("audit_epochs", "root_signature", "root_signature TEXT");
+addColumnIfMissing("audit_epochs", "anchored_at", "anchored_at TEXT");
+addColumnIfMissing("audit_epochs", "anchor_reference", "anchor_reference TEXT");
 addColumnIfMissing("terminal_sessions", "ended_reason", "ended_reason TEXT");
+addColumnIfMissing("terminal_sessions", "last_activity_at", "last_activity_at TEXT");
+addColumnIfMissing("terminal_sessions", "locked_at", "locked_at TEXT");
+addColumnIfMissing("terminal_sessions", "step_up_verified_at", "step_up_verified_at TEXT");
+addColumnIfMissing("terminal_sessions", "step_up_expires_at", "step_up_expires_at TEXT");
+addColumnIfMissing("terminal_sessions", "device_id", "device_id TEXT");
+addColumnIfMissing("terminals", "device_credential_hash", "device_credential_hash TEXT");
+addColumnIfMissing("terminals", "provisioned_at", "provisioned_at TEXT");
 addColumnIfMissing("staff_users", "permissions_override", "permissions_override TEXT");
 addColumnIfMissing("staff_users", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("stores", "merchant_id", "merchant_id TEXT");
@@ -1601,30 +2068,68 @@ addColumnIfMissing("payment_events", "recipient_verified", "recipient_verified I
 addColumnIfMissing("payment_events", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
 addColumnIfMissing("payment_events", "within_expiry", "within_expiry INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("payment_events", "recognition_status", "recognition_status TEXT NOT NULL DEFAULT 'pending'");
+addColumnIfMissing("payment_events", "transaction_index", "transaction_index INTEGER");
+addColumnIfMissing("payment_events", "deadline_eligible", "deadline_eligible INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_events", "reversed_at", "reversed_at TEXT");
 addColumnIfMissing("payment_events", "reorg_id", "reorg_id TEXT");
+addColumnIfMissing("payment_attempts", "amount_scale_version", "amount_scale_version TEXT");
+addColumnIfMissing("payment_attempts", "token_decimals", "token_decimals INTEGER");
+addColumnIfMissing("payment_attempts", "ledger_decimals", "ledger_decimals INTEGER");
+addColumnIfMissing("payment_attempts", "token_amount_atomic", "token_amount_atomic TEXT");
+addColumnIfMissing("payment_attempts", "ledger_amount_base", "ledger_amount_base TEXT");
+addColumnIfMissing("payment_attempts", "display_amount", "display_amount TEXT");
+addColumnIfMissing("payment_attempts", "detection_confirmations", "detection_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "fulfillment_required_confirmations", "fulfillment_required_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "accounting_finality_confirmations", "accounting_finality_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "block_number", "block_number INTEGER");
+addColumnIfMissing("payment_attempts", "block_hash", "block_hash TEXT");
+addColumnIfMissing("payment_attempts", "transaction_index", "transaction_index INTEGER");
+addColumnIfMissing("payment_attempts", "block_timestamp", "block_timestamp TEXT");
+addColumnIfMissing("payment_attempts", "confirmations", "confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "chain_verified", "chain_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "token_verified", "token_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "recipient_verified", "recipient_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "deadline_eligible", "deadline_eligible INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("payment_attempts", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
+addColumnIfMissing("payment_attempts", "recognition_status", "recognition_status TEXT NOT NULL DEFAULT 'pending'");
+addColumnIfMissing("payment_attempts", "reversed_at", "reversed_at TEXT");
 addColumnIfMissing("terminals", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("terminals", "public_entry_token", "public_entry_token TEXT");
 addColumnIfMissing("terminals", "current_invoice_id", "current_invoice_id TEXT");
 addColumnIfMissing("terminals", "current_invoice_assigned_at", "current_invoice_assigned_at TEXT");
 addColumnIfMissing("checkout_sessions", "merchant_id", "merchant_id TEXT");
 addColumnIfMissing("idempotency_records", "expires_at", "expires_at TEXT");
-addColumnIfMissing("chain_dead_letters", "status", "status TEXT NOT NULL DEFAULT 'pending'");
-addColumnIfMissing("chain_dead_letters", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("chain_dead_letters", "observation_count", "observation_count INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("chain_dead_letters", "retry_attempt_count", "retry_attempt_count INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("chain_dead_letters", "consecutive_retry_failures", "consecutive_retry_failures INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("chain_dead_letters", "last_observed_at", "last_observed_at TEXT");
-addColumnIfMissing("chain_dead_letters", "last_attempted_at", "last_attempted_at TEXT");
-addColumnIfMissing("chain_dead_letters", "last_error", "last_error TEXT");
-addColumnIfMissing("chain_dead_letters", "next_retry_at", "next_retry_at TEXT");
-addColumnIfMissing("chain_dead_letters", "resolved_at", "resolved_at TEXT");
-addColumnIfMissing("chain_dead_letters", "claimed_by", "claimed_by TEXT");
-addColumnIfMissing("chain_dead_letters", "claimed_until", "claimed_until TEXT");
-addColumnIfMissing("chain_rpc_failovers", "chain_id", "chain_id TEXT");
-addColumnIfMissing("chain_rpc_failovers", "provider_url_hash", "provider_url_hash TEXT");
+addColumnIfMissing("idempotency_records", "status", "status TEXT NOT NULL DEFAULT 'completed'");
+addColumnIfMissing("idempotency_records", "payload_hash", "payload_hash TEXT");
+addColumnIfMissing("idempotency_records", "lease_owner", "lease_owner TEXT");
+addColumnIfMissing("idempotency_records", "lease_expires_at", "lease_expires_at TEXT");
+addColumnIfMissing("idempotency_records", "response_status", "response_status INTEGER");
+addColumnIfMissing("idempotency_records", "response_headers_json", "response_headers_json TEXT");
+addColumnIfMissing("idempotency_records", "response_body_bytes", "response_body_bytes BLOB");
+addColumnIfMissing("idempotency_records", "completed_at", "completed_at TEXT");
+addColumnIfMissing("idempotency_records", "record_version", "record_version INTEGER NOT NULL DEFAULT 1");
 addColumnIfMissing("chain_reorgs", "status", "status TEXT NOT NULL DEFAULT 'unresolved'");
 addColumnIfMissing("chain_reorgs", "resolved_at", "resolved_at TEXT");
 addColumnIfMissing("chain_reorgs", "resolution_note", "resolution_note TEXT");
+addColumnIfMissing("chain_reorgs", "revalidation_status", "revalidation_status TEXT NOT NULL DEFAULT 'unverified'");
+addColumnIfMissing("chain_reorgs", "revalidation_evidence_json", "revalidation_evidence_json TEXT");
+addColumnIfMissing("chain_reorgs", "revalidation_reference", "revalidation_reference TEXT");
+addColumnIfMissing("chain_reorgs", "revalidated_at", "revalidated_at TEXT");
+addColumnIfMissing("chain_reorgs", "revalidation_failure_reason", "revalidation_failure_reason TEXT");
+addColumnIfMissing("refund_funding_lineage", "block_hash", "block_hash TEXT");
+addColumnIfMissing("refund_funding_lineage", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
+addColumnIfMissing("refund_funding_lineage", "confirmations", "confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_funding_lineage", "finality_required_confirmations", "finality_required_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_funding_lineage", "finalized_at", "finalized_at TEXT");
+addColumnIfMissing("refund_funding_lineage", "reorg_hold", "reorg_hold INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_funding_lineage", "reorg_hold_at", "reorg_hold_at TEXT");
+addColumnIfMissing("refund_funding_sweeps", "block_hash", "block_hash TEXT");
+addColumnIfMissing("refund_funding_sweeps", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
+addColumnIfMissing("refund_funding_sweeps", "confirmations", "confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_funding_sweeps", "finality_required_confirmations", "finality_required_confirmations INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_funding_sweeps", "finalized_at", "finalized_at TEXT");
+addColumnIfMissing("refund_funding_sweeps", "reorg_hold", "reorg_hold INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("refund_funding_sweeps", "reorg_hold_at", "reorg_hold_at TEXT");
 addColumnIfMissing("review_cases", "tx_hash", "tx_hash TEXT");
 addColumnIfMissing("review_cases", "billed_amount_jpyc_base", "billed_amount_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "paid_amount_jpyc_base", "paid_amount_jpyc_base TEXT");
@@ -1632,6 +2137,74 @@ addColumnIfMissing("review_cases", "diff_jpyc_base", "diff_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "suggested_action", "suggested_action TEXT");
 addColumnIfMissing("review_cases", "refundable_candidate_jpyc_base", "refundable_candidate_jpyc_base TEXT");
 addColumnIfMissing("review_cases", "admin_note", "admin_note TEXT");
+addColumnIfMissing("receive_addresses", "chain_id", "chain_id TEXT");
+addColumnIfMissing("receive_addresses", "address_provider_id", "address_provider_id TEXT");
+addColumnIfMissing("receive_addresses", "address_type", "address_type TEXT");
+addColumnIfMissing("receive_addresses", "control_proof_type", "control_proof_type TEXT");
+addColumnIfMissing("receive_addresses", "control_proof_payload_hash", "control_proof_payload_hash TEXT");
+addColumnIfMissing("receive_addresses", "control_proof_verified", "control_proof_verified INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("receive_addresses", "control_verified_at", "control_verified_at TEXT");
+addColumnIfMissing("receive_addresses", "sweep_destination", "sweep_destination TEXT");
+addColumnIfMissing("receive_addresses", "sweep_capability", "sweep_capability TEXT");
+addColumnIfMissing("receive_addresses", "provider_reference", "provider_reference TEXT");
+addColumnIfMissing("receive_addresses", "activation_status", "activation_status TEXT NOT NULL DEFAULT 'pending_proof'");
+addColumnIfMissing("receive_addresses", "manifest_batch_id", "manifest_batch_id TEXT");
+addColumnIfMissing("receive_addresses", "manifest_provider_id", "manifest_provider_id TEXT");
+addColumnIfMissing("receive_addresses", "manifest_chain_id", "manifest_chain_id TEXT");
+addColumnIfMissing("receive_addresses", "manifest_address_count", "manifest_address_count INTEGER");
+addColumnIfMissing("receive_addresses", "manifest_generated_at", "manifest_generated_at TEXT");
+addColumnIfMissing("receive_addresses", "manifest_sweep_policy", "manifest_sweep_policy TEXT");
+addColumnIfMissing("receive_addresses", "manifest_sha256", "manifest_sha256 TEXT");
+addColumnIfMissing("receive_addresses", "manifest_canonical_sha256", "manifest_canonical_sha256 TEXT");
+addColumnIfMissing("receive_addresses", "manifest_signature", "manifest_signature TEXT");
+addColumnIfMissing("receive_addresses", "manifest_signer_address", "manifest_signer_address TEXT");
+addColumnIfMissing("receive_addresses", "manifest_approval_ref", "manifest_approval_ref TEXT");
+addColumnIfMissing("receive_addresses", "manifest_signature_status", "manifest_signature_status TEXT");
+addColumnIfMissing("receive_addresses", "monitoring_status", "monitoring_status TEXT NOT NULL DEFAULT 'active'");
+addColumnIfMissing("receive_addresses", "last_reconciled_at", "last_reconciled_at TEXT");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS terminal_checkout_claims (
+  id TEXT PRIMARY KEY,
+  terminal_id TEXT NOT NULL REFERENCES terminals(id),
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  invoice_version INTEGER NOT NULL DEFAULT 1,
+  anonymous_device_id TEXT NOT NULL,
+  amount_scale_version TEXT NOT NULL,
+  token_amount_atomic TEXT NOT NULL,
+  ledger_amount_base TEXT NOT NULL,
+  claimed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  status TEXT NOT NULL DEFAULT 'claimed',
+  nonce_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_terminal_checkout_claims_active_invoice
+ON terminal_checkout_claims(invoice_id) WHERE status IN ('claimed', 'consumed');
+CREATE TABLE IF NOT EXISTS policy_documents (
+  id TEXT PRIMARY KEY,
+  policy_type TEXT NOT NULL,
+  version TEXT NOT NULL,
+  canonical_content TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  published_url TEXT NOT NULL,
+  effective_at TEXT NOT NULL,
+  revoked_at TEXT,
+  approval_ref TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(policy_type, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_receive_addresses_chain_address
+ON receive_addresses(chain_id, lower(address));
+CREATE INDEX IF NOT EXISTS idx_review_incidents_invoice_status
+ON review_incidents(invoice_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_blockchain_transfers_identity
+ON blockchain_transfers(chain_id, lower(tx_hash), log_index);
+CREATE INDEX IF NOT EXISTS idx_invoice_transfer_links_invoice
+ON invoice_transfer_links(invoice_id, linked_at, id);
+`);
 
 db.exec(`
 CREATE VIEW IF NOT EXISTS audit_logs_scoped AS
@@ -1660,6 +2233,66 @@ FROM audit_logs a
 LEFT JOIN audit_log_store_attributions attribution ON attribution.audit_log_id = a.id;
 `);
 
+let workerStateReadDb = null;
+let workerStateReadDbWarningShown = false;
+function openWorkerStateReadDb() {
+  if (workerStateReadDb?.open) return workerStateReadDb;
+  if (!fs.existsSync(WORKER_STATE_DB_PATH)) return null;
+  try {
+    workerStateReadDb = new Database(WORKER_STATE_DB_PATH, { readonly: true, fileMustExist: true });
+    workerStateReadDb.pragma("busy_timeout = 5000");
+    workerStateReadDb.pragma("query_only = ON");
+    return workerStateReadDb;
+  } catch (error) {
+    if (!workerStateReadDbWarningShown) {
+      workerStateReadDbWarningShown = true;
+      console.warn(JSON.stringify({
+        ts: nowIso(),
+        level: "warn",
+        type: "worker_state.read_open_failed",
+        message: String(error.message || error),
+      }));
+    }
+    return null;
+  }
+}
+
+function workerStateReadDbOrLegacy() {
+  const separate = openWorkerStateReadDb();
+  if (separate) return separate;
+  // Existing local/test fixtures historically colocated worker state with the
+  // app DB. Keep that read-only fallback only when the separate path was not
+  // explicitly configured; production-like startup requires the separate path.
+  if (!PRODUCTION_LIKE_RUNTIME && !WORKER_STATE_DB_PATH_CONFIGURED) return db;
+  return null;
+}
+
+function workerStateGet(sql, ...params) {
+  const stateDb = workerStateReadDbOrLegacy();
+  if (!stateDb) return null;
+  try {
+    return stateDb.prepare(sql).get(...params) || null;
+  } catch (error) {
+    if (String(error.message || error).includes("no such table")) return null;
+    throw error;
+  }
+}
+
+function workerStateAll(sql, ...params) {
+  const stateDb = workerStateReadDbOrLegacy();
+  if (!stateDb) return [];
+  try {
+    return stateDb.prepare(sql).all(...params);
+  } catch (error) {
+    if (String(error.message || error).includes("no such table")) return [];
+    throw error;
+  }
+}
+
+function workerStateCount(sql, ...params) {
+  return Number(workerStateGet(sql, ...params)?.count || 0);
+}
+
 function assertNoDeniedJpycContractsInDb() {
   const denylist = JPYC_PREPAID_DENYLIST_CONTRACTS;
   if (denylist.length === 0) return;
@@ -1672,8 +2305,17 @@ function assertNoDeniedJpycContractsInDb() {
     { table: "chain_unmatched_events", sql: `SELECT id FROM chain_unmatched_events WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
     { table: "refund_requests", sql: `SELECT id FROM refund_requests WHERE lower(token_contract) IN (${placeholders}) LIMIT 1` },
   ];
+  const workerStateTables = new Set(["chain_unmatched_events", "chain_dead_letters"]);
   for (const check of directChecks) {
-    const row = db.prepare(check.sql).get(...denylist);
+    const targetDb = workerStateTables.has(check.table) ? workerStateReadDbOrLegacy() : db;
+    if (!targetDb) continue;
+    let row;
+    try {
+      row = targetDb.prepare(check.sql).get(...denylist);
+    } catch (error) {
+      if (String(error.message || error).includes("no such table")) continue;
+      throw error;
+    }
     if (row) {
       console.error(`FATAL: denylisted JPYC Prepaid contract found in ${check.table}: ${row.id || "unknown"}`);
       process.exit(1);
@@ -1687,7 +2329,15 @@ function assertNoDeniedJpycContractsInDb() {
   ];
   for (const denied of denylist) {
     for (const check of payloadChecks) {
-      const row = db.prepare(check.sql).get(`%${denied}%`);
+      const targetDb = workerStateTables.has(check.table) ? workerStateReadDbOrLegacy() : db;
+      if (!targetDb) continue;
+      let row;
+      try {
+        row = targetDb.prepare(check.sql).get(`%${denied}%`);
+      } catch (error) {
+        if (String(error.message || error).includes("no such table")) continue;
+        throw error;
+      }
       if (row) {
         console.error(`FATAL: denylisted JPYC Prepaid contract found in ${check.table} payload: ${row.id || "unknown"}`);
         process.exit(1);
@@ -1704,11 +2354,13 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_logs_store_created_at ON audit_log
 addColumnIfMissing("review_cases", "audit_ref", "audit_ref TEXT");
 addColumnIfMissing("review_cases", "block_timestamp", "block_timestamp TEXT");
 addColumnIfMissing("review_cases", "detected_at", "detected_at TEXT");
+addColumnIfMissing("blockchain_transfers", "receipt_status", "receipt_status TEXT");
 
 db.exec(`CREATE INDEX IF NOT EXISTS idx_invoices_merchant_store_terminal ON invoices(merchant_id, store_id, terminal_id, created_at DESC)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_invoices_event_booth ON invoices(event_id, booth_id, created_at DESC)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_review_cases_reason_status ON review_cases(reason_type, status, created_at DESC)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_refund_requests_status_created_at ON refund_requests(status, created_at DESC)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_refund_requests_blockchain_transfer_id ON refund_requests(blockchain_transfer_id)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_settlement_exports_business_date ON settlement_exports(business_date, generated_at DESC)`);
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_terminals_public_entry_token ON terminals(public_entry_token) WHERE public_entry_token IS NOT NULL`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_terminals_current_invoice_id ON terminals(current_invoice_id)`);
@@ -1719,11 +2371,331 @@ db.exec(
    ON refund_requests(refund_tx_hash, COALESCE(refund_tx_log_index, -1))
    WHERE refund_tx_hash IS NOT NULL`
 );
+db.exec(`DROP INDEX IF EXISTS ux_payment_events_dedupe`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_events_invoice_dedupe
+         ON payment_events(invoice_id, chain_id, tx_hash, COALESCE(log_index, -1), event_type)`);
+db.exec(`DROP INDEX IF EXISTS ux_payment_attempts_chain_tx_log`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_attempts_invoice_chain_tx_log
+         ON payment_attempts(invoice_id, chain_id, tx_hash, COALESCE(log_index, -1))`);
+// The raw-string indexes above preserve compatibility with older schemas. The
+// canonical expression indexes are the actual identity guard for new and
+// legacy mixed-case rows. SQLite refuses to create them if the existing data
+// already contains an identity collision, so startup fails closed instead of
+// silently choosing one financial record.
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_events_invoice_canonical_dedupe
+         ON payment_events(invoice_id, chain_id, lower(tx_hash), COALESCE(log_index, -1), event_type)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_attempts_invoice_canonical_tx_log
+         ON payment_attempts(invoice_id, chain_id, lower(tx_hash), COALESCE(log_index, -1))`);
+// New transfer observations are written with a lowercase tx hash. Keep the
+// database-level identity guarantee aligned with the read-side normalization
+// so legacy mixed-case rows cannot create a second canonical transfer.
+try {
+  const transferRows = db.prepare(`SELECT id, chain_id, tx_hash, log_index FROM blockchain_transfers ORDER BY id ASC`).all();
+  const seenTransferIdentities = new Map();
+  const normalizeTransferRows = db.transaction(() => {
+    for (const row of transferRows) {
+      const chainId = normalizeChainId(row.chain_id);
+      const txHash = String(row.tx_hash || "").trim().toLowerCase();
+      const identity = `${chainId || ""}:${txHash}:${Number(row.log_index)}`;
+      const previousId = seenTransferIdentities.get(identity);
+      if (previousId && previousId !== row.id) {
+        throw new Error("duplicate blockchain transfer chain/tx identity");
+      }
+      seenTransferIdentities.set(identity, row.id);
+      if (chainId && (String(row.chain_id) !== chainId || String(row.tx_hash) !== txHash)) {
+        db.prepare(`UPDATE blockchain_transfers SET chain_id = ?, tx_hash = ? WHERE id = ?`).run(chainId, txHash, row.id);
+      }
+    }
+  });
+  normalizeTransferRows();
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_blockchain_transfers_canonical_identity
+           ON blockchain_transfers(chain_id, lower(tx_hash), log_index)`);
+} catch (_error) {
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(),
+    level: "fatal",
+    type: "blockchain_transfer_identity_conflict",
+    message: "existing blockchain transfer rows do not have a unique canonical chain/tx/log identity",
+  }));
+  process.exit(1);
+}
 
 const nowIso = () => new Date().toISOString();
 const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const hashJson = (value) => sha256(JSON.stringify(value ?? {}));
 const uuid = () => crypto.randomUUID();
+
+function initializePaymentReceiptKeyRegistry() {
+  const timestamp = nowIso();
+  const insert = db.prepare(
+    `INSERT INTO payment_receipt_keys
+     (kid, signature_algorithm, status, key_fingerprint, activated_at, expires_at, created_at)
+     VALUES (?, 'HMAC-SHA256', ?, ?, ?, NULL, ?)
+     ON CONFLICT(kid) DO UPDATE SET
+       signature_algorithm = excluded.signature_algorithm,
+       status = CASE WHEN payment_receipt_keys.status = 'revoked' THEN 'revoked' ELSE excluded.status END,
+       key_fingerprint = CASE
+         WHEN payment_receipt_keys.key_fingerprint = excluded.key_fingerprint THEN payment_receipt_keys.key_fingerprint
+         ELSE payment_receipt_keys.key_fingerprint
+       END`
+  );
+  for (const [kid, secret] of PAYMENT_RECEIPT_KEY_RING.keys.entries()) {
+    const fingerprint = `sha256:${sha256(secret)}`;
+    const existing = db.prepare(`SELECT * FROM payment_receipt_keys WHERE kid = ?`).get(kid);
+    if (existing && String(existing.key_fingerprint || "") !== fingerprint) {
+      console.error(`FATAL: payment receipt key fingerprint changed for kid=${kid}`);
+      process.exit(1);
+    }
+    const status = kid === PAYMENT_RECEIPT_ACTIVE_KID ? "active" : "verify_only";
+    insert.run(kid, status, fingerprint, existing?.activated_at || timestamp, existing?.created_at || timestamp);
+  }
+  const active = db.prepare(`SELECT status FROM payment_receipt_keys WHERE kid = ?`).get(PAYMENT_RECEIPT_ACTIVE_KID);
+  if (!active || String(active.status) !== "active") {
+    console.error("FATAL: payment receipt key registry has no active signing key.");
+    process.exit(1);
+  }
+}
+
+initializePaymentReceiptKeyRegistry();
+
+function paymentReceiptSecretForKid(kid) {
+  const normalizedKid = String(kid || "").trim();
+  if (!normalizedKid) return null;
+  const registryRow = db.prepare(`SELECT status FROM payment_receipt_keys WHERE kid = ?`).get(normalizedKid);
+  if (!registryRow || String(registryRow.status) === "revoked") return null;
+  return PAYMENT_RECEIPT_KEY_RING.keys.get(normalizedKid) || null;
+}
+
+const TRANSFER_IDENTITY_INCOMPLETE = "CHAIN_TRANSFER_IDENTITY_INCOMPLETE";
+const CROSS_INVOICE_TRANSFER_COLLISION = "CROSS_INVOICE_TRANSFER_COLLISION";
+const RECOGNITION_POLICY_VERSION = "payment-recognition-v2";
+
+function normalizeTransferIdentity(event = {}) {
+  const chainId = normalizeChainId(event.chain_id ?? event.chainId);
+  const txHash = String(event.tx_hash ?? event.txHash ?? "").trim().toLowerCase();
+  const logIndexRaw = event.log_index ?? event.logIndex;
+  const logIndex = logIndexRaw == null || String(logIndexRaw).trim() === ""
+    ? null
+    : Number(logIndexRaw);
+  if (!chainId || !txHash || !Number.isSafeInteger(logIndex) || logIndex < 0) {
+    return { complete: false, code: TRANSFER_IDENTITY_INCOMPLETE };
+  }
+  return {
+    complete: true,
+    chainId,
+    txHash,
+    logIndex,
+    identity: `${chainId}:${txHash}:${logIndex}`,
+  };
+}
+
+function normalizeEvidenceValue(value) {
+  return value == null || String(value).trim() === "" ? null : String(value).trim().toLowerCase();
+}
+
+function registerGlobalTransferObservation({ invoice, event, providerId = null }) {
+  const identity = normalizeTransferIdentity(event);
+  if (!identity.complete) return { ...identity, transferId: null, collision: false, disputed: false };
+  const observedAt = String(event.observed_at || nowIso());
+  const payloadJson = JSON.stringify(event);
+  const payloadHash = `sha256:${sha256(payloadJson)}`;
+  const numericChainId = /^\d+$/.test(identity.chainId) ? identity.chainId : null;
+  let existing = db.prepare(
+    `SELECT * FROM blockchain_transfers
+     WHERE lower(tx_hash) = ? AND log_index = ?
+       AND (
+         chain_id = ?
+         OR (
+           ? IS NOT NULL
+           AND chain_id GLOB '[0-9]*'
+           AND chain_id NOT GLOB '*[^0-9]*'
+           AND CAST(chain_id AS INTEGER) = CAST(? AS INTEGER)
+         )
+       )
+     ORDER BY CASE WHEN chain_id = ? THEN 0 ELSE 1 END, id ASC
+     LIMIT 1`
+  ).get(
+    identity.txHash,
+    identity.logIndex,
+    identity.chainId,
+    numericChainId,
+    numericChainId,
+    identity.chainId,
+  );
+  if (existing && String(existing.chain_id) !== identity.chainId) {
+    const canonicalRow = db.prepare(
+      `SELECT id FROM blockchain_transfers
+       WHERE chain_id = ? AND lower(tx_hash) = ? AND log_index = ?`
+    ).get(identity.chainId, identity.txHash, identity.logIndex);
+    if (!canonicalRow) {
+      db.prepare(`UPDATE blockchain_transfers SET chain_id = ? WHERE id = ?`).run(identity.chainId, existing.id);
+      existing = db.prepare(`SELECT * FROM blockchain_transfers WHERE id = ?`).get(existing.id);
+    }
+  }
+  const candidate = {
+    token_contract: normalizeEvidenceValue(event.token_contract),
+    from_address: normalizeEvidenceValue(event.from_address),
+    to_address: normalizeEvidenceValue(event.to_address),
+    token_amount_atomic: event.token_amount_atomic ?? event.amount_atomic ?? null,
+    block_number: event.block_number == null ? null : Number(event.block_number),
+    block_hash: normalizeEvidenceValue(event.block_hash),
+    block_timestamp: event.block_timestamp == null ? null : String(event.block_timestamp),
+    receipt_status: event.receipt_status == null ? null : String(event.receipt_status).trim().toLowerCase(),
+    canonical_status: String(event.canonical_status || "unknown").trim().toLowerCase(),
+  };
+  let transfer = existing;
+  if (!transfer) {
+    const transferId = uuid();
+    db.prepare(
+      `INSERT INTO blockchain_transfers
+       (id, chain_id, tx_hash, log_index, token_contract, from_address, to_address,
+        token_amount_atomic, block_number, block_hash, block_timestamp, receipt_status, canonical_status,
+        integrity_status, first_observed_at, latest_observed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?, ?)`
+    ).run(
+      transferId,
+      identity.chainId,
+      identity.txHash,
+      identity.logIndex,
+      candidate.token_contract,
+      candidate.from_address,
+      candidate.to_address,
+      candidate.token_amount_atomic == null ? null : String(candidate.token_amount_atomic),
+      Number.isSafeInteger(candidate.block_number) ? candidate.block_number : null,
+      candidate.block_hash,
+      candidate.block_timestamp,
+      candidate.receipt_status,
+      candidate.canonical_status,
+      observedAt,
+      observedAt,
+    );
+    transfer = db.prepare(`SELECT * FROM blockchain_transfers WHERE id = ?`).get(transferId);
+  }
+
+  const mismatches = [];
+  for (const field of ["token_contract", "from_address", "to_address", "token_amount_atomic", "block_hash", "block_timestamp", "receipt_status"]) {
+    const previous = normalizeEvidenceValue(transfer?.[field]);
+    const next = normalizeEvidenceValue(candidate[field]);
+    if (previous !== null && next !== null && previous !== next) mismatches.push(field);
+  }
+  const disputed = mismatches.length > 0 || String(transfer.integrity_status || "ok") === "disputed";
+  if (disputed) {
+    db.prepare(
+      `UPDATE blockchain_transfers
+       SET integrity_status = 'disputed', canonical_status = 'disputed', latest_observed_at = ?
+       WHERE id = ?`
+    ).run(observedAt, transfer.id);
+  } else {
+    db.prepare(
+      `UPDATE blockchain_transfers
+       SET token_contract = COALESCE(token_contract, ?),
+           from_address = COALESCE(from_address, ?),
+           to_address = COALESCE(to_address, ?),
+           token_amount_atomic = COALESCE(token_amount_atomic, ?),
+           block_number = COALESCE(block_number, ?),
+           block_hash = COALESCE(block_hash, ?),
+           block_timestamp = COALESCE(block_timestamp, ?),
+           receipt_status = COALESCE(receipt_status, ?),
+           canonical_status = CASE
+             WHEN ? = 'canonical' THEN 'canonical'
+             WHEN canonical_status = 'unknown' THEN ?
+             ELSE canonical_status
+           END,
+           latest_observed_at = ?
+       WHERE id = ?`
+    ).run(
+      candidate.token_contract,
+      candidate.from_address,
+      candidate.to_address,
+      candidate.token_amount_atomic == null ? null : String(candidate.token_amount_atomic),
+      Number.isSafeInteger(candidate.block_number) ? candidate.block_number : null,
+      candidate.block_hash,
+      candidate.block_timestamp,
+      candidate.receipt_status,
+      candidate.canonical_status,
+      candidate.canonical_status,
+      observedAt,
+      transfer.id,
+    );
+  }
+  db.prepare(
+    `INSERT INTO transfer_observations
+     (id, blockchain_transfer_id, provider_id, observed_tip_number, observed_tip_hash,
+      receipt_status, confirmations, raw_payload_hash, raw_payload_json, observed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    uuid(),
+    transfer.id,
+    String(providerId || event.provider_id || event.source || "unknown"),
+    event.observed_tip_number == null ? null : Number(event.observed_tip_number),
+    event.observed_tip_hash || null,
+    event.receipt_status || null,
+    event.confirmations == null ? null : Number(event.confirmations),
+    payloadHash,
+    payloadJson,
+    observedAt,
+  );
+  // Payment recognition is invoice-scoped; refund evidence is not payment
+  // evidence and must remain a global transfer record without being linked to
+  // the invoice's receivable transfer graph.
+  if (invoice?.id) {
+    db.prepare(
+      `INSERT INTO invoice_transfer_links
+       (id, invoice_id, blockchain_transfer_id, relation_type, recognition_status, linked_at)
+       VALUES (?, ?, ?, 'observed', 'pending', ?)
+       ON CONFLICT(invoice_id, blockchain_transfer_id) DO UPDATE SET linked_at = excluded.linked_at`
+    ).run(uuid(), invoice.id, transfer.id, observedAt);
+  }
+
+  const linkedInvoices = invoice?.id
+    ? db.prepare(
+      `SELECT DISTINCT invoice_id FROM invoice_transfer_links WHERE blockchain_transfer_id = ?`
+    ).all(transfer.id).map((row) => String(row.invoice_id))
+    : [];
+  const crossInvoiceCollision = linkedInvoices.length > 1;
+  if (crossInvoiceCollision || disputed) {
+    const reason = crossInvoiceCollision ? CROSS_INVOICE_TRANSFER_COLLISION : REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
+    db.prepare(
+      `UPDATE blockchain_transfers
+       SET integrity_status = 'disputed', canonical_status = 'disputed', latest_observed_at = ?
+       WHERE id = ?`
+    ).run(observedAt, transfer.id);
+    for (const invoiceId of linkedInvoices) {
+      const affected = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
+      if (!affected) continue;
+      const holdReason = crossInvoiceCollision ? CROSS_INVOICE_TRANSFER_COLLISION : "TRANSFER_EVIDENCE_DISPUTED";
+      db.prepare(
+        `UPDATE invoices
+         SET integrity_hold = 1,
+             integrity_hold_reason = ?,
+             integrity_hold_at = COALESCE(integrity_hold_at, ?),
+             integrity_status = 'hold',
+             fulfillment_status = 'hold',
+             review_status = 'open',
+             accounting_status = 'exception',
+             monitoring_status = 'integrity_hold',
+             version = COALESCE(version, 0) + 1,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(holdReason, observedAt, observedAt, invoiceId);
+      upsertReviewCase(affected, reason, {
+        txHash: identity.txHash,
+        eventAmountBase: affected.paid_amount_jpyc_base,
+        blockTimestamp: event.block_timestamp || null,
+        detectedAt: observedAt,
+        incidentType: holdReason,
+        transferId: transfer.id,
+      });
+    }
+  }
+  return {
+    ...identity,
+    transferId: transfer.id,
+    collision: crossInvoiceCollision,
+    disputed,
+    mismatchFields: mismatches,
+  };
+}
 
 const legacyInvoiceBusinessDates = db
   .prepare(
@@ -1788,14 +2760,99 @@ function recordAccountingEvent({
   );
 }
 
+const ACCOUNTING_ADJUSTMENT_TYPES = new Set([
+  "manual_acceptance",
+  "loss_accepted",
+  "goodwill",
+  "write_off",
+]);
+
+function normalizeAccountingAdjustmentType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ACCOUNTING_ADJUSTMENT_TYPES.has(normalized) ? normalized : null;
+}
+
+function parseAccountingAdjustmentEvidence(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { error: "evidence must be an object with evidence_ref" };
+  }
+  const evidenceRef = String(value.evidence_ref || value.reference || "").trim();
+  const evidenceHash = String(value.evidence_hash || value.sha256 || "").trim();
+  const note = value.note == null ? "" : String(value.note).trim();
+  if (!evidenceRef) return { error: "evidence.evidence_ref is required" };
+  if (evidenceRef.length > 512) return { error: "evidence.evidence_ref is too long" };
+  if (evidenceHash && evidenceHash.length > 256) return { error: "evidence.evidence_hash is too long" };
+  if (note.length > 2000) return { error: "evidence.note is too long" };
+  const normalized = {
+    evidence_ref: evidenceRef,
+    evidence_hash: evidenceHash || null,
+    note: note || null,
+  };
+  const serialized = JSON.stringify(normalized);
+  if (Buffer.byteLength(serialized, "utf8") > 4096) return { error: "evidence is too large" };
+  return { value: normalized, serialized };
+}
+
+function accountingAdjustmentInvoiceSnapshot(invoice) {
+  return {
+    id: invoice?.id || null,
+    status: invoice?.status || null,
+    paid_tx_hash: invoice?.paid_tx_hash || null,
+    paid_amount_jpyc_base: String(invoice?.paid_amount_jpyc_base ?? "0"),
+    updated_at: invoice?.updated_at || null,
+  };
+}
+
+function accountingAdjustmentRow(adjustmentId, storeId) {
+  return db.prepare(
+    `SELECT aa.*, i.store_id, i.status AS invoice_status, i.paid_tx_hash,
+            i.paid_amount_jpyc_base, i.updated_at AS invoice_updated_at,
+            r.id AS review_case_id
+     FROM accounting_adjustments aa
+     JOIN invoices i ON i.id = aa.invoice_id
+     LEFT JOIN review_cases r ON r.id = aa.related_review_case_id
+     WHERE aa.id = ? AND i.store_id = ?`
+  ).get(String(adjustmentId || ""), String(storeId || ""));
+}
+
+function projectAccountingAdjustment(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    invoice_id: row.invoice_id,
+    review_case_id: row.related_review_case_id || row.review_case_id || null,
+    adjustment_type: row.adjustment_type,
+    amount_jpyc_base: String(row.amount_jpyc_base ?? "0"),
+    reason: row.reason,
+    evidence: parseJsonWithWarning(row.evidence_json, `accounting_adjustment:${row.id}.evidence`, {}),
+    created_by: row.created_by,
+    created_session_id: row.created_session_id || null,
+    created_step_up_at: row.created_step_up_at || null,
+    approved_by: row.approved_by || null,
+    approved_session_id: row.approved_session_id || null,
+    approved_step_up_at: row.approved_step_up_at || null,
+    status: row.status,
+    created_at: row.created_at,
+    approved_at: row.approved_at || null,
+  };
+}
+
+function accountingAdjustmentResponse(row, invoice, accountingEvent = null) {
+  return {
+    accounting_adjustment: projectAccountingAdjustment(row),
+    invoice: accountingAdjustmentInvoiceSnapshot(invoice || row),
+    accounting_event_id: accountingEvent?.id || null,
+  };
+}
+
 function recordFinalRefundAccountingEvent(refund, storeId = null) {
-  if (!refund || !["succeeded", "verified"].includes(String(refund.status))) return null;
+  if (!refund || !["succeeded", "finalized"].includes(String(refund.status))) return null;
   const resolvedStoreId = storeId || db.prepare(`SELECT store_id FROM invoices WHERE id = ?`).get(refund.invoice_id)?.store_id;
   return recordAccountingEvent({
     storeId: resolvedStoreId,
     invoiceId: refund.invoice_id,
     eventType: "refund_succeeded",
-    occurredAt: refund.verified_at || refund.detected_at || refund.updated_at || nowIso(),
+    occurredAt: refund.finalized_at || refund.verified_at || refund.detected_at || refund.updated_at || nowIso(),
     amountBase: String(refund.refund_amount_jpyc_base || "0"),
     status: String(refund.status),
     sourceRef: `refund:${refund.id}`,
@@ -1806,7 +2863,11 @@ function recordFinalRefundAccountingEvent(refund, storeId = null) {
       funding_lineage_id: refund.funding_lineage_id || null,
       refund_tx_hash: refund.refund_tx_hash || null,
       refund_tx_log_index: refund.refund_tx_log_index ?? null,
+      blockchain_transfer_id: refund.blockchain_transfer_id || null,
       verified_at: refund.verified_at || null,
+      finalized_at: refund.finalized_at || null,
+      finality_confirmations: Number(refund.finality_confirmations || 0),
+      finality_required_confirmations: Number(refund.finality_required_confirmations || 0),
     },
   });
 }
@@ -1863,6 +2924,7 @@ function terminalCurrentInvoiceSnapshot(terminal, extra = {}) {
 function summarizeInvoiceForTerminalState(invoice) {
   if (!invoice) return null;
   const review = findLatestReviewCase(invoice.id);
+  const fulfillmentDecision = buildAuthoritativeFulfillmentDecision(invoice);
   return {
     invoice_id: invoice.id,
     invoice_no: invoice.invoice_no,
@@ -1872,17 +2934,312 @@ function summarizeInvoiceForTerminalState(invoice) {
     status_reason: invoice.status_reason || null,
     amount_jpy: invoice.amount_jpy,
     amount_jpyc_base: invoice.amount_jpyc_base,
+    amount_scale_version: invoice.amount_scale_version || AMOUNT_SCALE_VERSION,
+    token_decimals: invoice.token_decimals ?? TOKEN_DECIMALS,
+    ledger_decimals: invoice.ledger_decimals ?? LEDGER_DECIMALS,
+    token_amount_atomic: invoice.token_amount_atomic || null,
+    ledger_amount_base: invoice.ledger_amount_base || invoice.amount_jpyc_base || null,
+    display_amount: invoice.display_amount || invoice.amount_jpy,
+    invoice_version: Number(invoice.invoice_version || invoice.version || 1),
     paid_amount_jpyc_base: invoice.paid_amount_jpyc_base,
     monitor_until: invoice.monitor_until || null,
     last_reconciled_block: invoice.last_reconciled_block ?? null,
     integrity_hold: Number(invoice.integrity_hold || 0) === 1,
     integrity_hold_reason: invoice.integrity_hold_reason || null,
-    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
+    fulfillment_hold: fulfillmentDecision.decision !== FULFILLMENT_DECISIONS.ALLOW_FULFILLMENT,
+    fulfillment_decision: fulfillmentDecision,
     expires_at: invoice.expires_at,
     payment_url: invoice.payment_url,
     recipient_address: invoice.recipient_address,
     review_case_id: review?.id || null,
+    state_axes: deriveInvoiceStateAxes(invoice),
   };
+}
+
+function createTerminalCheckoutClaim({
+  publicEntryToken,
+  anonymousDeviceId,
+  nonce,
+  invoiceVersion,
+  amountScaleVersion,
+  tokenAmountAtomic,
+  ledgerAmountBase,
+  requestId,
+  ip,
+}) {
+  const terminal = getTerminalByPublicEntryToken(publicEntryToken);
+  if (!terminal) return { error: { code: "NOT_FOUND", message: "Terminal entry not found" } };
+  const device = String(anonymousDeviceId || "").trim();
+  const claimNonce = String(nonce || "").trim();
+  if (device.length < 8 || device.length > 160 || claimNonce.length < 16 || claimNonce.length > 256) {
+    return { error: { code: "VALIDATION_ERROR", message: "anonymous_device_id and nonce are required" } };
+  }
+  const context = resolveTerminalCurrentInvoiceContext(terminal.id, {
+    repairPointer: true,
+    actorType: "system",
+    actorId: "terminal.checkout_claim",
+    requestId,
+    ip,
+    reason: "checkout_claim_reconciliation",
+  });
+  if (context.invariantBroken) return { error: { code: "TERMINAL_ACTIVE_INVOICE_INVARIANT_BROKEN", message: "multiple active invoices exist for this terminal" } };
+  const invoice = context.currentInvoice;
+  if (!invoice || !["issued", "payment_detected", "confirming"].includes(String(invoice.status))) {
+    return { error: { code: "CHECKOUT_NOT_READY", message: "no claimable active invoice exists" } };
+  }
+  const expectedVersion = Number(invoice.invoice_version || invoice.version || 1);
+  const expectedLedger = String(invoice.ledger_amount_base || invoice.amount_jpyc_base || "");
+  const expectedAtomic = String(invoice.token_amount_atomic || "");
+  const expectedScale = String(invoice.amount_scale_version || AMOUNT_SCALE_VERSION);
+  if (
+    Number(invoiceVersion) !== expectedVersion
+    || String(amountScaleVersion || "") !== expectedScale
+    || String(tokenAmountAtomic || "") !== expectedAtomic
+    || String(ledgerAmountBase || "") !== expectedLedger
+  ) {
+    return {
+      error: {
+        code: "CHECKOUT_CLAIM_STALE",
+        message: "invoice content changed; refresh and confirm the current amount again",
+        details: { invoice_version: expectedVersion, amount_scale_version: expectedScale },
+      },
+    };
+  }
+
+  const nonceHash = sha256(claimNonce);
+  const anonymousDeviceHash = sha256(device);
+  const existingByNonce = db.prepare(`SELECT * FROM terminal_checkout_claims WHERE nonce_hash = ?`).get(nonceHash);
+  if (existingByNonce) {
+    if (existingByNonce.invoice_id !== invoice.id || existingByNonce.terminal_id !== terminal.id) {
+      return { error: { code: "CHECKOUT_CLAIM_CONFLICT", message: "checkout claim nonce is already bound" } };
+    }
+    if (String(existingByNonce.status) === "expired") {
+      return { error: { code: "CHECKOUT_CLAIM_EXPIRED", message: "checkout claim has expired; confirm the current invoice again" } };
+    }
+    return { claim: existingByNonce, invoice };
+  }
+
+  const claim = db.transaction(() => {
+    const active = db
+      .prepare(`SELECT * FROM terminal_checkout_claims WHERE invoice_id = ? AND status IN ('claimed', 'consumed') LIMIT 1`)
+      .get(invoice.id);
+    if (active) {
+      if (String(active.anonymous_device_id) === anonymousDeviceHash) {
+        return { claim: active, reused: true };
+      }
+      return { error: { code: "CHECKOUT_ALREADY_CLAIMED", message: "this invoice has already been claimed" } };
+    }
+    const id = uuid();
+    const claimedAt = nowIso();
+    const invoiceExpiry = new Date(invoice.expires_at).getTime();
+    const claimExpiry = new Date(Math.min(
+      Number.isFinite(invoiceExpiry) ? invoiceExpiry : Date.now() + 120_000,
+      Date.now() + 120_000,
+    )).toISOString();
+    db.prepare(
+      `INSERT INTO terminal_checkout_claims
+       (id, terminal_id, invoice_id, invoice_version, anonymous_device_id, amount_scale_version,
+        token_amount_atomic, ledger_amount_base, claimed_at, expires_at, consumed_at, status,
+        nonce_hash, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'claimed', ?, ?, ?)`
+    ).run(
+      id,
+      terminal.id,
+      invoice.id,
+      expectedVersion,
+      anonymousDeviceHash,
+      expectedScale,
+      expectedAtomic,
+      expectedLedger,
+      claimedAt,
+      claimExpiry,
+      nonceHash,
+      claimedAt,
+      claimedAt,
+    );
+    return { claim: db.prepare(`SELECT * FROM terminal_checkout_claims WHERE id = ?`).get(id) };
+  })();
+  if (claim.error) return claim;
+  if (claim.reused) {
+    audit({
+      storeId: terminal.store_id,
+      actorType: "customer_device",
+      actorId: anonymousDeviceHash,
+      action: "terminal.checkout_claim_reused",
+      targetType: "invoice",
+      targetId: invoice.id,
+      requestId,
+      beforeState: { claim: claim.claim },
+      afterState: { claim: claim.claim },
+      ip,
+    });
+    return { claim: claim.claim, invoice };
+  }
+  audit({
+    storeId: terminal.store_id,
+    actorType: "customer_device",
+    actorId: anonymousDeviceHash,
+    action: "terminal.checkout_claimed",
+    targetType: "invoice",
+    targetId: invoice.id,
+    requestId,
+    beforeState: { terminal: terminalCurrentInvoiceSnapshot(terminal), invoice: summarizeInvoiceForTerminalState(invoice) },
+    afterState: { claim: claim.claim, invoice_version: expectedVersion, amount_scale_version: expectedScale },
+    ip,
+  });
+  return { claim: claim.claim, invoice };
+}
+
+function consumeTerminalCheckoutClaim({
+  publicEntryToken,
+  claimId,
+  anonymousDeviceId,
+  invoiceVersion,
+  amountScaleVersion,
+  tokenAmountAtomic,
+  ledgerAmountBase,
+  requestId,
+  ip,
+}) {
+  const terminal = getTerminalByPublicEntryToken(publicEntryToken);
+  if (!terminal) return { error: { code: "NOT_FOUND", message: "Terminal entry not found" } };
+  const claim = db
+    .prepare(
+      `SELECT c.*, i.status AS invoice_status, i.invoice_version AS current_invoice_version,
+              i.amount_scale_version AS current_amount_scale_version,
+              i.token_amount_atomic AS current_token_amount_atomic,
+              i.ledger_amount_base AS current_ledger_amount_base,
+              i.payment_url, i.expires_at AS invoice_expires_at,
+              t.current_invoice_id
+       FROM terminal_checkout_claims c
+       JOIN invoices i ON i.id = c.invoice_id
+       JOIN terminals t ON t.id = c.terminal_id
+       WHERE c.id = ? AND c.terminal_id = ?`
+    )
+    .get(String(claimId || ""), terminal.id);
+  if (!claim) return { error: { code: "NOT_FOUND", message: "Checkout claim not found" } };
+  const deviceHash = sha256(String(anonymousDeviceId || "").trim());
+  if (String(anonymousDeviceId || "").trim().length < 8 || String(claim.anonymous_device_id) !== deviceHash) {
+    return { error: { code: "CHECKOUT_CLAIM_DEVICE_MISMATCH", message: "checkout claim belongs to another device" } };
+  }
+  if (String(claim.status) === "consumed") {
+    // A consumed claim may be replayed by the same device, but replay must
+    // not become a bypass around the current invoice snapshot or payment
+    // state.  Re-check the same bindings used by the first CAS consume.
+    const replayBodyMatches = Number(invoiceVersion) === Number(claim.invoice_version)
+      && String(amountScaleVersion || "") === String(claim.amount_scale_version || "")
+      && String(tokenAmountAtomic || "") === String(claim.token_amount_atomic || "")
+      && String(ledgerAmountBase || "") === String(claim.ledger_amount_base || "");
+    const replayCurrentMatches = String(claim.current_invoice_id || "") === String(claim.invoice_id)
+      && ["issued", "payment_detected", "confirming"].includes(String(claim.invoice_status || ""))
+      && Number(claim.current_invoice_version) === Number(claim.invoice_version)
+      && String(claim.current_amount_scale_version || "") === String(claim.amount_scale_version || "")
+      && String(claim.current_token_amount_atomic || "") === String(claim.token_amount_atomic || "")
+      && String(claim.current_ledger_amount_base || "") === String(claim.ledger_amount_base || "");
+    if (Date.parse(String(claim.expires_at || "")) <= Date.now()) {
+      return { error: { code: "CHECKOUT_CLAIM_EXPIRED", message: "checkout claim has expired; confirm the current invoice again" } };
+    }
+    if (!replayBodyMatches || !replayCurrentMatches) {
+      return { error: { code: "CHECKOUT_CLAIM_STALE", message: "invoice content or payment state changed; confirm the current amount again" } };
+    }
+    return { claim, invoice: db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(claim.invoice_id), replay: true };
+  }
+  if (String(claim.status) !== "claimed") {
+    return { error: { code: "CHECKOUT_CLAIM_NOT_CONSUMABLE", message: "checkout claim is no longer available" } };
+  }
+  if (Date.parse(String(claim.expires_at || "")) <= Date.now() || Date.parse(String(claim.invoice_expires_at || "")) <= Date.now()) {
+    const timestamp = nowIso();
+    db.prepare(
+      `UPDATE terminal_checkout_claims SET status = 'expired', updated_at = ? WHERE id = ? AND status = 'claimed'`
+    ).run(timestamp, claim.id);
+    audit({
+      storeId: terminal.store_id,
+      actorType: "customer_device",
+      actorId: deviceHash,
+      action: "terminal.checkout_claim_expired",
+      targetType: "invoice",
+      targetId: claim.invoice_id,
+      requestId,
+      beforeState: claim,
+      afterState: { claim_id: claim.id, status: "expired" },
+      ip,
+    });
+    return { error: { code: "CHECKOUT_CLAIM_EXPIRED", message: "checkout claim has expired; confirm the current invoice again" } };
+  }
+  if (String(claim.current_invoice_id || "") !== String(claim.invoice_id)
+    || !["issued", "payment_detected", "confirming"].includes(String(claim.invoice_status))) {
+    return { error: { code: "CHECKOUT_CLAIM_STALE", message: "invoice is no longer the current payable invoice" } };
+  }
+  const claimSnapshotMatchesCurrent = Number(claim.current_invoice_version) === Number(claim.invoice_version)
+    && String(claim.current_amount_scale_version || "") === String(claim.amount_scale_version || "")
+    && String(claim.current_token_amount_atomic || "") === String(claim.token_amount_atomic || "")
+    && String(claim.current_ledger_amount_base || "") === String(claim.ledger_amount_base || "");
+  if (!claimSnapshotMatchesCurrent) {
+    return { error: { code: "CHECKOUT_CLAIM_STALE", message: "invoice content changed; confirm the current amount again" } };
+  }
+  if (
+    Number(invoiceVersion) !== Number(claim.invoice_version)
+    || String(amountScaleVersion || "") !== String(claim.amount_scale_version || "")
+    || String(tokenAmountAtomic || "") !== String(claim.token_amount_atomic || "")
+    || String(ledgerAmountBase || "") !== String(claim.ledger_amount_base || "")
+  ) {
+    return { error: { code: "CHECKOUT_CLAIM_STALE", message: "invoice content changed; confirm the current amount again" } };
+  }
+  const timestamp = nowIso();
+  const updated = db
+    .prepare(
+      `UPDATE terminal_checkout_claims
+       SET status = 'consumed', consumed_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'claimed' AND anonymous_device_id = ?
+         AND invoice_version = ?
+         AND amount_scale_version = ?
+         AND token_amount_atomic = ?
+         AND ledger_amount_base = ?
+         AND EXISTS (
+           SELECT 1
+           FROM invoices i
+           JOIN terminals t ON t.id = terminal_checkout_claims.terminal_id
+           WHERE i.id = terminal_checkout_claims.invoice_id
+             AND t.current_invoice_id = i.id
+             AND i.status IN ('issued', 'payment_detected', 'confirming')
+             AND i.invoice_version = terminal_checkout_claims.invoice_version
+             AND i.amount_scale_version = terminal_checkout_claims.amount_scale_version
+             AND i.token_amount_atomic = terminal_checkout_claims.token_amount_atomic
+             AND i.ledger_amount_base = terminal_checkout_claims.ledger_amount_base
+         )`
+    )
+    .run(
+      timestamp,
+      timestamp,
+      claim.id,
+      deviceHash,
+      claim.invoice_version,
+      claim.amount_scale_version,
+      claim.token_amount_atomic,
+      claim.ledger_amount_base,
+    );
+  if (updated.changes !== 1) {
+    const current = db.prepare(`SELECT * FROM terminal_checkout_claims WHERE id = ?`).get(claim.id);
+    if (current?.status === "consumed" && String(current.anonymous_device_id) === deviceHash) {
+      return { claim: current, invoice: db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(current.invoice_id), replay: true };
+    }
+    return { error: { code: "CHECKOUT_CLAIM_CONFLICT", message: "checkout claim changed while being confirmed" } };
+  }
+  const consumed = db.prepare(`SELECT * FROM terminal_checkout_claims WHERE id = ?`).get(claim.id);
+  const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(claim.invoice_id);
+  audit({
+    storeId: terminal.store_id,
+    actorType: "customer_device",
+    actorId: deviceHash,
+    action: "terminal.checkout_claim_consumed",
+    targetType: "invoice",
+    targetId: claim.invoice_id,
+    requestId,
+    beforeState: claim,
+    afterState: { claim: consumed, invoice: summarizeInvoiceForTerminalState(invoice) },
+    ip,
+  });
+  return { claim: consumed, invoice };
 }
 
 function getTerminalById(terminalId) {
@@ -2166,9 +3523,18 @@ function buildPublicTerminalEntryState(publicEntryToken) {
   };
 }
 
+function ledgerIntegrityError(context, cause = null) {
+  const error = new Error(`LEDGER_INTEGRITY_ERROR: ${String(context || "unknown")}`);
+  error.code = "LEDGER_INTEGRITY_ERROR";
+  if (cause) error.cause = cause;
+  return error;
+}
+
 function safeDecimalToBase(value, context) {
   try {
-    return parseDecimalToBaseUnits(String(value ?? "0"), JPYC_SCALE_DECIMALS);
+    const raw = String(value ?? "").trim();
+    if (!raw) throw ledgerIntegrityError(context);
+    return parseDecimalToBaseUnits(raw, LEDGER_SCALE_DECIMALS);
   } catch (error) {
     console.warn(
       JSON.stringify({
@@ -2180,7 +3546,8 @@ function safeDecimalToBase(value, context) {
         message: String(error.message || error),
       })
     );
-    return "0";
+    if (error?.code === "LEDGER_INTEGRITY_ERROR") throw error;
+    throw ledgerIntegrityError(context, error);
   }
 }
 
@@ -2205,9 +3572,12 @@ function parseJsonWithWarning(raw, context, fallback = null) {
 
 function toDisplayJpyc(baseUnits) {
   try {
-    return formatBaseUnitsForDisplay(String(baseUnits ?? "0"), JPYC_SCALE_DECIMALS);
-  } catch (_error) {
-    return "0";
+    const raw = String(baseUnits ?? "").trim();
+    if (!/^\d+$/.test(raw)) throw ledgerIntegrityError("display_amount");
+    return formatBaseUnitsForDisplay(raw, LEDGER_SCALE_DECIMALS);
+  } catch (error) {
+    if (error?.code === "LEDGER_INTEGRITY_ERROR") throw error;
+    throw ledgerIntegrityError("display_amount", error);
   }
 }
 
@@ -2223,7 +3593,7 @@ function computeInvoiceExpectedAmountAtomic(invoice) {
 
 function convertLedgerBaseToTokenAtomicExact(amountBase) {
   try {
-    const converted = convertBaseUnitsBetweenDecimals(String(amountBase), JPYC_SCALE_DECIMALS, TOKEN_DECIMALS);
+    const converted = convertBaseUnitsBetweenDecimals(String(amountBase), LEDGER_SCALE_DECIMALS, TOKEN_DECIMALS);
     if (!converted.exact) {
       return { error: "ledger amount cannot be represented exactly in token atomic units" };
     }
@@ -2235,7 +3605,7 @@ function convertLedgerBaseToTokenAtomicExact(amountBase) {
 
 function convertTokenAtomicToLedgerBase(amountAtomic) {
   try {
-    return convertBaseUnitsBetweenDecimals(String(amountAtomic), TOKEN_DECIMALS, JPYC_SCALE_DECIMALS);
+    return convertBaseUnitsBetweenDecimals(String(amountAtomic), TOKEN_DECIMALS, LEDGER_SCALE_DECIMALS);
   } catch (error) {
     return { error: String(error.message || error) };
   }
@@ -2428,6 +3798,170 @@ runMigration("20260419_001_money_base_units", () => {
       : safeDecimalToBase(row.total_paid_jpyc, "migration.settlement.amount");
     db.prepare(`UPDATE settlements SET total_paid_jpyc_base = ? WHERE id = ?`).run(amountBase, row.id);
   }
+});
+
+runMigration("20260726_001_amount_units_v2", () => {
+  const strictDecimalToBase = (value, context) => {
+    try {
+      return parseDecimalToBaseUnits(String(value ?? ""), LEDGER_DECIMALS);
+    } catch (error) {
+      const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: ${context}`);
+      integrityError.code = "LEDGER_INTEGRITY_ERROR";
+      integrityError.cause = error;
+      throw integrityError;
+    }
+  };
+  const normalizeExistingLedger = (value, fallback, context) => {
+    const raw = value == null || String(value).trim() === ""
+      ? strictDecimalToBase(fallback, context)
+      : String(value).trim();
+    if (!/^\d+$/.test(raw)) {
+      const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: ${context}`);
+      integrityError.code = "LEDGER_INTEGRITY_ERROR";
+      throw integrityError;
+    }
+    return raw;
+  };
+  const assertLedgerMatchesAtomic = (atomic, ledger, context) => {
+    const converted = requireExactLedgerAmountBaseFromTokenAtomic(atomic);
+    if (converted.error || converted.value !== ledger) {
+      const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: ${context}`);
+      integrityError.code = "LEDGER_INTEGRITY_ERROR";
+      throw integrityError;
+    }
+  };
+
+  const invoiceRows = db.prepare(
+    `SELECT id, amount_jpyc, amount_jpyc_base, ledger_amount_base, token_amount_atomic
+     FROM invoices ORDER BY id ASC`
+  ).all();
+  const updateInvoice = db.prepare(
+    `UPDATE invoices
+     SET amount_scale_version = ?, token_decimals = ?, ledger_decimals = ?,
+         token_amount_atomic = ?, ledger_amount_base = ?, display_amount = ?,
+         updated_at = COALESCE(updated_at, ?)
+     WHERE id = ?`
+  );
+  for (const row of invoiceRows) {
+    const ledger = normalizeExistingLedger(row.ledger_amount_base ?? row.amount_jpyc_base, row.amount_jpyc, `invoice:${row.id}`);
+    const atomic = row.token_amount_atomic == null || String(row.token_amount_atomic).trim() === ""
+      ? tokenAmountAtomicFromLedgerBase(ledger)
+      : String(row.token_amount_atomic).trim();
+    if (!/^\d+$/.test(atomic)) {
+      const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: invoice:${row.id}`);
+      integrityError.code = "LEDGER_INTEGRITY_ERROR";
+      throw integrityError;
+    }
+    assertLedgerMatchesAtomic(atomic, ledger, `invoice:${row.id}`);
+    updateInvoice.run(
+      AMOUNT_SCALE_VERSION,
+      TOKEN_DECIMALS,
+      LEDGER_DECIMALS,
+      atomic,
+      ledger,
+      formatBaseUnitsForDisplay(ledger, LEDGER_DECIMALS),
+      nowIso(),
+      row.id,
+    );
+  }
+
+  const eventRows = db.prepare(
+    `SELECT id, amount_jpyc, amount_jpyc_base, amount_atomic, token_amount_atomic,
+            ledger_amount_base, token_decimals, ledger_decimals
+     FROM payment_events ORDER BY id ASC`
+  ).all();
+  const updateEvent = db.prepare(
+    `UPDATE payment_events
+     SET amount_scale_version = ?, token_decimals = ?, ledger_decimals = ?,
+         token_amount_atomic = ?, ledger_amount_base = ?, display_amount = ?,
+         recognition_status = CASE WHEN ? = 1 THEN recognition_status ELSE 'review_required' END
+     WHERE id = ?`
+  );
+  for (const row of eventRows) {
+    const atomicRaw = row.token_amount_atomic ?? row.amount_atomic;
+    if (atomicRaw != null && String(atomicRaw).trim() !== "") {
+      const atomic = String(atomicRaw).trim();
+      if (!/^\d+$/.test(atomic)) {
+        const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: payment_event:${row.id}`);
+        integrityError.code = "LEDGER_INTEGRITY_ERROR";
+        throw integrityError;
+      }
+      const converted = requireExactLedgerAmountBaseFromTokenAtomic(atomic);
+      const existingLedger = row.ledger_amount_base ?? row.amount_jpyc_base;
+      const ledger = existingLedger == null || String(existingLedger).trim() === ""
+        ? converted.value
+        : String(existingLedger).trim();
+      if (!/^\d+$/.test(ledger)) {
+        const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: payment_event:${row.id}`);
+        integrityError.code = "LEDGER_INTEGRITY_ERROR";
+        throw integrityError;
+      }
+      if (!converted.error && converted.value !== ledger) {
+        const integrityError = new Error(`LEDGER_INTEGRITY_ERROR: payment_event:${row.id}`);
+        integrityError.code = "LEDGER_INTEGRITY_ERROR";
+        throw integrityError;
+      }
+      updateEvent.run(
+        AMOUNT_SCALE_VERSION,
+        TOKEN_DECIMALS,
+        LEDGER_DECIMALS,
+        atomic,
+        ledger,
+        formatBaseUnitsForDisplay(ledger, LEDGER_DECIMALS),
+        converted.error ? 0 : 1,
+        row.id,
+      );
+      continue;
+    }
+    const ledger = normalizeExistingLedger(row.ledger_amount_base ?? row.amount_jpyc_base, row.amount_jpyc, `payment_event:${row.id}`);
+    updateEvent.run(
+      AMOUNT_SCALE_VERSION,
+      TOKEN_DECIMALS,
+      LEDGER_DECIMALS,
+      tokenAmountAtomicFromLedgerBase(ledger),
+      ledger,
+      formatBaseUnitsForDisplay(ledger, LEDGER_DECIMALS),
+      1,
+      row.id,
+    );
+  }
+
+  const refundRows = db.prepare(
+    `SELECT id, refund_amount_jpyc, refund_amount_jpyc_base, ledger_amount_base, token_amount_atomic
+     FROM refund_requests ORDER BY id ASC`
+  ).all();
+  const updateRefund = db.prepare(
+    `UPDATE refund_requests
+     SET amount_scale_version = ?, token_decimals = ?, ledger_decimals = ?,
+         token_amount_atomic = ?, ledger_amount_base = ?, display_amount = ?
+     WHERE id = ?`
+  );
+  for (const row of refundRows) {
+    const ledger = normalizeExistingLedger(row.ledger_amount_base ?? row.refund_amount_jpyc_base, row.refund_amount_jpyc, `refund:${row.id}`);
+    const atomic = row.token_amount_atomic == null || String(row.token_amount_atomic).trim() === ""
+      ? tokenAmountAtomicFromLedgerBase(ledger)
+      : String(row.token_amount_atomic).trim();
+    assertLedgerMatchesAtomic(atomic, ledger, `refund:${row.id}`);
+    updateRefund.run(
+      AMOUNT_SCALE_VERSION,
+      TOKEN_DECIMALS,
+      LEDGER_DECIMALS,
+      atomic,
+      ledger,
+      formatBaseUnitsForDisplay(ledger, LEDGER_DECIMALS),
+      row.id,
+    );
+  }
+
+  db.prepare(
+    `UPDATE receive_addresses
+     SET chain_id = COALESCE(chain_id, CASE lower(network) WHEN 'polygon' THEN '137' WHEN 'ethereum' THEN '1' WHEN 'avalanche' THEN '43114' ELSE ? END),
+         activation_status = CASE
+           WHEN control_verified_at IS NOT NULL AND COALESCE(sweep_capability, '') IN ('available', 'verified') THEN 'available'
+           WHEN status IN ('disabled', 'retired') THEN 'disabled'
+           ELSE COALESCE(activation_status, 'pending_proof') END
+     WHERE chain_id IS NULL OR chain_id = ''`
+  ).run(CHAIN_ID);
 });
 
 runMigration("20260724_002_refund_aggregate_lineage", () => {
@@ -3123,6 +4657,12 @@ const SETTLEMENT_EXPORT_V2_SNAPSHOT_HEADERS = [
   "external_sync_refs_json",
   "accounting_event_refs_json",
   "source_ledger_snapshot_hash",
+  "amount_scale_version",
+  "token_decimals",
+  "ledger_decimals",
+  "token_amount_atomic",
+  "ledger_amount_base",
+  "display_amount",
   "invoice_amount_jpyc_base",
   "invoice_status",
   "accounting_status",
@@ -3236,6 +4776,12 @@ const SETTLEMENT_EXPORT_V2_CANONICAL_JSON_ROW_FIELDS = [
   "external_sync_refs",
   "accounting_event_refs",
   "source_ledger_snapshot_hash",
+  "amount_scale_version",
+  "token_decimals",
+  "ledger_decimals",
+  "token_amount_atomic",
+  "ledger_amount_base",
+  "display_amount",
   "invoice_amount_jpyc_base",
   "invoice_status",
   "accounting_status",
@@ -3493,6 +5039,8 @@ function issueInvoiceRecord({
     if (amountBase.error) {
       return { error: { code: "VALIDATION_ERROR", message: "amount_jpy conversion failed" } };
     }
+    const tokenAmountAtomic = tokenAmountAtomicFromLedgerBase(amountBase.value);
+    const displayAmount = formatBaseUnitsForDisplay(amountBase.value, LEDGER_DECIMALS);
 
     const id = uuid();
     const no = invoiceNo();
@@ -3511,7 +5059,12 @@ function issueInvoiceRecord({
     const allocatedAddress = poolConfigured
       ? allocateReceiveAddress({ storeId: session.store_id, invoiceId: id, chainId })
       : null;
-    const recipient = allocatedAddress?.address || (!poolConfigured && !IS_PRODUCTION ? String(RECIPIENT_ADDRESS || "") : "");
+    // The configured recipient is a test-only fixture fallback. Production-like
+    // runtimes always require an allocated, control-verified pool address.
+    const recipient = allocatedAddress?.address
+      || (!poolConfigured && !PRODUCTION_LIKE_RUNTIME && RECEIVE_ADDRESS_DEV_AUTO_VERIFY
+        ? String(RECIPIENT_ADDRESS || "")
+        : "");
 
     if (!recipient) {
       return {
@@ -3554,9 +5107,10 @@ function issueInvoiceRecord({
     db.prepare(
       `INSERT INTO invoices
       (id, invoice_no, checkout_session_id, merchant_id, store_id, terminal_id, staff_user_id, operator_id, event_id, booth_id, amount_jpy, amount_jpyc, amount_jpyc_base,
+       amount_scale_version, token_decimals, ledger_decimals, token_amount_atomic, ledger_amount_base, display_amount, invoice_version, version,
        chain_id, token_contract, recipient_address, payment_url, expires_at, status, business_date, created_at, updated_at,
        reissued_from_invoice_id, reissue_root_invoice_id, policy_snapshot_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, ?, ?, ?)`
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       no,
@@ -3571,6 +5125,14 @@ function issueInvoiceRecord({
       amountJpy,
       amountJpy,
       amountBase.value,
+      AMOUNT_SCALE_VERSION,
+      TOKEN_DECIMALS,
+      LEDGER_DECIMALS,
+      tokenAmountAtomic,
+      amountBase.value,
+      displayAmount,
+      1,
+      1,
       chainId,
       tokenContract,
       recipient,
@@ -3610,7 +5172,7 @@ function issueInvoiceRecord({
 
 function parsePositiveBaseUnits(value, label) {
   try {
-    const parsed = parseDecimalToBaseUnits(String(value ?? ""), JPYC_SCALE_DECIMALS);
+    const parsed = parseDecimalToBaseUnits(String(value ?? ""), LEDGER_SCALE_DECIMALS);
     if (BigInt(parsed) <= 0n) {
       return { error: `${label} must be positive amount` };
     }
@@ -3642,6 +5204,21 @@ function toIntegerAmount(value, fallback = 0) {
   } catch (_error) {
     return fallback;
   }
+}
+
+function parseSettlementAmountBaseStrict(value, label) {
+  const raw = String(value ?? "").trim();
+  if (!/^\d+$/.test(raw)) throw ledgerIntegrityError(`settlement:${label}`);
+  let amount;
+  try {
+    amount = BigInt(raw);
+  } catch (error) {
+    throw ledgerIntegrityError(`settlement:${label}`, error);
+  }
+  if (amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw ledgerIntegrityError(`settlement:${label}`);
+  }
+  return Number(amount);
 }
 
 function createPaymentSession({
@@ -4378,6 +5955,22 @@ function getPaymentsDisableState({ storeId = null, terminalId = null } = {}) {
   };
 }
 
+function evaluateChainRuntimeRegistryGate(chainId = CHAIN_ID) {
+  const rows = workerStateAll(
+    `SELECT chain_id, rpc_endpoint_hash, token_contract, token_decimals, latest_block,
+            latest_block_hash, status, verified_at
+     FROM chain_runtime_registry
+     WHERE chain_id = ?
+     ORDER BY verified_at DESC, rpc_endpoint_hash ASC`,
+    String(chainId)
+  );
+  return assessChainRuntimeRegistry(rows, {
+    chainId: String(chainId),
+    tokenContract: TOKEN_CONTRACT,
+    tokenDecimals: TOKEN_DECIMALS,
+  });
+}
+
 function getInvoiceIssuanceBlockReason({ store, session }) {
   if (!store) {
     return {
@@ -4464,6 +6057,15 @@ function getInvoiceIssuanceBlockReason({ store, session }) {
     }
   }
   if (releaseGateRequired) {
+    const chainId = String(store.chain_id || CHAIN_ID);
+    const receiveAddressPool = getReceiveAddressPoolReadiness(store.id, chainId);
+    if (!receiveAddressPool.ok) {
+      return {
+        code: "RECEIVE_ADDRESS_POOL_NOT_READY",
+        message: "a control-verified receive address pool is required before invoice issuance",
+        details: receiveAddressPool,
+      };
+    }
     const refundTreasury = getRefundTreasuryConfig({ storeId: store.id, chainId: store.chain_id || CHAIN_ID });
     if (!refundTreasury || isPlaceholderLike(refundTreasury.approval_ref)) {
       return {
@@ -4472,10 +6074,9 @@ function getInvoiceIssuanceBlockReason({ store, session }) {
         details: { store_id: store.id, chain_id: String(store.chain_id || CHAIN_ID) },
       };
     }
-    const chainId = String(store.chain_id || CHAIN_ID);
-    const worker = db.prepare(`SELECT value FROM chain_monitor_state WHERE key = ?`).get(`worker:${chainId}:last_cycle_at`);
-    const workerRpc = db.prepare(`SELECT value FROM chain_monitor_state WHERE key = ?`).get(`worker:${chainId}:rpc_count`);
-    const workerCheckpoint = db.prepare(`SELECT value FROM chain_monitor_state WHERE key = ?`).get(`worker:${chainId}:last_checkpoint`);
+    const worker = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:last_cycle_at`);
+    const workerRpc = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:rpc_count`);
+    const workerCheckpoint = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:last_checkpoint`);
     const workerAt = worker?.value ? new Date(worker.value).getTime() : NaN;
     if (
       !Number.isFinite(workerAt)
@@ -4496,8 +6097,21 @@ function getInvoiceIssuanceBlockReason({ store, session }) {
         },
       };
     }
+    const runtimeRegistry = evaluateChainRuntimeRegistryGate(chainId);
+    if (!runtimeRegistry.ok) {
+      return {
+        code: "CHAIN_RUNTIME_NOT_READY",
+        message: "verified RPC/token runtime registry is not ready for invoice issuance",
+        details: runtimeRegistry,
+      };
+    }
     const unresolvedReorg = db
-      .prepare(`SELECT id, from_block, to_block, reason, detected_at FROM chain_reorgs WHERE chain_id = ? AND status = 'unresolved' ORDER BY detected_at DESC LIMIT 1`)
+      .prepare(`SELECT id, from_block, to_block, reason, status, revalidation_status, detected_at
+                FROM chain_reorgs
+                WHERE chain_id = ?
+                  AND (COALESCE(status, 'unresolved') <> 'resolved'
+                    OR COALESCE(revalidation_status, 'unverified') <> 'verified')
+                ORDER BY detected_at DESC LIMIT 1`)
       .get(chainId);
     if (unresolvedReorg) {
       return {
@@ -5032,8 +6646,14 @@ function evaluateCommercialRuntimeGate(metrics = null) {
   const dangerousFlagsGate = evaluateDangerousFlagsGate();
   const settlementPolicy = resolveSettlementUnresolvedReviewPolicy(null);
   const auditChainOk = Boolean(runtimeMetrics.audit_chain?.ok);
+  const chainRuntimeRegistryOk = Boolean(runtimeMetrics.chain_runtime_registry?.ok);
 
   const gates = {
+    database_gate: Boolean(runtimeMetrics.db_ok),
+    worker_gate: Boolean(runtimeMetrics.worker_ready),
+    rpc_runtime_gate: chainRuntimeRegistryOk,
+    clock_gate: Boolean(runtimeMetrics.clock_ok),
+    receive_address_pool_gate: Boolean(runtimeMetrics.receive_address_pool_gate?.ok),
     app_env: APP_ENV,
     payments_disabled: isPaymentsDisabled(),
     commercial_go_mode: COMMERCIAL_GO_MODE,
@@ -5047,7 +6667,7 @@ function evaluateCommercialRuntimeGate(metrics = null) {
       && !!APPROVED_JPYC_TOKEN_CONTRACT
       && String(TOKEN_CONTRACT).toLowerCase() === APPROVED_JPYC_TOKEN_CONTRACT
       && TOKEN_DECIMALS === APPROVED_TOKEN_DECIMALS
-      && JPYC_BASE_UNIT_SCALE === APPROVED_LEDGER_BASE_UNIT_SCALE,
+      && LEDGER_BASE_UNIT_SCALE === APPROVED_LEDGER_BASE_UNIT_SCALE,
     confirmation_policy_gate:
       !isPlaceholderLike(CONFIRMATIONS_POLICY_APPROVAL_REF)
       && REQUIRED_CONFIRMATIONS >= MIN_REQUIRED_CONFIRMATIONS,
@@ -5065,6 +6685,7 @@ function evaluateCommercialRuntimeGate(metrics = null) {
     refund_policy_gate: REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR,
     dangerous_flags_gate: dangerousFlagsGate.ok,
     chain_reorg_gate: Number(runtimeMetrics.unresolved_reorg_count || 0) === 0,
+    chain_runtime_registry_gate: chainRuntimeRegistryOk,
   };
 
   const blockers = [];
@@ -5081,6 +6702,12 @@ function evaluateCommercialRuntimeGate(metrics = null) {
   if (!gates.dangerous_flags_gate) blockers.push("dangerous_flags_gate");
   const releaseGateRequired = IS_PRODUCTION || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE) || gates.commercial_go_mode;
   if (releaseGateRequired) {
+    if (!gates.database_gate) blockers.push("database_gate");
+    if (!gates.worker_gate) blockers.push("worker_gate");
+    if (!gates.rpc_runtime_gate) blockers.push("rpc_runtime_gate");
+    if (!gates.clock_gate) blockers.push("clock_gate");
+    if (!gates.receive_address_pool_gate) blockers.push("receive_address_pool_gate");
+    if (!gates.chain_runtime_registry_gate) blockers.push("chain_runtime_registry_gate");
     if (!gates.chain_reorg_gate) blockers.push("chain_reorg_gate");
     if (!gates.release_selection_gate) blockers.push("release_selection_gate");
     if (!gates.release_manifest_gate) blockers.push("release_manifest_gate");
@@ -5201,6 +6828,20 @@ const rpcProvidersByChain = new Map(
   })
 );
 const rpcProviders = rpcProvidersByChain.get(String(CHAIN_ID)) || [];
+const recoveryRpcProvidersByChain = new Map(
+  listSupportedPaymentChains()
+    .filter((chain) => READ_ONLY_RECOVERY_CHAIN_IDS.includes(String(chain.chain_id)))
+    .map((chain) => {
+      const chainId = String(chain.chain_id);
+      const numericChainId = Number(chainId);
+      const providers = rpcUrlsForChain(chainId).map((url) => new JsonRpcProvider(
+        url,
+        Number.isFinite(numericChainId) ? numericChainId : undefined,
+        { staticNetwork: true }
+      ));
+      return [chainId, providers];
+    })
+);
 
 function normalizeAddress(value) {
   if (!isEvmAddress(value)) return null;
@@ -5261,6 +6902,56 @@ function hasConfiguredReceiveAddressPool(storeId, chainId = CHAIN_ID) {
   return Number(row?.count || 0) > 0;
 }
 
+function getReceiveAddressPoolReadiness(storeId, chainId = CHAIN_ID) {
+  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
+  if (policy.error) return { ok: false, configured_count: 0, available_count: 0, error: policy.error };
+  const row = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS configured_count,
+         SUM(CASE
+           WHEN status = 'available'
+            AND activation_status = 'available'
+            AND control_verified_at IS NOT NULL
+            AND control_proof_payload_hash IS NOT NULL
+            AND sweep_destination IS NOT NULL
+            AND sweep_capability NOT IN ('', 'unknown', 'unverified', 'none')
+           THEN 1 ELSE 0 END) AS available_count
+       FROM receive_addresses
+       WHERE store_id = ?
+         AND network = ?
+         AND lower(token_contract) = lower(?)`
+    )
+    .get(policy.storeId, policy.network, policy.tokenContract);
+  const configuredCount = Number(row?.configured_count || 0);
+  const availableCount = Number(row?.available_count || 0);
+  return {
+    ok: availableCount > 0,
+    configured_count: configuredCount,
+    available_count: availableCount,
+    chain_id: String(chainId),
+    token_contract: policy.tokenContract,
+  };
+}
+
+function evaluateReceiveAddressPoolGate() {
+  const stores = db
+    .prepare(`SELECT id, chain_id FROM stores WHERE status = 'active' ORDER BY id ASC`)
+    .all();
+  const readiness = stores.map((store) => ({
+    store_id: store.id,
+    chain_id: String(store.chain_id || CHAIN_ID),
+    ...getReceiveAddressPoolReadiness(store.id, String(store.chain_id || CHAIN_ID)),
+  }));
+  const failedStoreIds = readiness.filter((entry) => !entry.ok).map((entry) => entry.store_id);
+  return {
+    ok: stores.length > 0 && failedStoreIds.length === 0,
+    active_store_count: stores.length,
+    failed_store_ids: failedStoreIds,
+    stores: readiness,
+  };
+}
+
 function allocateReceiveAddress({ storeId, invoiceId, chainId = CHAIN_ID }) {
   const policy = getReceiveAddressPoolPolicy(storeId, chainId);
   if (policy.error) return null;
@@ -5274,6 +6965,12 @@ function allocateReceiveAddress({ storeId, invoiceId, chainId = CHAIN_ID }) {
            AND network = ?
            AND lower(token_contract) = lower(?)
            AND status = 'available'
+           AND activation_status = 'available'
+           AND control_proof_verified = 1
+           AND control_verified_at IS NOT NULL
+           AND control_proof_payload_hash IS NOT NULL
+           AND sweep_destination IS NOT NULL
+           AND sweep_capability NOT IN ('', 'unknown', 'unverified', 'none')
          ORDER BY created_at ASC, id ASC
          LIMIT 1`
       )
@@ -5289,7 +6986,13 @@ function allocateReceiveAddress({ storeId, invoiceId, chainId = CHAIN_ID }) {
              allocated_at = ?,
              updated_at = ?
          WHERE id = ?
-           AND status = 'available'`
+           AND status = 'available'
+           AND activation_status = 'available'
+           AND control_proof_verified = 1
+           AND control_verified_at IS NOT NULL
+           AND control_proof_payload_hash IS NOT NULL
+           AND sweep_destination IS NOT NULL
+           AND sweep_capability NOT IN ('', 'unknown', 'unverified', 'none')`
       )
       .run(invoiceId, ts, ts, selected.id);
     if (updated.changes !== 1) {
@@ -5305,11 +7008,15 @@ function allocateReceiveAddress({ storeId, invoiceId, chainId = CHAIN_ID }) {
   return null;
 }
 
-function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chainId, requestId, idempotencyKey, ip }) {
+function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chainId, manifest = null, requestId, idempotencyKey, ip }) {
+  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
+  if (policy.error) return { error: policy.error };
   const normalizedEntries = [];
   const seen = new Set();
   for (const entry of addresses) {
     const raw = typeof entry === "string" ? entry : entry?.address;
+    const entryObjectRaw = typeof entry === "object" && entry ? entry : {};
+    const { _proof_verified: _ignoredProofFlag, ...entryObject } = entryObjectRaw;
     const source = typeof entry === "object" && entry ? String(entry.source_label || sourceLabel || "").trim() : String(sourceLabel || "").trim();
     if (looksLikePrivateKeyMaterial(raw)) {
       return { error: { code: "PRIVATE_KEY_MATERIAL_REJECTED", message: "private key or mnemonic-like material cannot be imported" } };
@@ -5320,15 +7027,47 @@ function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chai
     }
     if (seen.has(address)) continue;
     seen.add(address);
-    normalizedEntries.push({ address, sourceLabel: source || "ops_import" });
+    const controlInput = {
+      ...entryObject,
+      address,
+      chain_id: chainId,
+      token_contract: policy.tokenContract,
+    };
+    let control = validateReceiveAddressControl(controlInput, { allowTestFixture: !IS_PRODUCTION && RECEIVE_ADDRESS_DEV_AUTO_VERIFY });
+    if (!control.ok && !IS_PRODUCTION && RECEIVE_ADDRESS_DEV_AUTO_VERIFY && !entryObject.control_proof_type) {
+      const fixturePayload = { address, chain_id: chainId, token_contract: policy.tokenContract, source_label: source || "ops_import" };
+      control = validateReceiveAddressControl({
+        ...controlInput,
+        control_proof_type: "test_fixture",
+        control_proof_payload_hash: sha256(JSON.stringify(fixturePayload)),
+        control_verified_at: nowIso(),
+        sweep_destination: RECIPIENT_ADDRESS || address,
+        sweep_capability: "test_fixture",
+      }, { allowTestFixture: true });
+    }
+    normalizedEntries.push({ address, sourceLabel: source || "ops_import", control });
   }
 
   if (normalizedEntries.length === 0) {
     return { error: { code: "VALIDATION_ERROR", message: "at least one receive address is required" } };
   }
 
-  const policy = getReceiveAddressPoolPolicy(storeId, chainId);
-  if (policy.error) return { error: policy.error };
+  const manifestValidation = validateReceiveAddressManifest(manifest || {}, {
+    addresses: normalizedEntries.map((entry) => entry.address),
+    chainId,
+    requireProductionFields: PRODUCTION_LIKE_RUNTIME,
+  });
+  if (!manifestValidation.ok) {
+    return {
+      error: {
+        code: "RECEIVE_ADDRESS_MANIFEST_INVALID",
+        message: "receive address manifest is missing, inconsistent, or not bound to the imported addresses",
+        details: manifestValidation.errors,
+      },
+    };
+  }
+  const manifestRecord = manifestValidation.normalized;
+
   const imported = [];
   try {
     db.transaction(() => {
@@ -5338,9 +7077,56 @@ function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chai
         try {
           db.prepare(
             `INSERT INTO receive_addresses
-             (id, merchant_id, store_id, network, token_contract, address, status, source_label, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'available', ?, ?, ?)`
-          ).run(id, policy.merchantId, policy.storeId, policy.network, policy.tokenContract, entry.address, entry.sourceLabel, ts, ts);
+             (id, merchant_id, store_id, chain_id, network, token_contract, address, status, source_label,
+              address_type, control_proof_type, control_proof_payload_hash, control_verified_at,
+              control_proof_verified,
+              sweep_destination, sweep_capability, provider_reference, activation_status,
+              manifest_batch_id, manifest_provider_id, manifest_chain_id, manifest_address_count,
+              manifest_generated_at, manifest_sweep_policy, manifest_sha256, manifest_canonical_sha256,
+              manifest_signature, manifest_signer_address, manifest_approval_ref, manifest_signature_status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_proof',
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     'pending_proof',
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            id,
+            policy.merchantId,
+            policy.storeId,
+            chainId,
+            policy.network,
+            policy.tokenContract,
+            entry.address,
+            entry.sourceLabel,
+            "receive",
+            entry.control.normalized.control_proof_type,
+            entry.control.normalized.control_proof_payload_hash,
+            entry.control.normalized.control_verified_at,
+            entry.control.normalized.control_proof_verified ? 1 : 0,
+            entry.control.normalized.sweep_destination,
+            entry.control.normalized.sweep_capability,
+            entry.control.normalized.provider_reference,
+            manifestRecord.batch_id || null,
+            manifestRecord.provider_id || null,
+            manifestRecord.chain_id || null,
+            manifestRecord.addresses.length,
+            manifestRecord.generated_at || null,
+            manifestRecord.sweep_policy || null,
+            manifestRecord.sha256 || null,
+            manifestRecord.canonical_sha256 || null,
+            manifestRecord.signature || null,
+            manifestRecord.signer_address || null,
+            manifestRecord.approval_ref || null,
+            manifestRecord.signature_status || null,
+            ts,
+            ts,
+          );
+          if (entry.control.ok) {
+            db.prepare(
+              `UPDATE receive_addresses
+               SET status = 'available', activation_status = 'available', updated_at = ?
+               WHERE id = ? AND status = 'pending_proof' AND activation_status = 'pending_proof'`
+            ).run(nowIso(), id);
+          }
           const row = db.prepare(`SELECT * FROM receive_addresses WHERE id = ?`).get(id);
           imported.push(row);
         } catch (error) {
@@ -5377,10 +7163,23 @@ function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chai
       addresses: imported.map((row) => row.address),
       network: policy.network,
       token_contract: policy.tokenContract,
+      manifest: {
+        batch_id: manifestRecord.batch_id || null,
+        provider_id: manifestRecord.provider_id || null,
+        chain_id: manifestRecord.chain_id || null,
+        address_count: manifestRecord.addresses.length,
+        generated_at: manifestRecord.generated_at || null,
+        sweep_policy: manifestRecord.sweep_policy || null,
+        sha256: manifestRecord.sha256 || null,
+        canonical_sha256: manifestRecord.canonical_sha256,
+        signature_status: manifestRecord.signature_status,
+        approval_ref: manifestRecord.approval_ref || null,
+      },
+      pending_proof_count: imported.filter((row) => row.activation_status !== "available").length,
     },
     ip,
   });
-  return { rows: imported };
+  return { rows: imported, manifest: manifestRecord };
 }
 
 function disableReceiveAddress({ storeId, receiveAddressId, actorId, reason, requestId, idempotencyKey, ip }) {
@@ -5446,6 +7245,41 @@ async function withRpcProvider(label, fn, chainId = CHAIN_ID) {
     }
   }
   throw lastError || new Error(`rpc_failed:${label}`);
+}
+
+async function verifyEip1271ControlProof({ address, chainId, message, signature }) {
+  const normalizedAddress = normalizeAddress(address);
+  const normalizedSignature = String(signature || "").trim();
+  if (!normalizedAddress || !/^0x[0-9a-fA-F]+$/.test(normalizedSignature)) {
+    return { ok: false, code: "CONTROL_PROOF_SIGNATURE_INVALID" };
+  }
+  const digest = keccak256Utf8(String(message || ""));
+  const bytes32Interface = new Interface(["function isValidSignature(bytes32,bytes) view returns (bytes4)"]);
+  const bytesInterface = new Interface(["function isValidSignature(bytes,bytes) view returns (bytes4)"]);
+  try {
+    const result = await withRpcProvider("receive_address_control_eip1271", async (provider) => {
+      const code = await provider.getCode(normalizedAddress);
+      if (!code || code === "0x") throw new Error("CONTROL_PROOF_TARGET_HAS_NO_CONTRACT_CODE");
+      const calls = [
+        bytes32Interface.encodeFunctionData("isValidSignature(bytes32,bytes)", [digest, normalizedSignature]),
+        bytesInterface.encodeFunctionData("isValidSignature(bytes,bytes)", [new TextEncoder().encode(String(message || "")), normalizedSignature]),
+      ];
+      for (const data of calls) {
+        try {
+          const response = await provider.call({ to: normalizedAddress, data });
+          if (String(response || "").slice(0, 10).toLowerCase() === "0x1626ba7e") return true;
+        } catch (_error) {
+          // Try the alternate EIP-1271 overload before failing closed.
+        }
+      }
+      return false;
+    }, chainId);
+    return result === true
+      ? { ok: true, code: "CONTROL_PROOF_VERIFIED_EIP1271" }
+      : { ok: false, code: "CONTROL_PROOF_SIGNATURE_REJECTED" };
+  } catch (_error) {
+    return { ok: false, code: "CONTROL_PROOF_RPC_UNAVAILABLE" };
+  }
 }
 
 function getReceiptTransferLogs(receipt, tokenContract) {
@@ -5585,6 +7419,212 @@ async function verifyTransferOnChain({
       transfer: amountMatches[0] || fromMatches[0] || toMatches[0] || transferLogs[0],
     };
   }, chainId);
+}
+
+function getRecoveryTransferLogs(receipt) {
+  const transferTopic = transferInterface.getEvent("Transfer").topicHash.toLowerCase();
+  const transfers = [];
+  for (const log of receipt?.logs || []) {
+    const topics = Array.isArray(log?.topics) ? log.topics : [];
+    if (String(topics[0] || "").toLowerCase() !== transferTopic) continue;
+    try {
+      const parsed = transferInterface.parseLog(log);
+      transfers.push({
+        token_contract: normalizeAddress(log.address) || null,
+        tx_hash: String(log.transactionHash || receipt.hash || "").toLowerCase(),
+        log_index: Number(log.index ?? log.logIndex ?? 0),
+        block_number: Number(log.blockNumber ?? receipt.blockNumber ?? 0),
+        from_address: normalizeAddress(parsed.args.from) || null,
+        to_address: normalizeAddress(parsed.args.to) || null,
+        amount_atomic: String(parsed.args.value),
+      });
+    } catch (_error) {
+      // A recovery report must remain unverified when a log cannot be decoded.
+    }
+  }
+  return transfers;
+}
+
+async function verifyRecoveryTransactionOnChain({ chainId, txHash }) {
+  const providers = recoveryRpcProvidersByChain.get(String(chainId)) || [];
+  if (providers.length === 0) {
+    return {
+      ok: false,
+      code: "RECOVERY_RPC_UNAVAILABLE",
+      rpcVerified: false,
+      receiptFound: false,
+      transferLogs: [],
+    };
+  }
+  let lastError = null;
+  for (const provider of providers) {
+    try {
+      const rpcChainIdHex = String(await provider.send("eth_chainId", []));
+      const rpcChainId = rpcChainIdHex.startsWith("0x") ? BigInt(rpcChainIdHex).toString() : rpcChainIdHex;
+      if (String(rpcChainId) !== String(chainId)) {
+        lastError = new Error("RECOVERY_RPC_CHAIN_MISMATCH");
+        continue;
+      }
+      const receipt = await provider.getTransactionReceipt(txHash);
+      if (!receipt) {
+        return {
+          ok: false,
+          code: "TX_NOT_FOUND",
+          rpcVerified: true,
+          receiptFound: false,
+          transferLogs: [],
+        };
+      }
+      const transferLogs = getRecoveryTransferLogs(receipt);
+      const latestBlock = Number(await provider.getBlockNumber());
+      const block = receipt.blockNumber != null ? await provider.getBlock(Number(receipt.blockNumber)) : null;
+      const receiptBlockHash = String(receipt.blockHash || "").toLowerCase();
+      const canonicalBlockHash = String(block?.hash || "").toLowerCase();
+      return {
+        ok: Number(receipt.status || 0) === 1,
+        code: Number(receipt.status || 0) === 1 ? null : "TX_REVERTED",
+        rpcVerified: true,
+        receiptFound: true,
+        canonicalStatus: receiptBlockHash && canonicalBlockHash && receiptBlockHash === canonicalBlockHash
+          ? "canonical"
+          : "unknown",
+        confirmations: Math.max(0, latestBlock - Number(receipt.blockNumber || 0) + 1),
+        blockNumber: Number(receipt.blockNumber || 0),
+        blockHash: receipt.blockHash || null,
+        transferLogs,
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return {
+    ok: false,
+    code: lastError?.message === "RECOVERY_RPC_CHAIN_MISMATCH"
+      ? "RECOVERY_RPC_CHAIN_MISMATCH"
+      : "RECOVERY_RPC_UNAVAILABLE",
+    rpcVerified: false,
+    receiptFound: false,
+    transferLogs: [],
+  };
+}
+
+async function createPaymentRecoveryReport({ invoice, body, reporterType, reporterId, requestId, ip }) {
+  const normalized = normalizeRecoveryReportInput({ ...body, reporter_type: reporterType });
+  if (!normalized.ok) {
+    return {
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "chain_id and tx_hash are required for a read-only recovery check",
+        details: { errors: normalized.errors },
+      },
+    };
+  }
+  const verification = await verifyRecoveryTransactionOnChain({
+    chainId: normalized.chainId,
+    txHash: normalized.txHash,
+  });
+  const classification = classifyRecoveryReport({
+    invoiceChainId: invoice.chain_id,
+    requestedChainId: normalized.chainId,
+    officialTokenContract: OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
+    expectedRecipient: invoice.recipient_address,
+    transferLogs: verification.transferLogs,
+    rpcVerified: verification.rpcVerified,
+    receiptFound: verification.receiptFound,
+    reportedIssue: normalized.reportedIssue,
+    reporterType: normalized.reporterType,
+  });
+  const evidence = {
+    requested_chain_id: normalized.chainId,
+    invoice_chain_id: String(invoice.chain_id),
+    tx_hash: normalized.txHash,
+    code: verification.code || null,
+    rpc_verified: verification.rpcVerified,
+    receipt_found: verification.receiptFound,
+    canonical_status: verification.canonicalStatus || "unknown",
+    confirmations: Number(verification.confirmations || 0),
+    block_number: verification.blockNumber ?? null,
+    block_hash: verification.blockHash || null,
+    transfer_logs: verification.transferLogs,
+    classification: classification.evidence,
+  };
+  const timestamp = nowIso();
+  const reportId = uuid();
+  const row = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO payment_recovery_reports
+       (id, invoice_id, reporter_type, reporter_id, requested_chain_id, tx_hash, reported_issue,
+        status, verified_chain_id, rpc_verified, receipt_found, canonical_status, confirmations,
+        evidence_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(invoice_id, requested_chain_id, tx_hash, reporter_type) DO UPDATE SET
+         reporter_id = excluded.reporter_id,
+         reported_issue = excluded.reported_issue,
+         status = excluded.status,
+         verified_chain_id = excluded.verified_chain_id,
+         rpc_verified = excluded.rpc_verified,
+         receipt_found = excluded.receipt_found,
+         canonical_status = excluded.canonical_status,
+         confirmations = excluded.confirmations,
+         evidence_json = excluded.evidence_json,
+         updated_at = excluded.updated_at`
+    ).run(
+      reportId,
+      invoice.id,
+      normalized.reporterType,
+      reporterId || null,
+      normalized.chainId,
+      normalized.txHash,
+      normalized.reportedIssue,
+      classification.status,
+      verification.rpcVerified ? normalized.chainId : null,
+      verification.rpcVerified ? 1 : 0,
+      verification.receiptFound ? 1 : 0,
+      verification.canonicalStatus || "unknown",
+      Number(verification.confirmations || 0),
+      JSON.stringify(evidence),
+      timestamp,
+      timestamp,
+    );
+    return db.prepare(
+      `SELECT id, invoice_id, reporter_type, requested_chain_id, tx_hash, reported_issue, status,
+              verified_chain_id, rpc_verified, receipt_found, canonical_status, confirmations,
+              created_at, updated_at
+       FROM payment_recovery_reports
+       WHERE invoice_id = ? AND requested_chain_id = ? AND tx_hash = ? AND reporter_type = ?`
+    ).get(invoice.id, normalized.chainId, normalized.txHash, normalized.reporterType);
+  })();
+  audit({
+    storeId: invoice.store_id,
+    actorType: normalized.reporterType === "staff" ? "admin" : "customer_anonymous",
+    actorId: reporterId || invoice.id,
+    action: "payment.recovery_reported",
+    targetType: "payment_recovery_report",
+    targetId: row.id,
+    requestId,
+    idempotencyKey: null,
+    beforeState: null,
+    afterState: {
+      invoice_id: invoice.id,
+      requested_chain_id: row.requested_chain_id,
+      tx_hash: row.tx_hash,
+      status: row.status,
+      rpc_verified: row.rpc_verified,
+      receipt_found: row.receipt_found,
+    },
+    ip,
+  });
+  return {
+    report: row,
+    classification,
+    verification: {
+      rpc_verified: verification.rpcVerified,
+      receipt_found: verification.receiptFound,
+      canonical_status: verification.canonicalStatus || "unknown",
+      confirmations: Number(verification.confirmations || 0),
+      transfer_count: verification.transferLogs.length,
+    },
+  };
 }
 
 function createSseToken({ invoiceId, terminalId, storeId, sessionId, expiresAtIso }) {
@@ -5732,7 +7772,9 @@ function getSessionByToken(token) {
   const tokenHash = sha256(token);
   const session = db
     .prepare(
-      `SELECT s.id AS session_id, s.terminal_id, s.staff_user_id, s.started_at, t.store_id, u.role, u.permissions_override
+      `SELECT s.id AS session_id, s.terminal_id, s.staff_user_id, s.started_at,
+              s.step_up_verified_at, s.step_up_expires_at,
+              t.store_id, u.role, u.permissions_override
        FROM terminal_sessions s
        JOIN terminals t ON t.id = s.terminal_id
        JOIN staff_users u ON u.id = s.staff_user_id
@@ -5767,12 +7809,26 @@ function requireSession(req, res, next) {
 const ROLE_PERMISSIONS = {
   staff: new Set(["invoice.create", "invoice.read"]),
   operator: new Set(["invoice.create", "invoice.read"]),
-  accounting: new Set(["invoice.read", "review.read", "refund.view", "settlement.close", "settlement.export", "audit.read", "audit.export"]),
+  accounting: new Set([
+    "invoice.read",
+    "review.read",
+    "refund.view",
+    "accounting.adjustment.read",
+    "accounting.adjustment.create",
+    "accounting.adjustment.approve",
+    "settlement.close",
+    "settlement.export",
+    "audit.read",
+    "audit.export",
+  ]),
   manager: new Set([
     "invoice.create",
     "invoice.read",
     "review.read",
     "review.update",
+    "accounting.adjustment.read",
+    "accounting.adjustment.create",
+    "accounting.adjustment.approve",
     "refund.request",
     "refund.view",
     "refund.approve",
@@ -5786,6 +7842,9 @@ const ROLE_PERMISSIONS = {
     "invoice.read",
     "review.read",
     "review.update",
+    "accounting.adjustment.read",
+    "accounting.adjustment.create",
+    "accounting.adjustment.approve",
     "refund.request",
     "refund.view",
     "refund.approve",
@@ -5939,6 +7998,17 @@ function requirePermission(permission) {
   };
 }
 
+function requireAnyPermission(...permissions) {
+  const required = permissions.flat().map((permission) => String(permission || "").trim()).filter(Boolean);
+  return (req, res, next) => {
+    if (!req.session) return jsonError(res, 401, "UNAUTHORIZED", "Session required");
+    if (!required.some((permission) => hasPermission(req.session, permission))) {
+      return jsonError(res, 403, "FORBIDDEN", `Permission denied: ${required.join(" or ")}`);
+    }
+    next();
+  };
+}
+
 function requirePlatformPermission(permission) {
   return (req, res, next) => {
     if (!req.session) return jsonError(res, 401, "UNAUTHORIZED", "Session required");
@@ -6005,16 +8075,17 @@ function requireServiceSignature(req, res, next) {
 }
 
 function isTransitionAllowed(from, to) {
-  const transitions = {
-    draft: new Set(["issued"]),
-    issued: new Set(["payment_detected", "expired", "cancelled"]),
-    payment_detected: new Set(["confirming", "review_required"]),
-    confirming: new Set(["paid", "review_required"]),
-    paid: new Set(["review_required"]),
-    expired: new Set(["review_required"]),
-    review_required: new Set(["review_required", "confirming", "paid", "cancelled"]),
-    cancelled: new Set(["review_required"])
-  };
+    const transitions = {
+      draft: new Set(["issued"]),
+      issued: new Set(["payment_detected", "expired", "cancelled"]),
+      payment_detected: new Set(["confirming", "review_required"]),
+      confirming: new Set(["paid", "review_required"]),
+      paid: new Set(["review_required", "settled"]),
+      settled: new Set(["review_required"]),
+      expired: new Set(["review_required"]),
+      review_required: new Set(["review_required", "confirming", "paid", "cancelled"]),
+      cancelled: new Set(["review_required"])
+    };
   return transitions[from] && transitions[from].has(to);
 }
 
@@ -6238,12 +8309,47 @@ function audit({
   );
 }
 
-const RESOLVED_REFUND_STATUSES = new Set(["succeeded", "verified", "cancelled", "rejected"]);
+// `verified` means the destination/transaction evidence passed validation;
+// it is deliberately not an accounting-final state.  A refund remains open
+// until the required chain finality is recorded as `succeeded`/`finalized`.
+const RESOLVED_REFUND_STATUSES = new Set(["succeeded", "finalized", "cancelled", "rejected"]);
 const REFUND_RESERVATION_RELEASED_STATUSES = new Set(["cancelled", "rejected"]);
 
 function isUnresolvedRefundStatus(status) {
   const value = String(status || "").trim();
   return !RESOLVED_REFUND_STATUSES.has(value);
+}
+
+function syncInvoiceRefundStatus(invoiceId) {
+  const rows = db.prepare(
+    `SELECT status, reorg_hold
+     FROM refund_requests
+     WHERE invoice_id = ?
+     ORDER BY created_at ASC, id ASC`
+  ).all(String(invoiceId || ""));
+  if (rows.length === 0) return null;
+  const statuses = new Set(rows.map((row) => String(row.status || "").trim()));
+  const next = rows.some((row) => Number(row.reorg_hold || 0) === 1)
+    ? "hold"
+    : statuses.has("finalized")
+      ? "finalized"
+      : statuses.has("verified")
+        ? "verified"
+        : rows.some((row) => ["recorded", "pending_verification", "verification_failed"].includes(String(row.status)))
+          ? "sent"
+          : statuses.has("approved")
+            ? "approved"
+            : statuses.has("requested")
+              ? "requested"
+              : statuses.has("failed")
+                ? "failed"
+                : "none";
+  db.prepare(
+    `UPDATE invoices
+     SET refund_status = ?, version = COALESCE(version, 0) + 1, updated_at = ?
+     WHERE id = ?`
+  ).run(next, nowIso(), String(invoiceId || ""));
+  return next;
 }
 
 function refundLedgerIntegrityError(refundId) {
@@ -6261,6 +8367,19 @@ function refundLedgerIntegrityApiResult(error) {
         code: "REFUND_LEDGER_INTEGRITY_ERROR",
         message: "Refund ledger amount is invalid; operation stopped for accounting safety",
         details: { refund_id: error?.refundId || null },
+      },
+    },
+  };
+}
+
+function settlementLedgerIntegrityApiResult(error) {
+  return {
+    status: 409,
+    body: {
+      error: {
+        code: "LEDGER_INTEGRITY_ERROR",
+        message: "Settlement ledger amount is invalid; operation stopped for accounting safety",
+        details: { context: String(error?.message || "settlement ledger integrity failure").slice(0, 240) },
       },
     },
   };
@@ -6305,7 +8424,7 @@ function findActiveRefundBySemantic({ reviewCaseId, refundCaseId, refundAmountBa
          AND refund_amount_jpyc_base = ?
          AND lower(refund_to_address) = lower(?)
          AND refund_chain_id = ?
-         AND status IN ('approved', 'recorded', 'pending_verification', 'verification_failed', 'failed', 'succeeded', 'verified')
+         AND status IN ('approved', 'recorded', 'pending_verification', 'verification_failed', 'failed', 'succeeded', 'verified', 'finalized')
        ORDER BY rowid ASC
        LIMIT 1`
     )
@@ -6437,6 +8556,40 @@ function getRefundFundingAllocationsForConservation(refundId, sweeps = null) {
   });
 }
 
+function getRefundFundingFinalityState(row) {
+  const confirmations = Number(row?.confirmations || 0);
+  const requiredConfirmations = Math.max(
+    ACCOUNTING_FINALITY_CONFIRMATIONS,
+    Number(row?.finality_required_confirmations || 0),
+  );
+  const canonicalStatus = String(row?.canonical_status || "unknown").trim().toLowerCase();
+  const finalizedAt = String(row?.finalized_at || "").trim();
+  const finalizedAtMs = finalizedAt ? Date.parse(finalizedAt) : NaN;
+  const finalityConfirmed = canonicalStatus === "canonical"
+    && Number.isFinite(confirmations)
+    && confirmations >= requiredConfirmations
+    && Number.isFinite(finalizedAtMs)
+    && Number(row?.reorg_hold || 0) !== 1;
+  const status = String(row?.status || "").trim().toLowerCase();
+  return {
+    status,
+    canonicalStatus,
+    confirmations: Number.isFinite(confirmations) ? confirmations : 0,
+    requiredConfirmations,
+    finalizedAt: finalizedAt || null,
+    reorgHold: Number(row?.reorg_hold || 0) === 1,
+    finalityConfirmed,
+    // Settlement close is deliberately stricter than the development
+    // compatibility path used by old refund fixtures: a row must have both
+    // an explicit finalized status and the corresponding evidence.
+    settlementReady: status === "finalized" && finalityConfirmed,
+    // A verified row may carry an explicit finality observation from its first
+    // verification. It can fund an allocation, but it cannot close settlement
+    // until the next verification reaches status=finalized.
+    allocationReady: finalityConfirmed && (status === "finalized" || status === "verified"),
+  };
+}
+
 function evaluateRefundFundingConservation(refund, sweeps = null, allocations = null) {
   const refundId = String(refund?.id || "");
   const fundingSweeps = Array.isArray(sweeps) ? sweeps : getRefundFundingSweeps(refundId);
@@ -6505,12 +8658,18 @@ function evaluateRefundFundingConservation(refund, sweeps = null, allocations = 
         allocated_amount_jpyc_base: allocatedAmount.toString(),
       });
     }
-    if (allocatedAmount > 0n && String(sweep.status || "") !== "verified") {
+    const finality = getRefundFundingFinalityState(sweep);
+    if (allocatedAmount > 0n && !finality.allocationReady) {
       violations.push({
-        code: "REFUND_FUNDING_SWEEP_NOT_VERIFIED",
-        message: "allocated refund funding sweep is not verified",
+        code: "REFUND_FUNDING_SWEEP_NOT_FINALIZED",
+        message: "allocated refund funding sweep is not accounting-finalized",
         sweep_id: sweepId,
         status: String(sweep.status || "") || null,
+        canonical_status: finality.canonicalStatus,
+        confirmations: finality.confirmations,
+        required_confirmations: finality.requiredConfirmations,
+        finalized_at: finality.finalizedAt,
+        reorg_hold: finality.reorgHold,
       });
     }
   }
@@ -6614,6 +8773,370 @@ function listIntegrityHeldInvoices(storeId, range = null) {
   return db.prepare(`SELECT id, status, integrity_hold_reason, integrity_hold_at FROM invoices WHERE ${clauses.join(" AND ")} ORDER BY created_at ASC`).all(...params);
 }
 
+function evaluateSettlementHardGate({ storeId, businessDate, store, range }) {
+  const chainId = String(store?.chain_id || CHAIN_ID);
+  const blockers = [];
+  const invoiceScope = businessDate
+    ? {
+      sql: "(business_date = ? OR (business_date IS NULL AND created_at BETWEEN ? AND ?))",
+      params: [businessDate, range.fromUtc, range.toUtc],
+    }
+    : {
+      sql: "created_at BETWEEN ? AND ?",
+      params: [range.fromUtc, range.toUtc],
+    };
+  const targetInvoices = db.prepare(
+    `SELECT id, status FROM invoices
+     WHERE store_id = ?
+       AND ${invoiceScope.sql}`
+  ).all(storeId, ...invoiceScope.params);
+  const paymentRelevant = targetInvoices.some((row) => ["paid", "settled", "review_required"].includes(String(row.status)));
+
+  const openIncidents = db.prepare(
+    `SELECT ri.id, ri.invoice_id, ri.incident_type, ri.primary_reason, ri.created_at
+     FROM review_incidents ri
+     JOIN invoices i ON i.id = ri.invoice_id
+     WHERE i.store_id = ?
+       AND ${businessDate
+         ? "(i.business_date = ? OR (i.business_date IS NULL AND i.created_at BETWEEN ? AND ?))"
+         : "i.created_at BETWEEN ? AND ?"}
+       AND ri.status IN ('open', 'in_progress')
+     ORDER BY ri.created_at ASC, ri.id ASC`
+  ).all(storeId, ...invoiceScope.params);
+  if (openIncidents.length > 0) {
+    blockers.push({ code: "OPEN_REVIEW_INCIDENTS", incident_ids: openIncidents.map((row) => row.id), details: openIncidents });
+  }
+
+  const unresolvedReorgs = db.prepare(
+    `SELECT id, chain_id, from_block, to_block, reason, detected_at
+     FROM chain_reorgs
+     WHERE chain_id = ? AND COALESCE(status, 'unresolved') <> 'resolved'
+     ORDER BY detected_at ASC, id ASC`
+  ).all(chainId);
+  if (unresolvedReorgs.length > 0) {
+    blockers.push({ code: "UNRESOLVED_CHAIN_REORGS", reorg_ids: unresolvedReorgs.map((row) => row.id), details: unresolvedReorgs });
+  }
+
+  const unverifiedReorgRevalidations = db.prepare(
+    `SELECT id, chain_id, from_block, to_block, status, revalidation_status,
+            revalidation_reference, revalidated_at, revalidation_failure_reason
+     FROM chain_reorgs
+     WHERE chain_id = ?
+       AND COALESCE(status, 'unresolved') = 'resolved'
+       AND COALESCE(revalidation_status, 'unverified') <> 'verified'
+     ORDER BY detected_at ASC, id ASC`
+  ).all(chainId);
+  if (unverifiedReorgRevalidations.length > 0) {
+    blockers.push({
+      code: "UNVERIFIED_CHAIN_REORG_REVALIDATION",
+      reorg_ids: unverifiedReorgRevalidations.map((row) => row.id),
+      details: unverifiedReorgRevalidations,
+    });
+  }
+
+  const deadLetterRows = workerStateAll(
+    `SELECT id, chain_id, tx_hash, log_index, invoice_id, reason, status, last_error
+     FROM chain_dead_letters
+     WHERE chain_id = ?
+       AND status NOT IN ('resolved', 'ignored', 'closed')
+     ORDER BY created_at ASC, id ASC`,
+    chainId
+  );
+  const deadLetters = deadLetterRows.filter((row) => {
+    if (!row.invoice_id) return true;
+    const invoice = db.prepare(`SELECT store_id FROM invoices WHERE id = ?`).get(row.invoice_id);
+    return invoice?.store_id === storeId;
+  });
+  if (deadLetters.length > 0) {
+    blockers.push({ code: "UNRESOLVED_CHAIN_DEAD_LETTERS", dead_letter_ids: deadLetters.map((row) => row.id), details: deadLetters });
+  }
+
+  const pendingNotifications = db.prepare(
+    `SELECT pno.id, pno.invoice_id, pno.notification_type, pno.status,
+            pno.attempt_count, pno.available_at, pno.last_error
+     FROM payment_notification_outbox pno
+     JOIN invoices i ON i.id = pno.invoice_id
+     WHERE i.store_id = ?
+       AND pno.status <> 'sent'
+       AND ${businessDate
+         ? "(i.business_date = ? OR (i.business_date IS NULL AND i.created_at BETWEEN ? AND ?))"
+         : "i.created_at BETWEEN ? AND ?"}
+     ORDER BY pno.created_at ASC, pno.id ASC`
+  ).all(storeId, ...invoiceScope.params);
+  if (pendingNotifications.length > 0 && isProductionLikeRuntime()) {
+    blockers.push({
+      code: "PENDING_PAYMENT_NOTIFICATION_OUTBOX",
+      outbox_ids: pendingNotifications.map((row) => row.id),
+      details: pendingNotifications,
+    });
+  }
+
+  const unmatchedEvents = workerStateAll(
+    `SELECT id, chain_id, tx_hash, log_index, reason, created_at
+     FROM chain_unmatched_events
+     WHERE chain_id = ? AND created_at BETWEEN ? AND ?
+     ORDER BY created_at ASC, id ASC`,
+    chainId,
+    range.fromUtc,
+    range.toUtc
+  );
+  if (unmatchedEvents.length > 0) {
+    blockers.push({ code: "UNRESOLVED_CHAIN_UNMATCHED_EVENTS", event_ids: unmatchedEvents.map((row) => row.id), details: unmatchedEvents });
+  }
+
+  const pendingAdjustments = db.prepare(
+    `SELECT id, invoice_id, adjustment_type, amount_jpyc_base, status, created_at
+     FROM accounting_adjustments
+     WHERE status NOT IN ('approved', 'rejected', 'cancelled')
+       AND invoice_id IN (SELECT id FROM invoices WHERE store_id = ?)
+     ORDER BY created_at ASC, id ASC`
+  ).all(storeId);
+  if (pendingAdjustments.length > 0) {
+    blockers.push({ code: "PENDING_ACCOUNTING_ADJUSTMENTS", adjustment_ids: pendingAdjustments.map((row) => row.id), details: pendingAdjustments });
+  }
+
+  const unsettledFundingSweeps = db.prepare(
+    `SELECT rfs.id, rfs.invoice_id, rfs.status, rfs.sweep_tx_hash,
+            rfs.canonical_status, rfs.confirmations,
+            rfs.finality_required_confirmations, rfs.finalized_at, rfs.reorg_hold
+     FROM refund_funding_sweeps rfs
+     JOIN invoices i ON i.id = rfs.invoice_id
+     WHERE i.store_id = ?
+       AND rfs.status NOT IN ('rejected', 'cancelled')
+       AND (
+         rfs.status <> 'finalized'
+         OR lower(COALESCE(rfs.canonical_status, 'unknown')) <> 'canonical'
+         OR COALESCE(rfs.confirmations, 0) < MAX(?, COALESCE(rfs.finality_required_confirmations, 0))
+         OR rfs.finalized_at IS NULL
+         OR COALESCE(rfs.reorg_hold, 0) = 1
+       )
+     ORDER BY rfs.created_at ASC, rfs.id ASC`
+  ).all(storeId, ACCOUNTING_FINALITY_CONFIRMATIONS);
+  if (unsettledFundingSweeps.length > 0) {
+    blockers.push({ code: "UNFINALIZED_REFUND_FUNDING_SWEEPS", sweep_ids: unsettledFundingSweeps.map((row) => row.id), details: unsettledFundingSweeps });
+  }
+
+  // Legacy single-lineage refunds use a separate table from v2 sweep rows.
+  // They must obey the same accounting-finality contract; a `verified` row
+  // is evidence, not a settlement-finalized funding source.
+  const unsettledFundingLineage = db.prepare(
+    `SELECT rfl.id, rfl.refund_request_id, rfl.invoice_id, rfl.status, rfl.sweep_tx_hash,
+            rfl.canonical_status, rfl.confirmations,
+            rfl.finality_required_confirmations, rfl.finalized_at, rfl.reorg_hold
+     FROM refund_funding_lineage rfl
+     JOIN invoices i ON i.id = rfl.invoice_id
+     WHERE i.store_id = ?
+       AND rfl.status NOT IN ('rejected', 'cancelled')
+       AND (
+         rfl.status <> 'finalized'
+         OR lower(COALESCE(rfl.canonical_status, 'unknown')) <> 'canonical'
+         OR COALESCE(rfl.confirmations, 0) < MAX(?, COALESCE(rfl.finality_required_confirmations, 0))
+         OR rfl.finalized_at IS NULL
+         OR COALESCE(rfl.reorg_hold, 0) = 1
+       )
+     ORDER BY rfl.created_at ASC, rfl.id ASC`
+  ).all(storeId, ACCOUNTING_FINALITY_CONFIRMATIONS);
+  if (unsettledFundingLineage.length > 0) {
+    blockers.push({
+      code: "UNFINALIZED_REFUND_FUNDING_LINEAGE",
+      funding_lineage_ids: unsettledFundingLineage.map((row) => row.id),
+      details: unsettledFundingLineage,
+    });
+  }
+
+  const releaseRequired = isProductionLikeRuntime();
+  if (releaseRequired && paymentRelevant) {
+    const worker = workerStateGet(`SELECT value, updated_at FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:last_cycle_at`)
+      || workerStateGet(`SELECT value, updated_at FROM chain_monitor_state WHERE key = 'worker:last_cycle_at'`);
+    const workerAt = worker?.value ? new Date(worker.value).getTime() : NaN;
+    const workerRpc = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:rpc_count`);
+    const workerCheckpoint = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:last_checkpoint`);
+    if (!Number.isFinite(workerAt) || Date.now() - workerAt > WORKER_STALE_SEC * 1000
+      || !Number.isFinite(Number(workerRpc?.value)) || Number(workerRpc.value) < 1 || !workerCheckpoint?.value) {
+      blockers.push({
+        code: "CHAIN_MONITOR_HEARTBEAT_STALE",
+        details: {
+          chain_id: chainId,
+          last_cycle_at: worker?.value || null,
+          rpc_count: Number.isFinite(Number(workerRpc?.value)) ? Number(workerRpc.value) : null,
+          last_checkpoint: workerCheckpoint?.value || null,
+          stale_after_sec: WORKER_STALE_SEC,
+        },
+      });
+    }
+    const runtimeRegistry = evaluateChainRuntimeRegistryGate(chainId);
+    if (!runtimeRegistry.ok) blockers.push({ code: "CHAIN_RUNTIME_REGISTRY_NOT_READY", details: runtimeRegistry });
+    const releaseGate = evaluateReleaseSelectionGate();
+    if (!releaseGate.release_manifest_gate) blockers.push({ code: "RELEASE_MANIFEST_GATE_BLOCKED", details: releaseGate });
+    const auditStatus = verifyAuditChain();
+    if (!auditStatus.ok) blockers.push({ code: "AUDIT_CHAIN_INVALID", details: auditStatus });
+  }
+
+  return { ok: blockers.length === 0, required: releaseRequired && paymentRelevant, chain_id: chainId, blockers };
+}
+
+function listAccountingFinalityPendingInvoices(storeId, range = null) {
+  const clauses = ["i.store_id = ?", "i.status = 'paid'", "i.settled_at IS NULL"];
+  const params = [String(storeId || "")];
+  if (range?.fromUtc && range?.toUtc) {
+    if (range.businessDate) {
+      clauses.push("(i.business_date = ? OR (i.business_date IS NULL AND i.created_at BETWEEN ? AND ?))");
+      params.push(range.businessDate, range.fromUtc, range.toUtc);
+    } else {
+      clauses.push("i.created_at BETWEEN ? AND ?");
+      params.push(range.fromUtc, range.toUtc);
+    }
+  }
+  const invoices = db.prepare(
+    `SELECT i.* FROM invoices i WHERE ${clauses.join(" AND ")} ORDER BY i.created_at ASC`
+  ).all(...params);
+  const pending = [];
+  for (const invoice of invoices) {
+    if (hasProviderSettlementPath(invoice.id)) continue;
+    const events = db.prepare(
+      `SELECT * FROM payment_events WHERE invoice_id = ? ORDER BY created_at DESC, rowid DESC`
+    ).all(invoice.id);
+    const primary = events.find((event) => String(event.tx_hash || "").toLowerCase() === String(invoice.paid_tx_hash || "").toLowerCase()) || events[0];
+    if (!primary) {
+      pending.push({
+        invoice_id: invoice.id,
+        status: invoice.status,
+        required_confirmations: ACCOUNTING_FINALITY_CONFIRMATIONS,
+        confirmations: 0,
+        reason: "missing_payment_event",
+      });
+      continue;
+    }
+    const required = Math.max(
+      ACCOUNTING_FINALITY_CONFIRMATIONS,
+      Number(primary.accounting_finality_confirmations || 0),
+    );
+    const reasons = [];
+    if (Number(primary.confirmations || 0) < required) reasons.push("confirmations_pending");
+    if (String(primary.canonical_status || "unknown").toLowerCase() !== "canonical") reasons.push("canonicality_unverified");
+    if (Number(primary.chain_verified || 0) !== 1) reasons.push("chain_unverified");
+    if (Number(primary.token_verified || 0) !== 1) reasons.push("token_unverified");
+    if (Number(primary.recipient_verified || 0) !== 1) reasons.push("recipient_unverified");
+    if (String(primary.recognition_status || "pending") !== "eligible") reasons.push("recognition_not_eligible");
+    if (reasons.length > 0) {
+      pending.push({
+        invoice_id: invoice.id,
+        status: invoice.status,
+        payment_event_id: primary.id,
+        tx_hash: primary.tx_hash,
+        required_confirmations: required,
+        confirmations: Number(primary.confirmations || 0),
+        canonical_status: primary.canonical_status || "unknown",
+        reasons,
+      });
+    }
+  }
+  return pending;
+}
+
+function buildDailySettlementPreview({ storeId, businessDate, store, range, unresolvedReviewReason = "", adminApproval = false }) {
+  const allInvoices = db
+    .prepare(
+      `SELECT id, amount_jpy, paid_amount_jpyc, paid_amount_jpyc_base, status, business_date, settled_at
+       FROM invoices
+       WHERE store_id = ?
+         AND (business_date = ? OR (business_date IS NULL AND created_at BETWEEN ? AND ?))`
+    )
+    .all(storeId, businessDate, range.fromUtc, range.toUtc);
+  const activeInvoices = allInvoices.filter((row) => (
+    isTerminalActiveInvoiceStatus(row.status)
+    && !row.settled_at
+    && !hasProviderSettlementPath(row.id)
+  ));
+  const targetInvoices = allInvoices.filter((row) => !row.settled_at && ["paid", "review_required"].includes(String(row.status)));
+  const paidInvoices = targetInvoices.filter((row) => String(row.status) === "paid");
+  const reviewInvoices = targetInvoices.filter((row) => String(row.status) === "review_required");
+  const reviewInvoiceIds = reviewInvoices.map((row) => row.id);
+  const unresolvedPolicy = resolveSettlementUnresolvedReviewPolicy(store);
+  const refunds = db
+    .prepare(
+      `SELECT rr.id, rr.status, rr.invoice_id, rr.reason, rr.refund_amount_jpyc, rr.refund_tx_hash, rr.updated_at
+       FROM refund_requests rr
+       JOIN invoices i ON i.id = rr.invoice_id
+       WHERE i.store_id = ? AND rr.created_at BETWEEN ? AND ?`
+    )
+    .all(storeId, range.fromUtc, range.toUtc);
+  const unresolvedRefunds = refunds.filter((row) => isUnresolvedRefundStatus(row.status));
+  const refundCounts = {
+    requested: refunds.filter((row) => String(row.status) === "requested").length,
+    approved: refunds.filter((row) => String(row.status) === "approved").length,
+    recorded: refunds.filter((row) => String(row.status) === "recorded").length,
+    pending_verification: refunds.filter((row) => String(row.status) === "pending_verification").length,
+    verification_failed: refunds.filter((row) => String(row.status) === "verification_failed").length,
+    failed: refunds.filter((row) => String(row.status) === "failed").length,
+    completed: refunds.filter((row) => ["succeeded", "finalized"].includes(String(row.status))).length,
+  };
+  const integrityHeld = listIntegrityHeldInvoices(storeId, range);
+  const accountingFinalityPending = listAccountingFinalityPendingInvoices(storeId, { ...range, businessDate });
+  const blockers = [];
+  if (integrityHeld.length > 0) {
+    blockers.push({ code: "INTEGRITY_HOLD_ACTIVE", invoice_ids: integrityHeld.map((row) => row.id), details: integrityHeld });
+  }
+  if (activeInvoices.length > 0) {
+    blockers.push({ code: "ACTIVE_INVOICES_BLOCK_CLOSE", invoice_ids: activeInvoices.map((row) => row.id) });
+  }
+  if (unresolvedPolicy === "block" && reviewInvoices.length > 0) {
+    blockers.push({ code: "UNRESOLVED_REVIEWS", invoice_ids: reviewInvoiceIds });
+  }
+  if (unresolvedPolicy === "warn" && reviewInvoices.length > 0 && !adminApproval) {
+    blockers.push({ code: "ADMIN_APPROVAL_REQUIRED", invoice_ids: reviewInvoiceIds });
+  }
+  if (unresolvedPolicy === "allow" && reviewInvoices.length > 0 && !unresolvedReviewReason) {
+    blockers.push({ code: "UNRESOLVED_REVIEW_REASON_REQUIRED", invoice_ids: reviewInvoiceIds });
+  }
+  if (unresolvedRefunds.length > 0) {
+    blockers.push({
+      code: "UNRESOLVED_REFUNDS",
+      refund_ids: unresolvedRefunds.map((row) => row.id),
+      refund_counts: refundCounts,
+    });
+  }
+  if (accountingFinalityPending.length > 0) {
+    blockers.push({
+      code: "ACCOUNTING_FINALITY_PENDING",
+      invoice_ids: accountingFinalityPending.map((row) => row.invoice_id),
+      details: accountingFinalityPending,
+    });
+  }
+  const hardGate = evaluateSettlementHardGate({ storeId, businessDate, store, range });
+  blockers.push(...hardGate.blockers);
+  let totalPaidBase = 0n;
+  for (const row of paidInvoices) totalPaidBase += parseBaseUnitOrZero(row.paid_amount_jpyc_base);
+  return {
+    business_date: businessDate,
+    timezone: store.timezone,
+    contract_version: SETTLEMENT_EXPORT_CONTRACT_V2,
+    ready: blockers.length === 0,
+    blockers,
+    unresolved_review_policy: unresolvedPolicy,
+    totals: {
+      paid_invoice_count: paidInvoices.length,
+      invoice_count: targetInvoices.length,
+      review_count: reviewInvoices.length,
+      total_billed_jpy: targetInvoices.reduce((acc, row) => acc + Number(row.amount_jpy || 0), 0),
+      total_paid_jpyc: Number(formatJpyc(totalPaidBase.toString())),
+      total_paid_jpyc_base: totalPaidBase.toString(),
+      review_invoice_ids: reviewInvoiceIds,
+      refund_counts: refundCounts,
+      accounting_finality_pending_count: accountingFinalityPending.length,
+      hard_gate_blocker_count: hardGate.blockers.length,
+    },
+    counts: {
+      all_invoices: allInvoices.length,
+      active_invoices: activeInvoices.length,
+      unresolved_refunds: unresolvedRefunds.length,
+      integrity_holds: integrityHeld.length,
+      hard_gate_blockers: hardGate.blockers.length,
+    },
+    hard_gate: hardGate,
+  };
+}
+
 function integrityHoldApiResult(rows, action = "operation") {
   return {
     status: 409,
@@ -6635,8 +9158,16 @@ function hasVerifiedRefundFundingLineage(refund) {
   }
 
   const lineage = getRefundFundingLineage(refund?.id);
-  const acceptedStatuses = isProductionLikeRuntime() ? ["verified"] : ["recorded", "verified"];
-  if (!lineage || !acceptedStatuses.includes(String(lineage.status || ""))) return false;
+  if (!lineage) return false;
+  const finality = getRefundFundingFinalityState(lineage);
+  if (!finality.finalityConfirmed) return false;
+  // Production must expose the explicit terminal state. Development keeps a
+  // narrow compatibility path for legacy fixtures whose first verification
+  // already recorded finalized_at, while settlement still requires status
+  // 'finalized'. The status value alone is never sufficient.
+  if (isProductionLikeRuntime() ? !finality.settlementReady : !["verified", "finalized"].includes(finality.status)) {
+    return false;
+  }
   if (String(lineage.invoice_id || "") !== String(refund?.invoice_id || "")) return false;
   if (String(lineage.chain_id || "") !== String(refund?.refund_chain_id || "")) return false;
   const refundStoreId = String(
@@ -6664,13 +9195,36 @@ function hasVerifiedRefundFundingLineage(refund) {
   );
 }
 
-function buildRefundDestinationApprovalMessage({ invoiceId, refundToAddress, refundAmountBase, refundChainId }) {
+function refundApprovalDomain() {
+  try {
+    return new URL(APP_HOST).host.toLowerCase();
+  } catch (_error) {
+    return String(APP_HOST || "").trim().toLowerCase();
+  }
+}
+
+function buildRefundDestinationApprovalMessage({
+  merchantId,
+  storeId,
+  invoiceId,
+  payerAddress,
+  refundToAddress,
+  refundAmountBase,
+  refundChainId,
+  domain,
+  nonce,
+}) {
   return [
-    "JPYC refund destination approval v1",
+    "JPYC refund destination approval v2",
+    `domain:${String(domain || refundApprovalDomain()).toLowerCase()}`,
+    `merchant_id:${String(merchantId || "")}`,
+    `store_id:${String(storeId || "")}`,
     `invoice_id:${String(invoiceId)}`,
+    `payer_address:${String(payerAddress).toLowerCase()}`,
     `refund_to_address:${String(refundToAddress).toLowerCase()}`,
     `refund_amount_jpyc_base:${String(refundAmountBase)}`,
     `refund_chain_id:${String(refundChainId)}`,
+    `nonce:${String(nonce || "")}`,
   ].join("\n");
 }
 
@@ -6711,6 +9265,7 @@ function buildRefundEvidenceResponse(refund) {
     executed_wallet: refund.executed_wallet || null,
     refund_tx_hash: refund.refund_tx_hash || null,
     refund_tx_log_index: refund.refund_tx_log_index ?? null,
+    blockchain_transfer_id: refund.blockchain_transfer_id || null,
     refund_amount_jpyc: refund.refund_amount_jpyc,
     refund_amount: refund.refund_amount_jpyc,
     refund_amount_jpyc_base: refund.refund_amount_jpyc_base,
@@ -6722,6 +9277,12 @@ function buildRefundEvidenceResponse(refund) {
     audit_log_refs: auditRefs,
     chain_id: refund.chain_id || refund.refund_chain_id || null,
     token_contract: refund.token_contract || null,
+    canonical_status: refund.canonical_status || "unknown",
+    finality_confirmations: Number(refund.finality_confirmations || 0),
+    finality_required_confirmations: Number(refund.finality_required_confirmations || 0),
+    reorg_hold: Number(refund.reorg_hold || 0) === 1,
+    reorg_hold_at: refund.reorg_hold_at || null,
+    finalized_at: refund.finalized_at || null,
     from_address: refund.from_address || null,
     to_address: refund.to_address || refund.refund_to_address || null,
     expected_from_address: refund.expected_from_address || null,
@@ -6737,6 +9298,13 @@ function buildRefundEvidenceResponse(refund) {
           sweep_tx_log_index: fundingLineage.sweep_tx_log_index ?? null,
           sweep_amount_jpyc_base: fundingLineage.sweep_amount_jpyc_base,
           status: fundingLineage.status,
+          block_hash: fundingLineage.block_hash || null,
+          canonical_status: fundingLineage.canonical_status || "unknown",
+          confirmations: Number(fundingLineage.confirmations || 0),
+          finality_required_confirmations: Number(fundingLineage.finality_required_confirmations || 0),
+          finalized_at: fundingLineage.finalized_at || null,
+          reorg_hold: Number(fundingLineage.reorg_hold || 0) === 1,
+          reorg_hold_at: fundingLineage.reorg_hold_at || null,
           evidence_note_path: fundingLineage.evidence_note_path || null,
           created_at: fundingLineage.created_at,
           updated_at: fundingLineage.updated_at,
@@ -6752,6 +9320,13 @@ function buildRefundEvidenceResponse(refund) {
             sweep_tx_log_index: primaryFundingSweep.sweep_tx_log_index ?? null,
             sweep_amount_jpyc_base: primaryFundingSweep.sweep_amount_jpyc_base,
             status: primaryFundingSweep.status,
+            block_hash: primaryFundingSweep.block_hash || null,
+            canonical_status: primaryFundingSweep.canonical_status || "unknown",
+            confirmations: Number(primaryFundingSweep.confirmations || 0),
+            finality_required_confirmations: Number(primaryFundingSweep.finality_required_confirmations || 0),
+            finalized_at: primaryFundingSweep.finalized_at || null,
+            reorg_hold: Number(primaryFundingSweep.reorg_hold || 0) === 1,
+            reorg_hold_at: primaryFundingSweep.reorg_hold_at || null,
             evidence_note_path: primaryFundingSweep.evidence_note_path || null,
             created_at: primaryFundingSweep.created_at,
             updated_at: primaryFundingSweep.updated_at,
@@ -6770,6 +9345,13 @@ function buildRefundEvidenceResponse(refund) {
       sweep_tx_log_index: sweep.sweep_tx_log_index ?? null,
       sweep_amount_jpyc_base: sweep.sweep_amount_jpyc_base,
       status: sweep.status,
+      block_hash: sweep.block_hash || null,
+      canonical_status: sweep.canonical_status || "unknown",
+      confirmations: Number(sweep.confirmations || 0),
+      finality_required_confirmations: Number(sweep.finality_required_confirmations || 0),
+      finalized_at: sweep.finalized_at || null,
+      reorg_hold: Number(sweep.reorg_hold || 0) === 1,
+      reorg_hold_at: sweep.reorg_hold_at || null,
       evidence_note_path: sweep.evidence_note_path || null,
       created_at: sweep.created_at,
       updated_at: sweep.updated_at,
@@ -6782,7 +9364,7 @@ function buildRefundEvidenceResponse(refund) {
     block_timestamp: refund.block_timestamp || null,
     detected_at: refund.detected_at || null,
     verified_at: refund.verified_at || null,
-    verified_onchain: refund.status === "succeeded" || refund.status === "verified",
+    verified_onchain: ["succeeded", "verified", "finalized"].includes(String(refund.status)),
   };
 }
 
@@ -6936,7 +9518,26 @@ function verifyAuditChain() {
   };
 }
 
-function idempotent(req, res, endpoint, actorId, logicFn) {
+function replayStoredIdempotencyResponse(res, record, label) {
+  const storedBytes = record?.response_body_bytes;
+  if (storedBytes && typeof storedBytes.length === "number" && storedBytes.length > 0) {
+    const headers = parseJsonWithWarning(record.response_headers_json, `${label}.response_headers_json`, {});
+    if (headers && typeof headers === "object" && !Array.isArray(headers)) {
+      for (const [name, value] of Object.entries(headers)) {
+        if (value == null) continue;
+        res.setHeader(name, value);
+      }
+    }
+    return res.status(Number(record.response_status ?? record.status_code)).send(Buffer.from(storedBytes));
+  }
+  const parsedResponse = parseJsonWithWarning(record.response_json, `${label}.response_json`, null);
+  if (!parsedResponse || typeof parsedResponse !== "object") {
+    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+  }
+  return res.status(record.status_code).json(parsedResponse);
+}
+
+function idempotentWithLease(req, res, endpoint, actorId, logicFn) {
   const key = req.header("Idempotency-Key");
   if (!key) {
     console.warn(
@@ -6954,65 +9555,117 @@ function idempotent(req, res, endpoint, actorId, logicFn) {
 
   cleanupIdempotencyRecords();
   const requestHash = hashJson(req.body);
-  const existing = db
-    .prepare(
-      `SELECT status_code, response_json, request_hash
-       FROM idempotency_records
-       WHERE actor_id = ? AND endpoint = ? AND idempotency_key = ? AND expires_at > ?`
-    )
-    .get(actorId, endpoint, key, nowIso());
-
-  if (existing) {
-    if (existing.request_hash !== requestHash) {
-      return jsonError(res, 409, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different payload");
-    }
-    const parsedResponse = parseJsonWithWarning(existing.response_json, "idempotency.response_json", null);
-    if (!parsedResponse || typeof parsedResponse !== "object") {
-      console.error(
-        JSON.stringify({
-          ts: nowIso(),
-          level: "error",
-          type: "idempotency.response_parse_failed",
-          endpoint,
-          request_id: requestIdFromReq(req),
-          actor_id: actorId,
-        })
-      );
-      return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
-    }
-    return res.status(existing.status_code).json(parsedResponse);
-  }
-
-  let outcome;
+  let claim;
   try {
-    const execute = db.transaction(() => {
-      const concurrentExisting = db
+    const executeClaim = db.transaction(() => {
+      const existing = db
         .prepare(
-          `SELECT status_code, response_json, request_hash
+          `SELECT id, status, status_code, response_json, request_hash, payload_hash,
+                  response_status, response_headers_json, response_body_bytes, lease_expires_at
            FROM idempotency_records
            WHERE actor_id = ? AND endpoint = ? AND idempotency_key = ? AND expires_at > ?`
         )
         .get(actorId, endpoint, key, nowIso());
-      if (concurrentExisting) {
-        return {
-          kind: concurrentExisting.request_hash === requestHash ? "replay" : "conflict",
-          existing: concurrentExisting,
-        };
+      if (existing) {
+        const storedRequestHash = existing.request_hash || existing.payload_hash || null;
+        const isPending = existing.status === "in_progress"
+          || (existing.status_code === IDEMPOTENCY_PENDING_STATUS_CODE
+            && existing.response_json === IDEMPOTENCY_PENDING_RESPONSE_JSON);
+        const leaseExpiresAt = existing.lease_expires_at ? new Date(existing.lease_expires_at).getTime() : Number.NaN;
+        const leaseExpired = !Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= Date.now();
+        if (storedRequestHash === requestHash && isPending && leaseExpired) {
+          const claimOwner = `${process.pid}:${existing.id}:${Date.now()}`;
+          const leaseExpires = new Date(Date.now() + IDEMPOTENCY_LEASE_SEC * 1000).toISOString();
+          const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
+          const reclaimed = db.prepare(
+            `UPDATE idempotency_records
+             SET status = 'in_progress', status_code = ?, response_json = ?,
+                 payload_hash = ?, lease_owner = ?, lease_expires_at = ?,
+                 response_status = NULL, response_headers_json = ?, response_body_bytes = NULL,
+                 completed_at = NULL, expires_at = ?, record_version = COALESCE(record_version, 1) + 1
+             WHERE id = ? AND status_code = ? AND response_json = ?
+               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`
+          ).run(
+            IDEMPOTENCY_PENDING_STATUS_CODE,
+            IDEMPOTENCY_PENDING_RESPONSE_JSON,
+            requestHash,
+            claimOwner,
+            leaseExpires,
+            JSON.stringify({ "content-type": "application/json; charset=utf-8" }),
+            expiresAt,
+            existing.id,
+            IDEMPOTENCY_PENDING_STATUS_CODE,
+            IDEMPOTENCY_PENDING_RESPONSE_JSON,
+            nowIso(),
+          );
+          if (reclaimed.changes === 1) return { kind: "claimed", claimId: existing.id };
+        }
+        return { kind: "existing", record: { ...existing, request_hash: storedRequestHash } };
       }
 
-      const result = logicFn() || {};
-      const statusCode = result.status ?? 200;
-      const responseBody = result.body ?? {};
+      const claimId = uuid();
       const createdAt = nowIso();
       const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
       db.prepare(
         `INSERT INTO idempotency_records
-        (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(uuid(), actorId, endpoint, key, requestHash, statusCode, JSON.stringify(responseBody), createdAt, expiresAt);
-      return { kind: "created", statusCode, responseBody };
+        (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json,
+         status, payload_hash, lease_owner, lease_expires_at, response_status,
+         response_headers_json, response_body_bytes, created_at, expires_at, record_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, NULL, ?, NULL, ?, ?, 1)`
+      ).run(
+        claimId,
+        actorId,
+        endpoint,
+        key,
+        requestHash,
+        IDEMPOTENCY_PENDING_STATUS_CODE,
+        IDEMPOTENCY_PENDING_RESPONSE_JSON,
+        requestHash,
+        `${process.pid}:${claimId}`,
+        new Date(Date.now() + IDEMPOTENCY_LEASE_SEC * 1000).toISOString(),
+        JSON.stringify({ "content-type": "application/json; charset=utf-8" }),
+        createdAt,
+        expiresAt,
+      );
+      return { kind: "claimed", claimId };
     });
-    outcome = execute.immediate();
+    claim = executeClaim.immediate();
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        ts: nowIso(),
+        level: "error",
+        type: "idempotency.claim_failed",
+        endpoint,
+        request_id: requestIdFromReq(req),
+        actor_id: actorId,
+        message: String(error.message || error),
+      })
+    );
+    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+  }
+
+  if (claim.kind === "existing") {
+    const existing = claim.record;
+    if (existing.request_hash !== requestHash) {
+      return jsonError(res, 409, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different payload");
+    }
+    if (
+      existing.status === "in_progress"
+      || (existing.status_code === IDEMPOTENCY_PENDING_STATUS_CODE
+        && existing.response_json === IDEMPOTENCY_PENDING_RESPONSE_JSON)
+    ) {
+      res.setHeader("retry-after", "1");
+      return jsonError(res, 409, "IDEMPOTENCY_IN_PROGRESS", "A request with this idempotency key is still in progress", {
+        retryable: true,
+      });
+    }
+    return replayStoredIdempotencyResponse(res, existing, "idempotency");
+  }
+
+  let result;
+  try {
+    result = logicFn() || {};
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -7025,20 +9678,48 @@ function idempotent(req, res, endpoint, actorId, logicFn) {
         message: String(error.message || error),
       })
     );
-    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
+    const responseBody = { error: { code: "INTERNAL_ERROR", message: "Unexpected server error", details: {} } };
+    try {
+      finalizeAsyncIdempotencyClaim(claim.claimId, 500, responseBody);
+    } catch (finalizeError) {
+      console.error(
+        JSON.stringify({
+          ts: nowIso(),
+          level: "error",
+          type: "idempotency.finalize_failed",
+          endpoint,
+          request_id: requestIdFromReq(req),
+          actor_id: actorId,
+          message: String(finalizeError.message || finalizeError),
+        })
+      );
+    }
+    return res.status(500).json(responseBody);
   }
 
-  if (outcome.kind === "conflict") {
-    return jsonError(res, 409, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different payload");
+  const statusCode = result.status ?? 200;
+  const responseBody = result.body ?? {};
+  try {
+    finalizeAsyncIdempotencyClaim(claim.claimId, statusCode, responseBody);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        ts: nowIso(),
+        level: "error",
+        type: "idempotency.finalize_failed",
+        endpoint,
+        request_id: requestIdFromReq(req),
+        actor_id: actorId,
+        message: String(error.message || error),
+      })
+    );
+    return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
   }
-  if (outcome.kind === "replay") {
-    const parsedResponse = parseJsonWithWarning(outcome.existing.response_json, "idempotency.concurrent_response_json", null);
-    if (!parsedResponse || typeof parsedResponse !== "object") {
-      return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
-    }
-    return res.status(outcome.existing.status_code).json(parsedResponse);
-  }
-  return res.status(outcome.statusCode).json(outcome.responseBody);
+  return res.status(statusCode).json(responseBody);
+}
+
+function idempotent(req, res, endpoint, actorId, logicFn) {
+  return idempotentWithLease(req, res, endpoint, actorId, logicFn);
 }
 
 const IDEMPOTENCY_PENDING_STATUS_CODE = 0;
@@ -7049,11 +9730,17 @@ function finalizeAsyncIdempotencyClaim(claimId, statusCode, responseBody) {
   const responseJson = JSON.stringify(responseBody);
   const updated = db.prepare(
     `UPDATE idempotency_records
-     SET status_code = ?, response_json = ?, expires_at = ?
+     SET status = 'completed', status_code = ?, response_json = ?, response_status = ?,
+         response_headers_json = ?, response_body_bytes = ?, completed_at = ?,
+         lease_owner = NULL, lease_expires_at = NULL, expires_at = ?
      WHERE id = ? AND status_code = ? AND response_json = ?`
   ).run(
     statusCode,
     responseJson,
+    statusCode,
+    JSON.stringify({ "content-type": "application/json; charset=utf-8" }),
+    Buffer.from(responseJson, "utf8"),
+    nowIso(),
     expiresAt,
     claimId,
     IDEMPOTENCY_PENDING_STATUS_CODE,
@@ -7079,20 +9766,58 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
     const executeClaim = db.transaction(() => {
       const existing = db
         .prepare(
-          `SELECT id, status_code, response_json, request_hash
+          `SELECT id, status, status_code, response_json, request_hash, payload_hash,
+                  response_status, response_headers_json, response_body_bytes, lease_expires_at
            FROM idempotency_records
            WHERE actor_id = ? AND endpoint = ? AND idempotency_key = ? AND expires_at > ?`
         )
         .get(actorId, endpoint, key, nowIso());
-      if (existing) return { kind: "existing", record: existing };
+      if (existing) {
+        const storedRequestHash = existing.request_hash || existing.payload_hash || null;
+        const isPending = existing.status === "in_progress"
+          || (existing.status_code === IDEMPOTENCY_PENDING_STATUS_CODE
+            && existing.response_json === IDEMPOTENCY_PENDING_RESPONSE_JSON);
+        const leaseExpiresAt = existing.lease_expires_at ? new Date(existing.lease_expires_at).getTime() : NaN;
+        const leaseExpired = !Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= Date.now();
+        if (storedRequestHash === requestHash && isPending && leaseExpired) {
+          const claimOwner = `${process.pid}:${existing.id}:${Date.now()}`;
+          const leaseExpires = new Date(Date.now() + IDEMPOTENCY_LEASE_SEC * 1000).toISOString();
+          const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
+          const reclaimed = db.prepare(
+            `UPDATE idempotency_records
+             SET status = 'in_progress', status_code = ?, response_json = ?,
+                 payload_hash = ?, lease_owner = ?, lease_expires_at = ?,
+                 response_status = NULL, response_headers_json = ?, response_body_bytes = NULL,
+                 completed_at = NULL, expires_at = ?, record_version = COALESCE(record_version, 1) + 1
+             WHERE id = ? AND status_code = ? AND response_json = ?
+               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`
+          ).run(
+            IDEMPOTENCY_PENDING_STATUS_CODE,
+            IDEMPOTENCY_PENDING_RESPONSE_JSON,
+            requestHash,
+            claimOwner,
+            leaseExpires,
+            JSON.stringify({ "content-type": "application/json; charset=utf-8" }),
+            expiresAt,
+            existing.id,
+            IDEMPOTENCY_PENDING_STATUS_CODE,
+            IDEMPOTENCY_PENDING_RESPONSE_JSON,
+            nowIso(),
+          );
+          if (reclaimed.changes === 1) return { kind: "claimed", claimId: existing.id };
+        }
+        return { kind: "existing", record: { ...existing, request_hash: storedRequestHash } };
+      }
 
       const claimId = uuid();
       const createdAt = nowIso();
       const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
       db.prepare(
         `INSERT INTO idempotency_records
-        (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (id, actor_id, endpoint, idempotency_key, request_hash, status_code, response_json,
+         status, payload_hash, lease_owner, lease_expires_at, response_status,
+         response_headers_json, response_body_bytes, created_at, expires_at, record_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, NULL, ?, NULL, ?, ?, 1)`
       ).run(
         claimId,
         actorId,
@@ -7101,6 +9826,10 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
         requestHash,
         IDEMPOTENCY_PENDING_STATUS_CODE,
         IDEMPOTENCY_PENDING_RESPONSE_JSON,
+        requestHash,
+        `${process.pid}:${claimId}`,
+        new Date(Date.now() + IDEMPOTENCY_LEASE_SEC * 1000).toISOString(),
+        JSON.stringify({ "content-type": "application/json; charset=utf-8" }),
         createdAt,
         expiresAt
       );
@@ -7136,11 +9865,7 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
         retryable: true,
       });
     }
-    const parsedResponse = parseJsonWithWarning(existing.response_json, "idempotency_async.response_json", null);
-    if (!parsedResponse || typeof parsedResponse !== "object") {
-      return jsonError(res, 500, "INTERNAL_ERROR", "Unexpected server error");
-    }
-    return res.status(existing.status_code).json(parsedResponse);
+    return replayStoredIdempotencyResponse(res, existing, "idempotency_async");
   }
 
   let result;
@@ -7202,11 +9927,12 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
 const clientsByTerminal = new Map();
 function sendEvent(terminalId, event, payload) {
   const clients = clientsByTerminal.get(terminalId);
-  if (!clients || clients.size === 0) return;
+  if (!clients || clients.size === 0) return 0;
   const lines = [`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`];
   if (event === "invoice.updated") {
     lines.push(`event: status_changed\ndata: ${JSON.stringify(payload)}\n\n`);
   }
+  let delivered = 0;
   for (const client of clients) {
     if (payload?.invoiceId && client.invoiceId && String(client.invoiceId) !== String(payload.invoiceId)) {
       continue;
@@ -7214,16 +9940,98 @@ function sendEvent(terminalId, event, payload) {
     for (const line of lines) {
       client.res.write(line);
     }
+    delivered += 1;
   }
+  return delivered;
+}
+
+const OUTBOX_WORKER_ID = `app-outbox:${process.pid}:${uuid()}`;
+
+function dispatchPaymentNotificationOutboxOnce({ limit = 50 } = {}) {
+  const now = nowIso();
+  db.prepare(
+    `UPDATE payment_notification_outbox
+     SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+     WHERE status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`
+  ).run(now, now);
+  const rows = db.prepare(
+    `SELECT * FROM payment_notification_outbox
+     WHERE status = 'pending'
+       AND available_at <= ?
+       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+     ORDER BY created_at ASC, id ASC
+     LIMIT ?`
+  ).all(now, now, Math.max(1, Math.min(Number(limit) || 50, 200)));
+  const result = { claimed: 0, sent: 0, retried: 0, dead_lettered: 0 };
+  for (const row of rows) {
+    const leaseUntil = new Date(Date.now() + NOTIFICATION_OUTBOX_LEASE_SEC * 1000).toISOString();
+    const claimed = db.prepare(
+      `UPDATE payment_notification_outbox
+       SET status = 'processing', attempt_count = attempt_count + 1,
+           lease_owner = ?, lease_expires_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'pending'
+         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`
+    ).run(OUTBOX_WORKER_ID, leaseUntil, now, row.id, now);
+    if (claimed.changes !== 1) continue;
+    result.claimed += 1;
+    triggerTestCrashFaultInjection("payment_outbox_after_lease_claim");
+    const attempt = Number(row.attempt_count || 0) + 1;
+    try {
+      const payload = JSON.parse(String(row.payload_json || "{}"));
+      const invoice = db.prepare(`SELECT id, terminal_id FROM invoices WHERE id = ?`).get(row.invoice_id);
+      if (!invoice) throw new Error("OUTBOX_INVOICE_NOT_FOUND");
+      // The outbox is a delivery record, not merely a parsed payload record.
+      // Keep it retryable when the intended terminal has no matching SSE
+      // client; otherwise an offline terminal would silently lose the event.
+      const delivered = sendEvent(invoice.terminal_id, "payment.notification", {
+        ...payload,
+        invoiceId: invoice.id,
+        outbox_id: row.id,
+      });
+      if (delivered < 1) throw new Error("OUTBOX_NO_ACTIVE_SSE_CLIENT");
+      db.prepare(
+        `UPDATE payment_notification_outbox
+         SET status = 'sent', sent_at = ?, last_error = NULL,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?`
+      ).run(nowIso(), nowIso(), row.id, OUTBOX_WORKER_ID);
+      result.sent += 1;
+    } catch (error) {
+      const message = String(error.message || error).slice(0, 240);
+      const deadLetter = attempt >= NOTIFICATION_OUTBOX_MAX_ATTEMPTS;
+      const nextAvailableAt = deadLetter
+        ? null
+        : new Date(Date.now() + NOTIFICATION_OUTBOX_RETRY_BASE_SEC * 1000 * 2 ** Math.min(attempt - 1, 8)).toISOString();
+      db.prepare(
+        `UPDATE payment_notification_outbox
+         SET status = ?, available_at = COALESCE(?, available_at),
+             last_error = ?, dead_lettered_at = CASE WHEN ? = 'dead_letter' THEN ? ELSE dead_lettered_at END,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?`
+      ).run(
+        deadLetter ? "dead_letter" : "pending",
+        nextAvailableAt,
+        message,
+        deadLetter ? "dead_letter" : "pending",
+        deadLetter ? nowIso() : null,
+        nowIso(),
+        row.id,
+        OUTBOX_WORKER_ID,
+      );
+      if (deadLetter) result.dead_lettered += 1;
+      else result.retried += 1;
+    }
+  }
+  return result;
 }
 
 function parseBaseUnitOrZero(value) {
   const raw = String(value ?? "").trim();
-  if (!raw || !/^-?\d+$/.test(raw)) return 0n;
+  if (!raw || !/^\d+$/.test(raw)) throw ledgerIntegrityError("base_unit");
   try {
     return BigInt(raw);
-  } catch (_error) {
-    return 0n;
+  } catch (error) {
+    throw ledgerIntegrityError("base_unit", error);
   }
 }
 
@@ -7245,6 +10053,7 @@ function normalizeReviewResolutionStatus(value, fallback = null) {
 
 const REVIEW_DISPOSITIONS = new Set([
   "accepted_as_paid",
+  "accounting_adjustment",
   "cancelled_no_sale",
   "refunded",
   "written_off",
@@ -7285,12 +10094,12 @@ function appendReviewActionHistory(existingHistoryJson, actionEntry) {
 }
 
 function buildReviewCasePayload(invoice, reasonType, context = {}) {
-  const reasonCode = normalizeReviewReasonCode(reasonType);
-  const billedAmountBase = String(invoice?.amount_jpyc_base || "0");
-  const paidAmountBase = String(context.eventAmountBase ?? invoice?.paid_amount_jpyc_base ?? "0");
+  const reasonCode = normalizeReviewReasonCode(context.reasonType || reasonType);
+  const billedAmountBase = String(invoice?.amount_jpyc_base ?? "");
+  const paidAmountBase = String(context.eventAmountBase ?? invoice?.paid_amount_jpyc_base ?? "");
   const diff = (parseBaseUnitOrZero(paidAmountBase) - parseBaseUnitOrZero(billedAmountBase)).toString();
   const refundable = computeReviewRefundableCandidateBase(reasonCode, billedAmountBase, paidAmountBase);
-  const blockTimestamp = context.blockTimestamp || context.observedAt || nowIso();
+  const blockTimestamp = context.blockTimestamp || null;
   const detectedAt = context.detectedAt || nowIso();
   return {
     reasonCode,
@@ -7308,9 +10117,81 @@ function buildReviewCasePayload(invoice, reasonType, context = {}) {
 }
 
 function upsertReviewCase(invoice, reasonType, context = {}) {
-  const existing = db.prepare(`SELECT * FROM review_cases WHERE invoice_id = ?`).get(invoice.id);
   const ts = nowIso();
   const payload = buildReviewCasePayload(invoice, reasonType, context);
+  const incidentType = String(context.incidentType || payload.reasonCode || REVIEW_REASON_CODES.OTHER).trim() || REVIEW_REASON_CODES.OTHER;
+  const incidentEvidence = {
+    invoice_id: String(invoice.id),
+    invoice_version: Number(invoice.invoice_version || invoice.version || 1),
+    incident_type: incidentType,
+    reason_code: payload.reasonCode,
+    transfer_id: context.transferId || null,
+    tx_hash: payload.txHash || null,
+    log_index: context.logIndex ?? null,
+    event_amount_jpyc_base: payload.paidAmountBase,
+    block_timestamp: payload.blockTimestamp,
+    audit_ref: payload.auditRef,
+  };
+  const evidenceFingerprint = sha256(JSON.stringify(incidentEvidence));
+  let incident = db.prepare(
+    `SELECT * FROM review_incidents
+     WHERE invoice_id = ? AND incident_type = ? AND evidence_fingerprint = ?`
+  ).get(invoice.id, incidentType, evidenceFingerprint);
+  if (!incident) {
+    const incidentId = uuid();
+    db.prepare(
+      `INSERT INTO review_incidents
+       (id, invoice_id, invoice_version, incident_type, evidence_fingerprint, primary_reason, status, resolution_status, disposition, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, ?)`
+    ).run(
+      incidentId,
+      invoice.id,
+      Number(invoice.invoice_version || invoice.version || 1),
+      incidentType,
+      evidenceFingerprint,
+      payload.reasonCode,
+      payload.resolutionStatus || "pending",
+      ts,
+    );
+    incident = db.prepare(`SELECT * FROM review_incidents WHERE id = ?`).get(incidentId);
+    db.prepare(
+      `INSERT INTO review_incident_reasons
+       (id, review_incident_id, reason_code, priority, evidence_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(uuid(), incidentId, payload.reasonCode, 0, JSON.stringify(incidentEvidence), ts);
+  }
+  if (context.transferId) {
+    db.prepare(
+      `INSERT INTO review_incident_transfers
+       (review_incident_id, blockchain_transfer_id, relation_type, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(review_incident_id, blockchain_transfer_id, relation_type) DO NOTHING`
+    ).run(incident.id, String(context.transferId), String(context.transferRelation || "primary_evidence"), ts);
+  }
+  const incidentEvent = {
+    incident_type: incidentType,
+    reason_code: payload.reasonCode,
+    invoice_version: Number(invoice.invoice_version || invoice.version || 1),
+    tx_hash: payload.txHash,
+    block_timestamp: payload.blockTimestamp,
+    detected_at: payload.detectedAt,
+    transfer_id: context.transferId || null,
+  };
+  db.prepare(
+    `INSERT INTO review_incident_events
+     (id, review_incident_id, event_type, actor_id, payload_hash, payload_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    uuid(),
+    incident.id,
+    "incident.observed",
+    String(context.actorId || "system"),
+    `sha256:${sha256(JSON.stringify(incidentEvent))}`,
+    JSON.stringify(incidentEvent),
+    ts,
+  );
+
+  const existing = db.prepare(`SELECT * FROM review_cases WHERE invoice_id = ?`).get(invoice.id);
   const actionEntry = {
     at: ts,
     action: "review.detected",
@@ -7318,8 +10199,13 @@ function upsertReviewCase(invoice, reasonType, context = {}) {
     tx_hash: payload.txHash,
     block_timestamp: payload.blockTimestamp,
     detected_at: payload.detectedAt,
+    incident_id: incident.id,
+    incident_type: incidentType,
   };
-  if (existing) {
+  const projectionCanUpdate = !existing
+    || ["open", "in_progress"].includes(String(existing.status || ""))
+    || context.allowProjectionReopen === true;
+  if (existing && projectionCanUpdate) {
     const actionHistory = appendReviewActionHistory(existing.action_history_json, actionEntry);
     db.prepare(
       `UPDATE review_cases
@@ -7355,7 +10241,20 @@ function upsertReviewCase(invoice, reasonType, context = {}) {
       ts,
       existing.id
     );
-    return db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(existing.id);
+    return {
+      ...db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(existing.id),
+      incident_id: incident.id,
+      incident_type: incidentType,
+      evidence_fingerprint: evidenceFingerprint,
+    };
+  }
+  if (existing) {
+    return {
+      ...existing,
+      incident_id: incident.id,
+      incident_type: incidentType,
+      evidence_fingerprint: evidenceFingerprint,
+    };
   }
   const reviewId = uuid();
   const actionHistory = JSON.stringify([actionEntry]);
@@ -7383,7 +10282,498 @@ function upsertReviewCase(invoice, reasonType, context = {}) {
     ts,
     ts
   );
-  return db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(reviewId);
+  return {
+    ...db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(reviewId),
+    incident_id: incident.id,
+    incident_type: incidentType,
+    evidence_fingerprint: evidenceFingerprint,
+  };
+}
+
+function canAutoResolveReviewAsPaid(invoice, primaryTransferId = null) {
+  if (!invoice || Number(invoice.integrity_hold || 0) === 1) return false;
+  if (!primaryTransferId) return false;
+  const currentInvoiceVersion = Number(invoice.invoice_version || invoice.version || 1);
+  if (!Number.isSafeInteger(currentInvoiceVersion) || currentInvoiceVersion < 1) return false;
+  const primaryTransfer = findCanonicalRecognizedTransfer(invoice);
+  if (!primaryTransfer || String(primaryTransfer.id) !== String(primaryTransferId)) return false;
+  const incidents = db.prepare(
+    `SELECT * FROM review_incidents
+     WHERE invoice_id = ? AND status IN ('open', 'in_progress')
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoice.id);
+  const allowedIncidentTypes = new Set([
+    "AWAITING_CONFIRMATIONS",
+    "CONFIRMATIONS_PENDING",
+    "awaiting_confirmations",
+  ]);
+  if (incidents.length === 0) return false;
+  if (incidents.some((incident) => !allowedIncidentTypes.has(String(incident.incident_type || "")))) {
+    return false;
+  }
+  if (incidents.some((incident) => Number(incident.invoice_version || 0) !== currentInvoiceVersion)) {
+    return false;
+  }
+  if (incidents.length > 0) {
+    const linked = db.prepare(
+      `SELECT 1
+       FROM review_incident_transfers rit
+       JOIN review_incidents ri ON ri.id = rit.review_incident_id
+       WHERE ri.invoice_id = ? AND ri.status IN ('open', 'in_progress')
+         AND rit.blockchain_transfer_id = ?
+       LIMIT 1`
+    ).get(invoice.id, String(primaryTransferId));
+    if (!linked) return false;
+  }
+  const legacy = db.prepare(
+    `SELECT * FROM review_cases WHERE invoice_id = ? AND status IN ('open', 'in_progress')`
+  ).get(invoice.id);
+  if (legacy && !allowedIncidentTypes.has(String(legacy.reason_type || ""))
+    && !(String(legacy.reason_type || "") === REVIEW_REASON_CODES.OTHER
+      && /confirm|確認/i.test(String(legacy.suggested_action || "")))) {
+    return false;
+  }
+  // The legacy review_cases row is only a projection.  It may be resolved
+  // together with the exact confirmation incident, but an unrelated or
+  // historical incident must keep the invoice under review.
+  return true;
+}
+
+function resolveEligibleReviewIncidentsAsPaid({
+  invoice,
+  primaryTransferId = null,
+  actorId = "chain-monitor",
+  requestId = null,
+  idempotencyKey = null,
+  ip = null,
+}) {
+  if (!canAutoResolveReviewAsPaid(invoice, primaryTransferId)) {
+    return { reviewIds: [], incidentIds: [] };
+  }
+  const timestamp = nowIso();
+  const allowedIncidentTypes = new Set([
+    "AWAITING_CONFIRMATIONS",
+    "CONFIRMATIONS_PENDING",
+    "awaiting_confirmations",
+  ]);
+  const eligibleIncidentIds = new Set(
+    db.prepare(
+      `SELECT ri.id
+       FROM review_incidents ri
+       JOIN review_incident_transfers rit ON rit.review_incident_id = ri.id
+       WHERE ri.invoice_id = ?
+         AND ri.status IN ('open', 'in_progress')
+         AND ri.invoice_version = ?
+         AND ri.incident_type IN ('AWAITING_CONFIRMATIONS', 'CONFIRMATIONS_PENDING', 'awaiting_confirmations')
+         AND rit.blockchain_transfer_id = ?`
+    ).all(
+      invoice.id,
+      Number(invoice.invoice_version || invoice.version || 1),
+      String(primaryTransferId),
+    ).map((row) => String(row.id))
+  );
+  if (eligibleIncidentIds.size === 0) return { reviewIds: [], incidentIds: [] };
+  const reviewRows = db.prepare(
+    `SELECT * FROM review_cases
+     WHERE invoice_id = ? AND status IN ('open', 'in_progress')
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoice.id);
+  const resolvedReviewIds = [];
+  for (const review of reviewRows) {
+    db.prepare(
+      `UPDATE review_cases
+       SET status = 'resolved',
+           resolution_status = 'settled',
+           disposition = 'accepted_as_paid',
+           resolution_note = COALESCE(resolution_note, 'payment_total_confirmed'),
+           resolved_at = ?,
+           updated_at = ?
+       WHERE id = ? AND status IN ('open', 'in_progress')`
+    ).run(timestamp, timestamp, review.id);
+    const afterReview = db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(review.id);
+    if (afterReview?.status === "resolved") {
+      resolvedReviewIds.push(review.id);
+      audit({
+        storeId: invoice.store_id,
+        actorType: "system",
+        actorId,
+        action: "review.auto_resolved_as_paid",
+        targetType: "review",
+        targetId: review.id,
+        requestId,
+        idempotencyKey,
+        beforeState: review,
+        afterState: afterReview,
+        ip,
+      });
+    }
+  }
+
+  const incidents = db.prepare(
+    `SELECT * FROM review_incidents
+     WHERE invoice_id = ? AND status IN ('open', 'in_progress')
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoice.id);
+  const resolvedIncidentIds = [];
+  for (const incident of incidents) {
+    if (!allowedIncidentTypes.has(String(incident.incident_type || ""))) continue;
+    if (!eligibleIncidentIds.has(String(incident.id))) continue;
+    db.prepare(
+      `UPDATE review_incidents
+       SET status = 'resolved', resolution_status = 'settled',
+           disposition = 'accepted_as_paid', resolved_at = ?
+       WHERE id = ? AND status IN ('open', 'in_progress')`
+    ).run(timestamp, incident.id);
+    const payload = {
+      incident_id: incident.id,
+      invoice_id: String(invoice.id),
+      review_case_id: resolvedReviewIds[0] || null,
+      reason_code: normalizeReviewReasonCode(incident.primary_reason || incident.incident_type),
+      status: "resolved",
+      resolution_status: "settled",
+      disposition: "accepted_as_paid",
+      actor_id: actorId,
+      occurred_at: timestamp,
+      primary_transfer_id: primaryTransferId || null,
+    };
+    db.prepare(
+      `INSERT INTO review_incident_events
+       (id, review_incident_id, event_type, actor_id, payload_hash, payload_json, created_at)
+       VALUES (?, ?, 'incident.resolved', ?, ?, ?, ?)`
+    ).run(
+      uuid(),
+      incident.id,
+      actorId,
+      `sha256:${sha256(JSON.stringify(payload))}`,
+      JSON.stringify(payload),
+      timestamp,
+    );
+    resolvedIncidentIds.push(incident.id);
+    audit({
+      storeId: invoice.store_id,
+      actorType: "system",
+      actorId,
+      action: "review_incident.auto_resolved_as_paid",
+      targetType: "review_incident",
+      targetId: incident.id,
+      requestId,
+      idempotencyKey,
+      beforeState: incident,
+      afterState: db.prepare(`SELECT * FROM review_incidents WHERE id = ?`).get(incident.id),
+      ip,
+    });
+  }
+  return { reviewIds: resolvedReviewIds, incidentIds: resolvedIncidentIds };
+}
+
+function findCanonicalRecognizedTransfer(invoice) {
+  if (!invoice?.id || Number(invoice.integrity_hold || 0) === 1) return null;
+  const byPrimaryId = invoice.primary_recognized_transfer_id
+    ? db.prepare(
+      `SELECT bt.*, itl.recognition_status AS link_recognition_status
+       FROM blockchain_transfers bt
+       JOIN invoice_transfer_links itl ON itl.blockchain_transfer_id = bt.id
+       WHERE bt.id = ? AND itl.invoice_id = ?
+         AND EXISTS (
+           SELECT 1 FROM transfer_observations tobs
+           WHERE tobs.blockchain_transfer_id = bt.id
+             AND tobs.confirmations >= ?
+             AND (tobs.receipt_status IS NULL OR lower(tobs.receipt_status) IN ('success', '0x1', '1', 'ok'))
+         )`
+    ).get(invoice.primary_recognized_transfer_id, invoice.id, FULFILLMENT_REQUIRED_CONFIRMATIONS)
+    : null;
+  const candidate = byPrimaryId || (invoice.paid_tx_hash
+    ? db.prepare(
+      `SELECT bt.*, itl.recognition_status AS link_recognition_status
+       FROM blockchain_transfers bt
+       JOIN invoice_transfer_links itl ON itl.blockchain_transfer_id = bt.id
+       WHERE itl.invoice_id = ? AND lower(bt.tx_hash) = lower(?)
+         AND EXISTS (
+           SELECT 1 FROM transfer_observations tobs
+           WHERE tobs.blockchain_transfer_id = bt.id
+             AND tobs.confirmations >= ?
+             AND (tobs.receipt_status IS NULL OR lower(tobs.receipt_status) IN ('success', '0x1', '1', 'ok'))
+         )
+       ORDER BY bt.latest_observed_at DESC, bt.id DESC
+       LIMIT 1`
+    ).get(invoice.id, invoice.paid_tx_hash, FULFILLMENT_REQUIRED_CONFIRMATIONS)
+    : null);
+  if (candidate
+    && String(candidate.integrity_status || "ok") === "ok"
+    && String(candidate.canonical_status || "") === "canonical"
+    && String(candidate.link_recognition_status || "") === "recognized"
+    && candidate.block_timestamp
+    && Number.isFinite(new Date(candidate.block_timestamp).getTime())) {
+    return candidate;
+  }
+  const event = invoice.paid_tx_hash
+    ? db.prepare(
+      `SELECT * FROM payment_events
+       WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
+         AND canonical_status = 'canonical'
+         AND recognition_status = 'eligible'
+         AND chain_verified = 1 AND token_verified = 1 AND recipient_verified = 1
+         AND within_expiry = 1
+         AND COALESCE(deadline_eligible, 1) = 1
+         AND block_timestamp IS NOT NULL
+         AND confirmations >= ?
+       ORDER BY confirmations DESC, created_at ASC, id ASC
+       LIMIT 1`
+    ).get(invoice.id, String(invoice.chain_id || ""), invoice.paid_tx_hash, FULFILLMENT_REQUIRED_CONFIRMATIONS)
+    : null;
+  return event || null;
+}
+
+function hasCanonicalRecognizedTransfer(invoice) {
+  const transfer = findCanonicalRecognizedTransfer(invoice);
+  if (!transfer) return false;
+  if (transfer.token_contract && invoice.token_contract
+    && normalizeAddress(transfer.token_contract) !== normalizeAddress(invoice.token_contract)) return false;
+  if (transfer.to_address && invoice.recipient_address
+    && normalizeAddress(transfer.to_address) !== normalizeAddress(invoice.recipient_address)) return false;
+  return true;
+}
+
+const PAYMENT_RECEIPT_VERSION = "payment_receipt_v1";
+// Kept as a source-compatibility alias for existing clients/tests; signing
+// always uses the active key selected through the registry above.
+const PAYMENT_RECEIPT_KID = PAYMENT_RECEIPT_ACTIVE_KID;
+
+function buildSignedPaymentReceipt(invoice, store = null) {
+  if (!invoice || !["paid", "settled"].includes(String(invoice.status || ""))) return null;
+  if (Number(invoice.integrity_hold || 0) === 1) return null;
+  const openReview = db.prepare(
+    `SELECT 1 FROM review_cases WHERE invoice_id = ? AND status IN ('open', 'in_progress') LIMIT 1`
+  ).get(invoice.id);
+  const openIncident = db.prepare(
+    `SELECT 1 FROM review_incidents WHERE invoice_id = ? AND status IN ('open', 'in_progress') LIMIT 1`
+  ).get(invoice.id);
+  if (openReview || openIncident) return null;
+  const transfer = findCanonicalRecognizedTransfer(invoice);
+  if (!transfer) return null;
+  const content = {
+    receipt_version: PAYMENT_RECEIPT_VERSION,
+    merchant_id: invoice.merchant_id || store?.merchant_id || null,
+    merchant_name: store?.name || "JPYC Store",
+    store_id: invoice.store_id || store?.id || null,
+    store_name: store?.name || "JPYC Store",
+    invoice_id: invoice.id,
+    invoice_no: invoice.invoice_no || null,
+    amount: {
+      jpy: Number(invoice.amount_jpy),
+      jpyc_base: String(invoice.amount_jpyc_base || "0"),
+      token_amount_atomic: String(transfer.token_amount_atomic || invoice.token_amount_atomic || "0"),
+      display_amount: invoice.display_amount || formatJpyc(invoice.amount_jpyc_base),
+    },
+    chain_id: String(transfer.chain_id || invoice.chain_id || CHAIN_ID),
+    token_contract: transfer.token_contract || invoice.token_contract || null,
+    blockchain_transfer_id: transfer.id,
+    tx_hash: transfer.tx_hash,
+    log_index: Number(transfer.log_index),
+    block_number: transfer.block_number == null ? null : Number(transfer.block_number),
+    block_hash: transfer.block_hash || null,
+    block_timestamp: transfer.block_timestamp || null,
+    recognized_at: invoice.recognized_at || transfer.latest_observed_at || null,
+    integrity_status: String(transfer.integrity_status || "ok"),
+  };
+  const canonicalContent = JSON.stringify(content);
+  const contentSha256 = sha256(canonicalContent);
+  const existing = db.prepare(`SELECT * FROM payment_receipts WHERE invoice_id = ?`).get(invoice.id);
+  if (existing?.revoked_at) return null;
+  if (existing) {
+    if (String(existing.content_sha256) !== contentSha256) {
+      db.prepare(
+        `UPDATE payment_receipts
+         SET revoked_at = COALESCE(revoked_at, ?), revocation_reason = COALESCE(revocation_reason, 'receipt_content_changed')
+         WHERE id = ?`
+      ).run(nowIso(), existing.id);
+      return null;
+    }
+    const existingSecret = paymentReceiptSecretForKid(existing.kid);
+    const expectedExistingSignature = existingSecret
+      ? hmacWithSecret(existingSecret, existing.signed_message)
+      : null;
+    if (!expectedExistingSignature || !safeHexEqual(expectedExistingSignature, existing.signature)) return null;
+    let storedContent;
+    try {
+      storedContent = JSON.parse(String(existing.content_json || "{}"));
+    } catch (_error) {
+      return null;
+    }
+    return {
+      ...storedContent,
+      content_sha256: existing.content_sha256,
+      signature: existing.signature,
+      kid: existing.kid,
+      signature_algorithm: existing.signature_algorithm,
+      signed_message: existing.signed_message,
+    };
+  }
+  const signingKid = PAYMENT_RECEIPT_KID;
+  const signingSecret = paymentReceiptSecretForKid(signingKid);
+  if (!signingSecret) return null;
+  const signedMessage = `${signingKid}.${contentSha256}`;
+  const signature = hmacWithSecret(signingSecret, signedMessage);
+  const receiptId = uuid();
+  const issuedAt = nowIso();
+  try {
+    db.prepare(
+      `INSERT INTO payment_receipts
+       (id, invoice_id, receipt_version, kid, signature_algorithm, content_json,
+        content_sha256, signature, signed_message, issued_at, revoked_at, revocation_reason)
+       VALUES (?, ?, ?, ?, 'HMAC-SHA256', ?, ?, ?, ?, ?, NULL, NULL)`
+    ).run(
+      receiptId,
+      invoice.id,
+      PAYMENT_RECEIPT_VERSION,
+      signingKid,
+      canonicalContent,
+      contentSha256,
+      signature,
+      signedMessage,
+      issuedAt,
+    );
+  } catch (error) {
+    if (!String(error.message || error).includes("UNIQUE")) throw error;
+    const raced = db.prepare(`SELECT * FROM payment_receipts WHERE invoice_id = ?`).get(invoice.id);
+    if (!raced || raced.revoked_at || String(raced.content_sha256) !== contentSha256) return null;
+    let racedContent;
+    try {
+      racedContent = JSON.parse(String(raced.content_json || "{}"));
+    } catch (_error) {
+      return null;
+    }
+    return {
+      ...racedContent,
+      content_sha256: raced.content_sha256,
+      signature: raced.signature,
+      kid: raced.kid,
+      signature_algorithm: raced.signature_algorithm,
+      signed_message: raced.signed_message,
+    };
+  }
+  return {
+    ...content,
+    content_sha256: contentSha256,
+    signature,
+    kid: signingKid,
+    signature_algorithm: "HMAC-SHA256",
+    signed_message: signedMessage,
+  };
+}
+
+function listReviewIncidents(invoiceId) {
+  const incidents = db.prepare(
+    `SELECT * FROM review_incidents
+     WHERE invoice_id = ?
+     ORDER BY created_at DESC, id DESC`
+  ).all(String(invoiceId || ""));
+  return incidents.map((incident) => ({
+    ...incident,
+    reasons: db.prepare(
+      `SELECT reason_code, priority, evidence_json, created_at
+       FROM review_incident_reasons
+       WHERE review_incident_id = ?
+       ORDER BY priority DESC, created_at ASC, id ASC`
+    ).all(incident.id).map((reason) => ({
+      ...reason,
+      evidence: parseJsonWithWarning(reason.evidence_json, `review_incident.reason:${incident.id}`, {}),
+    })),
+    transfers: db.prepare(
+      `SELECT rit.blockchain_transfer_id, rit.relation_type, rit.created_at,
+              bt.chain_id, bt.tx_hash, bt.log_index, bt.canonical_status, bt.integrity_status
+       FROM review_incident_transfers rit
+       JOIN blockchain_transfers bt ON bt.id = rit.blockchain_transfer_id
+       WHERE rit.review_incident_id = ?
+       ORDER BY rit.created_at ASC, rit.blockchain_transfer_id ASC`
+    ).all(incident.id),
+    events: db.prepare(
+      `SELECT id, event_type, actor_id, payload_hash, payload_json, created_at
+       FROM review_incident_events
+       WHERE review_incident_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT 100`
+    ).all(incident.id).map((event) => ({
+      ...event,
+      payload: parseJsonWithWarning(event.payload_json, `review_incident.event:${event.id}`, {}),
+    })),
+  }));
+}
+
+function syncReviewIncidentProjectionResolution({
+  review,
+  invoiceId,
+  incidentId = null,
+  nextStatus,
+  resolutionStatus,
+  disposition,
+  actorId,
+  timestamp,
+}) {
+  if (!review || !invoiceId || !["resolved", "rejected"].includes(String(nextStatus))) return null;
+  const reasonCode = normalizeReviewReasonCode(review.reason_type);
+  const incidents = db.prepare(
+    `SELECT * FROM review_incidents
+     WHERE invoice_id = ? AND status IN ('open', 'in_progress')
+     ORDER BY created_at DESC, id DESC`
+  ).all(String(invoiceId));
+  const incident = incidentId
+    ? incidents.find((candidate) => String(candidate.id) === String(incidentId))
+    : incidents.find((candidate) => (
+      normalizeReviewReasonCode(candidate.primary_reason) === reasonCode
+      || normalizeReviewReasonCode(candidate.incident_type) === reasonCode
+    ));
+  if (!incident) return null;
+  const eventType = nextStatus === "resolved" ? "incident.resolved" : "incident.rejected";
+  const payload = {
+    incident_id: incident.id,
+    invoice_id: String(invoiceId),
+    review_case_id: review.id,
+    reason_code: reasonCode,
+    status: nextStatus,
+    resolution_status: resolutionStatus || null,
+    disposition: disposition || null,
+    actor_id: actorId || null,
+    occurred_at: timestamp,
+  };
+  db.prepare(
+    `UPDATE review_incidents
+     SET status = ?, resolution_status = ?, disposition = ?, resolved_at = ?
+     WHERE id = ? AND status IN ('open', 'in_progress')`
+  ).run(nextStatus, resolutionStatus || "pending", disposition || null, timestamp, incident.id);
+  db.prepare(
+    `INSERT INTO review_incident_events
+     (id, review_incident_id, event_type, actor_id, payload_hash, payload_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    uuid(),
+    incident.id,
+    eventType,
+    actorId || null,
+    `sha256:${sha256(JSON.stringify(payload))}`,
+    JSON.stringify(payload),
+    timestamp,
+  );
+  return incident.id;
+}
+
+function getFreshStepUpSession(sessionId, storeId) {
+  const session = db.prepare(
+    `SELECT s.id, s.staff_user_id, s.terminal_id, s.step_up_verified_at, s.step_up_expires_at,
+            t.store_id, u.staff_name, u.role
+     FROM terminal_sessions s
+     JOIN terminals t ON t.id = s.terminal_id
+     JOIN staff_users u ON u.id = s.staff_user_id
+     WHERE s.id = ?
+       AND t.store_id = ?
+       AND s.revoked_at IS NULL
+       AND s.ended_at IS NULL
+       AND u.status = 'active'`
+  ).get(String(sessionId || ""), String(storeId || ""));
+  if (!session || !session.step_up_verified_at || !session.step_up_expires_at) return null;
+  const expiresAtMs = new Date(session.step_up_expires_at).getTime();
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return null;
+  return session;
 }
 
 function updateInvoiceStatus(invoiceId, nextStatus, reason = null, pointerContext = null) {
@@ -7400,14 +10790,31 @@ function updateInvoiceStatus(invoiceId, nextStatus, reason = null, pointerContex
      WHERE id = ?`
   ).run(nextStatus, reason, ts, invoiceId);
   const updated = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
+  const stateAxes = deriveInvoiceStateAxes({ ...updated, status: nextStatus, _force_legacy_state_axes: true });
+  db.prepare(
+    `UPDATE invoices
+     SET payment_status = ?, fulfillment_status = ?, review_status = ?, integrity_status = ?,
+         accounting_status = ?, refund_status = ?, monitoring_status = ?, version = COALESCE(version, 0) + 1
+     WHERE id = ?`
+  ).run(
+    stateAxes.payment_status,
+    stateAxes.fulfillment_status,
+    stateAxes.review_status,
+    stateAxes.integrity_status,
+    stateAxes.accounting_status,
+    stateAxes.refund_status,
+    stateAxes.monitoring_status,
+    invoiceId,
+  );
+  const updatedWithAxes = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (String(current.terminal_id || "")) {
     const actorType = pointerContext?.actorType || "system";
     const actorId = pointerContext?.actorId || "invoice.status_transition";
-    if (isTerminalActiveInvoiceStatus(updated.status)) {
+    if (isTerminalActiveInvoiceStatus(updatedWithAxes.status)) {
       setTerminalCurrentInvoicePointer({
         terminalId: updated.terminal_id,
         invoiceId: updated.id,
-        assignedAt: pointerContext?.assignedAt || updated.updated_at || ts,
+        assignedAt: pointerContext?.assignedAt || updatedWithAxes.updated_at || ts,
         actorType,
         actorId,
         requestId: pointerContext?.requestId || null,
@@ -7431,7 +10838,7 @@ function updateInvoiceStatus(invoiceId, nextStatus, reason = null, pointerContex
       }
     }
   }
-  return { invoice: updated, before: current };
+  return { invoice: updatedWithAxes, before: current };
 }
 
 
@@ -7470,6 +10877,85 @@ function findLatestReviewCase(invoiceId) {
   return db.prepare(`SELECT * FROM review_cases WHERE invoice_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1`).get(invoiceId) || null;
 }
 
+function buildAuthoritativeFulfillmentDecision(invoice) {
+  if (!invoice) {
+    return {
+      decision: FULFILLMENT_DECISIONS.HOLD,
+      reason_codes: ["INVOICE_NOT_FOUND"],
+      evaluated_at: nowIso(),
+      valid_until: null,
+      invoice_version: null,
+    };
+  }
+  const evaluatedAt = nowIso();
+  const reasonCodes = [];
+  const openReview = db.prepare(
+    `SELECT id, reason_type, status FROM review_cases WHERE invoice_id = ? AND status IN ('open', 'in_progress')`
+  ).get(invoice.id);
+  const openIncident = db.prepare(
+    `SELECT id, incident_type, primary_reason FROM review_incidents WHERE invoice_id = ? AND status IN ('open', 'in_progress') ORDER BY created_at ASC LIMIT 1`
+  ).get(invoice.id);
+  const paymentStatusOkay = ["paid", "settled"].includes(String(invoice.status || ""));
+  const providerPath = hasProviderSettlementPath(invoice.id);
+  const providerSummary = providerPath ? buildProviderSummary(invoice) : null;
+  const providerFulfillmentAllowed = providerPath
+    && String(providerSummary?.fulfillment_decision || "") === FULFILLMENT_DECISIONS.ALLOW_FULFILLMENT;
+  const canonicalTransfer = providerFulfillmentAllowed ? null : findCanonicalRecognizedTransfer(invoice);
+  const paymentRecognized = providerFulfillmentAllowed || Boolean(canonicalTransfer);
+  const paymentControl = getPaymentsDisableState({ storeId: invoice.store_id, terminalId: invoice.terminal_id });
+
+  if (!paymentStatusOkay) reasonCodes.push("PAYMENT_STATUS_NOT_FINAL");
+  if (Number(invoice.integrity_hold || 0) === 1) reasonCodes.push("INTEGRITY_HOLD_ACTIVE");
+  if (paymentControl.disabled) reasonCodes.push("PAYMENTS_DISABLED");
+  if (openReview || openIncident) reasonCodes.push("REVIEW_OPEN");
+  if (!paymentRecognized) reasonCodes.push("CANONICAL_TRANSFER_NOT_RECOGNIZED");
+  if (canonicalTransfer && Number(canonicalTransfer.confirmations || 0) < FULFILLMENT_REQUIRED_CONFIRMATIONS) {
+    reasonCodes.push("FULFILLMENT_FINALITY_PENDING");
+  }
+
+  const chainId = String(invoice.chain_id || CHAIN_ID);
+  const worker = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:last_cycle_at`)
+    || workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = 'worker:last_cycle_at'`);
+  const workerRpc = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:rpc_count`);
+  const workerCheckpoint = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${chainId}:last_checkpoint`);
+  const workerAt = worker?.value ? new Date(worker.value).getTime() : NaN;
+  const workerHealthy = Number.isFinite(workerAt)
+    && Date.now() - workerAt <= WORKER_STALE_SEC * 1000
+    && Number.isFinite(Number(workerRpc?.value))
+    && Number(workerRpc.value) >= 1
+    && Boolean(workerCheckpoint?.value);
+  if (!workerHealthy) reasonCodes.push("CHAIN_MONITOR_HEALTH_UNKNOWN_OR_STALE");
+
+  const runtimeRegistry = evaluateChainRuntimeRegistryGate(chainId);
+  if (!providerFulfillmentAllowed && !runtimeRegistry.ok) reasonCodes.push("RPC_RUNTIME_NOT_VERIFIED");
+  const validUntil = Number.isFinite(workerAt)
+    ? new Date(workerAt + WORKER_STALE_SEC * 1000).toISOString()
+    : null;
+  const allowed = reasonCodes.length === 0;
+  return {
+    decision: allowed ? FULFILLMENT_DECISIONS.ALLOW_FULFILLMENT : FULFILLMENT_DECISIONS.HOLD,
+    reason_codes: reasonCodes,
+    evaluated_at: evaluatedAt,
+    valid_until: validUntil,
+    invoice_version: Number(invoice.invoice_version || invoice.version || 1),
+    payment_status: String(invoice.status || ""),
+    integrity_status: Number(invoice.integrity_hold || 0) === 1 ? "hold" : "clear",
+    review_status: openReview || openIncident ? "open" : "clear",
+    worker_health: {
+      status: workerHealthy ? "healthy" : "unknown_or_stale",
+      last_cycle_at: worker?.value || null,
+      rpc_count: Number.isFinite(Number(workerRpc?.value)) ? Number(workerRpc.value) : null,
+      last_checkpoint: workerCheckpoint?.value || null,
+    },
+    rpc_health: {
+      status: providerFulfillmentAllowed ? "provider_authoritative" : runtimeRegistry.ok ? "verified" : "not_verified",
+      chain_id: chainId,
+      details: runtimeRegistry,
+    },
+    primary_transfer_id: canonicalTransfer?.id || invoice.primary_recognized_transfer_id || null,
+  };
+}
+
 function findLatestRefundRequest(invoiceId) {
   return db
     .prepare(`SELECT * FROM refund_requests WHERE invoice_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1`)
@@ -7504,7 +10990,7 @@ function buildSettlementRefundSummary(refunds) {
     return sum + BigInt(String(row.refund_amount_jpyc_base || 0));
   }, 0n);
   const succeededAmount = references.reduce((sum, row) => {
-    if (!["succeeded", "verified"].includes(row.status) || !row.refund_tx_hash) return sum;
+    if (!["succeeded", "verified", "finalized"].includes(row.status) || !row.refund_tx_hash) return sum;
     return sum + BigInt(String(row.refund_amount_jpyc_base || 0));
   }, 0n);
   return {
@@ -7642,7 +11128,7 @@ function findLatestProviderAllocationForPayment(providerPaymentId, invoiceId = n
 function shouldIncludeSettlementSnapshotRow({ invoice, paymentSession, providerSession, hasRefunds }) {
   if (hasRefunds) return true;
   if (providerSession || String(paymentSession?.rail_type) === PAYMENT_RAIL_TYPES.PROVIDER_EXTERNAL) return true;
-  return ["paid", "review_required", "cancelled"].includes(String(invoice.status));
+  return ["paid", "settled", "review_required", "cancelled"].includes(String(invoice.status));
 }
 
 function hasCleanProviderAllocation(providerAllocation, invoiceId) {
@@ -7689,11 +11175,11 @@ function settlementPrimaryPaymentEvent(invoice) {
     .prepare(
       `SELECT log_index, block_timestamp, detected_at
        FROM payment_events
-       WHERE invoice_id = ? AND tx_hash = ?
+       WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
        ORDER BY created_at ASC, id ASC
        LIMIT 1`
     )
-    .get(invoice.id, invoice.paid_tx_hash) || null;
+    .get(invoice.id, String(invoice.chain_id || ""), invoice.paid_tx_hash) || null;
 }
 
 function buildSettlementExportRow({
@@ -7710,10 +11196,38 @@ function buildSettlementExportRow({
   createdAt,
 }) {
   if (!shouldIncludeSettlementSnapshotRow({ invoice, paymentSession, providerSession, hasRefunds })) return null;
-  const invoiceAmountBase = toIntegerAmount(invoice.amount_jpyc_base, 0);
-  const paidAmountBase = toIntegerAmount(invoice.paid_amount_jpyc_base, 0);
-  const providerAmountBase = toIntegerAmount(providerSession?.provider_amount_jpyc_base, invoiceAmountBase);
-  const allocationAmountBase = toIntegerAmount(providerAllocation?.allocated_amount_jpyc_base, providerAmountBase);
+  const invoiceAmountBase = parseSettlementAmountBaseStrict(invoice.amount_jpyc_base, `invoice:${invoice.id}:amount_jpyc_base`);
+  const ledgerAmountBase = String(invoice.ledger_amount_base ?? invoice.amount_jpyc_base ?? "").trim();
+  parseSettlementAmountBaseStrict(ledgerAmountBase, `invoice:${invoice.id}:ledger_amount_base`);
+  const tokenAmountAtomic = String(
+    invoice.token_amount_atomic
+      ?? tokenAmountAtomicFromLedgerBase(ledgerAmountBase)
+  ).trim();
+  if (!/^\d+$/.test(tokenAmountAtomic)) throw ledgerIntegrityError(`invoice:${invoice.id}:token_amount_atomic`);
+  const amountScaleVersion = String(invoice.amount_scale_version || AMOUNT_SCALE_VERSION);
+  const tokenDecimals = Number(invoice.token_decimals ?? TOKEN_DECIMALS);
+  const ledgerDecimals = Number(invoice.ledger_decimals ?? LEDGER_DECIMALS);
+  const displayAmount = String(invoice.display_amount || formatBaseUnitsForDisplay(ledgerAmountBase, ledgerDecimals));
+  const paidAmountBase = parseSettlementAmountBaseStrict(
+    invoice.paid_amount_jpyc_base,
+    `invoice:${invoice.id}:paid_amount_jpyc_base`
+  );
+  const providerAmountBase = providerSession
+    ? parseSettlementAmountBaseStrict(
+      providerSession.provider_amount_jpyc_base == null || providerSession.provider_amount_jpyc_base === ""
+        ? invoiceAmountBase
+        : providerSession.provider_amount_jpyc_base,
+      `provider-session:${providerSession.id}:provider_amount_jpyc_base`
+    )
+    : invoiceAmountBase;
+  const allocationAmountBase = providerAllocation
+    ? parseSettlementAmountBaseStrict(
+      providerAllocation.allocated_amount_jpyc_base == null || providerAllocation.allocated_amount_jpyc_base === ""
+        ? providerAmountBase
+        : providerAllocation.allocated_amount_jpyc_base,
+      `provider-allocation:${providerAllocation.id}:allocated_amount_jpyc_base`
+    )
+    : providerAmountBase;
 
   let accountingStatus = "cancelled";
   let cashRecognitionStatus = "none";
@@ -7734,7 +11248,7 @@ function buildSettlementExportRow({
   } else if (providerSession?.provider_status === "voided") {
     accountingStatus = "voided";
     voidAmount = providerAmountBase;
-  } else if (String(invoice.status) === "paid") {
+  } else if (["paid", "settled"].includes(String(invoice.status))) {
     accountingStatus = "onchain_cash_confirmed";
     cashRecognitionStatus = "onchain_confirmed";
     onchainCashAmount = paidAmountBase;
@@ -7778,7 +11292,7 @@ function buildSettlementExportRow({
   const paymentAttemptIds = settlementPaymentAttemptIds(invoice.id);
   const primaryEvent = settlementPrimaryPaymentEvent(invoice);
   const primaryRefund = refundSummary.refund_references.find((refund) =>
-    ["succeeded", "verified"].includes(String(refund.status)) && refund.refund_tx_hash
+    ["succeeded", "verified", "finalized"].includes(String(refund.status)) && refund.refund_tx_hash
   ) || refundSummary.refund_references[0] || null;
   const auditLogRefs = settlementAuditRefs(invoice.id, [
     exportRunId,
@@ -7835,6 +11349,12 @@ function buildSettlementExportRow({
     audit_log_refs: auditLogRefs,
     external_sync_refs: externalSyncRefs,
     accounting_event_refs: accountingEventRefs,
+    amount_scale_version: amountScaleVersion,
+    token_decimals: tokenDecimals,
+    ledger_decimals: ledgerDecimals,
+    token_amount_atomic: tokenAmountAtomic,
+    ledger_amount_base: ledgerAmountBase,
+    display_amount: displayAmount,
     invoice_amount_jpyc_base: invoiceAmountBase,
     invoice_status: String(invoice.status),
     accounting_status: accountingStatus,
@@ -7958,10 +11478,15 @@ function createSettlementExportSnapshot({
       `INSERT INTO settlement_export_rows
        (id, export_run_id, export_version, business_date, store_id, terminal_id, operator_id, invoice_id, checkout_session_id,
         payment_session_id, rail_type, provider_code, invoice_amount_jpyc_base, invoice_status, accounting_status,
+        amount_scale_version, token_decimals, ledger_decimals, token_amount_atomic, ledger_amount_base, display_amount,
         cash_recognition_status, receivable_status, onchain_cash_amount_jpyc_base, provider_receivable_amount_jpyc_base,
         exception_amount_jpyc_base, refund_amount_jpyc_base, void_amount_jpyc_base, provider_payment_ref, provider_settlement_ref,
         onchain_transfer_ref, evidence_hash, payload_json, payload_schema_version, export_excluded_private_data, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (
+         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       )`
     ).run(
       row.id,
       row.export_run_id,
@@ -7978,6 +11503,12 @@ function createSettlementExportSnapshot({
       row.invoice_amount_jpyc_base,
       row.invoice_status,
       row.accounting_status,
+      row.amount_scale_version,
+      row.token_decimals,
+      row.ledger_decimals,
+      row.token_amount_atomic,
+      row.ledger_amount_base,
+      row.display_amount,
       row.cash_recognition_status,
       row.receivable_status,
       row.onchain_cash_amount_jpyc_base,
@@ -8570,21 +12101,23 @@ function qualifyStoredPaymentEvents(invoice) {
       || String(rawPayload?.amount_conversion_error || "").trim() === "non_exact_decimal_conversion";
     return {
       ...row,
-      amount_jpyc_base: String(row.amount_jpyc_base ?? "0"),
+      amount_jpyc_base: String(row.ledger_amount_base ?? row.amount_jpyc_base ?? ""),
+      ledger_amount_base: String(row.ledger_amount_base ?? row.amount_jpyc_base ?? ""),
+      token_amount_atomic: row.token_amount_atomic || row.amount_atomic || null,
       amount_conversion_exact: !nonExactTokenConversion,
       amount_conversion_error: nonExactTokenConversion ? "non_exact_decimal_conversion" : null,
       // Missing canonicality is not proof of finality.  Legacy rows remain
       // auditable, but qualification must fail closed until the chain worker
       // supplies an explicit canonical status.
       canonical_status: row.canonical_status || "unknown",
-      block_timestamp: row.block_timestamp || row.observed_at || null,
+      block_timestamp: row.block_timestamp || null,
     };
   });
   const decision = decideQualifiedPaymentStatus(invoice, events, {
     integrityHold: Number(invoice.integrity_hold || 0) === 1,
     qualificationOptions: (event) => ({
       canonicalStatus: event.canonical_status || "unknown",
-      blockTimestamp: event.block_timestamp || event.observed_at || null,
+      blockTimestamp: event.block_timestamp || null,
     }),
   });
   for (const item of decision.qualifications || []) {
@@ -8610,15 +12143,33 @@ function qualifyStoredPaymentEvents(invoice) {
       recognitionStatus,
       item.event.id,
     );
+    db.prepare(
+      `UPDATE payment_attempts
+       SET chain_verified = ?, token_verified = ?, recipient_verified = ?,
+           canonical_status = ?, recognition_status = ?, status = ?
+       WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
+         AND COALESCE(log_index, -1) = COALESCE(?, -1)`
+    ).run(
+      qualification.checks.chainMatches ? 1 : 0,
+      qualification.checks.tokenMatches ? 1 : 0,
+      qualification.checks.recipientMatches ? 1 : 0,
+      qualification.canonicalStatus,
+      recognitionStatus,
+      recognitionStatus === "eligible" ? "confirmed" : recognitionStatus === "pending" ? "confirming" : "review_required",
+      invoice.id,
+      item.event.chain_id,
+      item.event.tx_hash,
+      item.event.log_index ?? null,
+    );
   }
   const eligibleRows = (decision.qualifications || [])
     .filter((item) => item.qualification.eligible && item.event.amount_conversion_exact !== false)
     .map((item) => item.event);
   const totalPaidBase = eligibleRows
-    .reduce((total, row) => total + BigInt(String(row.amount_jpyc_base || "0")), 0n)
+    .reduce((total, row) => total + BigInt(String(row.ledger_amount_base ?? row.amount_jpyc_base ?? "0")), 0n)
     .toString();
   const earliestBlockTimestamp = eligibleRows
-    .map((row) => String(row.block_timestamp || row.observed_at || "").trim())
+    .map((row) => String(row.block_timestamp || "").trim())
     .filter((value) => Number.isFinite(new Date(value).getTime()))
     .sort((left, right) => new Date(left).getTime() - new Date(right).getTime())[0] || null;
   return { ...decision, events, totalPaidBase, earliestBlockTimestamp };
@@ -8626,6 +12177,52 @@ function qualifyStoredPaymentEvents(invoice) {
 
 function postPaymentMonitorUntil() {
   return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function enqueuePaymentNotificationOutbox({ invoice, paymentEventId, notificationType, confirmations, amountBase, txHash, status, reason }) {
+  if (!invoice?.id || !paymentEventId || !notificationType) return { queued: false, id: null };
+  const timestamp = nowIso();
+  const payload = {
+    invoice_id: invoice.id,
+    payment_event_id: paymentEventId,
+    tx_hash: txHash || null,
+    status: status || null,
+    confirmations: Number(confirmations || 0),
+    required_confirmations: REQUIRED_CONFIRMATIONS,
+    detection_confirmations: DETECTION_CONFIRMATIONS,
+    fulfillment_required_confirmations: FULFILLMENT_REQUIRED_CONFIRMATIONS,
+    accounting_finality_confirmations: ACCOUNTING_FINALITY_CONFIRMATIONS,
+    amount_scale_version: AMOUNT_SCALE_VERSION,
+    token_decimals: TOKEN_DECIMALS,
+    ledger_decimals: LEDGER_DECIMALS,
+    ledger_amount_base: String(amountBase || "0"),
+    customer_message: notificationType === "payment_confirmed"
+      ? "お支払いを確認しました。"
+      : "お支払いを確認中です。店舗スタッフの案内をお待ちください。",
+    staff_message: notificationType === "payment_confirmed"
+      ? "JPYC支払いが確認閾値に達しました。"
+      : notificationType === "payment_review"
+        ? "JPYC支払いは自動確定せず、レビューが必要です。"
+        : `JPYC支払いを検知しました。確認数 ${Number(confirmations || 0)}/${FULFILLMENT_REQUIRED_CONFIRMATIONS}。`,
+    reason: reason || null,
+  };
+  const queued = db.prepare(
+    `INSERT OR IGNORE INTO payment_notification_outbox
+     (id, invoice_id, payment_event_id, notification_type, audience, status, attempt_count,
+      available_at, payload_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`
+  ).run(
+    uuid(),
+    invoice.id,
+    paymentEventId,
+    notificationType,
+    "customer_and_staff",
+    timestamp,
+    JSON.stringify(payload),
+    timestamp,
+    timestamp,
+  );
+  return { queued: queued.changes === 1, id: queued.changes === 1 ? queued.lastInsertRowid || null : null };
 }
 
 function processPaymentEvent({
@@ -8638,18 +12235,61 @@ function processPaymentEvent({
   action,
   ip
 }) {
-  const nonExactTokenConversion = event.amount_conversion_exact === false
+  const normalizedEventChainId = normalizeChainId(event?.chain_id ?? event?.chainId);
+  if (!normalizedEventChainId) {
+    return {
+      status: 400,
+      body: { error: { code: "VALIDATION_ERROR", message: "chain_id is required" } },
+    };
+  }
+  const normalizedTxHash = String(event?.tx_hash ?? event?.txHash ?? "").trim().toLowerCase();
+  event = {
+    ...event,
+    chain_id: normalizedEventChainId,
+    ...(normalizedTxHash ? { tx_hash: normalizedTxHash } : {}),
+  };
+  let nonExactTokenConversion = event.amount_conversion_exact === false
     || String(event.amount_conversion_error || "").trim() === "non_exact_decimal_conversion";
   const forcedChainInconsistencyReason = String(event.chain_inconsistency_reason || "").trim() === "multiple_matching_transfers"
     ? "multiple_matching_transfers"
     : null;
-  const integrityHoldReason = forcedChainInconsistencyReason
-    || (nonExactTokenConversion ? "non_exact_decimal_conversion" : null);
-  const parsedAmountBaseResult = event.amount_jpyc_base != null
+  const eventAmountAtomic = event.token_amount_atomic ?? event.amount_atomic;
+  let parsedAmountBaseResult = event.amount_jpyc_base != null
     ? (nonExactTokenConversion && /^\d+$/.test(String(event.amount_jpyc_base).trim())
       ? { value: String(event.amount_jpyc_base).trim() }
       : parsePositiveBaseUnitInteger(String(event.amount_jpyc_base), "amount_jpyc_base"))
     : toBaseUnits(event.amount_jpyc);
+  if (eventAmountAtomic != null && String(eventAmountAtomic).trim() !== "") {
+    let atomicConversion;
+    try {
+      atomicConversion = requireExactLedgerAmountBaseFromTokenAtomic(String(eventAmountAtomic).trim());
+    } catch (_error) {
+      return {
+        status: 400,
+        body: { error: { code: "VALIDATION_ERROR", message: "token_amount_atomic must be an unsigned integer string" } },
+      };
+    }
+    if (atomicConversion.error) {
+      nonExactTokenConversion = true;
+      if (parsedAmountBaseResult.error || event.amount_jpyc_base == null) {
+        parsedAmountBaseResult = { value: atomicConversion.value };
+      }
+    } else if (event.amount_jpyc_base != null
+      && String(event.amount_jpyc_base).trim() !== String(atomicConversion.value)) {
+      return {
+        status: 409,
+        body: { error: { code: "LEDGER_INTEGRITY_ERROR", message: "token and ledger amount evidence disagree" } },
+      };
+    } else {
+      parsedAmountBaseResult = { value: atomicConversion.value };
+    }
+  }
+  let integrityHoldReason = forcedChainInconsistencyReason
+    || (nonExactTokenConversion ? "non_exact_decimal_conversion" : null);
+  const fulfillmentKillSwitchActive = getPaymentsDisableState({
+    storeId: invoice.store_id,
+    terminalId: invoice.terminal_id,
+  }).disabled;
   if (parsedAmountBaseResult.error) {
     return {
       status: 400,
@@ -8658,14 +12298,57 @@ function processPaymentEvent({
   }
   const parsedAmountBase = parsedAmountBaseResult.value;
   const parsedAmountDisplay = Number(formatJpyc(parsedAmountBase));
+  if (!Number.isFinite(parsedAmountDisplay)) {
+    return {
+      status: 409,
+      body: { error: { code: "LEDGER_INTEGRITY_ERROR", message: "ledger amount cannot be represented as a finite display amount" } },
+    };
+  }
   const parsedConfirmations = Number(event.confirmations || 0);
   const eventObservedAt = String(event.observed_at || nowIso());
-  const eventBlockTimestamp = String(event.block_timestamp || eventObservedAt);
+  const eventBlockTimestamp = event.block_timestamp == null || String(event.block_timestamp).trim() === ""
+    ? null
+    : String(event.block_timestamp);
   const eventCanonicalStatus = String(event.canonical_status || "unknown");
-  const eventAmountAtomic = event.amount_atomic == null ? null : String(event.amount_atomic);
+  let postCommitOutboxCount = 0;
   const decision = db.transaction(() => {
     const peId = uuid();
     const paymentAttemptId = uuid();
+    const globalTransfer = registerGlobalTransferObservation({ invoice, event });
+    const numericChainId = /^\d+$/.test(event.chain_id) ? event.chain_id : null;
+    if (numericChainId) {
+      const legacyEvent = db.prepare(
+        `SELECT id FROM payment_events
+         WHERE invoice_id = ? AND lower(tx_hash) = lower(?)
+           AND COALESCE(log_index, -1) = COALESCE(?, -1)
+           AND chain_id <> ?
+           AND chain_id GLOB '[0-9]*' AND chain_id NOT GLOB '*[^0-9]*'
+           AND CAST(chain_id AS INTEGER) = CAST(? AS INTEGER)
+         ORDER BY created_at ASC, id ASC LIMIT 1`
+      ).get(invoice.id, event.tx_hash, event.log_index ?? null, event.chain_id, numericChainId);
+      if (legacyEvent) {
+        db.prepare(`UPDATE payment_events SET chain_id = ? WHERE id = ?`).run(event.chain_id, legacyEvent.id);
+      }
+      const legacyAttempt = db.prepare(
+        `SELECT id FROM payment_attempts
+         WHERE invoice_id = ? AND lower(tx_hash) = lower(?)
+           AND COALESCE(log_index, -1) = COALESCE(?, -1)
+           AND chain_id <> ?
+           AND chain_id GLOB '[0-9]*' AND chain_id NOT GLOB '*[^0-9]*'
+           AND CAST(chain_id AS INTEGER) = CAST(? AS INTEGER)
+         ORDER BY created_at ASC, id ASC LIMIT 1`
+      ).get(invoice.id, event.tx_hash, event.log_index ?? null, event.chain_id, numericChainId);
+      if (legacyAttempt) {
+        db.prepare(`UPDATE payment_attempts SET chain_id = ? WHERE id = ?`).run(event.chain_id, legacyAttempt.id);
+      }
+    }
+    if (!globalTransfer.complete) {
+      integrityHoldReason = TRANSFER_IDENTITY_INCOMPLETE;
+    } else if (globalTransfer.collision) {
+      integrityHoldReason = CROSS_INVOICE_TRANSFER_COLLISION;
+    } else if (globalTransfer.disputed) {
+      integrityHoldReason = "TRANSFER_EVIDENCE_DISPUTED";
+    }
     try {
       db.prepare(
         `INSERT INTO payment_events
@@ -8685,7 +12368,7 @@ function processPaymentEvent({
           event.from_address || null,
           String(event.to_address),
           String(event.token_contract),
-          Number.isFinite(parsedAmountDisplay) ? parsedAmountDisplay : 0,
+          parsedAmountDisplay,
           parsedAmountBase,
           eventAmountAtomic,
           eventCanonicalStatus,
@@ -8697,7 +12380,27 @@ function processPaymentEvent({
           nowIso()
         );
       db.prepare(
-        `INSERT OR IGNORE INTO payment_attempts(id, invoice_id, chain_id, tx_hash, log_index, status, source, verified_onchain, payload_json, created_at)
+        `UPDATE payment_events
+         SET amount_scale_version = ?, token_decimals = ?, ledger_decimals = ?,
+             token_amount_atomic = ?, ledger_amount_base = ?, display_amount = ?,
+             detection_confirmations = ?, fulfillment_required_confirmations = ?,
+             accounting_finality_confirmations = ?, deadline_eligible = ?
+         WHERE id = ?`
+      ).run(
+        AMOUNT_SCALE_VERSION,
+        TOKEN_DECIMALS,
+        LEDGER_DECIMALS,
+        eventAmountAtomic || tokenAmountAtomicFromLedgerBase(parsedAmountBase),
+        parsedAmountBase,
+        formatBaseUnitsForDisplay(parsedAmountBase, LEDGER_DECIMALS),
+        DETECTION_CONFIRMATIONS,
+        FULFILLMENT_REQUIRED_CONFIRMATIONS,
+        ACCOUNTING_FINALITY_CONFIRMATIONS,
+        nonExactTokenConversion ? 0 : 1,
+        peId,
+      );
+      db.prepare(
+        `INSERT INTO payment_attempts(id, invoice_id, chain_id, tx_hash, log_index, status, source, verified_onchain, payload_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         paymentAttemptId,
@@ -8711,21 +12414,58 @@ function processPaymentEvent({
         JSON.stringify(event),
         nowIso()
       );
+      db.prepare(
+        `UPDATE payment_attempts
+         SET amount_scale_version = ?, token_decimals = ?, ledger_decimals = ?,
+             token_amount_atomic = ?, ledger_amount_base = ?, display_amount = ?,
+             block_number = ?, block_hash = ?, transaction_index = ?, block_timestamp = ?,
+             confirmations = ?, chain_verified = ?, token_verified = ?, recipient_verified = ?,
+             detection_confirmations = ?, fulfillment_required_confirmations = ?,
+             accounting_finality_confirmations = ?, deadline_eligible = ?,
+             canonical_status = ?, recognition_status = ?
+         WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?) AND COALESCE(log_index, -1) = COALESCE(?, -1)`
+      ).run(
+        AMOUNT_SCALE_VERSION,
+        TOKEN_DECIMALS,
+        LEDGER_DECIMALS,
+        eventAmountAtomic || tokenAmountAtomicFromLedgerBase(parsedAmountBase),
+        parsedAmountBase,
+        formatBaseUnitsForDisplay(parsedAmountBase, LEDGER_DECIMALS),
+        event.block_number ?? null,
+        event.block_hash ? String(event.block_hash) : null,
+        event.transaction_index ?? null,
+        eventBlockTimestamp,
+        parsedConfirmations,
+        event.chain_verified ? 1 : 0,
+        event.token_verified ? 1 : 0,
+        event.recipient_verified ? 1 : 0,
+        DETECTION_CONFIRMATIONS,
+        FULFILLMENT_REQUIRED_CONFIRMATIONS,
+        ACCOUNTING_FINALITY_CONFIRMATIONS,
+        nonExactTokenConversion ? 0 : 1,
+        eventCanonicalStatus,
+        nonExactTokenConversion ? "review_required" : "pending",
+        invoice.id,
+        String(event.chain_id),
+        String(event.tx_hash),
+        event.log_index ?? null,
+      );
     } catch (error) {
       if (String(error.message).includes("UNIQUE")) {
         const existingEvent = db
           .prepare(
             `SELECT * FROM payment_events
-             WHERE invoice_id = ? AND tx_hash = ? AND COALESCE(log_index, -1) = COALESCE(?, -1)
+             WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
+               AND COALESCE(log_index, -1) = COALESCE(?, -1)
              ORDER BY created_at ASC, id ASC
              LIMIT 1`
           )
-          .get(invoice.id, String(event.tx_hash), event.log_index ?? null);
+          .get(invoice.id, String(event.chain_id), String(event.tx_hash), event.log_index ?? null);
         if (existingEvent) {
           const previousInvoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
           const nextConfirmations = Math.max(Number(existingEvent.confirmations || 0), parsedConfirmations);
           const nextBlockHash = existingEvent.block_hash || event.block_hash || null;
-          const nextBlockTimestamp = existingEvent.block_timestamp || event.block_timestamp || eventObservedAt;
+          const nextBlockTimestamp = existingEvent.block_timestamp || event.block_timestamp || null;
           const nextDetectedAt = event.detected_at || existingEvent.detected_at || nowIso();
           const confirmationEvidenceAdvanced = nextConfirmations > Number(existingEvent.confirmations || 0);
           const blockHashEvidenceAdded = !existingEvent.block_hash && Boolean(event.block_hash);
@@ -8736,9 +12476,11 @@ function processPaymentEvent({
                  block_hash = COALESCE(block_hash, ?),
                  block_timestamp = COALESCE(block_timestamp, ?),
                  amount_atomic = COALESCE(amount_atomic, ?),
-                 canonical_status = COALESCE(?, canonical_status, 'unknown'),
-                 detected_at = ?,
-                 raw_payload = ?
+                 canonical_status = CASE
+                   WHEN canonical_status IN ('unknown', '') THEN COALESCE(?, canonical_status, 'unknown')
+                   ELSE canonical_status
+                 END,
+                 detected_at = COALESCE(detected_at, ?)
              WHERE id = ?`
           ).run(
             nextConfirmations,
@@ -8747,7 +12489,6 @@ function processPaymentEvent({
             eventAmountAtomic,
             eventCanonicalStatus,
             nextDetectedAt,
-            JSON.stringify(event),
             existingEvent.id
           );
           const qualified = qualifyStoredPaymentEvents(previousInvoice);
@@ -8775,11 +12516,9 @@ function processPaymentEvent({
             outcome.reasonType = REVIEW_REASON_CODES.LATE_PAYMENT;
             outcome.reasonLabel = "payment_after_cancelled_invoice";
           }
-          if (isPaymentsDisabled() && outcome.nextStatus === "paid") {
-            outcome.nextStatus = "review_required";
-            outcome.reasonType = "payments_disabled";
-            outcome.reasonLabel = "payments_disabled";
-          }
+          // A kill switch stops fulfillment only. Payment truth remains the
+          // canonical result of the chain evidence and is not rewritten as a
+          // review merely because operations are paused.
           const update = transitionInvoiceForPayment(previousInvoice, outcome.nextStatus, outcome.reasonLabel, {
             actorType,
             actorId,
@@ -8796,30 +12535,70 @@ function processPaymentEvent({
           }
           const refreshed = update.invoice || db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
           const totalPaidDisplay = Number(formatJpyc(totalPaidBase.toString()));
+          if (!Number.isFinite(totalPaidDisplay)) {
+            return {
+              status: 409,
+              body: { error: { code: "LEDGER_INTEGRITY_ERROR", message: "cumulative ledger amount cannot be represented as a finite display amount" } },
+            };
+          }
+          if (globalTransfer.transferId) {
+            db.prepare(
+              `UPDATE invoice_transfer_links
+               SET recognition_status = ?
+               WHERE invoice_id = ? AND blockchain_transfer_id = ?`
+            ).run(outcome.nextStatus === "paid" ? "recognized" : outcome.nextStatus, invoice.id, globalTransfer.transferId);
+          }
           db.prepare(`UPDATE invoices
-                      SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?, paid_tx_hash = COALESCE(paid_tx_hash, ?),
+                      SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?,
+                          paid_tx_hash = CASE WHEN ? = 'paid' THEN COALESCE(paid_tx_hash, ?) ELSE paid_tx_hash END,
+                          primary_recognized_transfer_id = CASE
+                            WHEN ? = 'paid' AND primary_recognized_transfer_id IS NULL THEN ?
+                            ELSE primary_recognized_transfer_id
+                          END,
+                          latest_observed_transfer_id = COALESCE(?, latest_observed_transfer_id),
+                          recognized_at = CASE WHEN ? = 'paid' AND recognized_at IS NULL THEN ? ELSE recognized_at END,
+                          recognition_policy_version = CASE WHEN ? = 'paid' THEN ? ELSE recognition_policy_version END,
                           integrity_hold = CASE WHEN ? IS NOT NULL THEN 1 ELSE integrity_hold END,
                           integrity_hold_reason = CASE WHEN ? IS NOT NULL THEN ? ELSE integrity_hold_reason END,
                           integrity_hold_at = CASE WHEN ? IS NOT NULL THEN COALESCE(integrity_hold_at, ?) ELSE integrity_hold_at END,
                           monitor_until = CASE WHEN ? = 'paid' THEN COALESCE(monitor_until, ?) ELSE monitor_until END,
                           updated_at = ? WHERE id = ?`).run(
-            Number.isFinite(totalPaidDisplay) ? totalPaidDisplay : 0,
+            totalPaidDisplay,
             totalPaidBase.toString(),
-            event.tx_hash,
-            integrityHoldReason,
-            integrityHoldReason,
-            integrityHoldReason,
-            integrityHoldReason,
-            nowIso(),
             outcome.nextStatus,
-            postPaymentMonitorUntil(),
-            nowIso(),
-            invoice.id
+            event.tx_hash,
+            outcome.nextStatus,
+            globalTransfer.transferId || null,
+            globalTransfer.transferId || null,
+            outcome.nextStatus,
+            eventBlockTimestamp || eventObservedAt,
+            outcome.nextStatus,
+            RECOGNITION_POLICY_VERSION,
+            integrityHoldReason,
+            integrityHoldReason,
+            integrityHoldReason,
+            integrityHoldReason,
+                      nowIso(),
+                      outcome.nextStatus,
+                      postPaymentMonitorUntil(),
+                      nowIso(),
+                      invoice.id
           );
+          const confirmationAfterUpdate = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+          if (outcome.nextStatus === "paid") {
+            resolveEligibleReviewIncidentsAsPaid({
+              invoice: confirmationAfterUpdate,
+              primaryTransferId: globalTransfer.transferId || null,
+              actorId: "chain-monitor",
+              requestId,
+              idempotencyKey,
+              ip,
+            });
+          }
           if (outcome.nextStatus === "paid") {
             recordAccountingEvent({
-              storeId: refreshed.store_id,
-              invoiceId: refreshed.id,
+              storeId: confirmationAfterUpdate.store_id,
+              invoiceId: confirmationAfterUpdate.id,
               eventType: "payment_confirmed",
               occurredAt: earliestBlockTimestamp || nextDetectedAt || nowIso(),
               amountBase: totalPaidBase.toString(),
@@ -8834,6 +12613,21 @@ function processPaymentEvent({
             });
           }
           const after = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+          const queuedNotification = enqueuePaymentNotificationOutbox({
+            invoice: after,
+            paymentEventId: existingEvent.id,
+            notificationType: outcome.nextStatus === "paid"
+              ? "payment_confirmed"
+              : outcome.nextStatus === "review_required"
+                ? "payment_review"
+                : "payment_pending",
+            confirmations: nextConfirmations,
+            amountBase: totalPaidBase.toString(),
+            txHash: event.tx_hash,
+            status: after.status,
+            reason: outcome.reasonLabel,
+          });
+          if (queuedNotification.queued) postCommitOutboxCount += 1;
           audit({
             storeId: invoice.store_id,
             actorType,
@@ -8885,13 +12679,66 @@ function processPaymentEvent({
     }
 
     const qualified = qualifyStoredPaymentEvents(invoice);
-    const totalPaidBase = BigInt(qualified.totalPaidBase || "0");
+    let totalPaidBase = BigInt(qualified.totalPaidBase || "0");
     const earliestBlockTimestamp = qualified.earliestBlockTimestamp || eventBlockTimestamp;
     const outcome = {
       nextStatus: qualified.nextStatus,
       reasonType: qualified.reasonType,
       reasonLabel: qualified.reasonLabel,
     };
+    if (!globalTransfer.complete) {
+      outcome.nextStatus = "review_required";
+      outcome.reasonType = REVIEW_REASON_CODES.CHAIN_TRANSFER_IDENTITY_INCOMPLETE;
+      outcome.reasonLabel = TRANSFER_IDENTITY_INCOMPLETE;
+    } else if (globalTransfer.collision) {
+      outcome.nextStatus = "review_required";
+      outcome.reasonType = REVIEW_REASON_CODES.CROSS_INVOICE_TRANSFER_COLLISION;
+      outcome.reasonLabel = CROSS_INVOICE_TRANSFER_COLLISION;
+    } else if (globalTransfer.disputed) {
+      outcome.nextStatus = "review_required";
+      outcome.reasonType = REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
+      outcome.reasonLabel = "TRANSFER_EVIDENCE_DISPUTED";
+    }
+    const isNewTransferAfterFinal = String(invoice.status || "") === "paid"
+      || String(invoice.status || "") === "settled"
+      || Boolean(invoice.settled_at);
+    const priorPaidBaseRaw = String(invoice.paid_amount_jpyc_base ?? "").trim();
+    const priorPaidBaseValid = /^\d+$/.test(priorPaidBaseRaw);
+    let preservePriorPaidFields = false;
+    if (isNewTransferAfterFinal) {
+      if (!priorPaidBaseValid) {
+        // Never replace a malformed historical ledger value with a computed
+        // total. Keep the original fields intact and create an integrity
+        // review so an operator can repair the ledger with evidence.
+        preservePriorPaidFields = true;
+        totalPaidBase = 0n;
+        outcome.nextStatus = "review_required";
+        outcome.reasonType = REVIEW_REASON_CODES.LEDGER_INTEGRITY_ERROR;
+        outcome.reasonLabel = "LEDGER_INTEGRITY_ERROR";
+        db.prepare(`UPDATE payment_events SET recognition_status = 'review_required' WHERE id = ?`).run(peId);
+        db.prepare(
+          `UPDATE payment_attempts
+           SET recognition_status = 'review_required', status = 'review_required'
+           WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
+             AND COALESCE(log_index, -1) = COALESCE(?, -1)`
+        ).run(invoice.id, String(event.chain_id), String(event.tx_hash), event.log_index ?? null);
+      } else {
+        // A new transfer after paid/settled is a separate payment attempt,
+        // not a new cumulative sale total. Preserve the original sale amount
+        // and transaction reference while routing the new evidence to review.
+        totalPaidBase = BigInt(priorPaidBaseRaw);
+        outcome.nextStatus = "review_required";
+        outcome.reasonType = REVIEW_REASON_CODES.DUPLICATE_PAYMENT;
+        outcome.reasonLabel = "duplicate_after_paid";
+        db.prepare(`UPDATE payment_events SET recognition_status = 'review_required' WHERE id = ?`).run(peId);
+        db.prepare(
+          `UPDATE payment_attempts
+           SET recognition_status = 'review_required', status = 'review_required'
+           WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
+             AND COALESCE(log_index, -1) = COALESCE(?, -1)`
+        ).run(invoice.id, String(event.chain_id), String(event.tx_hash), event.log_index ?? null);
+      }
+    }
     if (nonExactTokenConversion) {
       outcome.nextStatus = "review_required";
       outcome.reasonType = REVIEW_REASON_CODES.CHAIN_INCONSISTENT;
@@ -8909,11 +12756,7 @@ function processPaymentEvent({
       outcome.reasonType = REVIEW_REASON_CODES.LATE_PAYMENT;
       outcome.reasonLabel = "payment_after_cancelled_invoice";
     }
-    if (isPaymentsDisabled() && outcome.nextStatus === "paid") {
-      outcome.nextStatus = "review_required";
-      outcome.reasonType = "payments_disabled";
-      outcome.reasonLabel = "payments_disabled";
-    }
+    // A kill switch stops fulfillment only; it does not rewrite payment truth.
     const update = transitionInvoiceForPayment(invoice, outcome.nextStatus, outcome.reasonLabel, {
       actorType,
       actorId,
@@ -8933,8 +12776,10 @@ function processPaymentEvent({
       upsertReviewCase(update.invoice, outcome.reasonType || REVIEW_REASON_CODES.OTHER, {
         txHash: event.tx_hash,
         eventAmountBase: parsedAmountBase,
-        blockTimestamp: event.block_timestamp || event.observed_at || nowIso(),
+        blockTimestamp: event.block_timestamp || null,
         detectedAt: nowIso(),
+        transferId: globalTransfer.transferId || null,
+        incidentType: outcome.reasonLabel,
       });
       recordSuspiciousActivity({
         storeId: invoice.store_id,
@@ -8946,61 +12791,112 @@ function processPaymentEvent({
           reason_code: normalizeReviewReasonCode(outcome.reasonType || REVIEW_REASON_CODES.OTHER),
         },
       });
+    } else if (outcome.nextStatus === "confirming") {
+      // Confirmation waiting is an auditable incident, not an invisible
+      // transitional status.  It is intentionally eligible for automatic
+      // resolution only when this exact transfer later reaches the paid
+      // recognition threshold.
+      upsertReviewCase(update.invoice, REVIEW_REASON_CODES.OTHER, {
+        txHash: event.tx_hash,
+        eventAmountBase: parsedAmountBase,
+        blockTimestamp: eventBlockTimestamp,
+        detectedAt: nowIso(),
+        transferId: globalTransfer.transferId || null,
+        incidentType: "AWAITING_CONFIRMATIONS",
+        suggestedAction: "wait_for_confirmations",
+      });
     }
 
-    const totalPaidDisplay = Number(formatJpyc(totalPaidBase.toString()));
+    const appliedIntegrityHoldReason = integrityHoldReason
+      || (preservePriorPaidFields ? "ledger_integrity_error" : null);
+    const totalPaidDisplay = preservePriorPaidFields
+      ? Number(invoice.paid_amount_jpyc)
+      : Number(formatJpyc(totalPaidBase.toString()));
+    if (!Number.isFinite(totalPaidDisplay)) {
+      return {
+        status: 409,
+        body: { error: { code: "LEDGER_INTEGRITY_ERROR", message: "cumulative ledger amount cannot be represented as a finite display amount" } },
+      };
+    }
+    const paidBaseForInvoice = preservePriorPaidFields
+      ? String(invoice.paid_amount_jpyc_base)
+      : totalPaidBase.toString();
+    // `paid_tx_hash` is the primary recognized transfer, not a raw observed
+    // payment attempt.  Keep it empty while the invoice is confirming or in
+    // review; preserve a previously recognized primary transfer when a later
+    // duplicate/reorg observation is routed to review.
+    const paidTxHashForInvoice = outcome.nextStatus === "paid"
+      ? (isNewTransferAfterFinal ? (invoice.paid_tx_hash || null) : event.tx_hash)
+      : (invoice.paid_tx_hash || null);
+    if (globalTransfer.transferId) {
+      db.prepare(
+        `UPDATE invoice_transfer_links
+         SET recognition_status = ?
+         WHERE invoice_id = ? AND blockchain_transfer_id = ?`
+      ).run(outcome.nextStatus === "paid" ? "recognized" : outcome.nextStatus, invoice.id, globalTransfer.transferId);
+    }
     db.prepare(`UPDATE invoices
                 SET paid_amount_jpyc = ?, paid_amount_jpyc_base = ?, paid_tx_hash = ?,
+                    primary_recognized_transfer_id = CASE
+                      WHEN ? = 'paid' AND primary_recognized_transfer_id IS NULL THEN ?
+                      ELSE primary_recognized_transfer_id
+                    END,
+                    latest_observed_transfer_id = COALESCE(?, latest_observed_transfer_id),
+                    recognized_at = CASE WHEN ? = 'paid' AND recognized_at IS NULL THEN ? ELSE recognized_at END,
+                    recognition_policy_version = CASE WHEN ? = 'paid' THEN ? ELSE recognition_policy_version END,
                     integrity_hold = CASE WHEN ? IS NOT NULL THEN 1 ELSE integrity_hold END,
                     integrity_hold_reason = CASE WHEN ? IS NOT NULL THEN ? ELSE integrity_hold_reason END,
                     integrity_hold_at = CASE WHEN ? IS NOT NULL THEN COALESCE(integrity_hold_at, ?) ELSE integrity_hold_at END,
+                    fulfillment_status = CASE WHEN ? = 1 THEN 'hold' ELSE fulfillment_status END,
                     monitor_until = CASE WHEN ? = 'paid' THEN COALESCE(monitor_until, ?) ELSE monitor_until END,
                     updated_at = ? WHERE id = ?`).run(
-      Number.isFinite(totalPaidDisplay) ? totalPaidDisplay : 0,
-      totalPaidBase.toString(),
-      event.tx_hash,
-      integrityHoldReason,
-      integrityHoldReason,
-      integrityHoldReason,
-      integrityHoldReason,
+      totalPaidDisplay,
+      paidBaseForInvoice,
+      paidTxHashForInvoice,
+      outcome.nextStatus,
+      globalTransfer.transferId || null,
+      globalTransfer.transferId || null,
+      outcome.nextStatus,
+      eventBlockTimestamp || eventObservedAt,
+      outcome.nextStatus,
+      RECOGNITION_POLICY_VERSION,
+      appliedIntegrityHoldReason,
+      appliedIntegrityHoldReason,
+      appliedIntegrityHoldReason,
+      appliedIntegrityHoldReason,
       nowIso(),
+      fulfillmentKillSwitchActive ? 1 : 0,
       outcome.nextStatus,
       postPaymentMonitorUntil(),
       nowIso(),
       invoice.id
     );
-    if (outcome.nextStatus === "paid") {
-      const openReview = db
-        .prepare(`SELECT * FROM review_cases WHERE invoice_id = ? AND status IN ('open', 'in_progress')`)
-        .get(invoice.id);
-      if (openReview) {
-        const reviewTs = nowIso();
-        db.prepare(
-          `UPDATE review_cases
-           SET status = 'resolved',
-               resolution_status = 'settled',
-               disposition = 'accepted_as_paid',
-               resolution_note = COALESCE(resolution_note, 'payment_total_confirmed'),
-               resolved_at = ?,
-               updated_at = ?
-           WHERE id = ?`
-        ).run(reviewTs, reviewTs, openReview.id);
-        audit({
-          storeId: invoice.store_id,
-          actorType: "system",
-          actorId: "chain-monitor",
-          action: "review.auto_resolved_as_paid",
-          targetType: "review",
-          targetId: openReview.id,
-          requestId,
-          idempotencyKey,
-          beforeState: openReview,
-          afterState: db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(openReview.id),
-          ip,
-        });
-      }
-    }
     const refreshed = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+    if (outcome.nextStatus === "paid") {
+      resolveEligibleReviewIncidentsAsPaid({
+        invoice: refreshed,
+        primaryTransferId: globalTransfer.transferId || null,
+        actorId: "chain-monitor",
+        requestId,
+        idempotencyKey,
+        ip,
+      });
+    }
+    const queuedNotification = enqueuePaymentNotificationOutbox({
+      invoice: refreshed,
+      paymentEventId: peId,
+      notificationType: outcome.nextStatus === "paid"
+        ? "payment_confirmed"
+        : outcome.nextStatus === "review_required"
+          ? "payment_review"
+          : "payment_pending",
+      confirmations: parsedConfirmations,
+      amountBase: totalPaidBase.toString(),
+      txHash: event.tx_hash,
+      status: refreshed.status,
+      reason: outcome.reasonLabel,
+    });
+    if (queuedNotification.queued) postCommitOutboxCount += 1;
     if (outcome.nextStatus === "paid") {
       recordAccountingEvent({
         storeId: refreshed.store_id,
@@ -9048,6 +12944,8 @@ function processPaymentEvent({
       ip
     });
 
+    triggerTestCrashFaultInjection("payment_transaction_before_commit");
+
     return {
       status: 200,
       body: {
@@ -9062,6 +12960,24 @@ function processPaymentEvent({
     };
   })();
 
+  triggerTestCrashFaultInjection("payment_commit_before_outbox_dispatch");
+
+  if (postCommitOutboxCount > 0) {
+    try {
+      // Dispatch only after the financial transaction commits.  SSE writes
+      // are external side effects and must never participate in the ledger
+      // transaction or make a rolled-back payment appear delivered.
+      dispatchPaymentNotificationOutboxOnce({ limit: postCommitOutboxCount });
+    } catch (error) {
+      console.error(JSON.stringify({
+        ts: nowIso(),
+        level: "warn",
+        type: "payment.notification_outbox_post_commit_dispatch_failed",
+        invoice_id: invoice.id,
+        message: String(error.message || error),
+      }));
+    }
+  }
   if (decision.body?.status) {
     sendEvent(invoice.terminal_id, "invoice.updated", { invoiceId: invoice.id, status: decision.body.status });
   }
@@ -9070,27 +12986,49 @@ function processPaymentEvent({
 
 function buildIngestEvent(payload) {
   const txHash = parseTxHash(payload?.tx_hash);
+  const chainId = normalizeChainId(payload?.chain_id);
   const blockHash = payload?.block_hash == null || String(payload.block_hash).trim() === ""
     ? null
     : parseTxHash(payload.block_hash);
-  const amount = payload?.amount_jpyc;
-  const nonExactConversion = payload?.amount_conversion_exact === false
+  const amount = payload?.display_amount ?? payload?.amount_jpyc;
+  const atomicRaw = payload?.token_amount_atomic ?? payload?.amount_atomic;
+  const ledgerRaw = payload?.ledger_amount_base ?? payload?.amount_jpyc_base;
+  let nonExactConversion = payload?.amount_conversion_exact === false
     || String(payload?.amount_conversion_error || "").trim() === "non_exact_decimal_conversion";
-  const amountBaseParsed = payload?.amount_jpyc_base != null
-    ? (nonExactConversion
-      ? (/^\d+$/.test(String(payload.amount_jpyc_base).trim())
-        ? { value: String(payload.amount_jpyc_base).trim() }
-        : { error: "amount_jpyc_base is invalid" })
-      : parsePositiveBaseUnitInteger(payload.amount_jpyc_base, "amount_jpyc_base"))
-    : toBaseUnits(amount);
+  let amountBaseParsed;
+  let tokenAmountAtomic = null;
+  if (atomicRaw != null && String(atomicRaw).trim() !== "") {
+    tokenAmountAtomic = String(atomicRaw).trim();
+    if (!/^\d+$/.test(tokenAmountAtomic)) {
+      return { error: "token_amount_atomic must be an unsigned integer string" };
+    }
+    const converted = requireExactLedgerAmountBaseFromTokenAtomic(tokenAmountAtomic);
+    nonExactConversion = nonExactConversion || Boolean(converted.error);
+    amountBaseParsed = ledgerRaw != null && String(ledgerRaw).trim() !== ""
+      ? (/^\d+$/.test(String(ledgerRaw).trim())
+        ? { value: String(ledgerRaw).trim() }
+        : { error: "ledger_amount_base is invalid" })
+      : { value: converted.value };
+  } else if (ledgerRaw != null && String(ledgerRaw).trim() !== "") {
+    amountBaseParsed = nonExactConversion
+      ? (/^\d+$/.test(String(ledgerRaw).trim())
+        ? { value: String(ledgerRaw).trim() }
+        : { error: "ledger_amount_base is invalid" })
+      : parsePositiveBaseUnitInteger(ledgerRaw, "ledger_amount_base");
+    if (payload?.amount_conversion_exact === false) {
+      return { error: "token_amount_atomic is required when conversion is non-exact" };
+    }
+  } else {
+    amountBaseParsed = toBaseUnits(amount);
+  }
   const confirmations = Number(payload?.confirmations || 0);
-  if (!payload?.invoice_id || !txHash || !payload?.chain_id || !payload?.token_contract || !payload?.to_address) {
+  if (!payload?.invoice_id || !txHash || !chainId || !payload?.token_contract || !payload?.to_address) {
     return { error: "Missing required fields for ingest" };
   }
   if (payload?.block_hash != null && !blockHash) return { error: "block_hash must be a 0x-prefixed 32-byte hash" };
   if (amountBaseParsed.error) return { error: "amount_jpyc is invalid" };
   if (BigInt(amountBaseParsed.value) <= 0n && !nonExactConversion) return { error: "amount_jpyc must be > 0" };
-  if (nonExactConversion && !/^\d+$/.test(String(payload?.amount_atomic || ""))) {
+  if (nonExactConversion && !tokenAmountAtomic) {
     return { error: "amount_atomic is required for non-exact token conversion" };
   }
   if (!Number.isFinite(confirmations) || confirmations < 0) {
@@ -9099,7 +13037,7 @@ function buildIngestEvent(payload) {
   return {
     event: {
       invoice_id: String(payload.invoice_id),
-      chain_id: String(payload.chain_id),
+      chain_id: chainId,
       tx_hash: txHash,
       log_index: payload.log_index ?? null,
       block_number: payload.block_number ?? null,
@@ -9109,14 +13047,21 @@ function buildIngestEvent(payload) {
       token_contract: String(payload.token_contract),
       amount_jpyc: amount ?? formatJpyc(amountBaseParsed.value),
       amount_jpyc_base: amountBaseParsed.value,
-      amount_atomic: payload.amount_atomic == null ? null : String(payload.amount_atomic),
+      ledger_amount_base: amountBaseParsed.value,
+      amount_atomic: tokenAmountAtomic,
+      token_amount_atomic: tokenAmountAtomic,
+      amount_scale_version: payload.amount_scale_version || AMOUNT_SCALE_VERSION,
+      display_amount: amount ?? formatJpyc(amountBaseParsed.value),
+      token_decimals: payload.token_decimals ?? TOKEN_DECIMALS,
+      ledger_decimals: payload.ledger_decimals ?? LEDGER_DECIMALS,
       amount_conversion_exact: nonExactConversion ? false : true,
       amount_conversion_error: nonExactConversion ? String(payload.amount_conversion_error || "non_exact_decimal_conversion") : null,
       canonical_status: payload.canonical_status || "unknown",
+      source: payload.source || "service_ingest",
+      verified_onchain: payload.verified_onchain === true,
       observed_at: payload.observed_at || nowIso(),
       block_hash: blockHash,
       block_timestamp: payload.block_timestamp || null,
-      block_hash: payload.block_hash || null,
       detected_at: payload.detected_at || nowIso(),
     }
   };
@@ -9182,7 +13127,13 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
           token_contract: invoiceTokenContract,
           amount_jpyc: formatJpyc(observedAmount.value),
           amount_jpyc_base: observedAmount.value,
+          ledger_amount_base: observedAmount.value,
           amount_atomic: totalAmountAtomic,
+          token_amount_atomic: totalAmountAtomic,
+          amount_scale_version: AMOUNT_SCALE_VERSION,
+          display_amount: formatJpyc(observedAmount.value),
+          token_decimals: TOKEN_DECIMALS,
+          ledger_decimals: LEDGER_DECIMALS,
           amount_conversion_exact: observedAmount.exact,
           amount_conversion_error: observedAmount.exact ? null : "non_exact_decimal_conversion",
           chain_inconsistency_reason: "multiple_matching_transfers",
@@ -9228,7 +13179,13 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
           token_contract: invoiceTokenContract,
           amount_jpyc: formatJpyc(observedAmount.value),
           amount_jpyc_base: observedAmount.value,
+          ledger_amount_base: observedAmount.value,
           amount_atomic: verification.transfer.amountBase,
+          token_amount_atomic: verification.transfer.amountBase,
+          amount_scale_version: AMOUNT_SCALE_VERSION,
+          display_amount: formatJpyc(observedAmount.value),
+          token_decimals: TOKEN_DECIMALS,
+          ledger_decimals: LEDGER_DECIMALS,
           amount_conversion_exact: observedAmount.exact,
           amount_conversion_error: observedAmount.exact ? null : "non_exact_decimal_conversion",
           canonical_status: verification.canonicalStatus || "unknown",
@@ -9281,7 +13238,13 @@ async function buildVerifiedManualIngestEvent(invoice, payload) {
       token_contract: invoiceTokenContract,
       amount_jpyc: formatJpyc(observedAmount.value),
       amount_jpyc_base: observedAmount.value,
+      ledger_amount_base: observedAmount.value,
       amount_atomic: verification.transfer.amountBase,
+      token_amount_atomic: verification.transfer.amountBase,
+      amount_scale_version: AMOUNT_SCALE_VERSION,
+      display_amount: formatJpyc(observedAmount.value),
+      token_decimals: TOKEN_DECIMALS,
+      ledger_decimals: LEDGER_DECIMALS,
       amount_conversion_exact: observedAmount.exact,
       amount_conversion_error: observedAmount.exact ? null : "non_exact_decimal_conversion",
       canonical_status: verification.canonicalStatus || "unknown",
@@ -9433,16 +13396,27 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
     expectedFromAddresses: expectedFromAddresses.filter(Boolean),
     expectedAmountAtomic: expectedAmount.value,
   });
+  const verificationEvidence = {
+    chainId: String(refund.refund_chain_id || CHAIN_ID),
+    tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
+    canonicalStatus: verification.canonicalStatus || "unknown",
+    finalityConfirmations: Number(verification.confirmations || 0),
+    finalityRequiredConfirmations: ACCOUNTING_FINALITY_CONFIRMATIONS,
+    reorgHold: false,
+    tokenAmountAtomic: verification.transfer?.amountBase || expectedAmount.value,
+    blockHash: verification.receipt?.blockHash || null,
+    receiptStatus: "success",
+  };
   if (verification.ok && verification.canonicalStatus !== "canonical") {
     return {
       status: "verification_failed",
+      ...verificationEvidence,
       refundTxHash: txHash,
       refundTxLogIndex: verification.transfer?.logIndex ?? null,
       failureReason: "NON_CANONICAL",
+      reorgHold: true,
       fromAddress: verification.transfer?.from || null,
       toAddress: verification.transfer?.to || refund.refund_to_address || null,
-      chainId: String(refund.refund_chain_id || CHAIN_ID),
-      tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
       blockNumber: verification.transfer?.blockNumber ?? null,
       blockTimestamp: verification.observedAt || nowIso(),
       detectedAt: nowIso(),
@@ -9452,13 +13426,12 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
     if (["WRONG_AMOUNT", "WRONG_FROM_ADDRESS", "WRONG_RECIPIENT", "MULTIPLE_TRANSFERS"].includes(verification.code)) {
       return {
         status: "verification_failed",
+        ...verificationEvidence,
         refundTxHash: txHash,
         refundTxLogIndex: verification.transfer?.logIndex ?? null,
         failureReason: verification.code,
         fromAddress: verification.transfer?.from || null,
         toAddress: verification.transfer?.to || refund.refund_to_address || null,
-        chainId: String(refund.refund_chain_id || CHAIN_ID),
-        tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
         blockNumber: verification.transfer?.blockNumber ?? null,
         blockTimestamp: verification.observedAt || nowIso(),
         detectedAt: nowIso(),
@@ -9467,13 +13440,12 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
     if (verification.code === "TX_NOT_FOUND" || verification.code === "TX_REVERTED" || verification.code === "WRONG_TOKEN" || verification.code === "WRONG_CHAIN") {
       return {
         status: "verification_failed",
+        ...verificationEvidence,
         refundTxHash: txHash,
         refundTxLogIndex: verification.transfer?.logIndex ?? null,
         failureReason: verification.code,
         fromAddress: verification.transfer?.from || null,
         toAddress: verification.transfer?.to || refund.refund_to_address || null,
-        chainId: String(refund.refund_chain_id || CHAIN_ID),
-        tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
         blockNumber: verification.transfer?.blockNumber ?? null,
         blockTimestamp: verification.observedAt || nowIso(),
         detectedAt: nowIso(),
@@ -9481,38 +13453,52 @@ async function verifyRefundExecutionOnChain(refund, txHashOverride = null) {
     }
     return { error: { code: verification.code || "REFUND_VERIFICATION_FAILED", message: verification.message || "refund verification failed" } };
   }
-  if (verification.confirmations < REQUIRED_CONFIRMATIONS) {
+  if (verification.confirmations < FULFILLMENT_REQUIRED_CONFIRMATIONS) {
     return {
       status: "pending_verification",
+      ...verificationEvidence,
       refundTxHash: txHash,
       refundTxLogIndex: verification.transfer.logIndex,
-      failureReason: `confirmations_pending:${verification.confirmations}/${REQUIRED_CONFIRMATIONS}`,
+      failureReason: `confirmations_pending:${verification.confirmations}/${FULFILLMENT_REQUIRED_CONFIRMATIONS}`,
       fromAddress: verification.transfer?.from || null,
       toAddress: verification.transfer?.to || refund.refund_to_address || null,
-      chainId: String(refund.refund_chain_id || CHAIN_ID),
-      tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
       blockNumber: verification.transfer?.blockNumber ?? null,
       blockTimestamp: verification.observedAt || nowIso(),
       detectedAt: nowIso(),
     };
   }
+  if (isProductionLikeRuntime() && verification.confirmations < ACCOUNTING_FINALITY_CONFIRMATIONS) {
+    return {
+      status: "verified",
+      ...verificationEvidence,
+      refundTxHash: txHash,
+      refundTxLogIndex: verification.transfer.logIndex,
+      failureReason: `finality_pending:${verification.confirmations}/${ACCOUNTING_FINALITY_CONFIRMATIONS}`,
+      fromAddress: verification.transfer?.from || null,
+      toAddress: verification.transfer?.to || refund.refund_to_address || null,
+      blockNumber: verification.transfer?.blockNumber ?? null,
+      blockTimestamp: verification.observedAt || nowIso(),
+      detectedAt: nowIso(),
+      verifiedAt: verification.observedAt,
+    };
+  }
   return {
-    status: "succeeded",
+    status: isProductionLikeRuntime() ? "finalized" : "succeeded",
+    ...verificationEvidence,
     refundTxHash: txHash,
     refundTxLogIndex: verification.transfer.logIndex,
     failureReason: null,
     verifiedAt: verification.observedAt,
     fromAddress: verification.transfer?.from || null,
     toAddress: verification.transfer?.to || refund.refund_to_address || null,
-    chainId: String(refund.refund_chain_id || CHAIN_ID),
-    tokenContract: String(refund.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
     blockNumber: verification.transfer?.blockNumber ?? null,
     blockTimestamp: verification.observedAt || nowIso(),
     detectedAt: nowIso(),
+    finalizedAt: isProductionLikeRuntime() ? verification.observedAt : null,
   };
 }
 
-async function verifyRefundFundingLineageOnChain(refund, lineage) {
+async function verifyRefundFundingLineageOnChain(refund, lineage, { revalidate = false } = {}) {
   const tokenContract = String(
     refund.token_contract
       || refund.invoice_token_contract
@@ -9520,6 +13506,48 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
       || TOKEN_CONTRACT
       || ""
   );
+  const finalityRequiredConfirmations = ACCOUNTING_FINALITY_CONFIRMATIONS;
+  const buildVerificationResult = ({
+    status,
+    failureReason = null,
+    verification = null,
+    reorgHold = false,
+    finalized = false,
+  }) => {
+    const confirmations = Number(verification?.confirmations || 0);
+    const canonicalStatus = String(verification?.canonicalStatus || "unknown").trim().toLowerCase();
+    const blockHash = verification?.receipt?.blockHash || null;
+    const blockNumber = verification?.transfer?.blockNumber ?? verification?.receipt?.blockNumber ?? null;
+    const observedAt = verification?.observedAt || null;
+    const finalizedAt = finalized ? (observedAt || nowIso()) : null;
+    return {
+      status,
+      failureReason,
+      blockHash,
+      canonicalStatus,
+      confirmations,
+      finalityRequiredConfirmations,
+      finalizedAt,
+      reorgHold,
+      verifiedAt: confirmations >= FULFILLMENT_REQUIRED_CONFIRMATIONS ? observedAt : null,
+      blockNumber,
+      blockTimestamp: observedAt,
+      evidence: {
+        code: failureReason || (finalized ? "FINALIZED" : status === "verified" ? "VERIFIED" : status.toUpperCase()),
+        confirmations,
+        required_confirmations: FULFILLMENT_REQUIRED_CONFIRMATIONS,
+        finality_required_confirmations: finalityRequiredConfirmations,
+        canonical_status: canonicalStatus,
+        block_hash: blockHash,
+        block_number: blockNumber,
+        observed_at: observedAt,
+        finalized_at: finalizedAt,
+        revalidation: revalidate,
+        reorg_hold: reorgHold,
+        transfer: verification?.transfer || null,
+      },
+    };
+  };
   try {
     const expectedAmount = convertLedgerBaseToTokenAtomicExact(lineage.sweep_amount_jpyc_base);
     if (expectedAmount.error) {
@@ -9551,90 +13579,129 @@ async function verifyRefundFundingLineageOnChain(refund, lineage) {
         "WRONG_CHAIN",
       ]);
       if (permanentFailureCodes.has(String(verification.code || ""))) {
-        return {
+        return buildVerificationResult({
           status: "verification_failed",
           failureReason: verification.code,
-          evidence: {
-            code: verification.code,
-            message: verification.message || null,
-            confirmations: Number(verification.confirmations || 0),
-            observed_at: verification.observedAt || null,
-            transfer: verification.transfer || null,
-          },
-        };
+          verification,
+        });
       }
-      return {
+      return buildVerificationResult({
         status: "pending_verification",
         failureReason: verification.code || "RPC_VERIFICATION_PENDING",
-        evidence: {
-          code: verification.code || "RPC_VERIFICATION_PENDING",
-          message: verification.message || null,
-          confirmations: Number(verification.confirmations || 0),
-          observed_at: verification.observedAt || null,
-        },
-      };
+        verification,
+      });
     }
 
     if (verification.canonicalStatus !== "canonical") {
-      return {
+      return buildVerificationResult({
         status: "verification_failed",
         failureReason: "NON_CANONICAL",
-        evidence: {
-          code: "NON_CANONICAL",
-          confirmations: Number(verification.confirmations || 0),
-          observed_at: verification.observedAt || null,
-          canonical_status: verification.canonicalStatus || "unknown",
-          transfer: verification.transfer || null,
-        },
-      };
+        verification,
+        reorgHold: true,
+      });
     }
 
     if (Number(verification.confirmations || 0) < REQUIRED_CONFIRMATIONS) {
-      return {
+      return buildVerificationResult({
         status: "pending_verification",
         failureReason: `confirmations_pending:${Number(verification.confirmations || 0)}/${REQUIRED_CONFIRMATIONS}`,
-        evidence: {
-          code: "CONFIRMATIONS_PENDING",
-          confirmations: Number(verification.confirmations || 0),
-          required_confirmations: REQUIRED_CONFIRMATIONS,
-          observed_at: verification.observedAt || null,
-          canonical_status: verification.canonicalStatus || "unknown",
-          transfer: verification.transfer || null,
-        },
-      };
+        verification,
+      });
     }
 
-    return {
-      status: "verified",
-      failureReason: null,
-      evidence: {
-        code: "VERIFIED",
-        confirmations: Number(verification.confirmations || 0),
-        required_confirmations: REQUIRED_CONFIRMATIONS,
-        observed_at: verification.observedAt || null,
-        canonical_status: verification.canonicalStatus || "unknown",
-        transfer: verification.transfer || null,
-      },
-    };
+    const accountingFinalityReached = Number(verification.confirmations || 0) >= finalityRequiredConfirmations;
+    return buildVerificationResult({
+      // The first observation remains `verified` for the existing API/fixture
+      // contract. A later call with revalidate=true moves it to `finalized`;
+      // finalized_at is still recorded only when accounting finality is met.
+      status: revalidate && accountingFinalityReached ? "finalized" : "verified",
+      verification,
+      finalized: accountingFinalityReached,
+    });
   } catch (error) {
     return {
       status: "pending_verification",
       failureReason: "RPC_UNAVAILABLE",
+      blockHash: null,
+      canonicalStatus: "unknown",
+      confirmations: 0,
+      finalityRequiredConfirmations,
+      finalizedAt: null,
+      reorgHold: false,
+      verifiedAt: null,
+      blockNumber: null,
+      blockTimestamp: null,
       evidence: {
         code: "RPC_UNAVAILABLE",
         message: String(error.message || error).slice(0, 240),
+        finality_required_confirmations: finalityRequiredConfirmations,
+        revalidation: revalidate,
       },
     };
   }
+}
+
+function applyRefundFundingReorgHold({ refund, sweep, actorId, auditContext = null, reason = "refund_chain_reorg_detected" }) {
+  const timestamp = nowIso();
+  const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(refund.invoice_id);
+  if (!invoice) return null;
+  db.prepare(
+    `UPDATE invoices
+     SET integrity_hold = 1,
+         integrity_hold_reason = ?,
+         integrity_hold_at = COALESCE(integrity_hold_at, ?),
+         fulfillment_status = 'hold',
+         review_status = 'open',
+         integrity_status = 'hold',
+         accounting_status = 'adjusted',
+         monitoring_status = 'integrity_hold',
+         version = COALESCE(version, 0) + 1,
+         updated_at = ?
+     WHERE id = ?`
+  ).run(reason, timestamp, timestamp, invoice.id);
+  db.prepare(
+    `UPDATE refund_requests
+     SET reorg_hold = 1,
+         reorg_hold_at = COALESCE(reorg_hold_at, ?),
+         updated_at = ?
+     WHERE id = ?`
+  ).run(timestamp, timestamp, refund.id);
+  const afterInvoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+  const reviewCase = upsertReviewCase(afterInvoice, REVIEW_REASON_CODES.CHAIN_REORG, {
+    txHash: sweep?.sweep_tx_hash || null,
+    eventAmountBase: sweep?.sweep_amount_jpyc_base || afterInvoice.paid_amount_jpyc_base || "0",
+    detectedAt: timestamp,
+    suggestedAction: "revalidate_refund_funding_sweep_and_reconcile_chain_reorg",
+    incidentType: `REFUND_FUNDING_REORG:${sweep?.id || refund.id}`,
+  });
+  if (auditContext) {
+    audit({
+      storeId: invoice.store_id,
+      actorType: "admin",
+      actorId,
+      action: "refund.funding_sweep_reorg_hold",
+      targetType: "refund",
+      targetId: refund.id,
+      requestId: auditContext.requestId,
+      idempotencyKey: auditContext.idempotencyKey,
+      beforeState: { invoice, sweep },
+      afterState: { invoice: afterInvoice, review_case: reviewCase, reorg_hold: true },
+      ip: auditContext.ip,
+    });
+  }
+  return { invoice: afterInvoice, reviewCase };
 }
 
 async function verifyRefundFundingSweepsV2(refund, sweeps, actorId, auditContext = null) {
   const results = await Promise.all(
     sweeps.map(async (sweep) => ({
       sweep,
-      verification: String(sweep.status) === "verified"
-        ? { status: "verified", evidence: { code: "ALREADY_VERIFIED" } }
-        : await verifyRefundFundingLineageOnChain(refund, sweep),
+      // Finalized funding is not immutable evidence. Re-query the receipt and
+      // canonical block on every verification pass so a later reorg can place
+      // the sweep and its refund back into an integrity hold.
+      verification: await verifyRefundFundingLineageOnChain(refund, sweep, {
+        revalidate: ["verified", "finalized"].includes(String(sweep.status)),
+      }),
     }))
   );
   const requestedAmount = parseBaseUnitOrZero(refund.refund_amount_jpyc_base);
@@ -9669,7 +13736,10 @@ async function verifyRefundFundingSweepsV2(refund, sweeps, actorId, auditContext
           error.details = { sweep_id: sweep.id };
           throw error;
         }
-        if (String(currentSweep.status) === "verified") continue;
+        if (String(currentSweep.status) === "finalized"
+          && String(verification.status) === "finalized"
+          && String(verification.canonicalStatus) === "canonical"
+          && !verification.reorgHold) continue;
         if (String(currentSweep.status) !== String(sweep.status)
           || String(currentSweep.updated_at || "") !== String(sweep.updated_at || "")) {
           const error = new Error("funding sweep changed while verification was in progress");
@@ -9689,10 +13759,26 @@ async function verifyRefundFundingSweepsV2(refund, sweeps, actorId, auditContext
         };
         const updated = db.prepare(
           `UPDATE refund_funding_sweeps
-           SET status = ?, evidence_json = ?, updated_at = ?
+           SET status = ?,
+               block_hash = ?,
+               canonical_status = ?,
+               confirmations = ?,
+               finality_required_confirmations = ?,
+               finalized_at = ?,
+               reorg_hold = ?,
+               reorg_hold_at = ?,
+               evidence_json = ?,
+               updated_at = ?
            WHERE id = ? AND status = ? AND updated_at = ?`
         ).run(
           verification.status,
+          verification.blockHash || null,
+          verification.canonicalStatus || "unknown",
+          Number(verification.confirmations || 0),
+          Number(verification.finalityRequiredConfirmations || ACCOUNTING_FINALITY_CONFIRMATIONS),
+          verification.finalizedAt || null,
+          verification.reorgHold ? 1 : 0,
+          verification.reorgHold ? timestamp : null,
           JSON.stringify(sanitizeAuditState(evidence)),
           timestamp,
           currentSweep.id,
@@ -9705,6 +13791,34 @@ async function verifyRefundFundingSweepsV2(refund, sweeps, actorId, auditContext
           error.details = { sweep_id: sweep.id };
           throw error;
         }
+      }
+
+      const reorgResult = results.find(({ verification }) => verification.reorgHold);
+      if (reorgResult) {
+        const hold = applyRefundFundingReorgHold({
+          refund: currentRefund,
+          sweep: reorgResult.sweep,
+          actorId,
+          auditContext,
+        });
+        return {
+          incomplete: true,
+          afterRefund: db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id),
+          beforeState: buildRefundFundingAuditState(currentRefund, beforeConservation),
+          afterState: buildRefundFundingAuditState(
+            db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id),
+            evaluateRefundFundingConservation(
+              db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id),
+              getRefundFundingSweeps(refund.id),
+              getRefundFundingAllocationsForConservation(refund.id, getRefundFundingSweeps(refund.id)),
+            ),
+          ),
+          error: {
+            code: "REFUND_FUNDING_REORG_HOLD",
+            message: "refund funding sweep is no longer canonical; refund remains on integrity hold",
+            details: { sweep_id: reorgResult.sweep.id, hold_applied: Boolean(hold) },
+          },
+        };
       }
 
       const freshSweeps = getRefundFundingSweeps(refund.id);
@@ -9729,7 +13843,7 @@ async function verifyRefundFundingSweepsV2(refund, sweeps, actorId, auditContext
           .map((allocation) => String(allocation.sweep_id))
       );
       for (const sweep of freshSweeps) {
-        if (allocatedTotal >= requestedAmount || String(sweep.status) !== "verified") continue;
+        if (allocatedTotal >= requestedAmount || !getRefundFundingFinalityState(sweep).allocationReady) continue;
         if (refundSweepPairs.has(String(sweep.id))) continue;
         const sweepAmount = parseBaseUnitOrZero(sweep.sweep_amount_jpyc_base);
         const available = sweepAmount - (allocationsBySweep.get(String(sweep.id)) || 0n);
@@ -10068,20 +14182,28 @@ function runInvoiceExpirySweepOnce() {
       .get(invoice.id);
     const hasPaymentEvidence = invoice.status !== "issued" || Number(paymentEvidence?.count || 0) > 0 || !!invoice.paid_tx_hash;
     const expiresMs = new Date(invoice.expires_at).getTime();
-    const earliestCanonicalMs = new Date(String(paymentEvidence?.earliest_block_timestamp || "")).getTime();
-    if (
-      hasPaymentEvidence
+    const earliestCanonicalMs = paymentEvidence?.earliest_block_timestamp
+      ? new Date(String(paymentEvidence.earliest_block_timestamp)).getTime()
+      : Number.NaN;
+    const hasVerifiedBlockTimestamp = Number.isFinite(earliestCanonicalMs);
+    const isDetectedAfterExpiry = hasPaymentEvidence
+      && hasVerifiedBlockTimestamp
       && Number.isFinite(expiresMs)
-      && Number.isFinite(earliestCanonicalMs)
-      && earliestCanonicalMs <= expiresMs
-      && ["payment_detected", "confirming"].includes(String(invoice.status))
-    ) {
-      // The send was mined before expiry. Keep waiting for finality even when
-      // the monitor observed it after the customer-facing payment window.
-      continue;
-    }
+      && earliestCanonicalMs <= expiresMs;
+    const isLatePayment = hasPaymentEvidence
+      && hasVerifiedBlockTimestamp
+      && Number.isFinite(expiresMs)
+      && earliestCanonicalMs > expiresMs;
     const nextStatus = hasPaymentEvidence ? "review_required" : "expired";
-    const reason = hasPaymentEvidence ? "late_arrival_after_expiry" : "expired_timeout";
+    const reason = !hasPaymentEvidence
+      ? "expired_timeout"
+      : !hasVerifiedBlockTimestamp
+        ? "timestamp_unverified"
+        : isDetectedAfterExpiry
+          ? "detected_after_expiry"
+          : isLatePayment
+            ? "late_arrival_after_expiry"
+            : "timestamp_unverified";
     const update = hasPaymentEvidence
       ? transitionInvoiceForPayment(invoice, "review_required", reason, {
         actorType: "system",
@@ -10095,12 +14217,33 @@ function runInvoiceExpirySweepOnce() {
       });
     if (update.error || !update.invoice || update.invoice.status === invoice.status) continue;
     if (nextStatus === "review_required") {
-      upsertReviewCase(update.invoice, REVIEW_REASON_CODES.LATE_PAYMENT, {
+      const expiryReasonType = !hasVerifiedBlockTimestamp
+        ? REVIEW_REASON_CODES.TIMESTAMP_UNVERIFIED
+        : isDetectedAfterExpiry
+          ? REVIEW_REASON_CODES.DETECTED_AFTER_EXPIRY
+          : REVIEW_REASON_CODES.LATE_PAYMENT;
+      upsertReviewCase(update.invoice, expiryReasonType, {
         txHash: update.invoice.paid_tx_hash || null,
         eventAmountBase: update.invoice.paid_amount_jpyc_base || "0",
-        blockTimestamp: paymentEvidence?.earliest_block_timestamp || paymentEvidence?.earliest_observed_at || now,
+        blockTimestamp: paymentEvidence?.earliest_block_timestamp || null,
         detectedAt: now,
+        incidentType: !hasVerifiedBlockTimestamp
+          ? "TIMESTAMP_UNVERIFIED"
+          : isDetectedAfterExpiry
+            ? "DETECTED_AFTER_EXPIRY"
+            : "LATE_PAYMENT",
+        reasonType: expiryReasonType,
       });
+      if (!hasVerifiedBlockTimestamp) {
+        db.prepare(
+          `UPDATE invoices
+           SET integrity_hold = 1,
+               integrity_hold_reason = ?,
+               integrity_hold_at = COALESCE(integrity_hold_at, ?),
+               updated_at = ?
+           WHERE id = ?`
+        ).run("TIMESTAMP_UNVERIFIED", now, now, invoice.id);
+      }
     }
     audit({
       actorType: "system",
@@ -10132,6 +14275,28 @@ const expirySweepTimer = setInterval(() => {
   }
 }, 60_000);
 expirySweepTimer.unref();
+
+const notificationOutboxTimer = setInterval(() => {
+  try {
+    const result = dispatchPaymentNotificationOutboxOnce();
+    if (result.dead_lettered > 0) {
+      console.error(JSON.stringify({
+        ts: nowIso(),
+        level: "error",
+        type: "payment.notification_outbox_dead_lettered",
+        ...result,
+      }));
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      ts: nowIso(),
+      level: "error",
+      type: "payment.notification_outbox_dispatch_failed",
+      message: String(error.message || error),
+    }));
+  }
+}, 5_000);
+notificationOutboxTimer.unref();
 
 const app = express();
 app.disable("x-powered-by");
@@ -10278,21 +14443,38 @@ function collectRuntimeMetrics() {
   const dbOk = db.prepare(`SELECT 1 AS ok`).get()?.ok === 1;
   const reviewOpenCount = db.prepare(`SELECT COUNT(*) AS count FROM review_cases WHERE status IN ('open', 'in_progress')`).get().count;
   const unconfirmedTxCount = db.prepare(`SELECT COUNT(*) AS count FROM payment_events WHERE confirmations < ?`).get(REQUIRED_CONFIRMATIONS).count;
-  const unmatchedCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_unmatched_events WHERE chain_id = ?`).get(CHAIN_ID).count;
-  const deadLetterCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ?`).get(CHAIN_ID).count;
-  const deadLetterPendingCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'pending'`).get(CHAIN_ID).count;
-  const deadLetterAbandonedCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'abandoned'`).get(CHAIN_ID).count;
-  const rpcFailoverCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_rpc_failovers WHERE chain_id = ?`).get(CHAIN_ID).count;
-  const unresolvedReorgCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_reorgs WHERE chain_id = ? AND status = 'unresolved'`).get(CHAIN_ID).count;
+  const unmatchedCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_unmatched_events WHERE chain_id = ?`, CHAIN_ID);
+  const deadLetterCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ?`, CHAIN_ID);
+  const deadLetterPendingCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'pending'`, CHAIN_ID);
+  const deadLetterAbandonedCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'abandoned'`, CHAIN_ID);
+  const rpcFailoverCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_rpc_failovers WHERE chain_id = ?`, CHAIN_ID);
+  const unresolvedReorgCount = db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM chain_reorgs
+     WHERE chain_id = ?
+       AND (COALESCE(status, 'unresolved') <> 'resolved'
+         OR COALESCE(revalidation_status, 'unverified') <> 'verified')`
+  ).get(CHAIN_ID).count;
   const addressPoolAvailableCount = db.prepare(`SELECT COUNT(*) AS count FROM receive_addresses WHERE status = 'available'`).get().count;
   const issuedInvoiceCount = db.prepare(`SELECT COUNT(*) AS count FROM invoices WHERE status = 'issued'`).get().count;
   const expiredInvoiceCount = db.prepare(`SELECT COUNT(*) AS count FROM invoices WHERE status = 'expired'`).get().count;
   const manualReviewCount = db.prepare(`SELECT COUNT(*) AS count FROM invoices WHERE status = 'review_required'`).get().count;
-  const workerLastCycle = db.prepare(`SELECT value, updated_at FROM chain_monitor_state WHERE key = ?`).get(`worker:${CHAIN_ID}:last_cycle_at`);
+  const workerLastCycle = workerStateGet(`SELECT value, updated_at FROM chain_monitor_state WHERE key = ?`, `worker:${CHAIN_ID}:last_cycle_at`);
   const workerLastCycleAt = workerLastCycle?.value || null;
-  const workerStale =
-    !!workerLastCycleAt && Date.now() - new Date(workerLastCycleAt).getTime() > WORKER_STALE_SEC * 1000;
+  const workerRpc = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${CHAIN_ID}:rpc_count`);
+  const workerCheckpoint = workerStateGet(`SELECT value FROM chain_monitor_state WHERE key = ?`, `worker:${CHAIN_ID}:last_checkpoint`);
+  const workerAtMs = workerLastCycleAt ? new Date(workerLastCycleAt).getTime() : NaN;
+  const clockOk = Number.isFinite(workerAtMs) && workerAtMs <= Date.now() + SERVICE_AUTH_MAX_FUTURE_SEC * 1000;
+  const workerStale = !Number.isFinite(workerAtMs) || Date.now() - workerAtMs > WORKER_STALE_SEC * 1000;
+  const workerReady =
+    clockOk
+    && !workerStale
+    && Number.isFinite(Number(workerRpc?.value))
+    && Number(workerRpc.value) >= 1
+    && !!workerCheckpoint?.value;
   const auditStatus = verifyAuditChain();
+  const chainRuntimeRegistry = evaluateChainRuntimeRegistryGate(CHAIN_ID);
+  const receiveAddressPoolGate = evaluateReceiveAddressPoolGate();
   const replayGuardCount = db
     .prepare(`SELECT COUNT(*) AS count FROM service_replay_guards WHERE expires_at > ?`)
     .get(nowIso()).count;
@@ -10312,7 +14494,13 @@ function collectRuntimeMetrics() {
     manual_review_count: manualReviewCount,
     worker_last_cycle_at: workerLastCycleAt,
     worker_stale: workerStale,
+    worker_rpc_count: Number.isFinite(Number(workerRpc?.value)) ? Number(workerRpc.value) : null,
+    worker_last_checkpoint: workerCheckpoint?.value || null,
+    worker_ready: workerReady,
+    clock_ok: clockOk,
     audit_chain: auditStatus,
+    chain_runtime_registry: chainRuntimeRegistry,
+    receive_address_pool_gate: receiveAddressPoolGate,
     replay_guard_active_count: replayGuardCount
   };
 }
@@ -10395,9 +14583,10 @@ function renderPrometheusMetrics(metrics) {
 
 app.get("/readyz", requireMetricsAuth, (_req, res) => {
   const metrics = collectRuntimeMetrics();
-  const baseReady = metrics.db_ok && metrics.audit_chain.ok && !!metrics.worker_last_cycle_at && !metrics.worker_stale;
+  const baseReady = metrics.db_ok && metrics.audit_chain.ok && metrics.worker_ready;
   const commercial = evaluateCommercialRuntimeGate(metrics);
-  const commercialReady = !commercial.commercial_go_mode || commercial.blockers.length === 0;
+  const acceptanceGateRequired = IS_PRODUCTION || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE) || commercial.commercial_go_mode;
+  const commercialReady = !acceptanceGateRequired || commercial.blockers.length === 0;
   const ready = baseReady && commercialReady;
   return res.status(ready ? 200 : 503).json({
     ok: ready,
@@ -10405,6 +14594,12 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     app_env: APP_ENV,
     payments_disabled: commercial.payments_disabled,
     commercial_go_mode: commercial.commercial_go_mode,
+    acceptance_gate_required: acceptanceGateRequired,
+    database_gate: commercial.database_gate,
+    worker_gate: commercial.worker_gate,
+    rpc_runtime_gate: commercial.rpc_runtime_gate,
+    clock_gate: commercial.clock_gate,
+    receive_address_pool_gate: commercial.receive_address_pool_gate,
     legal_gate: commercial.legal_gate,
     aml_gate: commercial.aml_gate,
     privacy_gate: commercial.privacy_gate,
@@ -10423,6 +14618,7 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     refund_policy_gate: commercial.refund_policy_gate,
     dangerous_flags_gate: commercial.dangerous_flags_gate,
     chain_reorg_gate: commercial.chain_reorg_gate,
+    chain_runtime_registry_gate: commercial.chain_runtime_registry_gate,
     commercial_verdict: commercial.commercial_verdict,
     blockers: commercial.blockers,
     checks: metrics,
@@ -10542,6 +14738,353 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
   });
 });
 
+function applyChainReorgToFinancialLedger(payload = {}, auditContext = {}) {
+  const normalizedChainId = normalizeChainId(payload.chainId ?? payload.chain_id ?? CHAIN_ID) || CHAIN_ID;
+  const observedAt = String(payload.detectedAt ?? payload.detected_at ?? nowIso());
+  const from = Number.isSafeInteger(Number(payload.fromBlock ?? payload.from_block))
+    ? Number(payload.fromBlock ?? payload.from_block)
+    : null;
+  const to = Number.isSafeInteger(Number(payload.toBlock ?? payload.to_block))
+    ? Number(payload.toBlock ?? payload.to_block)
+    : from;
+  const previousHash = payload.previousHash ?? payload.previous_hash;
+  const observedHash = payload.observedHash ?? payload.observed_hash;
+  const reason = payload.reason;
+  const requestedReorgId = String(payload.reorgId ?? payload.reorg_id ?? "").trim();
+  const result = db.transaction(() => {
+    db.prepare(
+      `INSERT OR IGNORE INTO chain_reorgs
+       (id, chain_id, from_block, to_block, previous_checkpoint_hash, observed_checkpoint_hash, reason, status, detected_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'unresolved', ?)
+       `
+    ).run(requestedReorgId || uuid(), normalizedChainId, from, to, previousHash || null, observedHash || null, String(reason || "checkpoint_mismatch"), observedAt);
+    const reorg = db.prepare(
+      `SELECT * FROM chain_reorgs
+       WHERE chain_id = ?
+         AND COALESCE(from_block, -1) = COALESCE(?, -1)
+         AND COALESCE(to_block, -1) = COALESCE(?, -1)
+         AND COALESCE(previous_checkpoint_hash, '') = COALESCE(?, '')
+         AND COALESCE(observed_checkpoint_hash, '') = COALESCE(?, '')
+         AND reason = ?
+       ORDER BY detected_at DESC, id DESC LIMIT 1`
+    ).get(normalizedChainId, from, to, previousHash || null, observedHash || null, String(reason || "checkpoint_mismatch"));
+    if (!reorg || from == null || to == null) return { reorg_id: reorg?.id || null, affected_invoice_ids: [] };
+    const lowerBlock = Math.min(from, to);
+    const upperBlock = Math.max(from, to);
+    const affectedEvents = db.prepare(
+      `SELECT * FROM payment_events
+       WHERE chain_id = ? AND block_number BETWEEN ? AND ?
+       ORDER BY block_number ASC, created_at ASC, id ASC`
+    ).all(normalizedChainId, lowerBlock, upperBlock);
+    const affectedInvoiceIds = [...new Set(affectedEvents.map((row) => String(row.invoice_id || "")).filter(Boolean))];
+    for (const event of affectedEvents) {
+      const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(event.invoice_id);
+      if (!invoice) continue;
+      const raw = parseJsonWithWarning(event.raw_payload, `reorg.payment_event:${event.id}`, {});
+      const global = registerGlobalTransferObservation({
+        invoice,
+        providerId: "chain-monitor-reorg",
+        event: {
+          ...raw,
+          invoice_id: invoice.id,
+          chain_id: event.chain_id,
+          tx_hash: event.tx_hash,
+          log_index: event.log_index,
+          token_contract: event.token_contract,
+          from_address: event.from_address,
+          to_address: event.to_address,
+          token_amount_atomic: event.token_amount_atomic || event.amount_atomic,
+          amount_atomic: event.amount_atomic,
+          block_number: event.block_number,
+          block_hash: event.block_hash,
+          block_timestamp: event.block_timestamp,
+          confirmations: event.confirmations,
+          canonical_status: "disputed",
+          observed_at: observedAt,
+          reorg_id: reorg.id,
+        },
+      });
+      if (global.transferId) {
+        db.prepare(
+          `UPDATE blockchain_transfers
+           SET canonical_status = 'disputed', integrity_status = 'disputed', latest_observed_at = ?
+           WHERE id = ?`
+        ).run(observedAt, global.transferId);
+      }
+      db.prepare(
+        `UPDATE payment_events
+         SET canonical_status = 'disputed', recognition_status = 'review_required', reorg_id = ?
+         WHERE id = ?`
+      ).run(reorg.id, event.id);
+      db.prepare(
+        `UPDATE payment_attempts
+         SET status = 'disputed', recognition_status = 'review_required', canonical_status = 'disputed', reversed_at = COALESCE(reversed_at, ?)
+         WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?) AND COALESCE(log_index, -1) = COALESCE(?, -1)`
+      ).run(observedAt, invoice.id, event.chain_id, event.tx_hash, event.log_index ?? null);
+      db.prepare(
+        `UPDATE invoices
+         SET integrity_hold = 1,
+             integrity_hold_reason = 'chain_reorg_detected',
+             integrity_hold_at = COALESCE(integrity_hold_at, ?),
+             monitor_until = CASE WHEN monitor_until IS NULL OR monitor_until < ? THEN ? ELSE monitor_until END,
+             fulfillment_status = 'hold', review_status = 'open', integrity_status = 'hold',
+             accounting_status = 'exception', monitoring_status = 'integrity_hold',
+             version = COALESCE(version, 0) + 1, last_reconciled_at = COALESCE(last_reconciled_at, ?), updated_at = ?
+         WHERE id = ?`
+      ).run(observedAt, observedAt, new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString(), observedAt, observedAt, invoice.id);
+      const updatedInvoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+      upsertReviewCase(updatedInvoice, REVIEW_REASON_CODES.CHAIN_REORG, {
+        txHash: event.tx_hash,
+        eventAmountBase: event.ledger_amount_base ?? event.amount_jpyc_base,
+        blockTimestamp: event.block_timestamp || null,
+        detectedAt: observedAt,
+        incidentType: `CHAIN_REORG:${reorg.id}`,
+        transferId: global.transferId || null,
+        actorId: "chain-monitor",
+      });
+      enqueuePaymentNotificationOutbox({
+        invoice: updatedInvoice,
+        paymentEventId: event.id,
+        notificationType: "payment_review",
+        confirmations: event.confirmations,
+        amountBase: event.ledger_amount_base ?? event.amount_jpyc_base ?? "0",
+        txHash: event.tx_hash,
+        status: updatedInvoice.status,
+        reason: "chain_reorg_detected",
+      });
+    }
+    const afterReorg = db.prepare(`SELECT * FROM chain_reorgs WHERE id = ?`).get(reorg.id);
+    audit({
+      actorType: "service",
+      actorId: auditContext.actorId || "svc:chain-monitor",
+      action: "chain_reorg.detected",
+      targetType: "chain_reorg",
+      targetId: reorg.id,
+      requestId: auditContext.requestId || null,
+      idempotencyKey: auditContext.idempotencyKey || null,
+      beforeState: { reorg: { ...afterReorg, status: "unresolved", revalidation_status: "unverified" } },
+      afterState: { reorg: afterReorg, affected_invoice_ids: affectedInvoiceIds },
+      ip: null,
+    });
+    return { reorg_id: reorg.id, affected_invoice_ids: affectedInvoiceIds };
+  })();
+  return result;
+}
+
+app.post("/api/v1/internal/chain/candidates:read", requireServiceSignature, (req, res) => {
+  const payload = req.body || {};
+  const normalizedChainId = normalizeChainId(payload.chain_id || CHAIN_ID);
+  const normalizedTokenContract = String(payload.token_contract || APPROVED_TOKEN_CONTRACT).trim().toLowerCase();
+  if (normalizedChainId !== CHAIN_ID) {
+    return jsonError(res, 400, "CHAIN_ID_MISMATCH", "candidate chain_id does not match the configured chain");
+  }
+  if (normalizedTokenContract !== APPROVED_TOKEN_CONTRACT) {
+    return jsonError(res, 400, "TOKEN_CONTRACT_MISMATCH", "candidate token contract is not the approved JPYC contract");
+  }
+  const invoices = db
+    .prepare(
+      `SELECT id, amount_jpyc, amount_jpyc_base, recipient_address, status, monitor_until,
+              integrity_hold, last_reconciled_block
+       FROM invoices
+       WHERE chain_id = ?
+         AND lower(token_contract) = ?
+         AND status IN ('issued', 'payment_detected', 'confirming', 'expired', 'review_required', 'paid', 'settled', 'refunded', 'cancelled')
+       ORDER BY id ASC
+       LIMIT 10000`
+    )
+    .all(normalizedChainId, normalizedTokenContract);
+  return res.json({
+    schema_version: 1,
+    source: "api-server",
+    financial_reader: "api-server",
+    chain_id: normalizedChainId,
+    token_contract: normalizedTokenContract,
+    invoices,
+  });
+});
+
+app.post("/api/v1/internal/chain/payment-evidence:read", requireServiceSignature, (req, res) => {
+  const payload = req.body || {};
+  const normalizedChainId = normalizeChainId(payload.chain_id || CHAIN_ID);
+  const fromBlock = Number(payload.from_block);
+  const toBlock = Number(payload.to_block);
+  if (normalizedChainId !== CHAIN_ID) {
+    return jsonError(res, 400, "CHAIN_ID_MISMATCH", "payment evidence chain_id does not match the configured chain");
+  }
+  if (!Number.isSafeInteger(fromBlock) || !Number.isSafeInteger(toBlock) || fromBlock < 0 || toBlock < fromBlock) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "payment evidence block range is invalid");
+  }
+  if (toBlock - fromBlock > 10000) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "payment evidence block range is too large");
+  }
+  const events = db
+    .prepare(
+      `SELECT id, invoice_id, block_number, block_hash, tx_hash, log_index
+       FROM payment_events
+       WHERE chain_id = ?
+         AND block_number BETWEEN ? AND ?
+         AND block_hash IS NOT NULL
+       ORDER BY block_number ASC, created_at ASC, id ASC`
+    )
+    .all(normalizedChainId, fromBlock, toBlock);
+  return res.json({
+    schema_version: 1,
+    source: "api-server",
+    financial_reader: "api-server",
+    chain_id: normalizedChainId,
+    from_block: fromBlock,
+    to_block: toBlock,
+    events,
+  });
+});
+
+app.post("/api/v1/internal/chain/reorgs:ingest", requireServiceSignature, (req, res) => {
+  const payload = req.body || {};
+  const actorId = `svc:${req.serviceAuth.serviceId}`;
+  return idempotent(req, res, "POST:/api/v1/internal/chain/reorgs:ingest", actorId, () => {
+    if ((normalizeChainId(payload.chain_id || CHAIN_ID) || "") !== CHAIN_ID) {
+      return { status: 400, body: { error: { code: "CHAIN_ID_MISMATCH", message: "reorg chain_id does not match the configured chain" } } };
+    }
+    try {
+      const result = applyChainReorgToFinancialLedger(payload, {
+        actorId,
+        requestId: requestIdFromReq(req),
+        idempotencyKey: req.header("Idempotency-Key"),
+      });
+      return { status: 200, body: { ...result, financial_writer: "api-server" } };
+    } catch (error) {
+      console.error(JSON.stringify({ ts: nowIso(), level: "error", type: "chain.reorg_ingest_failed", message: String(error.message || error) }));
+      return { status: 500, body: { error: { code: "CHAIN_REORG_INGEST_FAILED", message: "chain reorg financial projection failed" } } };
+    }
+  });
+});
+
+function applyChainReconciliationToFinancialLedger(payload = {}) {
+  const normalizedChainId = normalizeChainId(payload.chainId ?? payload.chain_id ?? CHAIN_ID);
+  const normalizedTokenContract = String(payload.tokenContract ?? payload.token_contract ?? APPROVED_TOKEN_CONTRACT).trim().toLowerCase();
+  const normalizedBlock = Number(payload.blockNumber ?? payload.block_number);
+  const observedAt = String(payload.reconciledAt ?? payload.reconciled_at ?? nowIso());
+  const rawInvoices = payload.invoices;
+  const observedAtMs = Date.parse(observedAt);
+  if (normalizedChainId !== CHAIN_ID) {
+    return { error: { code: "CHAIN_ID_MISMATCH", message: "reconciliation chain_id does not match the configured chain" } };
+  }
+  if (normalizedTokenContract !== APPROVED_TOKEN_CONTRACT) {
+    return { error: { code: "TOKEN_CONTRACT_MISMATCH", message: "reconciliation token contract is not the approved JPYC contract" } };
+  }
+  if (!Number.isSafeInteger(normalizedBlock) || normalizedBlock < 0) {
+    return { error: { code: "VALIDATION_ERROR", message: "reconciliation block_number must be a non-negative integer" } };
+  }
+  if (!Number.isFinite(observedAtMs) || observedAtMs > Date.now() + 5 * 60 * 1000) {
+    return { error: { code: "VALIDATION_ERROR", message: "reconciled_at must be a valid non-future timestamp" } };
+  }
+  if (!Array.isArray(rawInvoices) || rawInvoices.length === 0 || rawInvoices.length > 1000) {
+    return { error: { code: "VALIDATION_ERROR", message: "invoices must contain between 1 and 1000 records" } };
+  }
+  const invoices = [...new Map(rawInvoices.map((entry) => [String(entry?.invoice_id || "").trim(), {
+    invoice_id: String(entry?.invoice_id || "").trim(),
+    recipient_address: normalizeAddress(entry?.recipient_address),
+  }]).filter(([invoiceId, entry]) => invoiceId && entry.recipient_address)).values()];
+  if (invoices.length !== rawInvoices.length) {
+    return { error: { code: "VALIDATION_ERROR", message: "each reconciliation invoice requires a unique invoice_id and valid recipient_address" } };
+  }
+
+  const result = db.transaction(() => {
+    const updateInvoice = db.prepare(
+      `UPDATE invoices
+       SET last_reconciled_block = ?,
+           last_reconciled_at = ?,
+           updated_at = ?
+       WHERE id = ?
+         AND chain_id = ?
+         AND lower(token_contract) = ?
+         AND lower(recipient_address) = ?
+         AND (last_reconciled_block IS NULL OR last_reconciled_block < ?)`
+    );
+    const addressUpdate = db.prepare(
+      `UPDATE receive_addresses
+       SET last_reconciled_at = ?,
+           monitoring_status = 'post_payment',
+           updated_at = ?
+       WHERE lower(address) = ?
+         AND lower(token_contract) = ?
+         AND (chain_id = ? OR network = ?)`
+    );
+    const reconciledInvoices = [];
+    for (const entry of invoices) {
+      const invoice = db.prepare(
+        `SELECT id, store_id, chain_id, token_contract, recipient_address, last_reconciled_block
+         FROM invoices WHERE id = ?`
+      ).get(entry.invoice_id);
+      if (!invoice
+        || normalizeChainId(invoice.chain_id) !== normalizedChainId
+        || String(invoice.token_contract || "").trim().toLowerCase() !== normalizedTokenContract
+        || normalizeAddress(invoice.recipient_address) !== entry.recipient_address) {
+        const error = new Error(`reconciliation invoice evidence mismatch:${entry.invoice_id}`);
+        error.code = "RECONCILIATION_INVOICE_EVIDENCE_MISMATCH";
+        error.details = { invoice_id: entry.invoice_id };
+        throw error;
+      }
+      const updated = updateInvoice.run(
+        normalizedBlock,
+        observedAt,
+        observedAt,
+        entry.invoice_id,
+        normalizedChainId,
+        normalizedTokenContract,
+        entry.recipient_address,
+        normalizedBlock,
+      );
+      addressUpdate.run(observedAt, observedAt, entry.recipient_address, normalizedTokenContract, normalizedChainId, normalizedChainId);
+      reconciledInvoices.push({
+        invoice_id: entry.invoice_id,
+        updated: updated.changes === 1,
+        previous_last_reconciled_block: invoice.last_reconciled_block ?? null,
+        last_reconciled_block: normalizedBlock,
+      });
+    }
+    audit({
+      actorType: "service",
+      actorId: `svc:${SERVICE_INGEST_ID}`,
+      action: "chain_reconciliation.recorded",
+      targetType: "chain_reconciliation",
+      targetId: `${normalizedChainId}:${normalizedBlock}:${sha256(JSON.stringify(invoices))}`,
+      requestId: null,
+      idempotencyKey: null,
+      beforeState: { chain_id: normalizedChainId, block_number: normalizedBlock, invoices: invoices.map((entry) => entry.invoice_id) },
+      afterState: { chain_id: normalizedChainId, block_number: normalizedBlock, reconciled_at: observedAt, invoices: reconciledInvoices },
+      ip: null,
+    });
+    return { chain_id: normalizedChainId, block_number: normalizedBlock, reconciled_at: observedAt, invoices: reconciledInvoices };
+  })();
+  return { result };
+}
+
+app.post("/api/v1/internal/chain/reconciliation:ingest", requireServiceSignature, (req, res) => {
+  const actorId = `svc:${req.serviceAuth.serviceId}`;
+  return idempotent(req, res, "POST:/api/v1/internal/chain/reconciliation:ingest", actorId, () => {
+    try {
+      const result = applyChainReconciliationToFinancialLedger(req.body || {});
+      if (result.error) return { status: 400, body: { error: result.error } };
+      return { status: 200, body: { ...result.result, financial_writer: "api-server" } };
+    } catch (error) {
+      if (error.code === "RECONCILIATION_INVOICE_EVIDENCE_MISMATCH") {
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: error.code,
+              message: "reconciliation invoice evidence does not match the canonical invoice",
+              details: error.details || {},
+            },
+          },
+        };
+      }
+      throw error;
+    }
+  });
+});
+
 app.post("/api/v1/internal/payments/events:ingest", requireServiceSignature, (req, res) => {
   const actorId = `svc:${req.serviceAuth.serviceId}`;
   return idempotent(req, res, "POST:/api/v1/internal/payments/events:ingest", actorId, () => {
@@ -10561,6 +15104,28 @@ app.post("/api/v1/internal/payments/events:ingest", requireServiceSignature, (re
       action: "payment.ingested.internal",
       ip: req.ip
     });
+  });
+});
+
+app.post("/api/v1/payment-recovery/reports", requireSession, requirePermission("invoice.read"), async (req, res) => {
+  const invoiceId = String(req.body?.invoice_id || "").trim();
+  const invoice = db
+    .prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ?`)
+    .get(invoiceId, req.session.store_id);
+  if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
+  const result = await createPaymentRecoveryReport({
+    invoice,
+    body: req.body || {},
+    reporterType: "staff",
+    reporterId: req.session.staff_user_id,
+    requestId: requestIdFromReq(req),
+    ip: req.ip,
+  });
+  if (result.error) return jsonError(res, 400, result.error.code, result.error.message, result.error.details || {});
+  return res.status(201).json({
+    report: result.report,
+    status: result.classification.status,
+    verification: result.verification,
   });
 });
 
@@ -10653,6 +15218,62 @@ app.post("/api/v1/provider-rail/mock/settlements:ingest", requireServiceSignatur
 });
 
 app.use("/api/v1", requireSession);
+
+app.post(
+  "/api/v1/terminal-sessions/current/step-up",
+  requireAnyPermission("review.update", "accounting.adjustment.create", "accounting.adjustment.approve"),
+  (req, res) => {
+    const staffPin = String(req.body?.staff_pin ?? req.body?.staffPin ?? "");
+    if (!/^\d{4,8}$/.test(staffPin)) {
+      return jsonError(res, 400, "VALIDATION_ERROR", "staff_pin must be 4-8 digits");
+    }
+    if (isLoginRateLimited(`step-up:${req.session.session_id}`)) {
+      return jsonError(res, 429, "RATE_LIMITED", "Too many step-up attempts. Please retry later.");
+    }
+    const staff = db.prepare(
+      `SELECT id, pin_hash
+       FROM staff_users
+       WHERE id = ? AND store_id = ? AND status = 'active'`
+    ).get(req.session.staff_user_id, req.session.store_id);
+    if (!staff || !verifyPin(staffPin, staff.pin_hash)) {
+      audit({
+        storeId: req.session.store_id,
+        actorType: "staff",
+        actorId: req.session.staff_user_id,
+        action: "session.step_up_failed",
+        targetType: "session",
+        targetId: req.session.session_id,
+        afterState: { reason: "invalid_pin" },
+        ip: req.ip,
+      });
+      return jsonError(res, 401, "UNAUTHORIZED", "Step-up verification failed");
+    }
+    const verifiedAt = nowIso();
+    const expiresAt = new Date(Date.now() + REVIEW_STEP_UP_SEC * 1000).toISOString();
+    db.prepare(
+      `UPDATE terminal_sessions
+       SET step_up_verified_at = ?, step_up_expires_at = ?, last_activity_at = ?
+       WHERE id = ? AND revoked_at IS NULL AND ended_at IS NULL`
+    ).run(verifiedAt, expiresAt, verifiedAt, req.session.session_id);
+    audit({
+      storeId: req.session.store_id,
+      actorType: "staff",
+      actorId: req.session.staff_user_id,
+      action: "session.step_up_verified",
+      targetType: "session",
+      targetId: req.session.session_id,
+      afterState: { verified_at: verifiedAt, expires_at: expiresAt, purpose: "accounting.adjustment" },
+      ip: req.ip,
+    });
+    return res.json({
+      step_up_verified: true,
+      session_id: req.session.session_id,
+      verified_at: verifiedAt,
+      expires_at: expiresAt,
+      purpose: "accounting.adjustment",
+    });
+  }
+);
 
 app.get("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
   const rows = db
@@ -11267,6 +15888,27 @@ app.get("/api/v1/admin/receive-addresses", requirePermission("address_pool.manag
       token_contract: row.token_contract,
       allocated_invoice_id: row.allocated_invoice_id,
       source_label: row.source_label,
+      chain_id: row.chain_id || null,
+      activation_status: row.activation_status || "pending_proof",
+      control_proof_type: row.control_proof_type || null,
+      control_proof_verified: Number(row.control_proof_verified || 0) === 1,
+      control_verified_at: row.control_verified_at || null,
+      sweep_destination: row.sweep_destination || null,
+      sweep_capability: row.sweep_capability || null,
+      provider_reference: row.provider_reference || null,
+      manifest: {
+        batch_id: row.manifest_batch_id || null,
+        provider_id: row.manifest_provider_id || null,
+        chain_id: row.manifest_chain_id || null,
+        address_count: row.manifest_address_count ?? null,
+        generated_at: row.manifest_generated_at || null,
+        sweep_policy: row.manifest_sweep_policy || null,
+        sha256: row.manifest_sha256 || null,
+        canonical_sha256: row.manifest_canonical_sha256 || null,
+        signature_status: row.manifest_signature_status || null,
+        signer_address: row.manifest_signer_address || null,
+        approval_ref: row.manifest_approval_ref || null,
+      },
       created_at: row.created_at,
       updated_at: row.updated_at,
     })),
@@ -11291,6 +15933,7 @@ app.post("/api/v1/admin/receive-addresses:import", requirePermission("address_po
       addresses,
       sourceLabel,
       chainId,
+      manifest: req.body?.manifest || null,
       requestId,
       idempotencyKey: idemKey,
       ip: req.ip,
@@ -11299,6 +15942,7 @@ app.post("/api/v1/admin/receive-addresses:import", requirePermission("address_po
       const code = [
         "PRIVATE_KEY_MATERIAL_REJECTED",
         "VALIDATION_ERROR",
+        "RECEIVE_ADDRESS_MANIFEST_INVALID",
         "UNSUPPORTED_PAYMENT_CHAIN",
         "PAYMENT_CHAIN_DISABLED",
       ].includes(imported.error.code) ? 400 : 409;
@@ -11314,8 +15958,103 @@ app.post("/api/v1/admin/receive-addresses:import", requirePermission("address_po
           status: row.status,
           source_label: row.source_label,
         })),
+        manifest: imported.manifest || null,
       },
     };
+  });
+});
+
+app.post("/api/v1/admin/receive-addresses/:receiveAddressId/control-proof", requirePermission("address_pool.manage"), (req, res) => {
+  const actorId = req.session.staff_user_id;
+  return idempotentAsync(req, res, "POST:/api/v1/admin/receive-addresses/:id/control-proof", actorId, async () => {
+    const requestId = requestIdFromReq(req);
+    const idempotencyKey = req.header("Idempotency-Key");
+    const row = db
+      .prepare(`SELECT * FROM receive_addresses WHERE id = ? AND store_id = ?`)
+      .get(req.params.receiveAddressId, req.session.store_id);
+    if (!row) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Receive address not found" } } };
+    if (row.status === "allocated") {
+      return { status: 409, body: { error: { code: "ADDRESS_IN_USE", message: "allocated receive address cannot change control proof" } } };
+    }
+    const { _proof_verified: _ignoredProofFlag, ...controlBody } = req.body || {};
+    const controlInput = {
+      ...controlBody,
+      address: row.address,
+      chain_id: row.chain_id || CHAIN_ID,
+      token_contract: row.token_contract,
+    };
+    let proofVerification = null;
+    if (String(controlInput.control_proof_type || "").toLowerCase() === "eip1271_signature") {
+      const message = String(controlInput.control_proof_message || buildReceiveAddressControlMessage({
+        address: row.address,
+        chainId: row.chain_id || CHAIN_ID,
+        tokenContract: row.token_contract,
+        sweepDestination: controlInput.sweep_destination,
+      }));
+      proofVerification = await verifyEip1271ControlProof({
+        address: row.address,
+        chainId: row.chain_id || CHAIN_ID,
+        message,
+        signature: controlInput.control_proof_signature,
+      });
+      if (!proofVerification.ok) {
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: proofVerification.code,
+              message: "smart-contract receive address proof could not be verified",
+            },
+          },
+        };
+      }
+      controlInput.control_proof_message = message;
+      controlInput._proof_verified = true;
+    }
+    const control = validateReceiveAddressControl(controlInput, { allowTestFixture: !IS_PRODUCTION && RECEIVE_ADDRESS_DEV_AUTO_VERIFY });
+    if (!control.ok) {
+      return {
+        status: 400,
+        body: { error: { code: "CONTROL_PROOF_REQUIRED", message: "verified control proof and sweep capability are required", details: control.errors } },
+      };
+    }
+    const updatedAt = nowIso();
+    db.prepare(
+      `UPDATE receive_addresses
+       SET control_proof_type = ?, control_proof_payload_hash = ?, control_verified_at = ?, control_proof_verified = ?,
+           sweep_destination = ?, sweep_capability = ?, provider_reference = ?,
+           status = 'available', activation_status = 'available', updated_at = ?
+       WHERE id = ? AND store_id = ? AND status <> 'allocated'`
+    ).run(
+      control.normalized.control_proof_type,
+      control.normalized.control_proof_payload_hash,
+      control.normalized.control_verified_at,
+      control.normalized.control_proof_verified ? 1 : 0,
+      control.normalized.sweep_destination,
+      control.normalized.sweep_capability,
+      control.normalized.provider_reference,
+      updatedAt,
+      row.id,
+      req.session.store_id,
+    );
+    const after = db.prepare(`SELECT * FROM receive_addresses WHERE id = ?`).get(row.id);
+    if (!isReceiveAddressAllocatable(after)) {
+      return { status: 409, body: { error: { code: "CONTROL_PROOF_NOT_ALLOCATABLE", message: "receive address control proof did not activate the address" } } };
+    }
+    audit({
+      storeId: req.session.store_id,
+      actorType: "admin",
+      actorId,
+      action: "receive_address.control_verified",
+      targetType: "receive_address",
+      targetId: row.id,
+      requestId,
+      idempotencyKey,
+      beforeState: row,
+      afterState: after,
+      ip: req.ip,
+    });
+    return { status: 200, body: { receive_address: after } };
   });
 });
 
@@ -11535,6 +16274,13 @@ app.post("/api/v1/invoices", (req, res) => {
         terminal_public_entry_token: publicEntry.public_entry_token,
         receive_address: created.recipient_address,
         checkout_session_id: created.checkout_session_id,
+        amount_scale_version: created.amount_scale_version || AMOUNT_SCALE_VERSION,
+        token_decimals: created.token_decimals ?? TOKEN_DECIMALS,
+        ledger_decimals: created.ledger_decimals ?? LEDGER_DECIMALS,
+        token_amount_atomic: created.token_amount_atomic || null,
+        ledger_amount_base: created.ledger_amount_base || created.amount_jpyc_base,
+        display_amount: created.display_amount || formatJpyc(created.amount_jpyc_base),
+        state_axes: deriveInvoiceStateAxes(created),
         ...walletPayload,
         sse: {
           token: sseToken,
@@ -11553,6 +16299,16 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(req.session.store_id);
   const review = db.prepare(`SELECT * FROM review_cases WHERE invoice_id = ?`).get(invoice.id);
+  const paymentRecovery = db
+    .prepare(
+      `SELECT status, requested_chain_id, tx_hash, rpc_verified, receipt_found, canonical_status,
+              confirmations, updated_at
+       FROM payment_recovery_reports
+       WHERE invoice_id = ?
+       ORDER BY updated_at DESC, created_at DESC
+       LIMIT 1`
+    )
+    .get(invoice.id);
   const events = db
     .prepare(`SELECT event_type, chain_id, tx_hash, confirmations, amount_jpyc, observed_at FROM payment_events WHERE invoice_id = ? ORDER BY created_at DESC`)
     .all(invoice.id);
@@ -11566,6 +16322,7 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
     .all(invoice.id, invoice.id);
   const walletPayload = buildInvoiceWalletPayload(invoice, store);
   const providerSummary = buildProviderSummary(invoice);
+  const fulfillmentDecision = buildAuthoritativeFulfillmentDecision(invoice);
   return res.json({
     invoice_id: invoice.id,
     invoice_no: invoice.invoice_no,
@@ -11578,13 +16335,32 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
     monitor_until: invoice.monitor_until || null,
     integrity_hold: Number(invoice.integrity_hold || 0) === 1,
     integrity_hold_reason: invoice.integrity_hold_reason || null,
-    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
+    fulfillment_hold: fulfillmentDecision.decision !== FULFILLMENT_DECISIONS.ALLOW_FULFILLMENT,
+    fulfillment_decision: fulfillmentDecision,
+    state_axes: {
+      payment_status: invoice.payment_status || deriveInvoiceStateAxes(invoice).payment_status,
+      fulfillment_status: invoice.fulfillment_status || deriveInvoiceStateAxes(invoice).fulfillment_status,
+      review_status: invoice.review_status || deriveInvoiceStateAxes(invoice).review_status,
+      integrity_status: invoice.integrity_status || deriveInvoiceStateAxes(invoice).integrity_status,
+      accounting_status: invoice.accounting_status || deriveInvoiceStateAxes(invoice).accounting_status,
+      refund_status: invoice.refund_status || deriveInvoiceStateAxes(invoice).refund_status,
+      monitoring_status: invoice.monitoring_status || deriveInvoiceStateAxes(invoice).monitoring_status,
+    },
     amounts: {
       amount_jpy: invoice.amount_jpy,
       amount_jpyc: invoice.amount_jpyc,
       paid_amount_jpyc: invoice.paid_amount_jpyc,
       amount_jpyc_base: invoice.amount_jpyc_base,
       paid_amount_jpyc_base: invoice.paid_amount_jpyc_base,
+      amount_scale_version: invoice.amount_scale_version || AMOUNT_SCALE_VERSION,
+      token_decimals: invoice.token_decimals ?? TOKEN_DECIMALS,
+      ledger_decimals: invoice.ledger_decimals ?? LEDGER_DECIMALS,
+      token_amount_atomic: invoice.token_amount_atomic || null,
+      ledger_amount_base: invoice.ledger_amount_base || invoice.amount_jpyc_base,
+      display_amount: invoice.display_amount || formatJpyc(invoice.amount_jpyc_base),
+      paid_token_amount_atomic: invoice.paid_amount_jpyc_base == null
+        ? null
+        : tokenAmountAtomicFromLedgerBase(invoice.paid_amount_jpyc_base),
       amount_jpyc_display: formatJpyc(invoice.amount_jpyc_base),
       paid_amount_jpyc_display: formatJpyc(invoice.paid_amount_jpyc_base)
     },
@@ -11598,6 +16374,16 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
     pay_url: invoice.payment_url,
     ...walletPayload,
     provider_summary: providerSummary,
+    payment_recovery: paymentRecovery ? {
+      status: paymentRecovery.status,
+      requested_chain_id: paymentRecovery.requested_chain_id,
+      tx_hash: paymentRecovery.tx_hash,
+      rpc_verified: Number(paymentRecovery.rpc_verified || 0) === 1,
+      receipt_found: Number(paymentRecovery.receipt_found || 0) === 1,
+      canonical_status: paymentRecovery.canonical_status || "unknown",
+      confirmations: Number(paymentRecovery.confirmations || 0),
+      updated_at: paymentRecovery.updated_at,
+    } : null,
     customer_payment_mode: providerSummary.customer_payment_mode,
     review_case_id: review?.id || null,
     events,
@@ -11884,7 +16670,7 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
           upsertReviewCase(previousInvoice, REVIEW_REASON_CODES.LATE_PAYMENT, {
             txHash: previousInvoice.paid_tx_hash || null,
             eventAmountBase: previousInvoice.paid_amount_jpyc_base || "0",
-            blockTimestamp: nowIso(),
+            blockTimestamp: null,
             detectedAt: nowIso(),
           });
         }
@@ -12041,7 +16827,7 @@ app.post("/api/v1/invoices/:invoiceId/expire", requirePermission("invoice.create
         upsertReviewCase(update.invoice, REVIEW_REASON_CODES.LATE_PAYMENT, {
           txHash: update.invoice.paid_tx_hash || null,
           eventAmountBase: update.invoice.paid_amount_jpyc_base || "0",
-          blockTimestamp: nowIso(),
+          blockTimestamp: null,
           detectedAt: nowIso(),
         });
       }
@@ -12136,6 +16922,7 @@ app.get("/api/v1/reviews", requirePermission("review.read"), (req, res) => {
   res.json({
     reviews: rows.map((row) => ({
       ...row,
+      incidents: listReviewIncidents(row.invoice_id),
       reason_type: normalizeReviewReasonCode(row.reason_type),
       reason_code: normalizeReviewReasonCode(row.reason_type),
       reason_label: reasonCodeLabelJa(row.reason_type),
@@ -12179,6 +16966,7 @@ app.get("/api/v1/reviews/:reviewId", requirePermission("review.read"), (req, res
   const auditHistory = db
     .prepare(`SELECT id, action, actor_id, created_at FROM audit_logs WHERE target_type = 'review' AND target_id = ? ORDER BY rowid DESC LIMIT 100`)
     .all(review.id);
+  const incidents = listReviewIncidents(review.invoice_id);
   const reasonCode = normalizeReviewReasonCode(review.reason_type);
   const relatedInvoices = review.checkout_session_id
     ? db
@@ -12211,6 +16999,7 @@ app.get("/api/v1/reviews/:reviewId", requirePermission("review.read"), (req, res
       suggested_action: review.suggested_action || suggestedReviewAction(reasonCode),
       refundable_candidate_jpyc_base:
         review.refundable_candidate_jpyc_base || computeReviewRefundableCandidateBase(reasonCode, review.billed_amount_jpyc_base, review.paid_amount_jpyc_base),
+      incidents,
       audit_log: auditHistory,
     },
     events,
@@ -12223,7 +17012,16 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
   return idempotent(req, res, "PATCH:/api/v1/reviews/:id", actorId, () => {
     const requestId = requestIdFromReq(req);
     const idemKey = req.header("Idempotency-Key");
-    const { status, resolution_note, assigned_to, admin_note, resolution_status, disposition } = req.body || {};
+    const {
+      status,
+      resolution_note,
+      assigned_to,
+      admin_note,
+      resolution_status,
+      disposition,
+      incident_id,
+      accounting_adjustment_id,
+    } = req.body || {};
     const review = db
       .prepare(
         `SELECT r.* FROM review_cases r
@@ -12239,6 +17037,26 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
     }
     const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ?`).get(review.invoice_id, req.session.store_id);
     if (!invoice) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Invoice for review case not found" } } };
+    if (incident_id != null) {
+      const incident = db.prepare(
+        `SELECT id, status, incident_type, primary_reason
+         FROM review_incidents
+         WHERE id = ? AND invoice_id = ?`
+      ).get(String(incident_id), invoice.id);
+      if (!incident) {
+        return {
+          status: 404,
+          body: { error: { code: "REVIEW_INCIDENT_NOT_FOUND", message: "Review incident not found for this invoice" } },
+        };
+      }
+      if (["resolved", "rejected"].includes(nextStatus)
+        && !["open", "in_progress"].includes(String(incident.status || ""))) {
+        return {
+          status: 409,
+          body: { error: { code: "REVIEW_INCIDENT_ALREADY_CLOSED", message: "Review incident is already closed" } },
+        };
+      }
+    }
     const currentResolutionStatus = normalizeReviewResolutionStatus(review.resolution_status, "pending") || "pending";
     const inferredDisposition = nextStatus === "resolved"
       ? (parseBaseUnitOrZero(invoice.paid_amount_jpyc_base) >= parseBaseUnitOrZero(invoice.amount_jpyc_base)
@@ -12246,6 +17064,90 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
         : "cancelled_no_sale")
       : (nextStatus === "rejected" ? "cancelled_no_sale" : null);
     const nextDisposition = normalizeReviewDisposition(disposition, normalizeReviewDisposition(review.disposition, inferredDisposition));
+    const accountingAdjustmentId = String(accounting_adjustment_id || "").trim() || null;
+    let approvedAccountingAdjustment = null;
+    if (["resolved", "rejected"].includes(nextStatus) && nextDisposition === "accounting_adjustment") {
+      if (!accountingAdjustmentId) {
+        return {
+          status: 400,
+          body: {
+            error: {
+              code: "ACCOUNTING_ADJUSTMENT_REQUIRED",
+              message: "An approved accounting adjustment is required to resolve this review",
+            },
+          },
+        };
+      }
+      approvedAccountingAdjustment = accountingAdjustmentRow(accountingAdjustmentId, req.session.store_id);
+      if (!approvedAccountingAdjustment || String(approvedAccountingAdjustment.invoice_id) !== String(invoice.id)) {
+        return {
+          status: 404,
+          body: { error: { code: "ACCOUNTING_ADJUSTMENT_NOT_FOUND", message: "Accounting adjustment not found for this invoice" } },
+        };
+      }
+      if (String(approvedAccountingAdjustment.related_review_case_id || "")
+        && String(approvedAccountingAdjustment.related_review_case_id) !== String(review.id)) {
+        return {
+          status: 409,
+          body: { error: { code: "ACCOUNTING_ADJUSTMENT_REVIEW_MISMATCH", message: "Accounting adjustment is linked to another review" } },
+        };
+      }
+      if (String(approvedAccountingAdjustment.status) !== "approved") {
+        return {
+          status: 409,
+          body: { error: { code: "ACCOUNTING_ADJUSTMENT_NOT_APPROVED", message: "Accounting adjustment must be approved before resolving the review" } },
+        };
+      }
+    }
+    if (
+      ["resolved", "rejected"].includes(nextStatus)
+      && nextDisposition === "accepted_as_paid"
+      && !["paid", "settled"].includes(String(invoice.status || ""))
+    ) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "ACCOUNTING_ADJUSTMENT_REQUIRED",
+            message: "accepted_as_paid cannot change an unpaid invoice; create and approve an accounting adjustment first",
+            details: {
+              invoice_id: invoice.id,
+              review_id: review.id,
+              required_disposition: "accounting_adjustment",
+              supported_adjustment_types: [...ACCOUNTING_ADJUSTMENT_TYPES],
+            },
+          },
+        },
+      };
+    }
+    if (["resolved", "rejected"].includes(nextStatus) && nextDisposition === "written_off") {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "ACCOUNTING_ADJUSTMENT_REQUIRED",
+            message: "write_off must be recorded through the two-person accounting adjustment workflow",
+            details: { required_disposition: "accounting_adjustment", required_adjustment_type: "write_off" },
+          },
+        },
+      };
+    }
+    if (
+      ["resolved", "rejected"].includes(nextStatus)
+      && nextDisposition === "refunded"
+      && !hasCanonicalRecognizedTransfer(invoice)
+    ) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "CANONICAL_TRANSFER_REQUIRED",
+            message: "A review cannot be refunded without a canonical recognized transfer",
+            details: { invoice_id: invoice.id, review_id: review.id },
+          },
+        },
+      };
+    }
     if (["resolved", "rejected"].includes(nextStatus) && nextDisposition === "escalated") {
       return {
         status: 400,
@@ -12284,6 +17186,7 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
       next_status: nextStatus,
       resolution_status: nextResolutionStatus || null,
       admin_note: nextAdminNote || null,
+      accounting_adjustment_id: accountingAdjustmentId,
     });
     const dispositionResult = db.transaction(() => {
       db.prepare(
@@ -12312,20 +17215,7 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
       );
 
       let updatedInvoice = invoice;
-      if (nextDisposition === "accepted_as_paid" || nextDisposition === "refunded") {
-        if (parseBaseUnitOrZero(invoice.paid_amount_jpyc_base) >= parseBaseUnitOrZero(invoice.amount_jpyc_base)) {
-          const update = transitionInvoiceForPayment(invoice, "paid", `review_${nextDisposition}`, {
-            actorType: "admin",
-            actorId,
-            requestId,
-            idempotencyKey: idemKey,
-            ip: req.ip,
-            reason: `review_${nextDisposition}`,
-          });
-          if (update.error) throw new Error(update.error);
-          updatedInvoice = update.invoice;
-        }
-      } else if (nextDisposition === "cancelled_no_sale" || nextDisposition === "written_off") {
+      if (nextDisposition === "cancelled_no_sale") {
         const update = updateInvoiceStatus(invoice.id, "cancelled", `review_${nextDisposition}`, {
           actorType: "admin",
           actorId,
@@ -12337,36 +17227,16 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
         if (update.error) throw new Error(update.error);
         updatedInvoice = update.invoice;
       }
-      if (
-        ["accepted_as_paid", "refunded"].includes(nextDisposition)
-        && String(updatedInvoice.status) === "paid"
-        && !db.prepare(`SELECT 1 FROM accounting_event_journal WHERE invoice_id = ? AND event_type = 'payment_confirmed' LIMIT 1`).get(updatedInvoice.id)
-      ) {
-        const paymentEvent = db
-          .prepare(
-            `SELECT id, tx_hash, log_index, block_timestamp, detected_at
-             FROM payment_events
-             WHERE invoice_id = ?
-             ORDER BY created_at ASC, rowid ASC
-             LIMIT 1`
-          )
-          .get(updatedInvoice.id);
-        recordAccountingEvent({
-          storeId: updatedInvoice.store_id,
-          invoiceId: updatedInvoice.id,
-          eventType: "payment_confirmed",
-          occurredAt: paymentEvent?.block_timestamp || paymentEvent?.detected_at || ts,
-          amountBase: String(updatedInvoice.paid_amount_jpyc_base || "0"),
-          status: "confirmed_by_review",
-          sourceRef: `review:${review.id}`,
-          payload: {
-            review_case_id: review.id,
-            payment_event_id: paymentEvent?.id || null,
-            tx_hash: paymentEvent?.tx_hash || updatedInvoice.paid_tx_hash || null,
-            log_index: paymentEvent?.log_index ?? null,
-          },
-        });
-      }
+      syncReviewIncidentProjectionResolution({
+        review,
+        invoiceId: invoice.id,
+        incidentId: incident_id == null ? null : String(incident_id),
+        nextStatus,
+        resolutionStatus: nextResolutionStatus,
+        disposition: nextDisposition,
+        actorId,
+        timestamp: ts,
+      });
       return { review: db.prepare(`SELECT * FROM review_cases WHERE id = ?`).get(review.id), invoice: updatedInvoice };
     })();
     const after = dispositionResult.review;
@@ -12389,6 +17259,7 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
         review: {
           ...after,
           disposition: after.disposition || nextDisposition,
+          accounting_adjustment_id: approvedAccountingAdjustment?.id || null,
           reason_type: reasonCode,
           reason_code: reasonCode,
           reason_label: reasonCodeLabelJa(reasonCode),
@@ -12399,9 +17270,254 @@ app.patch("/api/v1/reviews/:reviewId", requirePermission("review.update"), (req,
   });
 });
 
+app.get("/api/v1/accounting-adjustments", requirePermission("accounting.adjustment.read"), (req, res) => {
+  const invoiceId = String(req.query.invoice_id || "").trim();
+  const status = String(req.query.status || "").trim();
+  const clauses = ["i.store_id = ?"];
+  const params = [req.session.store_id];
+  if (invoiceId) {
+    clauses.push("aa.invoice_id = ?");
+    params.push(invoiceId);
+  }
+  if (status) {
+    clauses.push("aa.status = ?");
+    params.push(status);
+  }
+  const rows = db.prepare(
+    `SELECT aa.*, i.store_id, i.status AS invoice_status, i.paid_tx_hash,
+            i.paid_amount_jpyc_base, i.updated_at AS invoice_updated_at,
+            r.id AS review_case_id
+     FROM accounting_adjustments aa
+     JOIN invoices i ON i.id = aa.invoice_id
+     LEFT JOIN review_cases r ON r.id = aa.related_review_case_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY aa.created_at DESC, aa.id DESC
+     LIMIT 200`
+  ).all(...params);
+  return res.json({ adjustments: rows.map(projectAccountingAdjustment) });
+});
+
+app.post("/api/v1/accounting-adjustments", requirePermission("accounting.adjustment.create"), (req, res) => {
+  const actorId = req.session.staff_user_id;
+  return idempotent(req, res, "POST:/api/v1/accounting-adjustments", actorId, () => {
+    const requestId = requestIdFromReq(req);
+    const idemKey = req.header("Idempotency-Key");
+    const invoiceId = String(req.body?.invoice_id || "").trim();
+    const reviewCaseId = String(req.body?.review_case_id || "").trim() || null;
+    const adjustmentType = normalizeAccountingAdjustmentType(req.body?.adjustment_type);
+    const amount = parsePositiveBaseUnitInteger(req.body?.amount_jpyc_base, "amount_jpyc_base");
+    const reason = String(req.body?.reason || "").trim();
+    const evidence = parseAccountingAdjustmentEvidence(req.body?.evidence);
+    if (!invoiceId || !adjustmentType || amount.error || !reason || reason.length < 10 || reason.length > 2000 || evidence.error) {
+      return {
+        status: 400,
+        body: {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "invoice_id, supported adjustment_type, positive amount_jpyc_base, reason (10-2000 chars), and evidence.evidence_ref are required",
+            details: {
+              supported_adjustment_types: [...ACCOUNTING_ADJUSTMENT_TYPES],
+              amount_error: amount.error || null,
+              evidence_error: evidence.error || null,
+            },
+          },
+        },
+      };
+    }
+    const currentStepUp = getFreshStepUpSession(req.session.session_id, req.session.store_id);
+    if (!currentStepUp) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "STEP_UP_REQUIRED",
+            message: "A fresh step-up for the creating staff session is required",
+            details: { session_id: req.session.session_id, purpose: "accounting.adjustment" },
+          },
+        },
+      };
+    }
+    const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ?`).get(invoiceId, req.session.store_id);
+    if (!invoice) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Invoice not found" } } };
+    let review = null;
+    if (reviewCaseId) {
+      review = db.prepare(
+        `SELECT r.* FROM review_cases r
+         JOIN invoices i ON i.id = r.invoice_id
+         WHERE r.id = ? AND r.invoice_id = ? AND i.store_id = ?`
+      ).get(reviewCaseId, invoice.id, req.session.store_id);
+      if (!review) {
+        return { status: 404, body: { error: { code: "REVIEW_CASE_NOT_FOUND", message: "Review case not found for this invoice" } } };
+      }
+    }
+    const timestamp = nowIso();
+    const adjustmentId = uuid();
+    const created = db.transaction(() => {
+      db.prepare(
+        `INSERT INTO accounting_adjustments
+         (id, invoice_id, related_review_case_id, adjustment_type, amount_jpyc_base, reason, evidence_json,
+          created_by, created_session_id, created_step_up_at, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`
+      ).run(
+        adjustmentId,
+        invoice.id,
+        review?.id || null,
+        adjustmentType,
+        amount.value,
+        reason,
+        evidence.serialized,
+        actorId,
+        req.session.session_id,
+        currentStepUp.step_up_verified_at,
+        timestamp,
+      );
+      return { adjustment: accountingAdjustmentRow(adjustmentId, req.session.store_id) };
+    })();
+    audit({
+      storeId: invoice.store_id,
+      actorType: "staff",
+      actorId,
+      action: "accounting_adjustment.created",
+      targetType: "accounting_adjustment",
+      targetId: adjustmentId,
+      requestId,
+      idempotencyKey: idemKey,
+      beforeState: null,
+      afterState: {
+        adjustment: projectAccountingAdjustment(created.adjustment),
+        invoice: accountingAdjustmentInvoiceSnapshot(invoice),
+      },
+      ip: req.ip,
+    });
+    return {
+      status: 201,
+      body: accountingAdjustmentResponse(created.adjustment, invoice),
+    };
+  });
+});
+
+app.post("/api/v1/accounting-adjustments/:adjustmentId/approve", requirePermission("accounting.adjustment.approve"), (req, res) => {
+  const actorId = req.session.staff_user_id;
+  return idempotent(req, res, "POST:/api/v1/accounting-adjustments/:id/approve", actorId, () => {
+    const requestId = requestIdFromReq(req);
+    const idemKey = req.header("Idempotency-Key");
+    const currentStepUp = getFreshStepUpSession(req.session.session_id, req.session.store_id);
+    if (!currentStepUp) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "STEP_UP_REQUIRED",
+            message: "A fresh step-up for the approving staff session is required",
+            details: { session_id: req.session.session_id, purpose: "accounting.adjustment" },
+          },
+        },
+      };
+    }
+    const adjustment = accountingAdjustmentRow(req.params.adjustmentId, req.session.store_id);
+    if (!adjustment) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Accounting adjustment not found" } } };
+    if (String(adjustment.status) !== "pending") {
+      return {
+        status: 409,
+        body: { error: { code: "INVALID_STATE_TRANSITION", message: "Only pending accounting adjustments can be approved" } },
+      };
+    }
+    if (String(adjustment.created_by) === String(actorId)) {
+      return {
+        status: 409,
+        body: { error: { code: "TWO_PERSON_REQUIRED", message: "Accounting adjustment creator and approver must be different staff" } },
+      };
+    }
+    const invoiceBefore = db.prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ?`).get(adjustment.invoice_id, req.session.store_id);
+    if (!invoiceBefore) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Invoice not found" } } };
+    const timestamp = nowIso();
+    const approved = db.transaction(() => {
+      const current = accountingAdjustmentRow(req.params.adjustmentId, req.session.store_id);
+      if (!current) return { error: { status: 404, body: { error: { code: "NOT_FOUND", message: "Accounting adjustment not found" } } } };
+      if (String(current.status) !== "pending") {
+        return {
+          error: {
+            status: 409,
+            body: { error: { code: "INVALID_STATE_TRANSITION", message: "Accounting adjustment was already decided" } },
+          },
+        };
+      }
+      const update = db.prepare(
+        `UPDATE accounting_adjustments
+         SET approved_by = ?, approved_session_id = ?, approved_step_up_at = ?, status = 'approved', approved_at = ?
+         WHERE id = ? AND status = 'pending' AND approved_by IS NULL`
+      ).run(actorId, req.session.session_id, currentStepUp.step_up_verified_at, timestamp, current.id);
+      if (update.changes !== 1) {
+        return {
+          error: {
+            status: 409,
+            body: { error: { code: "ACCOUNTING_ADJUSTMENT_CONFLICT", message: "Accounting adjustment changed while approval was in progress" } },
+          },
+        };
+      }
+      const after = accountingAdjustmentRow(current.id, req.session.store_id);
+      const accountingEvent = recordAccountingEvent({
+        storeId: invoiceBefore.store_id,
+        invoiceId: invoiceBefore.id,
+        businessDate: invoiceBefore.business_date || null,
+        occurredAt: timestamp,
+        amountBase: String(current.amount_jpyc_base),
+        eventType: "accounting_adjustment",
+        status: "approved",
+        sourceRef: `accounting_adjustment:${current.id}`,
+        payload: {
+          adjustment_id: current.id,
+          adjustment_type: current.adjustment_type,
+          related_review_case_id: current.related_review_case_id || null,
+          amount_jpyc_base: String(current.amount_jpyc_base),
+          reason: current.reason,
+          evidence: parseJsonWithWarning(current.evidence_json, `accounting_adjustment:${current.id}.evidence`, {}),
+          created_by: current.created_by,
+          approved_by: actorId,
+          invoice_before: accountingAdjustmentInvoiceSnapshot(invoiceBefore),
+          invoice_transition: "none",
+        },
+      });
+      return { adjustment: after, accountingEvent };
+    })();
+    if (approved.error) return approved.error;
+    const invoiceAfter = db.prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ?`).get(invoiceBefore.id, req.session.store_id);
+    audit({
+      storeId: invoiceBefore.store_id,
+      actorType: "staff",
+      actorId,
+      action: "accounting_adjustment.approved",
+      targetType: "accounting_adjustment",
+      targetId: approved.adjustment.id,
+      requestId,
+      idempotencyKey: idemKey,
+      beforeState: {
+        adjustment: projectAccountingAdjustment(adjustment),
+        invoice: accountingAdjustmentInvoiceSnapshot(invoiceBefore),
+      },
+      afterState: {
+        adjustment: projectAccountingAdjustment(approved.adjustment),
+        invoice: accountingAdjustmentInvoiceSnapshot(invoiceAfter),
+      },
+      ip: req.ip,
+    });
+    return {
+      status: 200,
+      body: accountingAdjustmentResponse(approved.adjustment, invoiceAfter, approved.accountingEvent),
+    };
+  });
+});
+
+app.get("/api/v1/accounting-adjustments/:adjustmentId", requirePermission("accounting.adjustment.read"), (req, res) => {
+  const adjustment = accountingAdjustmentRow(req.params.adjustmentId, req.session.store_id);
+  if (!adjustment) return jsonError(res, 404, "NOT_FOUND", "Accounting adjustment not found");
+  const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ?`).get(adjustment.invoice_id, req.session.store_id);
+  return res.json(accountingAdjustmentResponse(adjustment, invoice));
+});
+
 app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
   const actorId = req.session.staff_user_id;
-  return idempotent(req, res, "POST:/api/v1/refunds", actorId, () => {
+  return idempotentAsync(req, res, "POST:/api/v1/refunds", actorId, async () => {
     const requestId = requestIdFromReq(req);
     const idemKey = req.header("Idempotency-Key");
     const {
@@ -12414,6 +17530,8 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
       evidence_screenshot,
       evidence_note_path,
       customer_note,
+      challenge_id,
+      challenge_nonce,
     } = req.body || {};
     const parsedRefundBase = parsePositiveBaseUnits(refund_amount_jpyc, "refund_amount_jpyc");
     if ((!review_case_id && !invoice_id) || parsedRefundBase.error || !refund_to_address || !refund_chain_id) {
@@ -12426,6 +17544,7 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
       .prepare(
         `SELECT r.*,
                 i.store_id,
+                i.merchant_id,
                 i.id AS invoice_id,
                 i.status AS invoice_status,
                 i.chain_id,
@@ -12447,10 +17566,39 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
       if (String(paidInvoice.status) !== "paid") {
         return { status: 409, body: { error: { code: "REFUND_REQUIRES_PAID_INVOICE", message: "Only a paid invoice can start a normal refund" } } };
       }
+      const paymentEvidence = findCanonicalRecognizedTransfer(paidInvoice);
+      const reviewProjection = upsertReviewCase(paidInvoice, REVIEW_REASON_CODES.OTHER, {
+        reasonType: REVIEW_REASON_CODES.OTHER,
+        incidentType: "REFUND_REQUESTED",
+        txHash: paidInvoice.paid_tx_hash || null,
+        eventAmountBase: paidInvoice.paid_amount_jpyc_base,
+        blockTimestamp: paymentEvidence?.block_timestamp || null,
+        detectedAt: nowIso(),
+        allowProjectionReopen: true,
+        actorId,
+      });
+      audit({
+        actorType: "admin",
+        actorId,
+        action: "refund.review_requested",
+        targetType: "invoice",
+        targetId: paidInvoice.id,
+        requestId,
+        idempotencyKey: idemKey,
+        afterState: {
+          review_case_id: reviewProjection?.id || null,
+          review_incident_id: reviewProjection?.incident_id || null,
+          invoice_id: paidInvoice.id,
+          status: "open",
+          disposition: null,
+        },
+        ip: req.ip,
+      });
       review = db
         .prepare(
           `SELECT r.*,
                   i.store_id,
+                  i.merchant_id,
                   i.id AS invoice_id,
                   i.status AS invoice_status,
                   i.chain_id,
@@ -12461,63 +17609,9 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
                   i.paid_amount_jpyc_base,
                   i.paid_tx_hash
            FROM review_cases r JOIN invoices i ON i.id = r.invoice_id
-           WHERE r.invoice_id = ? AND i.store_id = ?`
+           WHERE r.id = ? AND i.store_id = ?`
         )
-        .get(paidInvoice.id, req.session.store_id);
-      if (!review) {
-        const caseId = uuid();
-        const ts = nowIso();
-        db.prepare(
-          `INSERT INTO review_cases
-           (id, invoice_id, reason_type, tx_hash, billed_amount_jpyc_base, paid_amount_jpyc_base, diff_jpyc_base,
-            suggested_action, refundable_candidate_jpyc_base, action_history_json, resolution_status, disposition,
-            status, resolution_note, created_at, updated_at, resolved_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'settled', 'refunded', 'resolved', ?, ?, ?, ?)`
-        ).run(
-          caseId,
-          paidInvoice.id,
-          REVIEW_REASON_CODES.OTHER,
-          paidInvoice.paid_tx_hash || null,
-          String(paidInvoice.amount_jpyc_base || "0"),
-          String(paidInvoice.paid_amount_jpyc_base || "0"),
-          (parseBaseUnitOrZero(paidInvoice.paid_amount_jpyc_base) - parseBaseUnitOrZero(paidInvoice.amount_jpyc_base)).toString(),
-          "通常返金として承認・検証の証跡を残してください",
-          String(paidInvoice.paid_amount_jpyc_base || "0"),
-          JSON.stringify([{ at: ts, action: "refund.case.created_for_paid_invoice", actor_id: actorId }]),
-          "normal_refund_case_created",
-          ts,
-          ts,
-          ts
-        );
-        audit({
-          actorType: "admin",
-          actorId,
-          action: "refund.case.created_for_paid_invoice",
-          targetType: "invoice",
-          targetId: paidInvoice.id,
-          requestId,
-          idempotencyKey: idemKey,
-          afterState: { review_case_id: caseId, invoice_id: paidInvoice.id, disposition: "refunded" },
-          ip: req.ip,
-        });
-        review = db
-          .prepare(
-            `SELECT r.*,
-                    i.store_id,
-                    i.id AS invoice_id,
-                    i.status AS invoice_status,
-                    i.chain_id,
-                    i.token_contract,
-                    i.recipient_address,
-                    i.checkout_session_id,
-                    i.amount_jpyc_base,
-                    i.paid_amount_jpyc_base,
-                    i.paid_tx_hash
-             FROM review_cases r JOIN invoices i ON i.id = r.invoice_id
-             WHERE r.id = ? AND i.store_id = ?`
-          )
-          .get(caseId, req.session.store_id);
-      }
+        .get(reviewProjection?.id || "", req.session.store_id);
     }
     if (!review) return { status: 404, body: { error: { code: "NOT_FOUND", message: "Review not found" } } };
     const heldInvoice = db.prepare(`SELECT id, integrity_hold, integrity_hold_reason, integrity_hold_at FROM invoices WHERE id = ? AND integrity_hold = 1`).get(review.invoice_id);
@@ -12574,6 +17668,7 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
     const alternateDestination = requestedRefundAddress !== payerAddress;
     const customerApprovalSignature = String(req.body?.customer_approval_signature || "").trim();
     let destinationApprovalType = "payer_default";
+    let destinationChallenge = null;
     const effectiveReviewCaseId = review.id;
     const existingSemanticRefund = findActiveRefundBySemantic({
       reviewCaseId: effectiveReviewCaseId,
@@ -12644,79 +17739,219 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
     }
 
     if (alternateDestination) {
-      const approvalMessage = buildRefundDestinationApprovalMessage({
-        invoiceId: review.invoice_id,
-        refundToAddress: requestedRefundAddress,
-        refundAmountBase: parsedRefundBase.value,
-        refundChainId: refund_chain_id,
-      });
-      if (!customerApprovalSignature) {
+      const domain = refundApprovalDomain();
+      const merchantId = String(review.merchant_id || "merchant-001");
+      const issueChallenge = () => {
+        const issuedAt = nowIso();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        const nonce = crypto.randomBytes(32).toString("hex");
+        const challengeId = uuid();
+        db.prepare(
+          `INSERT INTO refund_destination_challenges
+           (id, merchant_id, store_id, invoice_id, payer_address, refund_to_address, refund_amount_base,
+            chain_id, domain, nonce_hash, issued_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          challengeId,
+          merchantId,
+          req.session.store_id,
+          review.invoice_id,
+          payerAddress,
+          requestedRefundAddress,
+          parsedRefundBase.value,
+          String(refund_chain_id),
+          domain,
+          sha256(nonce),
+          issuedAt,
+          expiresAt,
+        );
+        return {
+          challenge_id: challengeId,
+          nonce,
+          expires_at: expiresAt,
+          approval_message: buildRefundDestinationApprovalMessage({
+            merchantId,
+            storeId: req.session.store_id,
+            invoiceId: review.invoice_id,
+            payerAddress,
+            refundToAddress: requestedRefundAddress,
+            refundAmountBase: parsedRefundBase.value,
+            refundChainId: refund_chain_id,
+            domain,
+            nonce,
+          }),
+        };
+      };
+      if (!customerApprovalSignature || !challenge_id || !challenge_nonce) {
+        const issued = issueChallenge();
         return {
           status: 409,
           body: {
             error: {
-              code: "CUSTOMER_DESTINATION_APPROVAL_REQUIRED",
-              message: "an alternate refund destination requires a payer signature",
-              details: { approval_message: approvalMessage },
+              code: "CUSTOMER_DESTINATION_APPROVAL_CHALLENGE_REQUIRED",
+              message: "an alternate refund destination requires a fresh payer approval challenge",
+              details: issued,
             },
           },
         };
       }
-      try {
-        const recoveredAddress = normalizeAddress(verifyMessage(approvalMessage, customerApprovalSignature));
-        if (recoveredAddress !== payerAddress) throw new Error("payer_signature_mismatch");
-      } catch (_error) {
+      const challenge = db.prepare(
+        `SELECT * FROM refund_destination_challenges
+         WHERE id = ? AND store_id = ? AND invoice_id = ?
+           AND consumed_at IS NULL`
+      ).get(String(challenge_id), req.session.store_id, review.invoice_id);
+      const challengeExpired = !challenge || !challenge.expires_at
+        || new Date(challenge.expires_at).getTime() <= Date.now();
+      if (challengeExpired
+        || String(challenge.payer_address || "").toLowerCase() !== payerAddress.toLowerCase()
+        || String(challenge.refund_to_address || "").toLowerCase() !== requestedRefundAddress.toLowerCase()
+        || String(challenge.refund_amount_base || "") !== String(parsedRefundBase.value)
+        || String(challenge.chain_id || "") !== String(refund_chain_id)
+        || String(challenge.domain || "") !== domain) {
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: "CUSTOMER_DESTINATION_APPROVAL_CHALLENGE_INVALID",
+              message: "refund destination approval challenge is missing, expired, consumed, or bound to different refund fields",
+            },
+          },
+        };
+      }
+      if (sha256(String(challenge_nonce)) !== String(challenge.nonce_hash || "")) {
         return {
           status: 400,
           body: {
             error: {
-              code: "CUSTOMER_DESTINATION_APPROVAL_INVALID",
-              message: "customer approval signature does not match the recorded payer address",
+              code: "CUSTOMER_DESTINATION_APPROVAL_NONCE_INVALID",
+              message: "refund destination approval nonce is invalid",
             },
           },
         };
       }
-      destinationApprovalType = "payer_signed_alternate";
+      const approvalMessage = buildRefundDestinationApprovalMessage({
+        merchantId: challenge.merchant_id || merchantId,
+        storeId: challenge.store_id,
+        invoiceId: challenge.invoice_id,
+        payerAddress: challenge.payer_address,
+        refundToAddress: challenge.refund_to_address,
+        refundAmountBase: challenge.refund_amount_base,
+        refundChainId: challenge.chain_id,
+        domain: challenge.domain,
+        nonce: challenge_nonce,
+      });
+      let verified = false;
+      try {
+        const recoveredAddress = normalizeAddress(verifyMessage(approvalMessage, customerApprovalSignature));
+        verified = recoveredAddress === payerAddress;
+      } catch (_error) {
+        verified = false;
+      }
+      if (verified) {
+        destinationApprovalType = "payer_signed_alternate_eip191";
+      } else {
+        const eip1271 = await verifyEip1271ControlProof({
+          address: payerAddress,
+          chainId: String(refund_chain_id),
+          message: approvalMessage,
+          signature: customerApprovalSignature,
+        });
+        if (!eip1271.ok) {
+          return {
+            status: 400,
+            body: {
+              error: {
+                code: "CUSTOMER_DESTINATION_APPROVAL_INVALID",
+                message: "customer approval signature does not match the recorded payer address",
+                details: { verification_code: eip1271.code },
+              },
+            },
+          };
+        }
+        destinationApprovalType = "payer_signed_alternate_eip1271";
+      }
+      destinationChallenge = {
+        id: challenge.id,
+        nonce: String(challenge_nonce),
+        signatureHash: `sha256:${sha256(customerApprovalSignature)}`,
+      };
     }
 
     const rid = uuid();
     const ts = nowIso();
-    const refundDisplay = Number(refund_amount_jpyc);
+    const refundDisplay = Number(formatJpyc(parsedRefundBase.value));
     const normalizedReason = String(reason || normalizeReviewReasonCode(review.reason_type || REVIEW_REASON_CODES.OTHER)).trim();
-    db.prepare(
-      `INSERT INTO refund_requests
-      (id, review_case_id, refund_case_id, invoice_id, original_invoice_id, checkout_session_id, original_tx_hash, reason, requested_by, status, refund_amount_jpyc, refund_amount_jpyc_base,
-       refund_eligible_jpyc_base, refund_to_address, refund_chain_id, expected_from_address, customer_approval_signature, destination_approval_type,
-       to_address, chain_id, token_contract, evidence_screenshot, evidence_note_path, customer_note, detected_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      rid,
-      effectiveReviewCaseId,
-      refundCase.id,
-      review.invoice_id,
-      review.invoice_id,
-      review.checkout_session_id || null,
-      review.paid_tx_hash || null,
-      normalizedReason || null,
-      actorId,
-      Number.isFinite(refundDisplay) ? refundDisplay : 0,
-      parsedRefundBase.value,
-      eligibleBase,
-      String(refund_to_address),
-      String(refund_chain_id),
-      payerAddress,
-      alternateDestination ? customerApprovalSignature : null,
-      destinationApprovalType,
-      String(refund_to_address),
-      String(refund_chain_id),
-      String(review.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
-      String(evidence_screenshot || "").trim() || null,
-      String(evidence_note_path || "").trim() || null,
-      String(customer_note || "").trim() || null,
-      ts,
-      ts,
-      ts
-    );
+    try {
+      db.transaction(() => {
+        if (destinationChallenge) {
+          const consumed = db.prepare(
+            `UPDATE refund_destination_challenges
+             SET consumed_at = ?, signature_type = ?, signature_hash = ?
+             WHERE id = ? AND consumed_at IS NULL AND expires_at > ?`
+          ).run(
+            ts,
+            destinationApprovalType,
+            destinationChallenge.signatureHash,
+            destinationChallenge.id,
+            ts,
+          );
+          if (consumed.changes !== 1) {
+            const error = new Error("refund_destination_challenge_already_consumed");
+            error.code = "CUSTOMER_DESTINATION_APPROVAL_CHALLENGE_REPLAYED";
+            throw error;
+          }
+        }
+        db.prepare(
+          `INSERT INTO refund_requests
+          (id, review_case_id, refund_case_id, invoice_id, original_invoice_id, checkout_session_id, original_tx_hash, reason, requested_by, status, refund_amount_jpyc, refund_amount_jpyc_base,
+           refund_eligible_jpyc_base, refund_to_address, refund_chain_id, expected_from_address, customer_approval_signature, destination_approval_type,
+           to_address, chain_id, token_contract, evidence_screenshot, evidence_note_path, customer_note, detected_at, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          rid,
+          effectiveReviewCaseId,
+          refundCase.id,
+          review.invoice_id,
+          review.invoice_id,
+          review.checkout_session_id || null,
+          review.paid_tx_hash || null,
+          normalizedReason || null,
+          actorId,
+          refundDisplay,
+          parsedRefundBase.value,
+          eligibleBase,
+          String(refund_to_address),
+          String(refund_chain_id),
+          payerAddress,
+          destinationChallenge?.signatureHash || null,
+          destinationApprovalType,
+          String(refund_to_address),
+          String(refund_chain_id),
+          String(review.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
+          String(evidence_screenshot || "").trim() || null,
+          String(evidence_note_path || "").trim() || null,
+          String(customer_note || "").trim() || null,
+          ts,
+          ts,
+          ts
+        );
+      })();
+    } catch (error) {
+      if (error?.code === "CUSTOMER_DESTINATION_APPROVAL_CHALLENGE_REPLAYED") {
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: error.code,
+              message: "refund destination approval challenge was already consumed; issue a new challenge",
+            },
+          },
+        };
+      }
+      throw error;
+    }
+
+    syncInvoiceRefundStatus(review.invoice_id);
 
     const created = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(rid);
     audit({
@@ -12817,8 +18052,9 @@ app.post("/api/v1/refunds/:refundId/funding-lineage", requirePermission("refund.
         db.prepare(
           `INSERT INTO refund_funding_sweeps
            (id, invoice_id, store_id, chain_id, source_address, treasury_address, sweep_tx_hash, sweep_tx_log_index,
-            sweep_amount_jpyc_base, status, evidence_note_path, evidence_json, created_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?, ?, ?)`
+            sweep_amount_jpyc_base, status, canonical_status, finality_required_confirmations,
+            evidence_note_path, evidence_json, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', 'unknown', ?, ?, ?, ?, ?, ?)`
         ).run(
           sweepId,
           refund.invoice_id,
@@ -12829,6 +18065,7 @@ app.post("/api/v1/refunds/:refundId/funding-lineage", requirePermission("refund.
           sweepTxHash,
           sweepTxLogIndex,
           sweepAmount.value,
+          ACCOUNTING_FINALITY_CONFIRMATIONS,
           String(req.body?.evidence_note_path || "").trim() || null,
           JSON.stringify(sanitizeAuditState(req.body?.evidence || {})),
           actorId,
@@ -12911,11 +18148,9 @@ app.post("/api/v1/refunds/:refundId/funding-lineage/verify", requirePermission("
         },
       };
     }
-    if (String(lineage.status) === "verified") {
-      return { status: 200, body: buildRefundEvidenceResponse(refund) };
-    }
-
-    const verification = await verifyRefundFundingLineageOnChain(refund, lineage);
+    const verification = await verifyRefundFundingLineageOnChain(refund, lineage, {
+      revalidate: ["verified", "finalized"].includes(String(lineage.status)),
+    });
     const timestamp = nowIso();
     const existingEvidence = parseJsonWithWarning(
       lineage.evidence_json,
@@ -12926,23 +18161,50 @@ app.post("/api/v1/refunds/:refundId/funding-lineage/verify", requirePermission("
       ...(existingEvidence && typeof existingEvidence === "object" ? existingEvidence : {}),
       verification: verification.evidence || {},
     };
-    const update = db
-      .prepare(
-        `UPDATE refund_funding_lineage
-         SET status = ?, evidence_json = ?, updated_at = ?
-         WHERE id = ? AND status = ? AND updated_at = ?`
-      )
-      .run(
-        verification.status,
-        JSON.stringify(sanitizeAuditState(evidence)),
-        timestamp,
-        lineage.id,
-        lineage.status,
-        lineage.updated_at,
-      );
+    const update = db.transaction(() => {
+      const updated = db
+        .prepare(
+          `UPDATE refund_funding_lineage
+           SET status = ?,
+               block_hash = ?,
+               canonical_status = ?,
+               confirmations = ?,
+               finality_required_confirmations = ?,
+               finalized_at = ?,
+               reorg_hold = ?,
+               reorg_hold_at = ?,
+               evidence_json = ?,
+               updated_at = ?
+           WHERE id = ? AND status = ? AND updated_at = ?`
+        )
+        .run(
+          verification.status,
+          verification.blockHash || null,
+          verification.canonicalStatus || "unknown",
+          Number(verification.confirmations || 0),
+          Number(verification.finalityRequiredConfirmations || ACCOUNTING_FINALITY_CONFIRMATIONS),
+          verification.finalizedAt || null,
+          verification.reorgHold ? 1 : 0,
+          verification.reorgHold ? timestamp : null,
+          JSON.stringify(sanitizeAuditState(evidence)),
+          timestamp,
+          lineage.id,
+          lineage.status,
+          lineage.updated_at,
+        );
+      if (updated.changes === 1 && verification.reorgHold) {
+        applyRefundFundingReorgHold({
+          refund,
+          sweep: lineage,
+          actorId,
+          auditContext: { requestId, idempotencyKey: idemKey, ip: req.ip },
+        });
+      }
+      return updated;
+    })();
     if (update.changes !== 1) {
       const current = getRefundFundingLineage(refund.id);
-      if (current?.status === "verified") {
+      if (["verified", "finalized"].includes(String(current?.status || ""))) {
         return {
           status: 200,
           body: buildRefundEvidenceResponse(db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id)),
@@ -12958,7 +18220,15 @@ app.post("/api/v1/refunds/:refundId/funding-lineage/verify", requirePermission("
         },
       };
     }
-    if (verification.status === "verified") {
+    const verificationFinality = getRefundFundingFinalityState({
+      status: verification.status,
+      canonical_status: verification.canonicalStatus,
+      confirmations: verification.confirmations,
+      finality_required_confirmations: verification.finalityRequiredConfirmations,
+      finalized_at: verification.finalizedAt,
+      reorg_hold: verification.reorgHold ? 1 : 0,
+    });
+    if (["verified", "finalized"].includes(String(verification.status || "")) && verificationFinality.allocationReady) {
       const allocationIdempotencyKey = `refund-funding:${refund.id}:${lineage.id}`;
       const existingAllocations = db
         .prepare(
@@ -13064,6 +18334,7 @@ app.post("/api/v1/refunds/:refundId/approve", requirePermission("refund.approve"
     if (refund.refund_case_id) {
       db.prepare(`UPDATE refund_cases SET status = 'approved', updated_at = ? WHERE id = ?`).run(ts, refund.refund_case_id);
     }
+    syncInvoiceRefundStatus(refund.invoice_id);
     const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
     audit({
       actorType: "admin",
@@ -13219,6 +18490,7 @@ app.post("/api/v1/refunds/:refundId/execute", requirePermission("refund.execute"
     if (refund.refund_case_id) {
       db.prepare(`UPDATE refund_cases SET status = ?, updated_at = ? WHERE id = ?`).run(execResult.status, ts, refund.refund_case_id);
     }
+    syncInvoiceRefundStatus(refund.invoice_id);
     const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
     recordFinalRefundAccountingEvent(after, req.session.store_id);
     audit({
@@ -13263,7 +18535,7 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
     }
     const verifyHold = db.prepare(`SELECT id, integrity_hold, integrity_hold_reason, integrity_hold_at FROM invoices WHERE id = ? AND integrity_hold = 1`).get(refund.invoice_id);
     if (verifyHold) return integrityHoldApiResult([verifyHold], "refund verification");
-    if (!["recorded", "pending_verification", "verification_failed", "failed"].includes(String(refund.status))) {
+    if (!["recorded", "pending_verification", "verification_failed", "failed", "verified", "succeeded", "finalized"].includes(String(refund.status))) {
       return { status: 409, body: { error: { code: "INVALID_STATE_TRANSITION", message: "Refund is not awaiting verification" } } };
     }
 
@@ -13314,7 +18586,7 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         ? fundingConservation.executionReady
         : hasVerifiedRefundFundingLineage(current);
       const fundingRequired = currentFundingSweeps.length > 0 || isProductionLikeRuntime();
-      if (verified.status === "succeeded" && fundingRequired && !fundingReady) {
+      if (["succeeded", "verified", "finalized"].includes(String(verified.status)) && fundingRequired && !fundingReady) {
         const conservation = fundingConservation?.snapshot || null;
         return {
           status: 409,
@@ -13338,8 +18610,8 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
 
       const currentEvidenceMatchesResult = normalizeEvidenceHash(current.refund_tx_hash) === normalizeEvidenceHash(finalTxHash)
         && normalizeEvidenceLogIndex(current.refund_tx_log_index) === normalizeEvidenceLogIndex(finalTxLogIndex);
-      const alreadySameSuccess = ["succeeded", "verified"].includes(String(current.status))
-        && verified.status === "succeeded"
+      const alreadySameSuccess = ["succeeded", "finalized"].includes(String(current.status))
+        && ["succeeded", "finalized"].includes(String(verified.status))
         && currentEvidenceMatchesResult;
       const snapshotStillCurrent = String(current.status) === String(refund.status)
         && String(current.updated_at || "") === String(refund.updated_at || "")
@@ -13352,7 +18624,7 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         }
         return conflictResult(current);
       }
-      if (!["recorded", "pending_verification", "verification_failed", "failed"].includes(String(current.status))) {
+      if (!["recorded", "pending_verification", "verification_failed", "failed", "verified", "succeeded", "finalized"].includes(String(current.status))) {
         return { status: 409, body: { error: { code: "INVALID_STATE_TRANSITION", message: "Refund is not awaiting verification" } } };
       }
 
@@ -13371,12 +18643,63 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         }
       }
 
+      let globalRefundTransferId = current.blockchain_transfer_id || null;
+      const refundEvidenceStatuses = new Set(["verified", "succeeded", "finalized", "verification_failed"]);
+      if (refundEvidenceStatuses.has(String(verified.status)) && finalTxHash && finalTxLogIndex != null) {
+        const globalRefundTransfer = registerGlobalTransferObservation({
+          invoice: null,
+          providerId: "refund-verification",
+          event: {
+            chain_id: String(verified.chainId || current.refund_chain_id || current.chain_id || CHAIN_ID),
+            tx_hash: finalTxHash,
+            log_index: finalTxLogIndex,
+            token_contract: verified.tokenContract || current.token_contract || APPROVED_TOKEN_CONTRACT,
+            from_address: verified.fromAddress || current.from_address || null,
+            to_address: verified.toAddress || current.to_address || current.refund_to_address || null,
+            token_amount_atomic: verified.tokenAmountAtomic || current.token_amount_atomic || null,
+            block_number: verified.blockNumber ?? current.block_number ?? null,
+            block_hash: verified.blockHash || null,
+            block_timestamp: verified.blockTimestamp || null,
+            receipt_status: verified.receiptStatus || "success",
+            canonical_status: verified.canonicalStatus || "unknown",
+            confirmations: Number(verified.finalityConfirmations || verified.confirmations || 0),
+            observed_at: verified.verifiedAt || verified.detectedAt || nowIso(),
+            source: "refund-verification",
+          },
+        });
+        if (!globalRefundTransfer.complete) {
+          return {
+            status: 409,
+            body: {
+              error: {
+                code: TRANSFER_IDENTITY_INCOMPLETE,
+                message: "refund verification requires chain_id, tx_hash, and log_index before financial status can advance",
+              },
+            },
+          };
+        }
+        if (globalRefundTransfer.disputed) {
+          return {
+            status: 409,
+            body: {
+              error: {
+                code: "REFUND_TRANSFER_EVIDENCE_DISPUTED",
+                message: "refund transfer evidence conflicts with the canonical global transfer record",
+                details: { blockchain_transfer_id: globalRefundTransfer.transferId },
+              },
+            },
+          };
+        }
+        globalRefundTransferId = globalRefundTransfer.transferId;
+      }
+
       const ts = nowIso();
       const updated = db.prepare(
         `UPDATE refund_requests
          SET status = ?,
              refund_tx_hash = ?,
              refund_tx_log_index = ?,
+             blockchain_transfer_id = COALESCE(?, blockchain_transfer_id),
              failure_reason = ?,
              from_address = COALESCE(?, from_address),
              to_address = COALESCE(?, to_address),
@@ -13384,6 +18707,12 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
              token_contract = COALESCE(?, token_contract),
              block_number = ?,
              block_timestamp = ?,
+             finality_confirmations = ?,
+             finality_required_confirmations = ?,
+             canonical_status = ?,
+             reorg_hold = ?,
+             reorg_hold_at = ?,
+             finalized_at = ?,
              detected_at = ?,
              verified_at = ?,
              last_attempted_at = ?,
@@ -13397,6 +18726,7 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         verified.status,
         finalTxHash,
         finalTxLogIndex,
+        globalRefundTransferId,
         verified.failureReason || null,
         verified.fromAddress || null,
         verified.toAddress || null,
@@ -13404,6 +18734,12 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
         verified.tokenContract || null,
         verified.blockNumber ?? null,
         verified.blockTimestamp || null,
+        Number(verified.finalityConfirmations || verified.confirmations || 0),
+        Number(verified.finalityRequiredConfirmations || ACCOUNTING_FINALITY_CONFIRMATIONS),
+        String(verified.canonicalStatus || "unknown"),
+        verified.reorgHold ? 1 : 0,
+        verified.reorgHold ? ts : null,
+        verified.finalizedAt || null,
         verified.detectedAt || ts,
         verified.verifiedAt || null,
         ts,
@@ -13419,6 +18755,45 @@ app.post("/api/v1/refunds/:refundId/verify", requirePermission("refund.execute")
       if (current.refund_case_id) {
         db.prepare(`UPDATE refund_cases SET status = ?, updated_at = ? WHERE id = ?`).run(verified.status, ts, current.refund_case_id);
       }
+
+      if (verified.reorgHold) {
+        const affectedInvoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(current.invoice_id);
+        if (affectedInvoice) {
+          db.prepare(
+            `UPDATE invoices
+             SET integrity_hold = 1,
+                 integrity_hold_reason = 'refund_chain_reorg_detected',
+                 integrity_hold_at = COALESCE(integrity_hold_at, ?),
+                 fulfillment_status = 'hold',
+                 review_status = 'open',
+                 integrity_status = 'hold',
+                 accounting_status = 'adjusted',
+                 monitoring_status = 'integrity_hold',
+                 version = COALESCE(version, 0) + 1,
+                 updated_at = ?
+             WHERE id = ?`
+          ).run(ts, ts, affectedInvoice.id);
+          const reorgReview = upsertReviewCase(affectedInvoice, REVIEW_REASON_CODES.CHAIN_REORG, {
+            txHash: finalTxHash,
+            eventAmountBase: affectedInvoice.paid_amount_jpyc_base || "0",
+            detectedAt: ts,
+            blockTimestamp: verified.blockTimestamp || null,
+            suggestedAction: "reconcile_refund_chain_reorg_before_settlement",
+          });
+          recordAccountingEvent({
+            storeId: affectedInvoice.store_id,
+            invoiceId: affectedInvoice.id,
+            eventType: "refund_reorg_adjustment",
+            occurredAt: ts,
+            amountBase: "0",
+            status: "adjustment_pending",
+            sourceRef: `refund-reorg:${current.id}:${finalTxHash || "unknown"}`,
+            payload: { refund_request_id: current.id, review_case_id: reorgReview?.id || null },
+          });
+        }
+      }
+
+      syncInvoiceRefundStatus(current.invoice_id);
 
       const after = db.prepare(`SELECT * FROM refund_requests WHERE id = ?`).get(refund.id);
       recordFinalRefundAccountingEvent(after, req.session.store_id);
@@ -13748,17 +19123,23 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
 });
 
 app.get("/api/v1/chain-monitor/status", requirePlatformPermission("monitor.read"), (_req, res) => {
-  const stateRows = db.prepare(`SELECT key, value, updated_at FROM chain_monitor_state WHERE key LIKE ? OR key LIKE ? ORDER BY key ASC`).all(
+  const stateRows = workerStateAll(`SELECT key, value, updated_at FROM chain_monitor_state WHERE key LIKE ? OR key LIKE ? ORDER BY key ASC`,
     `worker:${CHAIN_ID}:%`,
     `last_block:${CHAIN_ID}:%`
   );
-  const failoverCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_rpc_failovers WHERE chain_id = ?`).get(CHAIN_ID).count;
-  const unmatchedCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_unmatched_events WHERE chain_id = ?`).get(CHAIN_ID).count;
-  const deadLetterCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ?`).get(CHAIN_ID).count;
+  const failoverCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_rpc_failovers WHERE chain_id = ?`, CHAIN_ID);
+  const unmatchedCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_unmatched_events WHERE chain_id = ?`, CHAIN_ID);
+  const deadLetterCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ?`, CHAIN_ID);
   const reorgCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_reorgs WHERE chain_id = ?`).get(CHAIN_ID).count;
-  const unresolvedReorgCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_reorgs WHERE chain_id = ? AND status = 'unresolved'`).get(CHAIN_ID).count;
-  const pendingDeadLetterCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'pending'`).get(CHAIN_ID).count;
-  const abandonedDeadLetterCount = db.prepare(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'abandoned'`).get(CHAIN_ID).count;
+  const unresolvedReorgCount = db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM chain_reorgs
+     WHERE chain_id = ?
+       AND (COALESCE(status, 'unresolved') <> 'resolved'
+         OR COALESCE(revalidation_status, 'unverified') <> 'verified')`
+  ).get(CHAIN_ID).count;
+  const pendingDeadLetterCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'pending'`, CHAIN_ID);
+  const abandonedDeadLetterCount = workerStateCount(`SELECT COUNT(*) AS count FROM chain_dead_letters WHERE chain_id = ? AND status = 'abandoned'`, CHAIN_ID);
   const addressPoolAvailableCount = db.prepare(`SELECT COUNT(*) AS count FROM receive_addresses WHERE status = 'available'`).get().count;
   return res.json({
     state: stateRows,
@@ -13782,18 +19163,261 @@ app.get("/api/v1/chain-monitor/reorgs", requirePlatformPermission("monitor.read"
   return res.json({ reorgs: rows, page: { limit, offset, returned: rows.length } });
 });
 
-app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("monitor.reconcile"), (req, res) => {
+function validateChainReorgRevalidationEvidence({ reorg, affectedInvoiceIds, body }) {
+  const input = body?.revalidation_evidence
+    || body?.canonical_revalidation
+    || body?.revalidation;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {
+      ok: false,
+      code: "REORG_REVALIDATION_EVIDENCE_REQUIRED",
+      message: "structured canonical revalidation evidence is required",
+    };
+  }
+  const range = input.block_range && typeof input.block_range === "object"
+    ? input.block_range
+    : input;
+  const fromBlock = Number(range.from_block ?? range.fromBlock);
+  const toBlock = Number(range.to_block ?? range.toBlock);
+  const expectedFromBlock = Number(reorg.from_block);
+  const expectedToBlock = Number(reorg.to_block);
+  const canonicalHash = String(
+    input.canonical_hash
+      ?? input.canonical_block_hash
+      ?? input.canonicalHash
+      ?? ""
+  ).trim().toLowerCase();
+  const canonicalStatus = String(
+    input.canonical_status
+      ?? input.canonicalStatus
+      ?? ""
+  ).trim().toLowerCase();
+  const recheckedAt = String(
+    input.rechecked_at
+      ?? input.revalidation_at
+      ?? input.checked_at
+      ?? ""
+  ).trim();
+  const reconciliationReference = String(
+    input.reconciliation_reference
+      ?? input.reconciliation_ref
+      ?? ""
+  ).trim();
+  const rawInvoiceResults = input.affected_invoices
+    ?? input.invoice_reconciliation_results
+    ?? input.reconciliation_results;
+  if (!Number.isSafeInteger(fromBlock) || !Number.isSafeInteger(toBlock)
+    || !Number.isSafeInteger(expectedFromBlock) || !Number.isSafeInteger(expectedToBlock)
+    || fromBlock !== expectedFromBlock || toBlock !== expectedToBlock) {
+    return {
+      ok: false,
+      code: "REORG_REVALIDATION_EVIDENCE_INVALID",
+      message: "revalidation evidence block range does not match the recorded reorg",
+      details: {
+        expected: { from_block: reorg.from_block, to_block: reorg.to_block },
+        received: { from_block: Number.isSafeInteger(fromBlock) ? fromBlock : null, to_block: Number.isSafeInteger(toBlock) ? toBlock : null },
+      },
+    };
+  }
+  const checkedAtMs = Date.parse(recheckedAt);
+  if (!canonicalHash || canonicalStatus !== "canonical" || !reconciliationReference
+    || !recheckedAt || !Number.isFinite(checkedAtMs) || checkedAtMs > Date.now() + 5 * 60 * 1000) {
+    return {
+      ok: false,
+      code: "REORG_REVALIDATION_EVIDENCE_INVALID",
+      message: "canonical hash/status, revalidation time, and reconciliation reference are required",
+    };
+  }
+  if (!Array.isArray(rawInvoiceResults)) {
+    return {
+      ok: false,
+      code: "REORG_REVALIDATION_EVIDENCE_INVALID",
+      message: "affected invoice reconciliation results are required as an array",
+    };
+  }
+  const normalizedResults = rawInvoiceResults.map((entry) => ({
+    invoice_id: String(entry?.invoice_id ?? entry?.invoiceId ?? "").trim(),
+    result: String(entry?.result ?? entry?.reconciliation_status ?? entry?.status ?? "").trim().toLowerCase(),
+    reconciliation_reference: String(
+      entry?.reconciliation_reference
+        ?? entry?.reconciliation_ref
+        ?? reconciliationReference
+    ).trim(),
+  }));
+  const resultIds = normalizedResults.map((entry) => entry.invoice_id);
+  const invalidResult = normalizedResults.find((entry) => (
+    !entry.invoice_id
+    || !entry.result
+    || !entry.reconciliation_reference
+    || ["pending", "unknown", "unverified", "failed"].includes(entry.result)
+  ));
+  const expectedIds = [...affectedInvoiceIds].map(String).sort();
+  const receivedIds = [...resultIds].sort();
+  if (invalidResult || new Set(resultIds).size !== resultIds.length
+    || JSON.stringify(expectedIds) !== JSON.stringify(receivedIds)) {
+    return {
+      ok: false,
+      code: "REORG_RECONCILIATION_RESULTS_INCOMPLETE",
+      message: "revalidation evidence must contain one completed result for every affected invoice",
+      details: {
+        affected_invoice_ids: expectedIds,
+        received_invoice_ids: receivedIds,
+      },
+    };
+  }
+  return {
+    ok: true,
+    evidence: {
+      block_range: { from_block: fromBlock, to_block: toBlock },
+      canonical_hash: canonicalHash,
+      canonical_status: canonicalStatus,
+      rechecked_at: new Date(checkedAtMs).toISOString(),
+      reconciliation_reference: reconciliationReference,
+      affected_invoices: normalizedResults,
+    },
+  };
+}
+
+async function verifyChainReorgRevalidationAgainstRpc({ reorg, evidence }) {
+  const lowerBlock = Math.min(Number(reorg.from_block), Number(reorg.to_block));
+  const upperBlock = Math.max(Number(reorg.from_block), Number(reorg.to_block));
+  const providers = rpcProvidersByChain.get(String(CHAIN_ID)) || [];
+  if (providers.length === 0) {
+    if (PRODUCTION_LIKE_RUNTIME) {
+      return {
+        ok: false,
+        code: "REORG_RPC_UNAVAILABLE",
+        message: "production reorg resolution requires server-side RPC revalidation",
+      };
+    }
+    return {
+      ok: true,
+      attestation: {
+        verification_mode: "development_fixture",
+        rpc_verified: false,
+        checked_chain_id: String(CHAIN_ID),
+        checked_block_range: { from_block: lowerBlock, to_block: upperBlock },
+        verified_transfer_count: 0,
+      },
+    };
+  }
+
+  return withRpcProvider("chain_reorg_revalidation", async (provider) => {
+    const rpcChainIdRaw = String(await provider.send("eth_chainId", []));
+    const rpcChainId = rpcChainIdRaw.startsWith("0x") ? BigInt(rpcChainIdRaw).toString() : rpcChainIdRaw;
+    if (rpcChainId !== String(CHAIN_ID)) {
+      return {
+        ok: false,
+        code: "REORG_RPC_CHAIN_MISMATCH",
+        message: "revalidation RPC chain does not match the configured payment chain",
+      };
+    }
+
+    const canonicalCheckpoint = await provider.getBlock(upperBlock);
+    const expectedCanonicalHash = String(evidence.canonical_hash || "").trim().toLowerCase();
+    const actualCanonicalHash = String(canonicalCheckpoint?.hash || "").trim().toLowerCase();
+    if (!canonicalCheckpoint?.hash || !expectedCanonicalHash || actualCanonicalHash !== expectedCanonicalHash) {
+      return {
+        ok: false,
+        code: "REORG_CANONICAL_RPC_MISMATCH",
+        message: "revalidation canonical hash does not match the server-side RPC block",
+        details: {
+          block_number: upperBlock,
+          expected_hash: expectedCanonicalHash || null,
+          actual_hash: actualCanonicalHash || null,
+        },
+      };
+    }
+
+    const eventRows = db.prepare(
+      `SELECT * FROM payment_events
+       WHERE chain_id = ? AND block_number BETWEEN ? AND ?
+       ORDER BY block_number ASC, created_at ASC, id ASC`
+    ).all(CHAIN_ID, lowerBlock, upperBlock);
+    const verifiedTransfers = [];
+    for (const event of eventRows) {
+      const txHash = parseTxHash(event.tx_hash);
+      if (!txHash) {
+        return {
+          ok: false,
+          code: "REORG_PAYMENT_EVIDENCE_INVALID",
+          message: "affected payment event has an invalid transaction hash",
+          details: { payment_event_id: event.id },
+        };
+      }
+      const receipt = await provider.getTransactionReceipt(txHash);
+      if (!receipt || Number(receipt.status || 0) !== 1) {
+        return {
+          ok: false,
+          code: "REORG_PAYMENT_RECEIPT_NOT_CANONICAL",
+          message: "affected payment event has no successful canonical receipt",
+          details: { payment_event_id: event.id, tx_hash: txHash },
+        };
+      }
+      const receiptBlock = await provider.getBlock(Number(receipt.blockNumber));
+      const receiptBlockHash = String(receipt.blockHash || "").trim().toLowerCase();
+      const receiptCanonicalHash = String(receiptBlock?.hash || "").trim().toLowerCase();
+      if (!receiptBlockHash || !receiptCanonicalHash || receiptBlockHash !== receiptCanonicalHash) {
+        return {
+          ok: false,
+          code: "REORG_PAYMENT_RECEIPT_NOT_CANONICAL",
+          message: "affected payment receipt block is not canonical",
+          details: { payment_event_id: event.id, tx_hash: txHash },
+        };
+      }
+      const transfers = getReceiptTransferLogs(receipt, event.token_contract);
+      const transfer = transfers.find((candidate) => Number(candidate.logIndex) === Number(event.log_index));
+      if (!transfer
+        || (event.to_address && normalizeAddress(transfer.to) !== normalizeAddress(event.to_address))
+        || (event.from_address && normalizeAddress(transfer.from) !== normalizeAddress(event.from_address))
+        || (event.token_amount_atomic
+          && compareBaseUnits(String(transfer.amountBase), String(event.token_amount_atomic)) !== 0)) {
+        return {
+          ok: false,
+          code: "REORG_PAYMENT_TRANSFER_MISMATCH",
+          message: "affected payment event transfer does not match the canonical receipt",
+          details: { payment_event_id: event.id, tx_hash: txHash, log_index: event.log_index },
+        };
+      }
+      verifiedTransfers.push({
+        payment_event_id: event.id,
+        tx_hash: txHash,
+        log_index: Number(event.log_index),
+        canonical_block_number: Number(receipt.blockNumber),
+        canonical_block_hash: receiptCanonicalHash,
+      });
+    }
+    return {
+      ok: true,
+      attestation: {
+        verification_mode: "server_rpc",
+        rpc_verified: true,
+        checked_chain_id: String(CHAIN_ID),
+        checked_block_range: { from_block: lowerBlock, to_block: upperBlock },
+        canonical_checkpoint_hash: actualCanonicalHash,
+        canonical_checkpoint_number: upperBlock,
+        verified_transfer_count: verifiedTransfers.length,
+        verified_transfers: verifiedTransfers,
+        server_checked_at: nowIso(),
+      },
+    };
+  }, CHAIN_ID);
+}
+
+app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("monitor.reconcile"), async (req, res) => {
   const reorgId = String(req.params.id || "").trim();
   const resolutionNote = String(req.body?.resolution_note || "").trim();
-  const invoiceIds = Array.isArray(req.body?.invoice_ids)
+  const requestedInvoiceIds = Array.isArray(req.body?.invoice_ids)
     ? [...new Set(req.body.invoice_ids.map((value) => String(value || "").trim()).filter(Boolean))]
     : null;
-  if (!reorgId || resolutionNote.length < 10 || invoiceIds === null) {
-    return jsonError(res, 400, "VALIDATION_ERROR", "resolution_note and invoice_ids array are required");
+  if (!reorgId || resolutionNote.length < 10) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "resolution_note is required");
   }
   const before = db.prepare(`SELECT * FROM chain_reorgs WHERE id = ? AND chain_id = ?`).get(reorgId, CHAIN_ID);
   if (!before) return jsonError(res, 404, "NOT_FOUND", "Chain reorganization record not found");
-  if (before.status !== "unresolved") return jsonError(res, 409, "ALREADY_RESOLVED", "Chain reorganization is already resolved");
+  if (String(before.revalidation_status || "unverified") === "verified") {
+    return jsonError(res, 409, "ALREADY_RESOLVED", "Chain reorganization is already canonically revalidated");
+  }
   const lowerBlock = [before.from_block, before.to_block]
     .map((value) => Number(value))
     .filter((value) => Number.isFinite(value))
@@ -13825,6 +19449,51 @@ app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("
       { invoice_ids: cancelledAffectedIds }
     );
   }
+  const evidenceValidation = validateChainReorgRevalidationEvidence({
+    reorg: before,
+    affectedInvoiceIds: affectedIds,
+    body: req.body,
+  });
+  if (!evidenceValidation.ok) {
+    return jsonError(
+      res,
+      409,
+      evidenceValidation.code,
+      evidenceValidation.message,
+      evidenceValidation.details || {}
+    );
+  }
+  let rpcVerification;
+  try {
+    rpcVerification = await verifyChainReorgRevalidationAgainstRpc({
+      reorg: before,
+      evidence: evidenceValidation.evidence,
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      ts: nowIso(),
+      level: "error",
+      type: "chain_reorg.revalidation_rpc_failed",
+      reorg_id: reorgId,
+      message: String(error.message || error),
+    }));
+    return jsonError(res, 503, "REORG_RPC_UNAVAILABLE", "server-side chain revalidation is temporarily unavailable");
+  }
+  if (!rpcVerification?.ok) {
+    return jsonError(
+      res,
+      409,
+      rpcVerification.code || "REORG_RPC_REVALIDATION_FAILED",
+      rpcVerification.message || "server-side chain revalidation failed",
+      rpcVerification.details || {}
+    );
+  }
+  evidenceValidation.evidence = {
+    ...evidenceValidation.evidence,
+    rpc_attestation: rpcVerification.attestation,
+  };
+  const invoiceIds = requestedInvoiceIds
+    || evidenceValidation.evidence.affected_invoices.map((entry) => entry.invoice_id);
   const unknownInvoiceIds = invoiceIds.filter((invoiceId) => !affectedIds.includes(invoiceId));
   const missingInvoiceIds = affectedIds.filter((invoiceId) => !invoiceIds.includes(invoiceId));
   if (unknownInvoiceIds.length > 0 || missingInvoiceIds.length > 0) {
@@ -13863,10 +19532,10 @@ app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("
            LIMIT 1`
         )
         .get(invoice.id, CHAIN_ID, lowerBlock, upperBlock);
-      const reviewCase = upsertReviewCase(updatedInvoice, REVIEW_REASON_CODES.CHAIN_INCONSISTENT, {
+      const reviewCase = upsertReviewCase(updatedInvoice, REVIEW_REASON_CODES.CHAIN_REORG, {
         txHash: event?.tx_hash || updatedInvoice.paid_tx_hash || null,
         eventAmountBase: updatedInvoice.paid_amount_jpyc_base || event?.amount_jpyc_base || "0",
-        blockTimestamp: event?.block_timestamp || event?.detected_at || resolvedAt,
+        blockTimestamp: event?.block_timestamp || null,
         detectedAt: event?.detected_at || resolvedAt,
         suggestedAction: "reconcile_chain_reorg_and_reconfirm_payment",
       });
@@ -13903,9 +19572,25 @@ app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("
     }
     db.prepare(
       `UPDATE chain_reorgs
-       SET status = 'resolved', resolved_at = ?, resolution_note = ?
-       WHERE id = ? AND chain_id = ? AND status = 'unresolved'`
-    ).run(resolvedAt, resolutionNote, reorgId, CHAIN_ID);
+       SET status = 'resolved',
+           resolved_at = ?,
+           resolution_note = ?,
+           revalidation_status = 'verified',
+           revalidation_evidence_json = ?,
+           revalidation_reference = ?,
+           revalidated_at = ?,
+           revalidation_failure_reason = NULL
+       WHERE id = ? AND chain_id = ?
+         AND COALESCE(revalidation_status, 'unverified') <> 'verified'`
+    ).run(
+      resolvedAt,
+      resolutionNote,
+      JSON.stringify(sanitizeAuditState(evidenceValidation.evidence)),
+      evidenceValidation.evidence.reconciliation_reference,
+      evidenceValidation.evidence.rechecked_at,
+      reorgId,
+      CHAIN_ID,
+    );
     const after = db.prepare(`SELECT * FROM chain_reorgs WHERE id = ?`).get(reorgId);
     audit({
       actorType: "platform_operator",
@@ -13915,27 +19600,44 @@ app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("
       targetId: reorgId,
       requestId,
       beforeState: before,
-      afterState: { reorg: after, reconciled_invoices: reconciled },
+      afterState: {
+        reorg: after,
+        revalidated_evidence: evidenceValidation.evidence,
+        reconciled_invoices: reconciled,
+      },
       ip: req.ip,
     });
-    return { after, reconciled };
+    return { after, reconciled, evidence: evidenceValidation.evidence };
   })();
-  return res.json({ reorg: result.after, reconciled_invoices: result.reconciled, audit_recorded: true });
+  return res.json({
+    reorg: result.after,
+    revalidated_evidence: result.evidence,
+    reconciled_invoices: result.reconciled,
+    audit_recorded: true,
+  });
 });
 
 app.get("/api/v1/chain-monitor/unmatched", requirePlatformPermission("monitor.read"), (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
   const offset = Math.max(Number(req.query.offset || 0), 0);
-  const rows = db
-    .prepare(`SELECT * FROM chain_unmatched_events WHERE chain_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`)
-    .all(CHAIN_ID, limit, offset);
+  const rows = workerStateAll(
+    `SELECT * FROM chain_unmatched_events WHERE chain_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+    CHAIN_ID,
+    limit,
+    offset
+  );
   return res.json({ unmatched_events: rows, page: { limit, offset, returned: rows.length } });
 });
 
 app.get("/api/v1/chain-monitor/dead-letters", requirePlatformPermission("monitor.read"), (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
   const offset = Math.max(Number(req.query.offset || 0), 0);
-  const rows = db.prepare(`SELECT * FROM chain_dead_letters WHERE chain_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(CHAIN_ID, limit, offset);
+  const rows = workerStateAll(
+    `SELECT * FROM chain_dead_letters WHERE chain_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+    CHAIN_ID,
+    limit,
+    offset
+  );
   return res.json({ dead_letters: rows, page: { limit, offset, returned: rows.length } });
 });
 
@@ -13953,6 +19655,33 @@ app.get("/api/v1/settlements/daily-status", requirePermission("settlement.close"
     closed: !!settlement,
     settlement: settlement || null
   });
+});
+
+app.get("/api/v1/settlements/daily:preview", (req, res, next) => {
+  if (req.path !== "/api/v1/settlements/daily:preview") return next("route");
+  return requirePermission("settlement.close")(req, res, next);
+}, (req, res) => {
+  const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(req.session.store_id);
+  if (!store) return jsonError(res, 404, "NOT_FOUND", "Store not found");
+  const defaultDate = DateTime.now().setZone(store.timezone || "Asia/Tokyo").toISODate();
+  const businessDate = String(req.query.business_date || defaultDate || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "business_date must be YYYY-MM-DD");
+  }
+  const range = utcRangeForBusinessDate(businessDate, store.timezone);
+  if (range.error) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "Invalid business_date for timezone", range.details || {});
+  }
+  const preview = buildDailySettlementPreview({
+    storeId: req.session.store_id,
+    businessDate,
+    store,
+    range,
+    unresolvedReviewReason: String(req.query.unresolved_review_reason || "").trim(),
+    adminApproval: String(req.query.admin_approval || "").toLowerCase() === "true",
+  });
+  const existing = db.prepare(`SELECT id, created_at FROM settlements WHERE store_id = ? AND business_date = ?`).get(req.session.store_id, businessDate);
+  return res.json({ ...preview, closed: Boolean(existing), settlement_id: existing?.id || null });
 });
 
 app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"), (req, res) => {
@@ -13975,7 +19704,37 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
     }
     const integrityHeld = listIntegrityHeldInvoices(req.session.store_id, range);
     if (integrityHeld.length > 0) return integrityHoldApiResult(integrityHeld, "daily close");
-
+    const accountingFinalityPending = listAccountingFinalityPendingInvoices(req.session.store_id, { ...range, businessDate });
+    if (accountingFinalityPending.length > 0) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "ACCOUNTING_FINALITY_PENDING",
+            message: "accounting finality confirmations are not complete",
+            details: { invoices: accountingFinalityPending },
+          },
+        },
+      };
+    }
+    const hardGate = evaluateSettlementHardGate({
+      storeId: req.session.store_id,
+      businessDate,
+      store,
+      range,
+    });
+    if (!hardGate.ok) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "SETTLEMENT_HARD_GATE_BLOCKED",
+            message: "settlement close is blocked until all chain, review, audit, worker, and release gates are clear",
+            details: hardGate,
+          },
+        },
+      };
+    }
     let result;
     try {
       result = db.transaction(() => {
@@ -14133,7 +19892,7 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
         pending_verification: refunds.filter((row) => String(row.status) === "pending_verification").length,
         verification_failed: refunds.filter((row) => String(row.status) === "verification_failed").length,
         failed: refunds.filter((row) => String(row.status) === "failed").length,
-        completed: refunds.filter((row) => String(row.status) === "succeeded").length,
+        completed: refunds.filter((row) => ["succeeded", "finalized"].includes(String(row.status))).length,
       };
       const unresolvedRefunds = refunds.filter((row) => isUnresolvedRefundStatus(row.status));
       if (unresolvedRefunds.length > 0) {
@@ -14157,7 +19916,10 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
           },
         };
       }
-      const totalPaidBase = paidInvoices.reduce((acc, row) => acc + BigInt(String(row.paid_amount_jpyc_base || "0")), 0n);
+      const totalPaidBase = paidInvoices.reduce(
+        (acc, row) => acc + BigInt(String(parseSettlementAmountBaseStrict(row.paid_amount_jpyc_base, `invoice:${row.id}:paid_amount_jpyc_base`))),
+        0n,
+      );
       const invoiceStatusCounts = {
         paid: allInvoices.filter((row) => String(row.status) === "paid").length,
         settled: allInvoices.filter((row) => String(row.status) === "settled" || !!row.settled_at).length,
@@ -14210,6 +19972,21 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
           closedAt,
           ...paidInvoices.map((row) => row.id)
         );
+        for (const paidInvoice of paidInvoices) {
+          const transitioned = updateInvoiceStatus(paidInvoice.id, "settled", "daily_settlement_closed", {
+            actorType: "admin",
+            actorId,
+            requestId,
+            idempotencyKey: idemKey,
+            ip: req.ip,
+            reason: "daily_settlement_closed",
+          });
+          if (transitioned.error) {
+            const error = new Error(`invoice settlement state transition failed: ${transitioned.error}`);
+            error.code = "SETTLEMENT_STATE_TRANSITION_FAILED";
+            throw error;
+          }
+        }
       }
 
       audit({
@@ -14271,6 +20048,7 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
       })();
     } catch (error) {
       if (error?.code === "REFUND_LEDGER_INTEGRITY_ERROR") return refundLedgerIntegrityApiResult(error);
+      if (error?.code === "LEDGER_INTEGRITY_ERROR") return settlementLedgerIntegrityApiResult(error);
       throw error;
     }
 
@@ -14278,7 +20056,10 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
   });
 });
 
-app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export"), (req, res) => {
+app.get("/api/v1/settlements/daily:export", (req, res, next) => {
+  if (req.path !== "/api/v1/settlements/daily:export") return next("route");
+  return requirePermission("settlement.export")(req, res, next);
+}, (req, res) => {
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(req.session.store_id);
   if (!store) return jsonError(res, 404, "NOT_FOUND", "Store not found");
   const defaultDate = DateTime.now().setZone(store.timezone || "Asia/Tokyo").toISODate();
@@ -14299,6 +20080,32 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
   if (integrityHeld.length > 0) {
     const blocked = integrityHoldApiResult(integrityHeld, "daily export");
     return res.status(blocked.status).json(blocked.body);
+  }
+  const accountingFinalityPending = listAccountingFinalityPendingInvoices(req.session.store_id, { ...range, businessDate });
+  if (accountingFinalityPending.length > 0) {
+    return res.status(409).json({
+      error: {
+        code: "ACCOUNTING_FINALITY_PENDING",
+        message: "accounting finality confirmations are not complete",
+        details: { invoices: accountingFinalityPending },
+      },
+    });
+  }
+
+  const hardGate = evaluateSettlementHardGate({
+    storeId: req.session.store_id,
+    businessDate,
+    store,
+    range,
+  });
+  if (!hardGate.ok) {
+    return res.status(409).json({
+      error: {
+        code: "SETTLEMENT_HARD_GATE_BLOCKED",
+        message: "daily settlement export is blocked until settlement hard gates are clear",
+        details: hardGate,
+      },
+    });
   }
 
   const rows = db
@@ -14353,7 +20160,7 @@ app.get("/api/v1/settlements/daily:export", requirePermission("settlement.export
     cancelled_count: invoiceRows.filter((row) => String(row.invoice_status) === "cancelled").length,
     expired_count: invoiceRows.filter((row) => String(row.invoice_status) === "expired").length,
     refund_requested_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "requested").length,
-    refund_completed_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "succeeded").length,
+    refund_completed_count: legacyRows.refund_rows.filter((row) => ["succeeded", "finalized"].includes(String(row.refund_status))).length,
   };
   if (format === "csv") {
     res.setHeader("content-type", "text/csv; charset=utf-8");
@@ -14400,6 +20207,32 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
     const blocked = integrityHoldApiResult(integrityHeld, "monthly export");
     return res.status(blocked.status).json(blocked.body);
   }
+  const accountingFinalityPending = listAccountingFinalityPendingInvoices(req.session.store_id, range);
+  if (accountingFinalityPending.length > 0) {
+    return res.status(409).json({
+      error: {
+        code: "ACCOUNTING_FINALITY_PENDING",
+        message: "accounting finality confirmations are not complete",
+        details: { invoices: accountingFinalityPending },
+      },
+    });
+  }
+
+  const hardGate = evaluateSettlementHardGate({
+    storeId: req.session.store_id,
+    businessDate: null,
+    store,
+    range,
+  });
+  if (!hardGate.ok) {
+    return res.status(409).json({
+      error: {
+        code: "SETTLEMENT_HARD_GATE_BLOCKED",
+        message: "monthly settlement export is blocked until settlement hard gates are clear",
+        details: hardGate,
+      },
+    });
+  }
 
   const rows = db
     .prepare(
@@ -14453,7 +20286,7 @@ app.get("/api/v1/settlements/monthly:export", requirePermission("settlement.expo
     cancelled_count: invoiceRows.filter((row) => String(row.invoice_status) === "cancelled").length,
     expired_count: invoiceRows.filter((row) => String(row.invoice_status) === "expired").length,
     refund_requested_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "requested").length,
-    refund_completed_count: legacyRows.refund_rows.filter((row) => String(row.refund_status) === "succeeded").length,
+    refund_completed_count: legacyRows.refund_rows.filter((row) => ["succeeded", "finalized"].includes(String(row.refund_status))).length,
   };
 
   if (format === "csv") {
@@ -14503,6 +20336,41 @@ app.post("/api/v1/settlement-exports", requirePermission("settlement.export"), (
     }
     const integrityHeld = listIntegrityHeldInvoices(req.session.store_id, range);
     if (integrityHeld.length > 0) return integrityHoldApiResult(integrityHeld, "settlement export");
+    const accountingFinalityPending = listAccountingFinalityPendingInvoices(req.session.store_id, {
+      ...range,
+      businessDate,
+    });
+    if (accountingFinalityPending.length > 0) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "ACCOUNTING_FINALITY_PENDING",
+            message: "accounting finality confirmations are not complete",
+            details: { invoices: accountingFinalityPending },
+          },
+        },
+      };
+    }
+
+    const hardGate = evaluateSettlementHardGate({
+      storeId: req.session.store_id,
+      businessDate,
+      store,
+      range,
+    });
+    if (!hardGate.ok) {
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "SETTLEMENT_HARD_GATE_BLOCKED",
+            message: "settlement export is blocked until settlement hard gates are clear",
+            details: hardGate,
+          },
+        },
+      };
+    }
 
     let result;
     try {
@@ -14546,6 +20414,7 @@ app.post("/api/v1/settlement-exports", requirePermission("settlement.export"), (
       })();
     } catch (error) {
       if (error?.code === "REFUND_LEDGER_INTEGRITY_ERROR") return refundLedgerIntegrityApiResult(error);
+      if (error?.code === "LEDGER_INTEGRITY_ERROR") return settlementLedgerIntegrityApiResult(error);
       throw error;
     }
 
@@ -14692,6 +20561,7 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     integrity_hold: Number(invoice.integrity_hold || 0) === 1,
     integrity_hold_reason: invoice.integrity_hold_reason || null,
     fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
+    fulfillment_decision: buildAuthoritativeFulfillmentDecision(invoice),
     status_version: invoice.updated_at,
     terminal_id: terminalId,
     store_id: invoice.store_id,
@@ -14726,6 +20596,7 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     integrity_hold: Number(row.integrity_hold || 0) === 1,
     integrity_hold_reason: row.integrity_hold_reason || null,
     fulfillment_hold: Number(row.integrity_hold || 0) === 1 || row.status === "review_required",
+    fulfillment_decision: buildAuthoritativeFulfillmentDecision(row),
     status_version: row.updated_at || null,
     last_event_id: req.header("last-event-id") || null,
   });
@@ -14826,6 +20697,72 @@ app.get("/api/v1/public/terminal-entry/:publicEntryToken", (req, res) => {
   return res.json(entry);
 });
 
+app.post("/api/v1/public/terminal-entry/:publicEntryToken/claim", (req, res) => {
+  const publicEntryToken = String(req.params.publicEntryToken || "").trim();
+  if (!publicEntryToken) return jsonError(res, 400, "VALIDATION_ERROR", "Terminal entry token is required");
+  if (isPublicRateLimited(`public:terminal-entry-claim:${req.ip}:${publicEntryToken}`)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  const result = createTerminalCheckoutClaim({
+    publicEntryToken,
+    anonymousDeviceId: req.body?.anonymous_device_id,
+    nonce: req.body?.nonce,
+    invoiceVersion: req.body?.invoice_version,
+    amountScaleVersion: req.body?.amount_scale_version,
+    tokenAmountAtomic: req.body?.token_amount_atomic,
+    ledgerAmountBase: req.body?.ledger_amount_base,
+    requestId: requestIdFromReq(req),
+    ip: req.ip,
+  });
+  if (result.error) {
+    const status = ["NOT_FOUND"].includes(result.error.code) ? 404
+      : ["CHECKOUT_ALREADY_CLAIMED", "CHECKOUT_CLAIM_CONFLICT", "CHECKOUT_CLAIM_STALE", "CHECKOUT_CLAIM_EXPIRED"].includes(result.error.code) ? 409
+        : result.error.code === "CHECKOUT_NOT_READY" ? 409 : 400;
+    return jsonError(res, status, result.error.code, result.error.message, result.error.details || {});
+  }
+  return res.status(201).json({
+    claim_id: result.claim.id,
+    claim_status: result.claim.status,
+    invoice_id: result.invoice.id,
+    invoice_version: Number(result.claim.invoice_version),
+    expires_at: result.claim.expires_at,
+  });
+});
+
+app.post("/api/v1/public/terminal-entry/:publicEntryToken/claim/:claimId/consume", (req, res) => {
+  const publicEntryToken = String(req.params.publicEntryToken || "").trim();
+  if (!publicEntryToken) return jsonError(res, 400, "VALIDATION_ERROR", "Terminal entry token is required");
+  if (isPublicRateLimited(`public:terminal-entry-claim-consume:${req.ip}:${publicEntryToken}`)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  const result = consumeTerminalCheckoutClaim({
+    publicEntryToken,
+    claimId: req.params.claimId,
+    anonymousDeviceId: req.body?.anonymous_device_id,
+    invoiceVersion: req.body?.invoice_version,
+    amountScaleVersion: req.body?.amount_scale_version,
+    tokenAmountAtomic: req.body?.token_amount_atomic,
+    ledgerAmountBase: req.body?.ledger_amount_base,
+    requestId: requestIdFromReq(req),
+    ip: req.ip,
+  });
+  if (result.error) {
+    const status = result.error.code === "NOT_FOUND" ? 404
+      : ["CHECKOUT_CLAIM_DEVICE_MISMATCH"].includes(result.error.code) ? 403
+        : ["CHECKOUT_CLAIM_EXPIRED", "CHECKOUT_CLAIM_NOT_CONSUMABLE", "CHECKOUT_CLAIM_STALE", "CHECKOUT_CLAIM_CONFLICT"].includes(result.error.code) ? 409
+          : 400;
+    return jsonError(res, status, result.error.code, result.error.message, result.error.details || {});
+  }
+  return res.status(result.replay ? 200 : 201).json({
+    claim_id: result.claim.id,
+    claim_status: result.claim.status,
+    invoice_id: result.invoice.id,
+    invoice_version: Number(result.claim.invoice_version),
+    pay_url: result.invoice.payment_url,
+    expires_at: result.claim.expires_at,
+  });
+});
+
 app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
   const invoiceId = req.params.invoiceId;
   if (isPublicRateLimited(`public:get:${req.ip}:${invoiceId}`)) {
@@ -14839,8 +20776,19 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
   const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);
+  const paymentRecovery = db
+    .prepare(
+      `SELECT status, requested_chain_id, tx_hash, rpc_verified, receipt_found, canonical_status,
+              confirmations, updated_at
+       FROM payment_recovery_reports
+       WHERE invoice_id = ?
+       ORDER BY updated_at DESC, created_at DESC
+       LIMIT 1`
+    )
+    .get(invoice.id);
   const walletPayload = buildInvoiceWalletPayload(invoice, store);
   const providerSummary = buildProviderSummary(invoice);
+  const fulfillmentDecision = buildAuthoritativeFulfillmentDecision(invoice);
   const officialPaymentChain = getSupportedPaymentChain(invoice.chain_id);
   let policySnapshot = null;
   try {
@@ -14850,17 +20798,28 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
   }
   const paymentEvidenceTimestamps = findInvoicePaymentEvidenceTimestamps(invoice);
   const serverNow = nowIso();
+  const signedReceipt = buildSignedPaymentReceipt(invoice, store);
   res.json({
     invoice_id: invoice.id,
     invoice_no: invoice.invoice_no,
     amount_jpy: invoice.amount_jpy,
     amount_jpyc: invoice.amount_jpyc,
     amount_jpyc_base: invoice.amount_jpyc_base,
+    amount_scale_version: invoice.amount_scale_version || AMOUNT_SCALE_VERSION,
+    token_decimals: invoice.token_decimals ?? TOKEN_DECIMALS,
+    ledger_decimals: invoice.ledger_decimals ?? LEDGER_DECIMALS,
+    token_amount_atomic: invoice.token_amount_atomic || null,
+    ledger_amount_base: invoice.ledger_amount_base || invoice.amount_jpyc_base,
+    display_amount: invoice.display_amount || formatJpyc(invoice.amount_jpyc_base),
     status: invoice.status,
+    state_axes: deriveInvoiceStateAxes(invoice),
     monitor_until: invoice.monitor_until || null,
     integrity_hold: Number(invoice.integrity_hold || 0) === 1,
     integrity_hold_reason: invoice.integrity_hold_reason || null,
-    fulfillment_hold: Number(invoice.integrity_hold || 0) === 1 || invoice.status === "review_required",
+    fulfillment_hold: fulfillmentDecision.decision !== FULFILLMENT_DECISIONS.ALLOW_FULFILLMENT,
+    fulfillment_decision: fulfillmentDecision,
+    receipt_status: signedReceipt ? "issued" : "not_ready",
+    receipt: signedReceipt,
     status_version: invoice.updated_at,
     issued_at: invoice.created_at,
     created_at: invoice.created_at,
@@ -14879,11 +20838,142 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
     policy_urls: policySnapshot?.urls || null,
     policy_versions: policySnapshot?.versions || null,
     policy_hashes: policySnapshot?.hashes || null,
+    payment_recovery: paymentRecovery ? {
+      status: paymentRecovery.status,
+      requested_chain_id: paymentRecovery.requested_chain_id,
+      tx_hash: paymentRecovery.tx_hash,
+      rpc_verified: Number(paymentRecovery.rpc_verified || 0) === 1,
+      receipt_found: Number(paymentRecovery.receipt_found || 0) === 1,
+      canonical_status: paymentRecovery.canonical_status || "unknown",
+      confirmations: Number(paymentRecovery.confirmations || 0),
+      updated_at: paymentRecovery.updated_at,
+    } : null,
     public_payment_simulation_enabled: ENABLE_PUBLIC_PAYMENT_SIMULATION,
     payment_url: invoice.payment_url,
     pay_url: invoice.payment_url,
     customer_payment_mode: providerSummary.customer_payment_mode,
     ...walletPayload,
+  });
+});
+
+app.get("/api/v1/public/invoices/:invoiceId/receipt", (req, res) => {
+  const invoiceId = String(req.params.invoiceId || "");
+  if (isPublicRateLimited(`public:receipt:${req.ip}:${invoiceId}`)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  const sig = String(req.query.sig || "");
+  const exp = String(req.query.exp || "");
+  const nonce = String(req.query.nonce || "");
+  const verified = verifySig(invoiceId, exp, nonce, sig);
+  if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
+  if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
+  const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);
+  const receipt = buildSignedPaymentReceipt(invoice, store);
+  if (!receipt) {
+    return jsonError(res, 409, "RECEIPT_NOT_READY", "A signed receipt is issued only after canonical payment recognition and review closure");
+  }
+  audit({
+    storeId: invoice.store_id,
+    actorType: "customer",
+    actorId: invoice.id,
+    action: "receipt.issued",
+    targetType: "invoice",
+    targetId: invoice.id,
+    requestId: requestIdFromReq(req),
+    beforeState: null,
+    afterState: {
+      receipt_version: receipt.receipt_version,
+      content_sha256: receipt.content_sha256,
+      kid: receipt.kid,
+      blockchain_transfer_id: receipt.blockchain_transfer_id,
+    },
+    ip: req.ip,
+  });
+  return res.json({ receipt });
+});
+
+app.post("/api/v1/public/payment-receipts/verify", (req, res) => {
+  if (isPublicRateLimited(`public:receipt-verify:${req.ip}`)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  const input = req.body?.receipt && typeof req.body.receipt === "object"
+    ? req.body.receipt
+    : req.body;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return jsonError(res, 400, "VALIDATION_ERROR", "receipt object is required");
+  }
+  const receiptId = String(input.receipt_id || "").trim();
+  const kid = String(input.kid || "").trim();
+  const contentSha256 = String(input.content_sha256 || "").trim().toLowerCase();
+  const signature = String(input.signature || "").trim().toLowerCase();
+  const signedMessage = String(input.signed_message || "").trim();
+  const algorithm = String(input.signature_algorithm || "").trim();
+  const {
+    receipt_id: _receiptId,
+    issued_at: _issuedAt,
+    content_sha256: _contentSha256,
+    signature: _signature,
+    kid: _kid,
+    signature_algorithm: _algorithm,
+    signed_message: _signedMessage,
+    ...content
+  } = input;
+  const computedContentSha256 = sha256(JSON.stringify(content));
+  const expectedMessage = `${kid}.${contentSha256}`;
+  const secret = paymentReceiptSecretForKid(kid);
+  const persisted = receiptId
+    ? db.prepare(`SELECT id, content_sha256, signature, signed_message, revoked_at FROM payment_receipts WHERE id = ?`).get(receiptId)
+    : db.prepare(
+      `SELECT id, content_sha256, signature, signed_message, revoked_at
+       FROM payment_receipts WHERE invoice_id = ?`
+    ).get(String(content.invoice_id || ""));
+  const valid = Boolean(
+    persisted
+      && !persisted.revoked_at
+      && algorithm === "HMAC-SHA256"
+      && contentSha256 === computedContentSha256
+      && signedMessage === expectedMessage
+      && persisted.content_sha256 === contentSha256
+      && persisted.signature === signature
+      && persisted.signed_message === signedMessage
+      && secret
+      && safeHexEqual(hmacWithSecret(secret, signedMessage), signature)
+  );
+  return res.json({
+    valid,
+    receipt_id: persisted?.id || receiptId || null,
+    kid: kid || null,
+    status: valid ? "valid" : "invalid",
+    reason: valid ? null : "RECEIPT_SIGNATURE_OR_PERSISTENCE_INVALID",
+  });
+});
+
+app.post("/api/v1/public/invoices/:invoiceId/payment-recovery", async (req, res) => {
+  const invoiceId = String(req.params.invoiceId || "").trim();
+  if (isPublicRateLimited(`public:payment-recovery:${req.ip}:${invoiceId}`)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  const sig = String(req.query.sig || "");
+  const exp = String(req.query.exp || "");
+  const nonce = String(req.query.nonce || "");
+  const verified = verifySig(invoiceId, exp, nonce, sig);
+  if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
+  if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
+  const result = await createPaymentRecoveryReport({
+    invoice,
+    body: req.body || {},
+    reporterType: "customer",
+    reporterId: invoice.id,
+    requestId: requestIdFromReq(req),
+    ip: req.ip,
+  });
+  if (result.error) return jsonError(res, 400, result.error.code, result.error.message, result.error.details || {});
+  return res.status(201).json({
+    report: result.report,
+    status: result.classification.status,
+    verification: result.verification,
   });
 });
 
@@ -15073,17 +21163,23 @@ export function startServer() {
   return serverInstance;
 }
 
-export { app, runInvoiceExpirySweepOnce };
+export { app, runInvoiceExpirySweepOnce, dispatchPaymentNotificationOutboxOnce };
 
 const isMainModule = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
 async function shutdown(signal = "shutdown") {
   if (shutdownStarted) return;
   shutdownStarted = true;
   clearInterval(expirySweepTimer);
+  clearInterval(notificationOutboxTimer);
   try {
     if (serverInstance) {
       await new Promise((resolve) => serverInstance.close(() => resolve()));
     }
+  } catch (_error) {
+    // no-op
+  }
+  try {
+    if (workerStateReadDb?.open) workerStateReadDb.close();
   } catch (_error) {
     // no-op
   }

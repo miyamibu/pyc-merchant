@@ -5,13 +5,15 @@ import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { Interface, JsonRpcProvider } from "ethers";
 import {
+  AMOUNT_SCALE_VERSION as DEFAULT_AMOUNT_SCALE_VERSION,
   compareBaseUnits,
   convertBaseUnitsBetweenDecimals,
   formatBaseUnitsForDisplay,
   parseDecimalToBaseUnits,
   scaleToDecimals,
 } from "./amounts.mjs";
-import { decideMonitoringLifecycle } from "./payment-logic.mjs";
+import { buildChainRuntimeRegistryRecord } from "./chain-runtime-registry.mjs";
+import { decideMonitoringLifecycle, normalizeChainId } from "./payment-logic.mjs";
 import {
   OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
   getSupportedPaymentChain,
@@ -30,7 +32,7 @@ const DEFAULTS = {
   APP_ENV: "development",
   APP_HOST: "http://localhost:4173",
   INTERNAL_APP_ORIGIN: "",
-  DB_PATH: "./data/app.db",
+  WORKER_STATE_DB_PATH: "",
   CHAIN_ID: "137",
   TOKEN_CONTRACT: "",
   APPROVED_JPYC_TOKEN_CONTRACT: "",
@@ -40,7 +42,8 @@ const DEFAULTS = {
   APPROVED_TOKEN_NAME: "",
   APPROVED_TOKEN_CODE_HASH: "",
   APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH: "",
-  JPYC_BASE_UNIT_SCALE: "",
+  LEDGER_DECIMALS: "6",
+  LEDGER_BASE_UNIT_SCALE: "1000000",
   RPC_URLS: "",
   RPC_URLS_1: "",
   RPC_URLS_43114: "",
@@ -48,6 +51,9 @@ const DEFAULTS = {
   MONITOR_POLL_INTERVAL_MS: "15000",
   MONITOR_BACKSCAN_BLOCKS: "12",
   MIN_MONITOR_BACKSCAN_BLOCKS: "12",
+  DETECTION_CONFIRMATIONS: "0",
+  FULFILLMENT_REQUIRED_CONFIRMATIONS: "2",
+  ACCOUNTING_FINALITY_CONFIRMATIONS: "2",
   REQUIRED_CONFIRMATIONS: "2",
   MIN_REQUIRED_CONFIRMATIONS: "2",
   CONFIRMATIONS_POLICY_APPROVAL_REF: "",
@@ -105,8 +111,14 @@ const PRODUCTION_LIKE = IS_PRODUCTION
   || String(ENV.COMMERCIAL_GO_MODE || "").trim().toLowerCase() === "true";
 const APP_HOST = ENV.APP_HOST || DEFAULTS.APP_HOST;
 const INTERNAL_APP_ORIGIN = String(ENV.INTERNAL_APP_ORIGIN || DEFAULTS.INTERNAL_APP_ORIGIN || "").trim().replace(/\/$/, "");
-const DB_PATH = path.resolve(CWD, ENV.DB_PATH || DEFAULTS.DB_PATH);
-const CHAIN_ID = String(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID);
+const CHAIN_ID = normalizeChainId(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID)
+  || normalizeChainId(DEFAULTS.CHAIN_ID)
+  || "137";
+const WORKER_STATE_DB_PATH_CONFIGURED = String(ENV.WORKER_STATE_DB_PATH || "").trim();
+const WORKER_STATE_DB_PATH = path.resolve(
+  CWD,
+  WORKER_STATE_DB_PATH_CONFIGURED || `./runtime/worker-state/chain-${CHAIN_ID}.db`
+);
 const TOKEN_CONTRACT = String(ENV.TOKEN_CONTRACT || DEFAULTS.TOKEN_CONTRACT).toLowerCase();
 const APPROVED_JPYC_TOKEN_CONTRACT = String(ENV.APPROVED_JPYC_TOKEN_CONTRACT || DEFAULTS.APPROVED_JPYC_TOKEN_CONTRACT).toLowerCase();
 const JPYC_CONTRACT_APPROVAL_REF = String(ENV.JPYC_CONTRACT_APPROVAL_REF || DEFAULTS.JPYC_CONTRACT_APPROVAL_REF || "");
@@ -116,8 +128,13 @@ const APPROVED_TOKEN_CODE_HASH = String(ENV.APPROVED_TOKEN_CODE_HASH || DEFAULTS
 const APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH = String(
   ENV.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || DEFAULTS.APPROVED_TOKEN_IMPLEMENTATION_CODE_HASH || ""
 ).trim().toLowerCase();
-const JPYC_BASE_UNIT_SCALE = String(ENV.JPYC_BASE_UNIT_SCALE || DEFAULTS.JPYC_BASE_UNIT_SCALE || "");
-const JPYC_DECIMALS = scaleToDecimals(JPYC_BASE_UNIT_SCALE);
+const LEDGER_BASE_UNIT_SCALE = String(ENV.LEDGER_BASE_UNIT_SCALE || DEFAULTS.LEDGER_BASE_UNIT_SCALE || "");
+const LEDGER_DECIMALS = Number(ENV.LEDGER_DECIMALS || DEFAULTS.LEDGER_DECIMALS);
+const LEDGER_SCALE_DECIMALS = scaleToDecimals(LEDGER_BASE_UNIT_SCALE);
+const AMOUNT_SCALE_VERSION = TOKEN_DECIMALS === APPROVED_TOKEN_DECIMALS
+  && LEDGER_BASE_UNIT_SCALE === APPROVED_LEDGER_BASE_UNIT_SCALE
+  ? DEFAULT_AMOUNT_SCALE_VERSION
+  : `token-${TOKEN_DECIMALS}-ledger-${LEDGER_DECIMALS}-v1`;
 const CHAIN_ID_NUMERIC = Number(CHAIN_ID);
 const PAYMENT_CHAIN = getSupportedPaymentChain(CHAIN_ID);
 const RPC_URLS = String(ENV[`RPC_URLS_${CHAIN_ID}`] || ENV.RPC_URLS || DEFAULTS.RPC_URLS)
@@ -125,9 +142,20 @@ const RPC_URLS = String(ENV[`RPC_URLS_${CHAIN_ID}`] || ENV.RPC_URLS || DEFAULTS.
   .map((value) => value.trim())
   .filter(Boolean);
 const MONITOR_POLL_INTERVAL_MS = Number(ENV.MONITOR_POLL_INTERVAL_MS || DEFAULTS.MONITOR_POLL_INTERVAL_MS);
+const RPC_METADATA_RECOVERY_RETRY_INTERVAL_MS = Math.max(MONITOR_POLL_INTERVAL_MS, 30_000);
 const MONITOR_BACKSCAN_BLOCKS = Number(ENV.MONITOR_BACKSCAN_BLOCKS || DEFAULTS.MONITOR_BACKSCAN_BLOCKS);
 const MIN_MONITOR_BACKSCAN_BLOCKS = Number(ENV.MIN_MONITOR_BACKSCAN_BLOCKS || DEFAULTS.MIN_MONITOR_BACKSCAN_BLOCKS);
-const REQUIRED_CONFIRMATIONS = Number(ENV.REQUIRED_CONFIRMATIONS || DEFAULTS.REQUIRED_CONFIRMATIONS);
+const DETECTION_CONFIRMATIONS = Number(ENV.DETECTION_CONFIRMATIONS || DEFAULTS.DETECTION_CONFIRMATIONS);
+const FULFILLMENT_REQUIRED_CONFIRMATIONS = Number(
+  ENV.FULFILLMENT_REQUIRED_CONFIRMATIONS || ENV.REQUIRED_CONFIRMATIONS || DEFAULTS.FULFILLMENT_REQUIRED_CONFIRMATIONS
+);
+const ACCOUNTING_FINALITY_CONFIRMATIONS = Number(
+  ENV.ACCOUNTING_FINALITY_CONFIRMATIONS
+    || ENV.FULFILLMENT_REQUIRED_CONFIRMATIONS
+    || ENV.REQUIRED_CONFIRMATIONS
+    || DEFAULTS.ACCOUNTING_FINALITY_CONFIRMATIONS
+);
+const REQUIRED_CONFIRMATIONS = FULFILLMENT_REQUIRED_CONFIRMATIONS;
 const MIN_REQUIRED_CONFIRMATIONS = Number(ENV.MIN_REQUIRED_CONFIRMATIONS || DEFAULTS.MIN_REQUIRED_CONFIRMATIONS);
 const CONFIRMATIONS_POLICY_APPROVAL_REF = String(ENV.CONFIRMATIONS_POLICY_APPROVAL_REF || DEFAULTS.CONFIRMATIONS_POLICY_APPROVAL_REF || "");
 const BACKSCAN_POLICY_APPROVAL_REF = String(ENV.BACKSCAN_POLICY_APPROVAL_REF || DEFAULTS.BACKSCAN_POLICY_APPROVAL_REF || "");
@@ -138,11 +166,13 @@ const MONITOR_DEAD_LETTER_RETRY_INTERVAL_MS = Number(
 const MONITOR_LOG_CHUNK_SIZE = Number(ENV.MONITOR_LOG_CHUNK_SIZE || DEFAULTS.MONITOR_LOG_CHUNK_SIZE);
 const SERVICE_INGEST_ID = String(ENV.SERVICE_INGEST_ID || DEFAULTS.SERVICE_INGEST_ID);
 const SERVICE_INGEST_SECRET = String(ENV.SERVICE_INGEST_SECRET || DEFAULTS.SERVICE_INGEST_SECRET);
+const RECONCILIATION_API_PATH = "/api/v1/internal/chain/reconciliation:ingest";
+const CANDIDATES_API_PATH = "/api/v1/internal/chain/candidates:read";
+const PAYMENT_EVIDENCE_API_PATH = "/api/v1/internal/chain/payment-evidence:read";
 const ACTIVE_TOKEN_CONTRACT = OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER;
 
 if (RPC_URLS.length === 0) {
-  console.error("FATAL: RPC_URLS is empty. Set at least one RPC endpoint.");
-  process.exit(1);
+  console.error("WARN: RPC_URLS is empty. Chain acceptance remains quarantined; the monitor will retry configuration.");
 }
 if (!SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET === DEFAULTS.SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET.length < 32) {
   console.error("FATAL: SERVICE_INGEST_SECRET must be configured with a strong random value.");
@@ -152,8 +182,12 @@ if (!Number.isFinite(TOKEN_DECIMALS) || TOKEN_DECIMALS < 0 || TOKEN_DECIMALS > 3
   console.error("FATAL: TOKEN_DECIMALS is invalid.");
   process.exit(1);
 }
-if (!JPYC_BASE_UNIT_SCALE) {
-  console.error("FATAL: JPYC_BASE_UNIT_SCALE is invalid.");
+if (!LEDGER_BASE_UNIT_SCALE) {
+  console.error("FATAL: LEDGER_BASE_UNIT_SCALE is invalid.");
+  process.exit(1);
+}
+if (!Number.isInteger(LEDGER_DECIMALS) || LEDGER_DECIMALS < 0 || LEDGER_DECIMALS !== LEDGER_SCALE_DECIMALS) {
+  console.error("FATAL: LEDGER_DECIMALS must match LEDGER_BASE_UNIT_SCALE.");
   process.exit(1);
 }
 if (!PAYMENT_CHAIN) {
@@ -175,8 +209,22 @@ if (APPROVED_JPYC_TOKEN_CONTRACT) {
     process.exit(1);
   }
 }
-if (!Number.isFinite(REQUIRED_CONFIRMATIONS) || REQUIRED_CONFIRMATIONS < 0 || !Number.isInteger(REQUIRED_CONFIRMATIONS)) {
-  console.error("FATAL: REQUIRED_CONFIRMATIONS must be a non-negative integer.");
+for (const [name, value] of [
+  ["DETECTION_CONFIRMATIONS", DETECTION_CONFIRMATIONS],
+  ["FULFILLMENT_REQUIRED_CONFIRMATIONS", FULFILLMENT_REQUIRED_CONFIRMATIONS],
+  ["ACCOUNTING_FINALITY_CONFIRMATIONS", ACCOUNTING_FINALITY_CONFIRMATIONS],
+]) {
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    console.error(`FATAL: ${name} must be a non-negative integer.`);
+    process.exit(1);
+  }
+}
+if (FULFILLMENT_REQUIRED_CONFIRMATIONS < DETECTION_CONFIRMATIONS) {
+  console.error("FATAL: FULFILLMENT_REQUIRED_CONFIRMATIONS must be >= DETECTION_CONFIRMATIONS.");
+  process.exit(1);
+}
+if (ACCOUNTING_FINALITY_CONFIRMATIONS < FULFILLMENT_REQUIRED_CONFIRMATIONS) {
+  console.error("FATAL: ACCOUNTING_FINALITY_CONFIRMATIONS must be >= FULFILLMENT_REQUIRED_CONFIRMATIONS.");
   process.exit(1);
 }
 if (!Number.isFinite(MIN_REQUIRED_CONFIRMATIONS) || MIN_REQUIRED_CONFIRMATIONS < 1 || !Number.isInteger(MIN_REQUIRED_CONFIRMATIONS)) {
@@ -207,11 +255,11 @@ if (IS_PRODUCTION && MONITOR_BACKSCAN_BLOCKS < MIN_MONITOR_BACKSCAN_BLOCKS) {
   console.error("FATAL: MONITOR_BACKSCAN_BLOCKS is below the production minimum.");
   process.exit(1);
 }
-if (IS_PRODUCTION && REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
-  console.error("FATAL: REQUIRED_CONFIRMATIONS is below MIN_REQUIRED_CONFIRMATIONS.");
+if (IS_PRODUCTION && FULFILLMENT_REQUIRED_CONFIRMATIONS < MIN_REQUIRED_CONFIRMATIONS) {
+  console.error("FATAL: FULFILLMENT_REQUIRED_CONFIRMATIONS is below MIN_REQUIRED_CONFIRMATIONS.");
   process.exit(1);
 }
-if (PRODUCTION_LIKE && (TOKEN_DECIMALS !== APPROVED_TOKEN_DECIMALS || JPYC_BASE_UNIT_SCALE !== APPROVED_LEDGER_BASE_UNIT_SCALE)) {
+if (PRODUCTION_LIKE && (TOKEN_DECIMALS !== APPROVED_TOKEN_DECIMALS || LEDGER_BASE_UNIT_SCALE !== APPROVED_LEDGER_BASE_UNIT_SCALE)) {
   console.error("FATAL: production-like monitor requires token atomic decimals=18 and ledger base scale=1000000.");
   process.exit(1);
 }
@@ -222,6 +270,10 @@ if (PRODUCTION_LIKE && (!APPROVED_TOKEN_NAME || !/^0x[0-9a-f]{64}$/.test(APPROVE
 }
 if (PRODUCTION_LIKE && !INTERNAL_APP_ORIGIN) {
   console.error("FATAL: INTERNAL_APP_ORIGIN is required for production-like chain monitor ingest.");
+  process.exit(1);
+}
+if (PRODUCTION_LIKE && !WORKER_STATE_DB_PATH_CONFIGURED) {
+  console.error("FATAL: WORKER_STATE_DB_PATH must be explicitly configured for production-like chain monitor state.");
   process.exit(1);
 }
 if (IS_PRODUCTION) {
@@ -261,39 +313,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const hmac = (secret, value) => crypto.createHmac("sha256", secret).update(value).digest("hex");
 
-const db = new Database(DB_PATH);
+fs.mkdirSync(path.dirname(WORKER_STATE_DB_PATH), { recursive: true });
+const db = new Database(WORKER_STATE_DB_PATH);
 db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
+db.pragma("synchronous = FULL");
+db.pragma("fullfsync = ON");
 db.exec(`
 CREATE TABLE IF NOT EXISTS chain_monitor_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS chain_reorgs (
-  id TEXT PRIMARY KEY,
-  chain_id TEXT NOT NULL,
-  from_block INTEGER,
-  to_block INTEGER,
-  previous_checkpoint_hash TEXT,
-  observed_checkpoint_hash TEXT,
-  reason TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'unresolved',
-  detected_at TEXT NOT NULL,
-  resolved_at TEXT,
-  resolution_note TEXT
-);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_chain_reorgs_fingerprint
-ON chain_reorgs(
-  chain_id,
-  COALESCE(from_block, -1),
-  COALESCE(to_block, -1),
-  COALESCE(previous_checkpoint_hash, ''),
-  COALESCE(observed_checkpoint_hash, ''),
-  reason
-);
-CREATE INDEX IF NOT EXISTS idx_chain_reorgs_status_detected_at
-ON chain_reorgs(chain_id, status, detected_at DESC);
 
 CREATE TABLE IF NOT EXISTS chain_unmatched_events (
   id TEXT PRIMARY KEY,
@@ -348,6 +379,23 @@ CREATE TABLE IF NOT EXISTS chain_rpc_failovers (
   error_message TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chain_runtime_registry (
+  id TEXT PRIMARY KEY,
+  chain_id TEXT NOT NULL,
+  rpc_endpoint_hash TEXT NOT NULL,
+  token_contract TEXT NOT NULL,
+  token_decimals INTEGER NOT NULL,
+  proxy_implementation TEXT,
+  proxy_code_hash TEXT,
+  token_code_hash TEXT,
+  latest_block TEXT,
+  latest_block_hash TEXT,
+  verified_at TEXT NOT NULL,
+  approval_ref TEXT,
+  status TEXT NOT NULL,
+  UNIQUE(chain_id, rpc_endpoint_hash)
+);
+
 `);
 
 function addColumnIfMissing(tableName, columnName, ddl) {
@@ -375,19 +423,6 @@ addColumnIfMissing("chain_dead_letters", "claimed_by", "claimed_by TEXT");
 addColumnIfMissing("chain_dead_letters", "claimed_until", "claimed_until TEXT");
 addColumnIfMissing("chain_rpc_failovers", "chain_id", "chain_id TEXT");
 addColumnIfMissing("chain_rpc_failovers", "provider_url_hash", "provider_url_hash TEXT");
-addColumnIfMissing("invoices", "monitor_until", "monitor_until TEXT");
-addColumnIfMissing("invoices", "integrity_hold", "integrity_hold INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("invoices", "integrity_hold_reason", "integrity_hold_reason TEXT");
-addColumnIfMissing("invoices", "integrity_hold_at", "integrity_hold_at TEXT");
-addColumnIfMissing("invoices", "last_reconciled_block", "last_reconciled_block INTEGER");
-addColumnIfMissing("payment_events", "amount_atomic", "amount_atomic TEXT");
-addColumnIfMissing("payment_events", "chain_verified", "chain_verified INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("payment_events", "token_verified", "token_verified INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("payment_events", "recipient_verified", "recipient_verified INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("payment_events", "canonical_status", "canonical_status TEXT NOT NULL DEFAULT 'unknown'");
-addColumnIfMissing("payment_events", "within_expiry", "within_expiry INTEGER NOT NULL DEFAULT 0");
-addColumnIfMissing("payment_events", "recognition_status", "recognition_status TEXT NOT NULL DEFAULT 'pending'");
-addColumnIfMissing("payment_events", "reorg_id", "reorg_id TEXT");
 
 const transferInterface = new Interface(["event Transfer(address indexed from, address indexed to, uint256 value)"]);
 const providers = VALID_RPC_URLS.map((url) =>
@@ -399,14 +434,17 @@ const checkpointHashKey = `last_block_hash:${CHAIN_ID}:${ACTIVE_TOKEN_CONTRACT}`
 const WORKER_ID = `${CHAIN_ID}:${crypto.randomUUID()}`;
 
 function toInvoiceBaseUnits(invoice) {
+  if (invoice?.ledger_amount_base != null && String(invoice.ledger_amount_base).trim() !== "") {
+    return String(invoice.ledger_amount_base);
+  }
   if (invoice?.amount_jpyc_base != null && String(invoice.amount_jpyc_base).trim() !== "") {
     return String(invoice.amount_jpyc_base);
   }
-  return parseDecimalToBaseUnits(String(invoice?.amount_jpyc ?? "0"), JPYC_DECIMALS);
+  return parseDecimalToBaseUnits(String(invoice?.amount_jpyc ?? "0"), LEDGER_DECIMALS);
 }
 
 function toAppBaseUnitsFromTokenValue(tokenValueBaseUnits) {
-  const converted = convertBaseUnitsBetweenDecimals(String(tokenValueBaseUnits), TOKEN_DECIMALS, JPYC_DECIMALS);
+  const converted = convertBaseUnitsBetweenDecimals(String(tokenValueBaseUnits), TOKEN_DECIMALS, LEDGER_DECIMALS);
   if (!converted.exact) {
     return { error: "non_exact_decimal_conversion", value: converted.value };
   }
@@ -439,24 +477,32 @@ function buildPaymentIngestPayload({
 }) {
   return {
     invoice_id: String(invoiceId),
-    amount_jpyc: formatBaseUnitsForDisplay(String(amountBase), JPYC_DECIMALS),
+    amount_jpyc: formatBaseUnitsForDisplay(String(amountBase), LEDGER_DECIMALS),
     chain_id: CHAIN_ID,
     token_contract: ACTIVE_TOKEN_CONTRACT,
     to_address: String(toAddress || "").toLowerCase(),
     from_address: String(fromAddress || "").toLowerCase(),
     confirmations: Number(confirmations || 0),
+    detection_confirmations: DETECTION_CONFIRMATIONS,
+    fulfillment_required_confirmations: FULFILLMENT_REQUIRED_CONFIRMATIONS,
+    accounting_finality_confirmations: ACCOUNTING_FINALITY_CONFIRMATIONS,
     tx_hash: String(txHash),
     log_index: Number(logIndex ?? 0),
     block_number: Number(blockNumber || 0),
     block_hash: String(blockHash || ""),
     amount_jpyc_base: String(amountBase),
+    ledger_amount_base: String(amountBase),
     amount_atomic: String(amountAtomic),
+    token_amount_atomic: String(amountAtomic),
+    amount_scale_version: AMOUNT_SCALE_VERSION,
+    display_amount: formatBaseUnitsForDisplay(String(amountBase), LEDGER_DECIMALS),
     token_decimals: TOKEN_DECIMALS,
-    ledger_decimals: JPYC_DECIMALS,
+    ledger_decimals: LEDGER_DECIMALS,
     amount_conversion_exact: amountConversionExact === true,
     amount_conversion_error: amountConversionExact === true ? null : String(amountConversionError || "non_exact_decimal_conversion"),
     canonical_status: canonicalStatus === "canonical" ? "canonical" : "unknown",
     source: "chain_monitor",
+    verified_onchain: true,
     block_timestamp: blockTimestamp || null,
     detected_at: detectedAt,
   };
@@ -509,83 +555,45 @@ function setCheckpoint(blockNumber, blockHash = null) {
   }
 }
 
-function recordReorg({ fromBlock, toBlock, previousHash, observedHash, reason }) {
+async function recordReorg({ fromBlock, toBlock, previousHash, observedHash, reason }) {
   const detectedAt = nowIso();
-  db.prepare(
-    `INSERT OR IGNORE INTO chain_reorgs
-     (id, chain_id, from_block, to_block, previous_checkpoint_hash, observed_checkpoint_hash, reason, status, detected_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'unresolved', ?)`
-  ).run(
-    crypto.randomUUID(),
-    CHAIN_ID,
-    Number.isFinite(Number(fromBlock)) ? Number(fromBlock) : null,
-    Number.isFinite(Number(toBlock)) ? Number(toBlock) : null,
-    previousHash || null,
-    observedHash || null,
-    String(reason || "checkpoint_mismatch"),
-    detectedAt
-  );
-  const reorgId = db
-    .prepare(
-      `SELECT id FROM chain_reorgs
-       WHERE chain_id = ?
-         AND COALESCE(from_block, -1) = COALESCE(?, -1)
-         AND COALESCE(to_block, -1) = COALESCE(?, -1)
-         AND COALESCE(previous_checkpoint_hash, '') = COALESCE(?, '')
-         AND COALESCE(observed_checkpoint_hash, '') = COALESCE(?, '')
-         AND reason = ?
-       ORDER BY detected_at DESC LIMIT 1`
-    )
-    .get(CHAIN_ID, fromBlock ?? null, toBlock ?? null, previousHash || null, observedHash || null, String(reason || "checkpoint_mismatch"))?.id || null;
   const from = Number.isFinite(Number(fromBlock)) ? Number(fromBlock) : null;
   const to = Number.isFinite(Number(toBlock)) ? Number(toBlock) : from;
-  const monitorUntil = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
-  if (reorgId && from != null && to != null) {
-    db.transaction(() => {
-      db.prepare(
-        `UPDATE payment_events
-         SET canonical_status = 'disputed',
-             recognition_status = 'review_required',
-             reorg_id = ?
-         WHERE chain_id = ? AND block_number BETWEEN ? AND ?`
-      ).run(reorgId, CHAIN_ID, Math.min(from, to), Math.max(from, to));
-      db.prepare(
-        `UPDATE invoices
-         SET integrity_hold = 1,
-             integrity_hold_reason = 'chain_reorg_detected',
-             integrity_hold_at = COALESCE(integrity_hold_at, ?),
-             monitor_until = CASE
-               WHEN monitor_until IS NULL OR monitor_until < ? THEN ?
-               ELSE monitor_until
-             END,
-             updated_at = ?
-         WHERE id IN (
-           SELECT DISTINCT invoice_id FROM payment_events
-           WHERE reorg_id = ?
-         )`
-      ).run(detectedAt, detectedAt, monitorUntil, detectedAt, reorgId);
-    })();
-  }
+  const normalizedReason = String(reason || "checkpoint_mismatch");
+
+  // The chain monitor is never a financial writer. This API path is used in
+  // development too, so a local run cannot accidentally exercise a second
+  // invoice/reorg writer against the same database.
+  const reorgId = crypto.randomUUID();
+  const response = await postReorgToApi({
+    chain_id: CHAIN_ID,
+    reorg_id: reorgId,
+    from_block: from,
+    to_block: to,
+    previous_hash: previousHash || null,
+    observed_hash: observedHash || null,
+    reason: normalizedReason,
+    detected_at: detectedAt,
+  });
+  const persistedReorgId = response?.reorg_id || reorgId;
   setState("worker:last_reorg_at", detectedAt);
-  setState("worker:last_reorg_id", reorgId || "");
-  setState("worker:last_reorg_from", fromBlock ?? "");
-  setState("worker:last_reorg_to", toBlock ?? "");
-  setState("worker:last_reorg_reason", reason || "checkpoint_mismatch");
-  return reorgId;
+  setState("worker:last_reorg_id", persistedReorgId);
+  setState("worker:last_reorg_from", from ?? "");
+  setState("worker:last_reorg_to", to ?? "");
+  setState("worker:last_reorg_reason", normalizedReason);
+  return persistedReorgId;
 }
 
-function getCandidateInvoices() {
-  const rows = db
-    .prepare(
-      `SELECT id, amount_jpyc, amount_jpyc_base, recipient_address, status, monitor_until, integrity_hold,
-              last_reconciled_block
-       FROM invoices
-       WHERE chain_id = ?
-         AND lower(token_contract) = ?
-         AND status IN ('issued', 'payment_detected', 'confirming', 'expired', 'review_required', 'paid', 'settled', 'refunded', 'cancelled')`
-    )
-    .all(CHAIN_ID, ACTIVE_TOKEN_CONTRACT);
-  return rows.filter((invoice) => {
+async function getCandidateInvoices() {
+  const rows = await postSignedServiceJson(
+    CANDIDATES_API_PATH,
+    { chain_id: CHAIN_ID, token_contract: ACTIVE_TOKEN_CONTRACT },
+    `chain-candidates:${CHAIN_ID}:${crypto.randomUUID()}`
+  );
+  if (!Array.isArray(rows?.invoices)) {
+    throw new Error("chain_candidates_response_invalid");
+  }
+  return rows.invoices.filter((invoice) => {
     const lifecycle = decideMonitoringLifecycle(invoice, {
       recipientAddress: invoice.recipient_address,
       addressUsed: ["payment_detected", "confirming", "paid", "settled", "refunded", "review_required"].includes(invoice.status),
@@ -597,18 +605,49 @@ function getCandidateInvoices() {
   });
 }
 
-function markUsedAddressesReconciled(invoices, blockNumber) {
+async function getRecentPaymentEvidence(fromBlock, toBlock) {
+  const lower = Number(fromBlock);
+  const upper = Number(toBlock);
+  if (!Number.isSafeInteger(lower) || !Number.isSafeInteger(upper) || lower < 0 || upper < lower) return [];
+  const result = await postSignedServiceJson(
+    PAYMENT_EVIDENCE_API_PATH,
+    { chain_id: CHAIN_ID, from_block: lower, to_block: upper },
+    `chain-payment-evidence:${CHAIN_ID}:${lower}:${upper}:${crypto.randomUUID()}`
+  );
+  if (!Array.isArray(result?.events)) throw new Error("chain_payment_evidence_response_invalid");
+  return result.events;
+}
+
+function buildReconciliationPayload(invoices, blockNumber, reconciledAt = nowIso()) {
+  const normalizedBlock = Number(blockNumber);
+  const invoiceRows = [...new Map(
+    invoices
+      .filter((invoice) => invoice && String(invoice.id || "").trim())
+      .map((invoice) => [String(invoice.id), {
+        invoice_id: String(invoice.id),
+        recipient_address: String(invoice.recipient_address || "").toLowerCase(),
+      }])
+  ).values()].sort((left, right) => left.invoice_id.localeCompare(right.invoice_id));
+  return {
+    schema_version: 1,
+    source: "chain_monitor",
+    chain_id: CHAIN_ID,
+    token_contract: ACTIVE_TOKEN_CONTRACT,
+    block_number: normalizedBlock,
+    reconciled_at: reconciledAt,
+    invoices: invoiceRows,
+  };
+}
+
+async function markUsedAddressesReconciled(invoices, blockNumber) {
   const normalizedBlock = Number(blockNumber);
   if (!Number.isSafeInteger(normalizedBlock) || normalizedBlock < 0 || !Array.isArray(invoices) || invoices.length === 0) return;
-  const update = db.prepare(
-    `UPDATE invoices
-     SET last_reconciled_block = ?
-     WHERE id = ? AND chain_id = ?
-       AND (last_reconciled_block IS NULL OR last_reconciled_block < ?)`
-  );
-  db.transaction(() => {
-    for (const invoice of invoices) update.run(normalizedBlock, invoice.id, CHAIN_ID, normalizedBlock);
-  })();
+  const reconciledAt = nowIso();
+  const payload = buildReconciliationPayload(invoices, normalizedBlock, reconciledAt);
+  const idempotencyKey = `chain-reconciliation:${CHAIN_ID}:${normalizedBlock}:${sha256(JSON.stringify(payload.invoices)).slice(0, 32)}`;
+  await postReconciliationToApi(payload, idempotencyKey);
+  setState("worker:last_reconciliation_api_at", reconciledAt);
+  setState("worker:last_reconciliation_api_block", normalizedBlock);
 }
 
 function selectInvoiceForLog(invoices, toAddress, amountJpyc) {
@@ -683,7 +722,14 @@ async function withProvider(label, fn) {
       );
     }
   }
-  throw lastError || new Error(`All providers failed for ${label}`);
+  if (verifiedProviderIndexes) {
+    verifiedProviderIndexes.clear();
+    setState("worker:rpc_metadata_status", "quarantined");
+    setState("worker:rpc_runtime_registry_status", "quarantined");
+  }
+  const error = lastError || new Error(`All providers failed for ${label}`);
+  error.code = error.code || "RPC_ALL_PROVIDERS_FAILED";
+  throw error;
 }
 
 function tokenMetadataPolicy() {
@@ -736,6 +782,66 @@ async function verifyConfiguredRpcMetadata() {
       .map((endpoint, index) => endpoint.endpoint_state === "verified" ? index : null)
       .filter((index) => index != null)
   );
+  const registryRecords = [];
+  for (const [index, endpoint] of result.endpoints.entries()) {
+    let latestBlockHash = null;
+    if (endpoint.endpoint_state === "verified") {
+      try {
+        const latestBlock = await providers[index]?.getBlock("latest");
+        latestBlockHash = latestBlock?.hash || null;
+      } catch (_error) {
+        latestBlockHash = null;
+      }
+    }
+    registryRecords.push(buildChainRuntimeRegistryRecord({
+      chainId: CHAIN_ID,
+      tokenContract: ACTIVE_TOKEN_CONTRACT,
+      tokenDecimals: TOKEN_DECIMALS,
+      endpoint,
+      latestBlockHash,
+      approvalRef: JPYC_CONTRACT_APPROVAL_REF,
+      verifiedAt: nowIso(),
+    }));
+  }
+  const upsertRegistry = db.transaction(() => {
+    for (const record of registryRecords) {
+      db.prepare(
+        `INSERT INTO chain_runtime_registry
+         (id, chain_id, rpc_endpoint_hash, token_contract, token_decimals, proxy_implementation,
+          proxy_code_hash, token_code_hash, latest_block, latest_block_hash, verified_at, approval_ref, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(chain_id, rpc_endpoint_hash) DO UPDATE SET
+           token_contract = excluded.token_contract,
+           token_decimals = excluded.token_decimals,
+           proxy_implementation = excluded.proxy_implementation,
+           proxy_code_hash = excluded.proxy_code_hash,
+           token_code_hash = excluded.token_code_hash,
+           latest_block = excluded.latest_block,
+           latest_block_hash = excluded.latest_block_hash,
+           verified_at = excluded.verified_at,
+           approval_ref = excluded.approval_ref,
+           status = excluded.status`
+      ).run(
+        crypto.randomUUID(),
+        record.chain_id || CHAIN_ID,
+        record.rpc_endpoint_hash,
+        record.token_contract || ACTIVE_TOKEN_CONTRACT,
+        record.token_decimals ?? TOKEN_DECIMALS,
+        record.proxy_implementation,
+        record.proxy_code_hash,
+        record.token_code_hash,
+        record.latest_block,
+        record.latest_block_hash,
+        record.verified_at,
+        record.approval_ref,
+        record.status,
+      );
+    }
+  });
+  upsertRegistry();
+  setState("worker:rpc_runtime_registry_status", registryRecords.some((record) => record.status === "verified") ? "ready" : "quarantined");
+  setState("worker:rpc_runtime_registry_verified_count", registryRecords.filter((record) => record.status === "verified").length);
+  setState("worker:rpc_runtime_registry_quarantined_count", registryRecords.filter((record) => record.status !== "verified").length);
   setState(
     "worker:rpc_metadata_status",
     result.ok ? "verified" : (verifiedProviderIndexes.size > 0 ? "partially_verified" : "quarantined")
@@ -748,6 +854,39 @@ async function verifyConfiguredRpcMetadata() {
     throw error;
   }
   return result;
+}
+
+async function postSignedServiceJson(apiPath, payload, idempotencyKey) {
+  const body = JSON.stringify(payload || {});
+  const timestamp = Math.floor(Date.now() / 1000);
+  const serviceJti = crypto.randomUUID();
+  const payloadHash = sha256(body);
+  const signature = hmac(SERVICE_INGEST_SECRET, `${SERVICE_INGEST_ID}.${timestamp}.${serviceJti}.${payloadHash}`);
+  const origin = INTERNAL_APP_ORIGIN || APP_HOST;
+  const response = await fetch(`${origin}${apiPath}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "idempotency-key": idempotencyKey,
+      "x-request-id": crypto.randomUUID(),
+      "x-service-id": SERVICE_INGEST_ID,
+      "x-service-timestamp": String(timestamp),
+      "x-service-jti": serviceJti,
+      "x-service-signature": signature,
+    },
+    body,
+  });
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_error) {
+    data = { raw };
+  }
+  if (!response.ok) {
+    throw new Error(`service_read_failed path=${apiPath} status=${response.status} body=${JSON.stringify(data)}`);
+  }
+  return data;
 }
 
 async function postIngest(payload, idempotencyKey) {
@@ -778,6 +917,69 @@ async function postIngest(payload, idempotencyKey) {
   }
   if (!response.ok) {
     throw new Error(`ingest_failed status=${response.status} body=${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+async function postReorgToApi(payload) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const serviceJti = crypto.randomUUID();
+  const payloadHash = sha256(JSON.stringify(payload));
+  const signature = hmac(SERVICE_INGEST_SECRET, `${SERVICE_INGEST_ID}.${timestamp}.${serviceJti}.${payloadHash}`);
+  const ingestOrigin = INTERNAL_APP_ORIGIN || APP_HOST;
+  const response = await fetch(`${ingestOrigin}/api/v1/internal/chain/reorgs:ingest`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "idempotency-key": `chain-reorg:${payload.reorg_id}`,
+      "x-request-id": crypto.randomUUID(),
+      "x-service-id": SERVICE_INGEST_ID,
+      "x-service-timestamp": String(timestamp),
+      "x-service-jti": serviceJti,
+      "x-service-signature": signature,
+    },
+    body: JSON.stringify(payload),
+  });
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_error) {
+    data = { raw };
+  }
+  if (!response.ok) throw new Error(`reorg_ingest_failed status=${response.status} body=${JSON.stringify(data)}`);
+  return data;
+}
+
+async function postReconciliationToApi(payload, idempotencyKey) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const serviceJti = crypto.randomUUID();
+  const body = JSON.stringify(payload);
+  const payloadHash = sha256(body);
+  const signature = hmac(SERVICE_INGEST_SECRET, `${SERVICE_INGEST_ID}.${timestamp}.${serviceJti}.${payloadHash}`);
+  const ingestOrigin = INTERNAL_APP_ORIGIN || APP_HOST;
+  const response = await fetch(`${ingestOrigin}${RECONCILIATION_API_PATH}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "idempotency-key": idempotencyKey,
+      "x-request-id": crypto.randomUUID(),
+      "x-service-id": SERVICE_INGEST_ID,
+      "x-service-timestamp": String(timestamp),
+      "x-service-jti": serviceJti,
+      "x-service-signature": signature,
+    },
+    body,
+  });
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_error) {
+    data = { raw };
+  }
+  if (!response.ok) {
+    throw new Error(`reconciliation_ingest_failed status=${response.status} body=${JSON.stringify(data)}`);
   }
   return data;
 }
@@ -971,16 +1173,7 @@ function blockTimestampIso(block) {
 
 async function revalidateRecentPaymentEventCanonicalHashes(latestBlock, blockCache) {
   const fromBlock = Math.max(Number(latestBlock) - MONITOR_BACKSCAN_BLOCKS, 0);
-  const rows = db
-    .prepare(
-      `SELECT id, invoice_id, block_number, block_hash, tx_hash, log_index
-       FROM payment_events
-       WHERE chain_id = ?
-         AND block_number BETWEEN ? AND ?
-         AND block_hash IS NOT NULL
-       ORDER BY block_number ASC, created_at ASC, id ASC`
-    )
-    .all(CHAIN_ID, fromBlock, Number(latestBlock));
+  const rows = await getRecentPaymentEvidence(fromBlock, Number(latestBlock));
   const blockNumbers = [...new Set(rows.map((row) => Number(row.block_number)).filter((value) => Number.isFinite(value)))];
   for (const blockNumber of blockNumbers) {
     let canonicalBlock = blockCache.get(blockNumber);
@@ -992,7 +1185,7 @@ async function revalidateRecentPaymentEventCanonicalHashes(latestBlock, blockCac
     if (!canonicalHash) continue;
     const mismatched = rows.filter((row) => Number(row.block_number) === blockNumber && String(row.block_hash || "").toLowerCase() !== canonicalHash);
     if (mismatched.length === 0) continue;
-    recordReorg({
+    await recordReorg({
       fromBlock: blockNumber,
       toBlock: blockNumber,
       previousHash: mismatched[0].block_hash,
@@ -1015,7 +1208,7 @@ async function revalidateRecentPaymentEventCanonicalHashes(latestBlock, blockCac
 
 async function runCycle() {
   setState("worker:last_cycle_started_at", nowIso());
-  const invoices = getCandidateInvoices();
+  const invoices = await getCandidateInvoices();
   const latestBlock = await withProvider("getBlockNumber", (provider) => provider.getBlockNumber());
   const blockCache = new Map();
   const latestBlockData = await withProvider("getBlock:latest", (provider) => provider.getBlock(latestBlock));
@@ -1043,7 +1236,7 @@ async function runCycle() {
     const checkpointBlock = latestBlock === previous
       ? latestBlockData
       : (previous != null ? await withProvider(`getBlock:checkpoint:${previous}`, (provider) => provider.getBlock(previous)) : null);
-    recordReorg({
+    await recordReorg({
       fromBlock: previous,
       toBlock: latestBlock,
       previousHash,
@@ -1121,7 +1314,7 @@ async function runCycle() {
     const amountConversion = toAppBaseUnitsFromTokenValue(amountAtomic);
     const amountBase = amountConversion.value;
     if (!amountConversion.error && compareBaseUnits(amountBase, "0") <= 0) continue;
-    const amountJpyc = formatBaseUnitsForDisplay(amountBase, JPYC_DECIMALS);
+    const amountJpyc = formatBaseUnitsForDisplay(amountBase, LEDGER_DECIMALS);
     const confirmations = Math.max(0, latestBlock - Number(log.blockNumber) + 1);
     const blockNumber = Number(log.blockNumber || 0);
     let blockData = blockCache.get(blockNumber);
@@ -1162,9 +1355,13 @@ async function runCycle() {
             to_address: toAddress,
             amount_jpyc: amountJpyc,
             amount_jpyc_base: amountBase,
+            ledger_amount_base: amountBase,
             amount_atomic: amountAtomic,
+            token_amount_atomic: amountAtomic,
+            amount_scale_version: AMOUNT_SCALE_VERSION,
+            display_amount: amountJpyc,
             token_decimals: TOKEN_DECIMALS,
-            ledger_decimals: JPYC_DECIMALS,
+            ledger_decimals: LEDGER_DECIMALS,
             amount_conversion_exact: !amountConversion.error,
             amount_conversion_error: amountConversion.error || null,
             canonical_status: canonicalStatus,
@@ -1248,14 +1445,32 @@ async function runCycle() {
     }
   }
   setCheckpoint(toBlock, latestBlockData?.hash || null);
-  markUsedAddressesReconciled(invoices, toBlock);
+  await markUsedAddressesReconciled(invoices, toBlock);
   setState("worker:last_cycle_at", nowIso());
   setState("worker:last_checkpoint", toBlock);
 }
 
 let stopping = false;
+let lastRpcMetadataRecoveryAttemptMs = 0;
 async function main() {
-  await verifyConfiguredRpcMetadata();
+  let rpcMetadataReady = false;
+  try {
+    await verifyConfiguredRpcMetadata();
+    rpcMetadataReady = true;
+    setState("worker:rpc_recovery_status", "ready");
+  } catch (error) {
+    if (error.code !== "RPC_METADATA_QUARANTINED") throw error;
+    lastRpcMetadataRecoveryAttemptMs = Date.now();
+    setState("worker:rpc_recovery_status", "quarantined");
+    setState("worker:rpc_recovery_last_error", error.code);
+    console.error(JSON.stringify({
+      ts: nowIso(),
+      level: "error",
+      type: "chain.rpc_metadata_quarantined",
+      code: error.code,
+      message: "All configured RPC endpoints are quarantined; recovery verification will continue in the background",
+    }));
+  }
   setState("worker:started_at", nowIso());
   setState("worker:chain_id", CHAIN_ID);
   setState("worker:token_contract", ACTIVE_TOKEN_CONTRACT);
@@ -1267,14 +1482,39 @@ async function main() {
       type: "chain.monitor_started",
       chain_id: CHAIN_ID,
       token_contract: ACTIVE_TOKEN_CONTRACT,
-      db_path: DB_PATH,
+      worker_state_db_path: WORKER_STATE_DB_PATH,
       rpc_count: providers.length
     })
   );
   while (!stopping) {
+    if (!rpcMetadataReady || !verifiedProviderIndexes || verifiedProviderIndexes.size === 0) {
+      if (Date.now() - lastRpcMetadataRecoveryAttemptMs < RPC_METADATA_RECOVERY_RETRY_INTERVAL_MS) {
+        await sleep(MONITOR_POLL_INTERVAL_MS);
+        continue;
+      }
+      lastRpcMetadataRecoveryAttemptMs = Date.now();
+      try {
+        await verifyConfiguredRpcMetadata();
+        rpcMetadataReady = true;
+        setState("worker:rpc_recovery_status", "ready");
+        setState("worker:rpc_recovery_last_error", "");
+      } catch (error) {
+        if (error.code !== "RPC_METADATA_QUARANTINED") throw error;
+        rpcMetadataReady = false;
+        setState("worker:rpc_recovery_status", "quarantined");
+        setState("worker:rpc_recovery_last_error", error.code);
+        await sleep(MONITOR_POLL_INTERVAL_MS);
+        continue;
+      }
+    }
     try {
       await runCycle();
     } catch (error) {
+      if (error.code === "RPC_ALL_PROVIDERS_FAILED") {
+        rpcMetadataReady = false;
+        setState("worker:rpc_recovery_status", "quarantined");
+        setState("worker:rpc_recovery_last_error", error.code);
+      }
       setState("worker:last_cycle_error_at", nowIso());
       setState("worker:last_cycle_error", String(error.message || error));
       console.error(
@@ -1340,6 +1580,9 @@ export {
   runCycle,
   getCheckpoint,
   setCheckpoint,
+  buildReconciliationPayload,
+  markUsedAddressesReconciled,
+  postReconciliationToApi,
 };
 
 const isMainModule = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;

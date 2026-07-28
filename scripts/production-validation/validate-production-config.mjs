@@ -145,10 +145,15 @@ async function main() {
 
   try {
     const appEnv = String(env.APP_ENV || expectedAppEnv).trim().toLowerCase();
-    const productionChecks = appEnv === "production";
+    const deploymentStage = String(env.DEPLOYMENT_STAGE || "").trim().toLowerCase();
+    const productionChecks = appEnv === "production"
+      || ["pilot", "commercial"].includes(deploymentStage)
+      || boolFlag(env.COMMERCIAL_GO_MODE);
     const publicBaseUrl = String(env.PUBLIC_BASE_URL || env.APP_HOST || env.PAY_BASE_URL || "").trim();
     const appHost = String(env.APP_HOST || env.PUBLIC_BASE_URL || env.PAY_BASE_URL || (productionChecks ? "" : "http://127.0.0.1:4173")).trim();
     const payBaseUrl = String(env.PAY_BASE_URL || env.APP_HOST || env.PUBLIC_BASE_URL || appHost).trim();
+    const dbPath = String(env.DB_PATH || "").trim();
+    const workerStateDbPath = String(env.WORKER_STATE_DB_PATH || "").trim();
     const corsOrigins = String(env.CORS_ALLOW_ORIGINS || "")
       .split(",")
       .map((value) => value.trim().replace(/\/$/, ""))
@@ -158,12 +163,20 @@ async function main() {
     const tokenContract = normalizeAddress(env.TOKEN_CONTRACT);
     const approvedTokenContract = normalizeAddress(env.APPROVED_JPYC_TOKEN_CONTRACT);
     const tokenDecimals = Number(env.TOKEN_DECIMALS || APPROVED_TOKEN_DECIMALS);
-    const ledgerBaseUnitScale = String(env.JPYC_BASE_UNIT_SCALE || APPROVED_LEDGER_BASE_UNIT_SCALE).trim();
+    const ledgerBaseUnitScale = String(env.LEDGER_BASE_UNIT_SCALE || env.JPYC_BASE_UNIT_SCALE || APPROVED_LEDGER_BASE_UNIT_SCALE).trim();
+    const configuredLedgerDecimals = env.LEDGER_DECIMALS == null || String(env.LEDGER_DECIMALS).trim() === ""
+      ? null
+      : Number(env.LEDGER_DECIMALS);
     let ledgerDecimals = null;
     try {
       ledgerDecimals = scaleToDecimals(ledgerBaseUnitScale);
     } catch (_error) {
-      ensure(false, "JPYC_BASE_UNIT_SCALE must be a positive power of 10", { value: ledgerBaseUnitScale });
+      ensure(false, "LEDGER_BASE_UNIT_SCALE must be a positive power of 10", { value: ledgerBaseUnitScale });
+    }
+    if (configuredLedgerDecimals != null) {
+      ensure(Number.isInteger(configuredLedgerDecimals) && configuredLedgerDecimals === ledgerDecimals,
+        "LEDGER_DECIMALS must match LEDGER_BASE_UNIT_SCALE",
+        { ledger_decimals: configuredLedgerDecimals, scale_decimals: ledgerDecimals });
     }
     const rpcUrls = String(env[`RPC_URLS_${chainId}`] || env.RPC_URLS || "")
       .split(",")
@@ -196,6 +209,22 @@ async function main() {
       record("trusted_proxy_boundary", true, { skipped: true, reason: "allow-empty" });
     }
 
+    if (productionChecks && !allowEmpty) {
+      ensure(dbPath, "DB_PATH must be explicit for production", {});
+      ensure(workerStateDbPath, "WORKER_STATE_DB_PATH must be explicit for production", {});
+      ensure(
+        path.resolve(process.cwd(), dbPath) !== path.resolve(process.cwd(), workerStateDbPath),
+        "WORKER_STATE_DB_PATH must differ from DB_PATH",
+        { db_path: dbPath, worker_state_db_path: workerStateDbPath },
+      );
+      record("financial_worker_state_db_separation", true, {
+        db_path: dbPath,
+        worker_state_db_path: workerStateDbPath,
+      });
+    } else {
+      record("financial_worker_state_db_separation", true, { skipped: true, reason: "allow-empty-or-non-production" });
+    }
+
     const paymentChain = getSupportedPaymentChain(chainId);
     ensure(paymentChain && enabledChainIds.includes(chainId), "CHAIN_ID must be an enabled JPYC chain (1, 43114, or 137)", {
       actual: chainId,
@@ -207,7 +236,7 @@ async function main() {
       expected: APPROVED_TOKEN_DECIMALS,
       actual: tokenDecimals,
     });
-    ensure(ledgerBaseUnitScale === APPROVED_LEDGER_BASE_UNIT_SCALE, "JPYC_BASE_UNIT_SCALE must remain the approved ledger scale", {
+    ensure(ledgerBaseUnitScale === APPROVED_LEDGER_BASE_UNIT_SCALE, "LEDGER_BASE_UNIT_SCALE must remain the approved ledger scale", {
       expected: APPROVED_LEDGER_BASE_UNIT_SCALE,
       actual: ledgerBaseUnitScale,
     });

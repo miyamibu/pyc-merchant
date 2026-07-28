@@ -11,8 +11,42 @@ EVIDENCE_DIR="${PRODUCTION_EVIDENCE_DIR:-${EVIDENCE_ROOT}/${TIMESTAMP}}"
 mkdir -p "$EVIDENCE_DIR"
 
 export DB_PATH="${DB_PATH:-$EVIDENCE_DIR/validation-app.db}"
+export WORKER_STATE_DB_PATH="${WORKER_STATE_DB_PATH:-$EVIDENCE_DIR/validation-worker-state.db}"
 export BACKUP_DIR="${BACKUP_DIR:-$EVIDENCE_DIR/backups}"
 export COMMERCIAL_EVIDENCE_ROOT="${COMMERCIAL_EVIDENCE_ROOT:-$EVIDENCE_ROOT}"
+
+PRODUCTION_LIKE_VALIDATION=false
+if [[ "${APP_ENV:-development}" == "production" \
+  || "${DEPLOYMENT_STAGE:-}" == "pilot" \
+  || "${DEPLOYMENT_STAGE:-}" == "commercial" \
+  || "${COMMERCIAL_GO_MODE:-}" =~ ^(1|true|yes|on)$ ]]; then
+  PRODUCTION_LIKE_VALIDATION=true
+fi
+
+# Development validation runs several server processes against the same isolated
+# DB. Keep the generated fallback receipt key stable across those processes,
+# while production-like validation still requires explicit key configuration.
+if [[ "$PRODUCTION_LIKE_VALIDATION" == "false" \
+  && -z "${APP_SECRET:-}" \
+  && -z "${PAYMENT_RECEIPT_KEY_RING:-}" ]]; then
+  export APP_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(48).toString("hex"))')"
+  export PAYMENT_RECEIPT_KEY_RING="app-secret-v1=${APP_SECRET}"
+fi
+
+if [[ -z "${BASE_URL:-}" ]]; then
+  case "${APP_HOST:-}" in
+    http://127.0.0.1:*|http://localhost:*)
+      export BASE_URL="$APP_HOST"
+      ;;
+    "")
+      export BASE_URL="http://127.0.0.1:${APP_PORT:-4173}"
+      ;;
+    *)
+      echo "BASE_URL must be explicit when APP_HOST is not a local validation host" >&2
+      exit 1
+      ;;
+  esac
+fi
 mkdir -p "$BACKUP_DIR"
 
 run_step() {
@@ -36,7 +70,11 @@ run_json_step() {
 bash ./scripts/production-validation/collect-evidence.sh "$EVIDENCE_DIR" >/dev/null
 
 run_step check npm run check
-run_step test npm test
+# Keep validation-only production configuration from changing tests that
+# intentionally assert unsafe/default startup behavior.  Run the fixture
+# suite serially so concurrent test servers cannot collide on ephemeral ports
+# and make the production validation result nondeterministic.
+run_step test env -i PATH="$PATH" npm run test:serial
 run_step audit npm run audit
 run_step smoke npm run test:smoke
 run_step audit-chain npm run test:audit-chain

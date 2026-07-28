@@ -62,6 +62,7 @@ test("SR-18 expired invoice does not become paid and records LATE_PAYMENT review
       tx_hash: randomTxHash("late-arrival"),
       from_address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       observed_at: new Date(Date.now() + 1000).toISOString(),
+      block_timestamp: new Date(Date.parse(created.data.expires_at) + 1000).toISOString(),
     },
     `late-pay-${Date.now()}`
   );

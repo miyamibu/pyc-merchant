@@ -203,6 +203,18 @@ export async function startMockRpcServer({
     setLatestBlock(blockNumber) {
       latestBlock = Math.max(latestBlock, Number(blockNumber));
     },
+    getBlockHash(blockNumber) {
+      return blocks.get(Number(blockNumber))?.hash || null;
+    },
+    setCanonicalBlockHash(blockNumber, hashOrPrefix) {
+      const number = Number(blockNumber);
+      const current = blocks.get(number) || { number, timestamp: 1_710_000_000 };
+      const value = String(hashOrPrefix || "");
+      blocks.set(number, {
+        ...current,
+        hash: /^0x[0-9a-f]{64}$/i.test(value) ? value.toLowerCase() : fakeHash(value || "z", number),
+      });
+    },
     setBeforeRespond(handler) {
       beforeRespond = typeof handler === "function" ? handler : null;
     },
