@@ -16,7 +16,9 @@ node --check scripts/production-validation/validate-wallet-launch.mjs >/dev/null
 node --check scripts/production-validation/validate-smoke-payment-flow.mjs >/dev/null
 node --check scripts/deploy/verify-release-image.mjs >/dev/null
 bash ./scripts/deploy/preflight.sh .env.production.example --allow-empty
-node ./scripts/production-validation/validate-production-config.mjs --env-file .env.production.example --allow-empty --skip-rpc >/dev/null
+# Validate the template as written. CI/developer runtime variables must not
+# override the public production-origin values in the template.
+env -i PATH="$PATH" node ./scripts/production-validation/validate-production-config.mjs --env-file .env.production.example --allow-empty --skip-rpc >/dev/null
 node ./scripts/production-validation/validate-dependency-docker-hygiene.mjs --skip-docker true >/dev/null
 
 if command -v docker >/dev/null 2>&1; then
