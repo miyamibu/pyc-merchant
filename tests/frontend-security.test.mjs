@@ -63,6 +63,9 @@ test("SR-10 terminal SSE reconnect refreshes current invoice snapshot", () => {
   assert.match(terminalJs, /FALLBACK_POLL_INTERVAL_MS/);
   assert.match(terminalJs, /\/api\/v1\/invoices\/\$\{encodeURIComponent\(invoiceId\)\}\/sse-token/);
   assert.match(terminalJs, /sse_token=\$\{encodeURIComponent\(sseToken\)\}/);
+  assert.match(terminalJs, /last_event_id/);
+  assert.match(terminalJs, /event\.lastEventId/);
+  assert.match(terminalJs, /processedStreamEventKeys/);
   assert.doesNotMatch(terminalJs, /sse_token=\$\{encodeURIComponent\(state\.token\)\}/);
   assert.match(terminalJs, /diagnosticsEnabled/);
   assert.match(terminalJs, /sse_connection:/);
@@ -84,14 +87,12 @@ test("index prototype demo controls are guarded and delete key has aria-label", 
   assert.match(indexHtml, /Pilot-ready/);
 
   assert.match(indexJs, /query\.get\("demo"\)\s*===\s*"1"/);
-  assert.match(indexJs, /config\.app_env\s*!==\s*"production"/);
-  assert.match(indexJs, /config\.demo_controls_enabled\s*===\s*true/);
+  assert.match(indexJs, /config\.prototype_demo_enabled\s*===\s*true/);
   assert.match(indexJs, /demoControlsSection\.remove\(\)/);
   assert.match(indexJs, /data-prototype-preset/);
 
   assert.match(server, /DEMO_CONTROLS_ENABLED/);
-  assert.match(server, /app_env:\s*APP_ENV/);
-  assert.match(server, /demo_controls_enabled:\s*DEMO_CONTROLS_ENABLED/);
+  assert.match(server, /prototype_demo_enabled:\s*DEMO_CONTROLS_ENABLED/);
 });
 
 test("mobile customer-first UX keeps technical fields in details and includes wallet CTA", () => {
@@ -258,7 +259,8 @@ test("consent gate: detail copy buttons and handlers all enforce state.consented
 test("consent gate: server.mjs exposes /consent endpoint with sig verification and rate limiting", () => {
   const server = read("src/server.mjs");
   assert.match(server, /\/api\/v1\/public\/invoices\/:invoiceId\/consent/);
-  assert.match(server, /isPublicRateLimited.*public:consent/);
+  assert.match(server, /publicRequestPreflight\(req, res, \{ invoiceId \}\)/);
+  assert.match(server, /publicInvoiceRateLimit\(req, res, invoiceId\)/);
   assert.match(server, /verifySig\(invoiceId/);
   assert.match(server, /evaluatePolicyUrlsGate\(\)/);
   assert.match(server, /POLICY_CONFIGURATION_NOT_READY/);

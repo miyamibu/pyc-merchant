@@ -1184,23 +1184,19 @@ async function loadRuntimeConfig() {
     if (!res.ok) throw new Error("config fetch failed");
     const payload = await res.json();
     return {
-      app_env: String(payload.app_env || "").toLowerCase(),
-      demo_controls_enabled: payload.demo_controls_enabled === true,
+      prototype_demo_enabled: payload.prototype_demo_enabled === true,
     };
   } catch (_error) {
-    const localLike = /localhost|127\.0\.0\.1/.test(location.hostname);
     return {
-      app_env: localLike ? "development" : "production",
-      demo_controls_enabled: false,
+      prototype_demo_enabled: false,
     };
   }
 }
 
 function guardDemoControls(config) {
   const allowByQuery = query.get("demo") === "1";
-  const allowByEnv = config.app_env !== "production";
-  const allowByFlag = config.demo_controls_enabled === true;
-  state.demoEnabled = allowByQuery && allowByEnv && allowByFlag;
+  const allowByFlag = config.prototype_demo_enabled === true;
+  state.demoEnabled = allowByQuery && allowByFlag;
 
   if (!state.demoEnabled) {
     if (el.demoControlsSection) {
@@ -1211,7 +1207,7 @@ function guardDemoControls(config) {
   el.demoModeBadge.classList.remove("hidden");
   el.demoControlsSection.classList.remove("hidden");
   el.demoGuardNote.textContent =
-    "demo=1 かつ DEMO_CONTROLS_ENABLED=true かつ非production環境でのみ表示されます。";
+    "demo=1 かつ公開プロトタイプ機能が有効な環境でのみ表示されます。";
 }
 
 function bindBaseEvents() {

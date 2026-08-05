@@ -109,6 +109,20 @@ const DEFAULTS = {
   PAY_BASE_URL: "",
   PUBLIC_BASE_URL: "",
   APP_SECRET: "__REPLACE_WITH_LONG_RANDOM_SECRET__",
+  PAY_LINK_SIGNING_KEYS: "",
+  SSE_SIGNING_KEYS: "",
+  TERMINAL_ENTRY_SIGNING_KEYS: "",
+  SESSION_SIGNING_KEYS: "",
+  SERVICE_HMAC_KEYS: "",
+  AUDIT_ROOT_SIGNING_KEYS: "",
+  PAYMENT_LINK_ACTIVE_KID: "pay-v1",
+  PAYMENT_LINK_KEY_RING: "",
+  SSE_ACTIVE_KID: "sse-v1",
+  SSE_KEY_RING: "",
+  TERMINAL_ENTRY_ACTIVE_KID: "terminal-v1",
+  SESSION_ACTIVE_KID: "session-v1",
+  SERVICE_HMAC_ACTIVE_KID: "service-v1",
+  TERMINAL_ENTRY_TOKEN_TTL_SEC: "31536000",
   PAYMENT_RECEIPT_ACTIVE_KID: "app-secret-v1",
   PAYMENT_RECEIPT_KEY_RING: "",
   PAYMENT_RECEIPT_VERIFY_ONLY_KIDS: "",
@@ -144,6 +158,7 @@ const DEFAULTS = {
   PUBLIC_LINK_GRACE_SEC: "86400",
   PUBLIC_RATE_LIMIT_WINDOW_MS: "60000",
   PUBLIC_RATE_LIMIT_MAX: "120",
+  PUBLIC_RATE_LIMIT_MAX_KEYS: "100000",
   LOGIN_RATE_LIMIT_WINDOW_MS: "600000",
   LOGIN_RATE_LIMIT_MAX: "10",
   TRUST_PROXY: "true",
@@ -204,6 +219,7 @@ const DEFAULTS = {
   NOTIFICATION_OUTBOX_LEASE_SEC: "30",
   NOTIFICATION_OUTBOX_MAX_ATTEMPTS: "5",
   NOTIFICATION_OUTBOX_RETRY_BASE_SEC: "5",
+  CONFIRMATION_SLA_SEC: "900",
   REVIEW_STEP_UP_SEC: "300",
   PAYMENTS_DISABLED: "false",
   MAX_ACTIVE_INVOICES_PER_RECIPIENT: "1",
@@ -304,6 +320,24 @@ const APP_HOST = ENV.APP_HOST || ENV.PAY_BASE_URL || ENV.PUBLIC_BASE_URL || DEFA
 const APP_BIND_HOST = String(ENV.APP_BIND_HOST || DEFAULTS.APP_BIND_HOST || "").trim();
 const INTERNAL_APP_ORIGIN = String(ENV.INTERNAL_APP_ORIGIN || DEFAULTS.INTERNAL_APP_ORIGIN || "").trim();
 const APP_SECRET = ENV.APP_SECRET || DEFAULTS.APP_SECRET;
+const PAYMENT_LINK_ACTIVE_KID = String(ENV.PAYMENT_LINK_ACTIVE_KID || DEFAULTS.PAYMENT_LINK_ACTIVE_KID).trim();
+const PAYMENT_LINK_KEY_RING_RAW = String(
+  ENV.PAY_LINK_SIGNING_KEYS || ENV.PAYMENT_LINK_KEY_RING || DEFAULTS.PAY_LINK_SIGNING_KEYS || DEFAULTS.PAYMENT_LINK_KEY_RING || ""
+).trim();
+const SSE_ACTIVE_KID = String(ENV.SSE_ACTIVE_KID || DEFAULTS.SSE_ACTIVE_KID).trim();
+const SSE_KEY_RING_RAW = String(
+  ENV.SSE_SIGNING_KEYS || ENV.SSE_KEY_RING || DEFAULTS.SSE_SIGNING_KEYS || DEFAULTS.SSE_KEY_RING || ""
+).trim();
+const TERMINAL_ENTRY_ACTIVE_KID = String(
+  ENV.TERMINAL_ENTRY_ACTIVE_KID || DEFAULTS.TERMINAL_ENTRY_ACTIVE_KID
+).trim();
+const TERMINAL_ENTRY_KEY_RING_RAW = String(
+  ENV.TERMINAL_ENTRY_SIGNING_KEYS || DEFAULTS.TERMINAL_ENTRY_SIGNING_KEYS || ""
+).trim();
+const SESSION_ACTIVE_KID = String(ENV.SESSION_ACTIVE_KID || DEFAULTS.SESSION_ACTIVE_KID).trim();
+const SESSION_KEY_RING_RAW = String(
+  ENV.SESSION_SIGNING_KEYS || DEFAULTS.SESSION_SIGNING_KEYS || ""
+).trim();
 const PAYMENT_RECEIPT_ACTIVE_KID = String(
   ENV.PAYMENT_RECEIPT_ACTIVE_KID || DEFAULTS.PAYMENT_RECEIPT_ACTIVE_KID
 ).trim();
@@ -316,6 +350,40 @@ const PAYMENT_RECEIPT_VERIFY_ONLY_KIDS = new Set(
     .map((value) => value.trim())
     .filter(Boolean)
 );
+function parsePurposeKeyRing(rawValue, fallbackKid, purpose) {
+  const keys = new Map();
+  const errors = [];
+  for (const entry of String(rawValue || "").split(",").map((value) => value.trim()).filter(Boolean)) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) {
+      errors.push(`${purpose}:invalid_entry`);
+      continue;
+    }
+    const kid = entry.slice(0, separator).trim();
+    const secret = entry.slice(separator + 1).trim();
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(kid) || secret.length < 32) {
+      errors.push(`${purpose}:invalid_key:${kid || "missing"}`);
+      continue;
+    }
+    if (keys.has(kid)) {
+      errors.push(`${purpose}:duplicate_kid:${kid}`);
+      continue;
+    }
+    keys.set(kid, secret);
+  }
+  if (keys.size === 0 && !IS_PRODUCTION && APP_SECRET && !isPlaceholderLike(APP_SECRET)) {
+    keys.set(fallbackKid, APP_SECRET);
+  }
+  return { keys, errors };
+}
+const PAYMENT_LINK_KEY_RING = parsePurposeKeyRing(PAYMENT_LINK_KEY_RING_RAW, PAYMENT_LINK_ACTIVE_KID, "payment_link");
+const SSE_KEY_RING = parsePurposeKeyRing(SSE_KEY_RING_RAW, SSE_ACTIVE_KID, "sse");
+const TERMINAL_ENTRY_KEY_RING = parsePurposeKeyRing(
+  TERMINAL_ENTRY_KEY_RING_RAW,
+  TERMINAL_ENTRY_ACTIVE_KID,
+  "terminal_entry"
+);
+const SESSION_KEY_RING = parsePurposeKeyRing(SESSION_KEY_RING_RAW, SESSION_ACTIVE_KID, "session");
 function parsePaymentReceiptKeyRing(rawValue) {
   const keys = new Map();
   const errors = [];
@@ -389,6 +457,7 @@ const RECIPIENT_ADDRESS = ENV.RECIPIENT_ADDRESS || DEFAULTS.RECIPIENT_ADDRESS;
 const PUBLIC_LINK_GRACE_SEC = Number(ENV.PUBLIC_LINK_GRACE_SEC || DEFAULTS.PUBLIC_LINK_GRACE_SEC);
 const PUBLIC_RATE_LIMIT_WINDOW_MS = Number(ENV.PUBLIC_RATE_LIMIT_WINDOW_MS || DEFAULTS.PUBLIC_RATE_LIMIT_WINDOW_MS);
 const PUBLIC_RATE_LIMIT_MAX = Number(ENV.PUBLIC_RATE_LIMIT_MAX || DEFAULTS.PUBLIC_RATE_LIMIT_MAX);
+const PUBLIC_RATE_LIMIT_MAX_KEYS = Number(ENV.PUBLIC_RATE_LIMIT_MAX_KEYS || DEFAULTS.PUBLIC_RATE_LIMIT_MAX_KEYS);
 const LOGIN_RATE_LIMIT_WINDOW_MS = Number(ENV.LOGIN_RATE_LIMIT_WINDOW_MS || DEFAULTS.LOGIN_RATE_LIMIT_WINDOW_MS);
 const LOGIN_RATE_LIMIT_MAX = Number(ENV.LOGIN_RATE_LIMIT_MAX || DEFAULTS.LOGIN_RATE_LIMIT_MAX);
 const TRUST_PROXY = parseFlag(ENV.TRUST_PROXY ?? DEFAULTS.TRUST_PROXY, true);
@@ -475,12 +544,27 @@ const RELEASE_REVOKED_KEY_IDS = new Set(String(
   ENV.RELEASE_REVOKED_KEY_IDS || DEFAULTS.RELEASE_REVOKED_KEY_IDS || ""
 ).split(",").map((value) => value.trim()).filter(Boolean));
 const SESSION_TTL_SEC = Number(ENV.SESSION_TTL_SEC || DEFAULTS.SESSION_TTL_SEC);
+const TERMINAL_ENTRY_TOKEN_TTL_SEC = Number(
+  ENV.TERMINAL_ENTRY_TOKEN_TTL_SEC || DEFAULTS.TERMINAL_ENTRY_TOKEN_TTL_SEC
+);
 const CORS_ALLOW_ORIGINS = String(ENV.CORS_ALLOW_ORIGINS || DEFAULTS.CORS_ALLOW_ORIGINS)
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
 const SERVICE_INGEST_ID = String(ENV.SERVICE_INGEST_ID || DEFAULTS.SERVICE_INGEST_ID);
 const SERVICE_INGEST_SECRET = String(ENV.SERVICE_INGEST_SECRET || DEFAULTS.SERVICE_INGEST_SECRET);
+const SERVICE_HMAC_ACTIVE_KID = String(
+  ENV.SERVICE_HMAC_ACTIVE_KID || DEFAULTS.SERVICE_HMAC_ACTIVE_KID
+).trim();
+const SERVICE_HMAC_KEY_RING_RAW = String(
+  ENV.SERVICE_HMAC_KEYS || DEFAULTS.SERVICE_HMAC_KEYS || ""
+).trim();
+const SERVICE_HMAC_KEY_RING = parsePurposeKeyRing(
+  SERVICE_HMAC_KEY_RING_RAW,
+  SERVICE_HMAC_ACTIVE_KID,
+  "service_hmac",
+  SERVICE_INGEST_SECRET
+);
 const SERVICE_AUTH_MAX_SKEW_SEC = Number(ENV.SERVICE_AUTH_MAX_SKEW_SEC || DEFAULTS.SERVICE_AUTH_MAX_SKEW_SEC);
 const SERVICE_AUTH_MAX_FUTURE_SEC = Number(ENV.SERVICE_AUTH_MAX_FUTURE_SEC || DEFAULTS.SERVICE_AUTH_MAX_FUTURE_SEC);
 const SERVICE_REPLAY_GUARD_TTL_SEC = Number(ENV.SERVICE_REPLAY_GUARD_TTL_SEC || DEFAULTS.SERVICE_REPLAY_GUARD_TTL_SEC);
@@ -588,6 +672,7 @@ const SETTLEMENT_BLOCK_ON_UNRESOLVED_REVIEWS = parseFlag(
 const SETTLEMENT_UNRESOLVED_REVIEW_POLICY = String(
   ENV.SETTLEMENT_UNRESOLVED_REVIEW_POLICY || DEFAULTS.SETTLEMENT_UNRESOLVED_REVIEW_POLICY || ""
 ).trim().toLowerCase();
+const CONFIRMATION_SLA_SEC = Number(ENV.CONFIRMATION_SLA_SEC || DEFAULTS.CONFIRMATION_SLA_SEC);
 const PAYMENTS_DISABLED_ENV = parseFlag(ENV.PAYMENTS_DISABLED ?? DEFAULTS.PAYMENTS_DISABLED, false);
 const MAX_ACTIVE_INVOICES_PER_RECIPIENT = Number(ENV.MAX_ACTIVE_INVOICES_PER_RECIPIENT || DEFAULTS.MAX_ACTIVE_INVOICES_PER_RECIPIENT);
 const MAX_INVOICE_AMOUNT_JPY = Number(ENV.MAX_INVOICE_AMOUNT_JPY || DEFAULTS.MAX_INVOICE_AMOUNT_JPY);
@@ -639,6 +724,18 @@ if (INSECURE_SECRETS.has(APP_SECRET) || APP_SECRET.length < 32 || (IS_PRODUCTION
   console.error("FATAL: APP_SECRET is not set securely. Use a unique random secret with length >= 32.");
   process.exit(1);
 }
+for (const [purpose, activeKid, ring] of [
+  ["PAYMENT_LINK_KEY_RING", PAYMENT_LINK_ACTIVE_KID, PAYMENT_LINK_KEY_RING],
+  ["SSE_KEY_RING", SSE_ACTIVE_KID, SSE_KEY_RING],
+  ["TERMINAL_ENTRY_SIGNING_KEYS", TERMINAL_ENTRY_ACTIVE_KID, TERMINAL_ENTRY_KEY_RING],
+  ["SESSION_SIGNING_KEYS", SESSION_ACTIVE_KID, SESSION_KEY_RING],
+  ["SERVICE_HMAC_KEYS", SERVICE_HMAC_ACTIVE_KID, SERVICE_HMAC_KEY_RING],
+]) {
+  if (IS_PRODUCTION && (ring.keys.size === 0 || ring.errors.length > 0 || !ring.keys.has(activeKid))) {
+    console.error(`FATAL: ${purpose} must contain an explicit active kid and key in production.`);
+    process.exit(1);
+  }
+}
 if (
   INSECURE_SECRETS.has(SERVICE_INGEST_SECRET)
   || SERVICE_INGEST_SECRET.length < 32
@@ -649,6 +746,10 @@ if (
 }
 if (!Number.isFinite(SESSION_TTL_SEC) || SESSION_TTL_SEC <= 0) {
   console.error("FATAL: SESSION_TTL_SEC must be a positive integer.");
+  process.exit(1);
+}
+if (!Number.isInteger(TERMINAL_ENTRY_TOKEN_TTL_SEC) || TERMINAL_ENTRY_TOKEN_TTL_SEC < 3600) {
+  console.error("FATAL: TERMINAL_ENTRY_TOKEN_TTL_SEC must be an integer of at least 3600 seconds.");
   process.exit(1);
 }
 if (!Number.isFinite(SERVICE_AUTH_MAX_SKEW_SEC) || SERVICE_AUTH_MAX_SKEW_SEC <= 0) {
@@ -736,6 +837,14 @@ if (!Number.isFinite(TOKEN_DECIMALS) || TOKEN_DECIMALS < 0 || TOKEN_DECIMALS > 3
 }
 if (!Number.isFinite(MIN_REQUIRED_CONFIRMATIONS) || MIN_REQUIRED_CONFIRMATIONS < 1 || !Number.isInteger(MIN_REQUIRED_CONFIRMATIONS)) {
   console.error("FATAL: MIN_REQUIRED_CONFIRMATIONS must be a positive integer.");
+  process.exit(1);
+}
+if (!Number.isFinite(PUBLIC_RATE_LIMIT_MAX_KEYS) || PUBLIC_RATE_LIMIT_MAX_KEYS < 1 || !Number.isInteger(PUBLIC_RATE_LIMIT_MAX_KEYS)) {
+  console.error("FATAL: PUBLIC_RATE_LIMIT_MAX_KEYS must be a positive integer.");
+  process.exit(1);
+}
+if (!Number.isFinite(CONFIRMATION_SLA_SEC) || CONFIRMATION_SLA_SEC < 1 || !Number.isInteger(CONFIRMATION_SLA_SEC)) {
+  console.error("FATAL: CONFIRMATION_SLA_SEC must be a positive integer.");
   process.exit(1);
 }
 if (!Number.isFinite(MONITOR_BACKSCAN_BLOCKS) || MONITOR_BACKSCAN_BLOCKS < 1 || !Number.isInteger(MONITOR_BACKSCAN_BLOCKS)) {
@@ -1058,6 +1167,9 @@ CREATE TABLE IF NOT EXISTS invoices (
   expires_at TEXT NOT NULL,
   status TEXT NOT NULL,
   business_date TEXT,
+  confirmation_started_at TEXT,
+  confirmation_deadline_at TEXT,
+  confirmation_sla_sec INTEGER,
   status_reason TEXT,
   paid_amount_jpyc REAL NOT NULL DEFAULT 0,
   paid_amount_jpyc_base INTEGER NOT NULL DEFAULT 0,
@@ -1103,10 +1215,46 @@ CREATE TABLE IF NOT EXISTS payment_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_events_dedupe
 ON payment_events(chain_id, tx_hash, COALESCE(log_index, -1), event_type);
 
+CREATE TABLE IF NOT EXISTS domain_event_outbox (
+  event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  aggregate_type TEXT NOT NULL,
+  aggregate_id TEXT NOT NULL,
+  aggregate_version INTEGER NOT NULL DEFAULT 1,
+  event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending', 'published', 'applied', 'failed')),
+  available_at TEXT NOT NULL,
+  published_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_domain_event_outbox_aggregate
+ON domain_event_outbox(aggregate_type, aggregate_id, event_sequence);
+CREATE INDEX IF NOT EXISTS idx_domain_event_outbox_pending
+ON domain_event_outbox(status, available_at, event_sequence);
+
+CREATE TABLE IF NOT EXISTS sse_delivery_attempts (
+  id TEXT PRIMARY KEY,
+  event_sequence INTEGER NOT NULL REFERENCES domain_event_outbox(event_sequence),
+  terminal_id TEXT,
+  invoice_id TEXT,
+  status TEXT NOT NULL CHECK(status IN ('delivered', 'no_active_client', 'failed')),
+  attempt_count INTEGER NOT NULL DEFAULT 1,
+  error_code TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sse_delivery_attempts_event
+ON sse_delivery_attempts(event_sequence, created_at, id);
+
 CREATE TABLE IF NOT EXISTS payment_notification_outbox (
   id TEXT PRIMARY KEY,
   invoice_id TEXT NOT NULL REFERENCES invoices(id),
   payment_event_id TEXT REFERENCES payment_events(id),
+  domain_event_id TEXT REFERENCES domain_event_outbox(id),
+  domain_event_sequence INTEGER,
   notification_type TEXT NOT NULL,
   audience TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
@@ -1758,6 +1906,7 @@ CREATE TABLE IF NOT EXISTS payment_reconciliation_links (
 
 CREATE TABLE IF NOT EXISTS settlement_export_runs (
   id TEXT PRIMARY KEY,
+  settlement_id TEXT REFERENCES settlements(id),
   export_version TEXT NOT NULL DEFAULT 'v1',
   business_date TEXT NOT NULL,
   store_id TEXT,
@@ -1874,16 +2023,6 @@ ON chain_reorgs(
 CREATE INDEX IF NOT EXISTS idx_chain_reorgs_status_detected_at
 ON chain_reorgs(chain_id, status, detected_at DESC);
 
-CREATE TABLE IF NOT EXISTS rate_limit_events (
-  id TEXT PRIMARY KEY,
-  scope TEXT NOT NULL,
-  key_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  created_at_unix_ms INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_rate_limit_events_scope_key_time
-ON rate_limit_events(scope, key_hash, created_at_unix_ms);
-
 CREATE TABLE IF NOT EXISTS suspicious_activity_logs (
   id TEXT PRIMARY KEY,
   store_id TEXT,
@@ -1904,6 +2043,9 @@ function addColumnIfMissing(tableName, columnName, ddl) {
 addColumnIfMissing("invoices", "settled_at", "settled_at TEXT");
 addColumnIfMissing("invoices", "business_date", "business_date TEXT");
 addColumnIfMissing("invoices", "settlement_id", "settlement_id TEXT");
+addColumnIfMissing("invoices", "confirmation_started_at", "confirmation_started_at TEXT");
+addColumnIfMissing("invoices", "confirmation_deadline_at", "confirmation_deadline_at TEXT");
+addColumnIfMissing("invoices", "confirmation_sla_sec", "confirmation_sla_sec INTEGER");
 addColumnIfMissing("invoices", "amount_jpyc_base", "amount_jpyc_base INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("invoices", "paid_amount_jpyc_base", "paid_amount_jpyc_base INTEGER NOT NULL DEFAULT 0");
 addColumnIfMissing("invoices", "amount_scale_version", "amount_scale_version TEXT");
@@ -1993,6 +2135,8 @@ addColumnIfMissing("refund_requests", "finalized_at", "finalized_at TEXT");
 addColumnIfMissing("payment_notification_outbox", "last_error", "last_error TEXT");
 addColumnIfMissing("payment_notification_outbox", "sent_at", "sent_at TEXT");
 addColumnIfMissing("payment_notification_outbox", "dead_lettered_at", "dead_lettered_at TEXT");
+addColumnIfMissing("payment_notification_outbox", "domain_event_id", "domain_event_id TEXT");
+addColumnIfMissing("payment_notification_outbox", "domain_event_sequence", "domain_event_sequence INTEGER");
 addColumnIfMissing("refund_requests", "detected_at", "detected_at TEXT");
 addColumnIfMissing("refund_requests", "audit_log", "audit_log TEXT");
 addColumnIfMissing("settlements", "total_paid_jpyc_base", "total_paid_jpyc_base INTEGER NOT NULL DEFAULT 0");
@@ -2011,6 +2155,7 @@ addColumnIfMissing("settlements", "unresolved_review_note", "unresolved_review_n
 addColumnIfMissing("settlements", "audit_root", "audit_root TEXT");
 addColumnIfMissing("settlements", "snapshot_hash", "snapshot_hash TEXT");
 addColumnIfMissing("settlements", "close_status", "close_status TEXT NOT NULL DEFAULT 'open'");
+addColumnIfMissing("settlement_export_runs", "settlement_id", "settlement_id TEXT");
 addColumnIfMissing("settlement_export_rows", "payload_json", "payload_json TEXT");
 addColumnIfMissing("settlement_export_rows", "amount_scale_version", "amount_scale_version TEXT");
 addColumnIfMissing("settlement_export_rows", "token_decimals", "token_decimals INTEGER");
@@ -2894,8 +3039,54 @@ function hasProviderSettlementPath(invoiceId) {
     || ["failed", "voided", "refund_accepted", "settlement_pending", "settled", "reported", "confirmed"].includes(String(row.provider_status || ""));
 }
 
-function generateTerminalPublicEntryToken() {
-  return crypto.randomBytes(18).toString("base64url");
+function generateTerminalPublicEntryToken(terminalId) {
+  const issuedAtSec = Math.floor(Date.now() / 1000);
+  const kid = TERMINAL_ENTRY_ACTIVE_KID;
+  const secret = TERMINAL_ENTRY_KEY_RING.keys.get(kid);
+  if (!secret) throw new Error("TERMINAL_ENTRY_SIGNING_KEY_UNAVAILABLE");
+  const payload = {
+    purpose: "terminal_entry",
+    kid,
+    iat: issuedAtSec,
+    exp: issuedAtSec + TERMINAL_ENTRY_TOKEN_TTL_SEC,
+    sub: String(terminalId),
+    terminal_id: String(terminalId),
+    nonce: crypto.randomBytes(12).toString("hex"),
+  };
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const signature = hmacWithSecret(secret, `terminal_entry.${kid}.${body}`);
+  return `${body}.${signature}`;
+}
+
+function verifyTerminalPublicEntryToken(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) return { ok: false, reason: "malformed_token" };
+  const [body, signature] = parts;
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch (_error) {
+    return { ok: false, reason: "payload_decode_failed" };
+  }
+  const kid = String(payload.kid || "");
+  const secret = TERMINAL_ENTRY_KEY_RING.keys.get(kid);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (
+    payload.purpose !== "terminal_entry"
+    || !secret
+    || !Number.isInteger(Number(payload.iat))
+    || Number(payload.iat) > nowSec + 30
+    || !Number.isInteger(Number(payload.exp))
+    || Number(payload.exp) < nowSec
+    || !/^[0-9a-f]{24}$/i.test(String(payload.nonce || ""))
+    || !String(payload.sub || "").trim()
+    || String(payload.sub) !== String(payload.terminal_id || "")
+  ) {
+    return { ok: false, reason: "invalid_token_metadata" };
+  }
+  const expected = hmacWithSecret(secret, `terminal_entry.${kid}.${body}`);
+  if (!safeHexEqual(expected, signature)) return { ok: false, reason: "signature_mismatch" };
+  return { ok: true, payload };
 }
 
 function buildTerminalPublicEntryUrl(publicEntryToken) {
@@ -3247,6 +3438,9 @@ function getTerminalById(terminalId) {
 }
 
 function getTerminalByPublicEntryToken(publicEntryToken) {
+  const token = String(publicEntryToken || "").trim();
+  const verified = verifyTerminalPublicEntryToken(token);
+  if (!verified.ok && IS_PRODUCTION) return null;
   return (
     db
       .prepare(
@@ -3255,7 +3449,7 @@ function getTerminalByPublicEntryToken(publicEntryToken) {
          JOIN stores s ON s.id = t.store_id
          WHERE t.public_entry_token = ?`
       )
-      .get(String(publicEntryToken || "").trim()) || null
+      .get(token) || null
   );
 }
 
@@ -3264,7 +3458,7 @@ function ensureTerminalPublicEntryToken(terminalId) {
   if (!current) return null;
   if (String(current.public_entry_token || "").trim()) return current;
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const token = generateTerminalPublicEntryToken();
+    const token = generateTerminalPublicEntryToken(terminalId);
     const updated = db
       .prepare(
         `UPDATE terminals
@@ -4400,17 +4594,27 @@ function safeHexEqual(left, right) {
 
 function signInvoiceAccess(invoiceId, expiresAtIso) {
   const expiresSec = Math.floor(new Date(expiresAtIso).getTime() / 1000) + PUBLIC_LINK_GRACE_SEC;
+  const issuedAtSec = Math.floor(Date.now() / 1000);
   const nonce = crypto.randomBytes(12).toString("hex");
-  const sig = hmac(`${invoiceId}.${expiresSec}.${nonce}`);
-  return { expiresSec, nonce, sig };
+  const kid = PAYMENT_LINK_ACTIVE_KID;
+  const secret = PAYMENT_LINK_KEY_RING.keys.get(kid);
+  if (!secret) throw new Error("PAYMENT_LINK_SIGNING_KEY_UNAVAILABLE");
+  // Keep the query-based public API compatible with clients that send only
+  // exp/nonce/sig. The opaque ref still carries iat/purpose/kid, and supplied
+  // iat/purpose values are validated at the public API boundary.
+  const sig = hmacWithSecret(secret, `pay.${kid}.${invoiceId}.${expiresSec}.${nonce}`);
+  return { expiresSec, issuedAtSec, nonce, kid, sig };
 }
 
 function createSignedPayRef(invoiceId, expiresAtIso) {
   const signature = signInvoiceAccess(invoiceId, expiresAtIso);
   const payload = {
+    purpose: "payment_link",
     invoice_id: invoiceId,
     exp: signature.expiresSec,
+    iat: signature.issuedAtSec,
     nonce: signature.nonce,
+    kid: signature.kid,
     sig: signature.sig,
   };
   return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
@@ -4422,8 +4626,11 @@ function parseSignedPayRef(ref) {
     const payload = JSON.parse(decoded);
     return {
       invoiceId: String(payload.invoice_id || ""),
+      purpose: String(payload.purpose || ""),
       exp: String(payload.exp || ""),
+      iat: String(payload.iat || ""),
       nonce: String(payload.nonce || ""),
+      kid: String(payload.kid || ""),
       sig: String(payload.sig || ""),
     };
   } catch (_error) {
@@ -4431,70 +4638,111 @@ function parseSignedPayRef(ref) {
   }
 }
 
-function verifySig(invoiceId, expRaw, nonce, sig) {
+function verifySig(invoiceId, expRaw, nonce, sig, kidRaw = "", iatRaw = "", purposeRaw = "") {
   if (!invoiceId || !expRaw || !nonce || !sig) return { ok: false, reason: "missing_signature_fields" };
+  if (purposeRaw && purposeRaw !== "payment_link") return { ok: false, reason: "invalid_signature_purpose" };
   const exp = Number(expRaw);
+  const iat = iatRaw === "" ? null : Number(iatRaw);
   if (!Number.isInteger(exp)) return { ok: false, reason: "invalid_exp" };
+  if (iat !== null && (!Number.isInteger(iat) || iat > Math.floor(Date.now() / 1000) + 30)) {
+    return { ok: false, reason: "invalid_iat" };
+  }
   const nowSec = Math.floor(Date.now() / 1000);
   if (exp < nowSec) return { ok: false, reason: "signature_expired" };
   if (!/^[0-9a-f]{24}$/i.test(nonce)) return { ok: false, reason: "invalid_nonce" };
-  const expected = hmac(`${invoiceId}.${exp}.${nonce}`);
-  if (!safeHexEqual(expected, sig)) return { ok: false, reason: "signature_mismatch" };
-  return { ok: true };
+  const candidates = kidRaw
+    ? [[String(kidRaw), PAYMENT_LINK_KEY_RING.keys.get(String(kidRaw))]]
+    : [...PAYMENT_LINK_KEY_RING.keys.entries()];
+  const valid = candidates.some(([kid, secret]) => {
+    if (!secret) return false;
+    const messages = iat === null
+      ? [`pay.${kid}.${invoiceId}.${exp}.${nonce}`]
+      : [
+        `pay.${kid}.${invoiceId}.${exp}.${iat}.${nonce}`,
+        // Migration compatibility for the immediately preceding key-ring
+        // format; this still requires a configured payment-link key.
+        `pay.${kid}.${invoiceId}.${exp}.${nonce}`,
+      ];
+    return messages.some((message) => safeHexEqual(hmacWithSecret(secret, message), sig));
+  });
+  // Legacy payment URLs remain readable during non-production migration only.
+  const legacyValid = !IS_PRODUCTION && iat === null && safeHexEqual(hmac(`${invoiceId}.${exp}.${nonce}`), sig);
+  if (!valid && !legacyValid) return { ok: false, reason: "signature_mismatch" };
+  return { ok: true, purpose: "payment_link", kid: kidRaw || null, iat };
 }
 
-const RATE_LIMIT_RETENTION_MS =
-  Math.max(PUBLIC_RATE_LIMIT_WINDOW_MS, LOGIN_RATE_LIMIT_WINDOW_MS, 60_000) * 12;
-let rateLimitCleanupTick = 0;
-function cleanupRateLimitEvents(nowMs) {
-  rateLimitCleanupTick = (rateLimitCleanupTick + 1) % 100;
-  if (rateLimitCleanupTick !== 0) return;
-  db.prepare(`DELETE FROM rate_limit_events WHERE created_at_unix_ms <= ?`).run(nowMs - RATE_LIMIT_RETENTION_MS);
+function verifyPublicInvoiceSignature(req, invoiceId) {
+  return verifySig(
+    invoiceId,
+    String(req.query.exp || ""),
+    String(req.query.nonce || ""),
+    String(req.query.sig || ""),
+    String(req.query.kid || ""),
+    String(req.query.iat || ""),
+    String(req.query.purpose || ""),
+  );
 }
 
-function makeHybridRateLimiter(scope, windowMs, maxRequests) {
+function makeTtlLruRateLimiter(scope, windowMs, maxRequests, maxKeys) {
   const buckets = new Map();
   return function isRateLimited(key) {
     const nowMs = Date.now();
     const windowStart = nowMs - windowMs;
     const keyHash = sha256(`${scope}:${String(key || "")}`);
-    const bucket = buckets.get(keyHash) || [];
-    const fresh = bucket.filter((ts) => ts > windowStart);
+    const bucket = buckets.get(keyHash);
+    const fresh = (bucket || []).filter((ts) => ts > windowStart);
+    buckets.delete(keyHash);
+    if (fresh.length === 0 && buckets.size >= maxKeys) {
+      const oldestKey = buckets.keys().next().value;
+      if (oldestKey) buckets.delete(oldestKey);
+    }
     fresh.push(nowMs);
     buckets.set(keyHash, fresh);
-    cleanupRateLimitEvents(nowMs);
-    try {
-      db.prepare(
-        `INSERT INTO rate_limit_events(id, scope, key_hash, created_at, created_at_unix_ms)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(uuid(), scope, keyHash, nowIso(), nowMs);
-      const dbCount = Number(
-        db
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM rate_limit_events
-             WHERE scope = ? AND key_hash = ? AND created_at_unix_ms > ?`
-          )
-          .get(scope, keyHash, windowStart)?.count || 0
-      );
-      return Math.max(fresh.length, dbCount) > maxRequests;
-    } catch (error) {
-      console.warn(
-        JSON.stringify({
-          ts: nowIso(),
-          level: "warn",
-          type: "rate_limit.db_fallback",
-          scope,
-          message: String(error.message || error),
-        })
-      );
-      return fresh.length > maxRequests;
-    }
+    return fresh.length > maxRequests;
   };
 }
 
-const isPublicRateLimited = makeHybridRateLimiter("public", PUBLIC_RATE_LIMIT_WINDOW_MS, PUBLIC_RATE_LIMIT_MAX);
-const isLoginRateLimited = makeHybridRateLimiter("login", LOGIN_RATE_LIMIT_WINDOW_MS, LOGIN_RATE_LIMIT_MAX);
+const isPublicRateLimited = makeTtlLruRateLimiter(
+  "public-ip",
+  PUBLIC_RATE_LIMIT_WINDOW_MS,
+  PUBLIC_RATE_LIMIT_MAX,
+  PUBLIC_RATE_LIMIT_MAX_KEYS,
+);
+const isPublicInvoiceRateLimited = makeTtlLruRateLimiter(
+  "public-invoice",
+  PUBLIC_RATE_LIMIT_WINDOW_MS,
+  PUBLIC_RATE_LIMIT_MAX,
+  PUBLIC_RATE_LIMIT_MAX_KEYS,
+);
+const isLoginRateLimited = makeTtlLruRateLimiter(
+  "login",
+  LOGIN_RATE_LIMIT_WINDOW_MS,
+  LOGIN_RATE_LIMIT_MAX,
+  PUBLIC_RATE_LIMIT_MAX_KEYS,
+);
+
+const PUBLIC_MAX_URL_LENGTH = 2048;
+const PUBLIC_INVOICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+function publicRequestPreflight(req, res, { invoiceId = null } = {}) {
+  if (String(req.originalUrl || "").length > PUBLIC_MAX_URL_LENGTH) {
+    return jsonError(res, 414, "URI_TOO_LONG", "Public request URL is too long");
+  }
+  if (invoiceId !== null && !PUBLIC_INVOICE_ID_PATTERN.test(String(invoiceId || ""))) {
+    return jsonError(res, 400, "INVALID_INVOICE_ID", "Invoice ID has an invalid format");
+  }
+  if (isPublicRateLimited(req.ip)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  return null;
+}
+
+function publicInvoiceRateLimit(req, res, invoiceId) {
+  if (isPublicInvoiceRateLimited(`${req.ip}:${invoiceId}`)) {
+    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
+  }
+  return null;
+}
 
 function parseTxHash(txHash) {
   const hash = String(txHash || "").trim().toLowerCase();
@@ -6124,6 +6372,20 @@ function getInvoiceIssuanceBlockReason({ store, session }) {
   return null;
 }
 
+function getPaymentAcceptanceUnavailableError(issuanceBlocked) {
+  if (!issuanceBlocked || !["CHAIN_MONITOR_NOT_READY", "CHAIN_RUNTIME_NOT_READY"].includes(issuanceBlocked.code)) {
+    return null;
+  }
+  return {
+    code: "PAYMENT_ACCEPTANCE_UNAVAILABLE",
+    message: "new payment acceptance is temporarily unavailable; existing invoice and review operations remain available",
+    details: {
+      cause_code: issuanceBlocked.code,
+      cause: issuanceBlocked.details || {},
+    },
+  };
+}
+
 function normalizeSettlementUnresolvedReviewPolicy(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (["block", "warn", "allow"].includes(raw)) return raw;
@@ -7636,7 +7898,11 @@ function createSseToken({ invoiceId, terminalId, storeId, sessionId, expiresAtIs
     : fallbackExpiryMs;
   const payload = {
     aud: "sse",
+    purpose: "sse",
     scope: "invoice:read",
+    kid: SSE_ACTIVE_KID,
+    iat: Math.floor(Date.now() / 1000),
+    nonce: crypto.randomBytes(12).toString("hex"),
     invoice_id: invoiceId,
     terminal_id: terminalId,
     store_id: storeId,
@@ -7644,7 +7910,9 @@ function createSseToken({ invoiceId, terminalId, storeId, sessionId, expiresAtIs
     exp: Math.floor(tokenExpiryMs / 1000),
   };
   const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  const sig = hmac(`sse.${body}`);
+  const secret = SSE_KEY_RING.keys.get(SSE_ACTIVE_KID);
+  if (!secret) throw new Error("SSE_SIGNING_KEY_UNAVAILABLE");
+  const sig = hmacWithSecret(secret, `sse.${SSE_ACTIVE_KID}.${body}`);
   return `${body}.${sig}`;
 }
 
@@ -7653,21 +7921,38 @@ function verifySseToken(token, expected) {
   const parts = raw.split(".");
   if (parts.length !== 2) return { ok: false, code: "INVALID_SSE_TOKEN", message: "malformed sse token" };
   const [body, sig] = parts;
-  const expectedSig = hmac(`sse.${body}`);
-  if (!safeHexEqual(expectedSig, sig)) {
-    return { ok: false, code: "INVALID_SSE_TOKEN", message: "signature mismatch" };
-  }
   let payload;
   try {
     payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
   } catch (_error) {
     return { ok: false, code: "INVALID_SSE_TOKEN", message: "payload decode failed" };
   }
+  const kid = String(payload.kid || "");
+  const iat = Number(payload.iat);
+  const nonce = String(payload.nonce || "");
+  const secret = SSE_KEY_RING.keys.get(kid);
+  const legacyDevelopmentToken = !IS_PRODUCTION
+    && !kid
+    && !Number.isFinite(Number(payload.iat))
+    && !nonce
+    && !payload.purpose
+    && APP_SECRET
+    && !isPlaceholderLike(APP_SECRET)
+    && safeHexEqual(hmacWithSecret(APP_SECRET, `sse.${body}`), sig);
+  if (!legacyDevelopmentToken) {
+    if (!secret || payload.purpose !== "sse" || !Number.isInteger(iat) || iat > Math.floor(Date.now() / 1000) + 30 || !/^[0-9a-f]{24}$/i.test(nonce)) {
+      return { ok: false, code: "INVALID_SSE_TOKEN", message: "invalid key metadata" };
+    }
+    const expectedSig = hmacWithSecret(secret, `sse.${kid}.${body}`);
+    if (!safeHexEqual(expectedSig, sig)) {
+      return { ok: false, code: "INVALID_SSE_TOKEN", message: "signature mismatch" };
+    }
+  }
   const exp = Number(payload.exp);
   if (!Number.isInteger(exp) || exp < Math.floor(Date.now() / 1000)) {
     return { ok: false, code: "SSE_TOKEN_EXPIRED", message: "sse token expired" };
   }
-  if (payload.aud !== "sse" || payload.scope !== "invoice:read") {
+  if (payload.aud !== "sse" || payload.scope !== "invoice:read" || (!legacyDevelopmentToken && payload.purpose !== "sse")) {
     return { ok: false, code: "INVALID_SSE_TOKEN_SCOPE", message: "invalid sse token scope" };
   }
   if (expected.invoiceId && String(payload.invoice_id) !== String(expected.invoiceId)) {
@@ -7768,8 +8053,64 @@ function parseAuth(req) {
   return raw.slice(7).trim();
 }
 
+function createSessionToken({ sessionId, terminalId, staffUserId, expiresAtIso }) {
+  const issuedAtSec = Math.floor(Date.now() / 1000);
+  const kid = SESSION_ACTIVE_KID;
+  const secret = SESSION_KEY_RING.keys.get(kid);
+  if (!secret) throw new Error("SESSION_SIGNING_KEY_UNAVAILABLE");
+  const payload = {
+    purpose: "session",
+    kid,
+    iat: issuedAtSec,
+    exp: Math.floor(new Date(expiresAtIso).getTime() / 1000),
+    sub: String(sessionId),
+    session_id: String(sessionId),
+    terminal_id: String(terminalId),
+    staff_user_id: String(staffUserId),
+    nonce: crypto.randomBytes(12).toString("hex"),
+  };
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const signature = hmacWithSecret(secret, `session.${kid}.${body}`);
+  return `${body}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) return { ok: false, reason: "malformed_token" };
+  const [body, signature] = parts;
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch (_error) {
+    return { ok: false, reason: "payload_decode_failed" };
+  }
+  const kid = String(payload.kid || "");
+  const secret = SESSION_KEY_RING.keys.get(kid);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (
+    payload.purpose !== "session"
+    || !secret
+    || !Number.isInteger(Number(payload.iat))
+    || Number(payload.iat) > nowSec + 30
+    || !Number.isInteger(Number(payload.exp))
+    || Number(payload.exp) < nowSec
+    || !/^[0-9a-f]{24}$/i.test(String(payload.nonce || ""))
+    || !String(payload.sub || "").trim()
+    || String(payload.sub) !== String(payload.session_id || "")
+  ) {
+    return { ok: false, reason: "invalid_token_metadata" };
+  }
+  const expected = hmacWithSecret(secret, `session.${kid}.${body}`);
+  if (!safeHexEqual(expected, signature)) return { ok: false, reason: "signature_mismatch" };
+  return { ok: true, payload };
+}
+
 function getSessionByToken(token) {
-  const tokenHash = sha256(token);
+  const rawToken = String(token || "");
+  const verified = verifySessionToken(rawToken);
+  const legacyOpaqueToken = !rawToken.includes(".");
+  if (!verified.ok && (IS_PRODUCTION || !legacyOpaqueToken)) return null;
+  const tokenHash = sha256(rawToken);
   const session = db
     .prepare(
       `SELECT s.id AS session_id, s.terminal_id, s.staff_user_id, s.started_at,
@@ -7782,6 +8123,11 @@ function getSessionByToken(token) {
     )
     .get(tokenHash);
   if (!session) return null;
+  if (verified.ok && (
+    String(verified.payload.session_id) !== String(session.session_id)
+    || String(verified.payload.terminal_id) !== String(session.terminal_id)
+    || String(verified.payload.staff_user_id) !== String(session.staff_user_id)
+  )) return null;
   if (Number.isFinite(SESSION_TTL_SEC) && SESSION_TTL_SEC > 0) {
     const ageMs = Date.now() - new Date(session.started_at).getTime();
     if (!Number.isFinite(ageMs) || ageMs > SESSION_TTL_SEC * 1000) {
@@ -8028,6 +8374,7 @@ function requireAdmin(req, res, next) {
 
 function requireServiceSignature(req, res, next) {
   const serviceId = String(req.header("X-Service-Id") || "");
+  const serviceKid = String(req.header("X-Service-Kid") || SERVICE_HMAC_ACTIVE_KID);
   const timestampRaw = String(req.header("X-Service-Timestamp") || "");
   const signature = String(req.header("X-Service-Signature") || "");
   const serviceJti = String(req.header("X-Service-JTI") || req.header("Idempotency-Key") || "");
@@ -8049,8 +8396,14 @@ function requireServiceSignature(req, res, next) {
     return jsonError(res, 401, "UNAUTHORIZED", "Service signature timestamp is in the future");
   }
   const payloadHash = sha256(JSON.stringify(req.body || {}));
-  const expected = hmacWithSecret(SERVICE_INGEST_SECRET, `${serviceId}.${timestamp}.${serviceJti}.${payloadHash}`);
-  if (!safeHexEqual(expected, signature)) {
+  const serviceSecret = SERVICE_HMAC_KEY_RING.keys.get(serviceKid);
+  const expected = serviceSecret
+    ? hmacWithSecret(serviceSecret, `service.${serviceKid}.${serviceId}.${timestamp}.${serviceJti}.${payloadHash}`)
+    : null;
+  const legacyExpected = !IS_PRODUCTION && !req.header("X-Service-Kid")
+    ? hmacWithSecret(SERVICE_INGEST_SECRET, `${serviceId}.${timestamp}.${serviceJti}.${payloadHash}`)
+    : null;
+  if ((!expected || !safeHexEqual(expected, signature)) && (!legacyExpected || !safeHexEqual(legacyExpected, signature))) {
     return jsonError(res, 401, "UNAUTHORIZED", "Invalid service signature");
   }
   cleanupServiceReplayGuards();
@@ -8070,7 +8423,7 @@ function requireServiceSignature(req, res, next) {
     nowIso(),
     replayExpiresAt
   );
-  req.serviceAuth = { serviceId, timestamp, serviceJti };
+  req.serviceAuth = { serviceId, serviceKid, timestamp, serviceJti };
   next();
 }
 
@@ -8790,6 +9143,14 @@ function evaluateSettlementHardGate({ storeId, businessDate, store, range }) {
      WHERE store_id = ?
        AND ${invoiceScope.sql}`
   ).all(storeId, ...invoiceScope.params);
+  const confirmingInvoices = targetInvoices.filter((row) => String(row.status || "") === "confirming");
+  if (confirmingInvoices.length > 0) {
+    blockers.push({
+      code: "ACTIVE_CONFIRMING_PAYMENT",
+      invoice_ids: confirmingInvoices.map((row) => row.id),
+      details: confirmingInvoices,
+    });
+  }
   const paymentRelevant = targetInvoices.some((row) => ["paid", "settled", "review_required"].includes(String(row.status)));
 
   const openIncidents = db.prepare(
@@ -8858,6 +9219,7 @@ function evaluateSettlementHardGate({ storeId, businessDate, store, range }) {
      JOIN invoices i ON i.id = pno.invoice_id
      WHERE i.store_id = ?
        AND pno.status <> 'sent'
+       AND COALESCE(pno.last_error, '') <> 'OUTBOX_NO_ACTIVE_SSE_CLIENT'
        AND ${businessDate
          ? "(i.business_date = ? OR (i.business_date IS NULL AND i.created_at BETWEEN ? AND ?))"
          : "i.created_at BETWEEN ? AND ?"}
@@ -9925,12 +10287,13 @@ async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
 }
 
 const clientsByTerminal = new Map();
-function sendEvent(terminalId, event, payload) {
+function sendEvent(terminalId, event, payload, eventSequence = null) {
   const clients = clientsByTerminal.get(terminalId);
   if (!clients || clients.size === 0) return 0;
-  const lines = [`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`];
+  const eventId = Number.isInteger(Number(eventSequence)) ? `id: ${Number(eventSequence)}\n` : "";
+  const lines = [`${eventId}event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`];
   if (event === "invoice.updated") {
-    lines.push(`event: status_changed\ndata: ${JSON.stringify(payload)}\n\n`);
+    lines.push(`${eventId}event: status_changed\ndata: ${JSON.stringify(payload)}\n\n`);
   }
   let delivered = 0;
   for (const client of clients) {
@@ -9962,7 +10325,7 @@ function dispatchPaymentNotificationOutboxOnce({ limit = 50 } = {}) {
      ORDER BY created_at ASC, id ASC
      LIMIT ?`
   ).all(now, now, Math.max(1, Math.min(Number(limit) || 50, 200)));
-  const result = { claimed: 0, sent: 0, retried: 0, dead_lettered: 0 };
+  const result = { claimed: 0, sent: 0, no_active_client: 0, retried: 0, dead_lettered: 0 };
   for (const row of rows) {
     const leaseUntil = new Date(Date.now() + NOTIFICATION_OUTBOX_LEASE_SEC * 1000).toISOString();
     const claimed = db.prepare(
@@ -9980,22 +10343,42 @@ function dispatchPaymentNotificationOutboxOnce({ limit = 50 } = {}) {
       const payload = JSON.parse(String(row.payload_json || "{}"));
       const invoice = db.prepare(`SELECT id, terminal_id FROM invoices WHERE id = ?`).get(row.invoice_id);
       if (!invoice) throw new Error("OUTBOX_INVOICE_NOT_FOUND");
-      // The outbox is a delivery record, not merely a parsed payload record.
-      // Keep it retryable when the intended terminal has no matching SSE
-      // client; otherwise an offline terminal would silently lose the event.
+      const domainEvent = row.domain_event_id
+        ? db.prepare(`SELECT * FROM domain_event_outbox WHERE id = ?`).get(row.domain_event_id)
+        : null;
+      if (!domainEvent) throw new Error("OUTBOX_DOMAIN_EVENT_NOT_FOUND");
       const delivered = sendEvent(invoice.terminal_id, "payment.notification", {
         ...payload,
         invoiceId: invoice.id,
         outbox_id: row.id,
-      });
-      if (delivered < 1) throw new Error("OUTBOX_NO_ACTIVE_SSE_CLIENT");
+      }, Number(domainEvent.event_sequence));
+      const deliveryStatus = delivered > 0 ? "delivered" : "no_active_client";
+      db.prepare(
+        `INSERT INTO sse_delivery_attempts
+         (id, event_sequence, terminal_id, invoice_id, status, attempt_count, error_code, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`
+      ).run(
+        uuid(),
+        domainEvent.event_sequence,
+        invoice.terminal_id,
+        invoice.id,
+        deliveryStatus,
+        attempt,
+        nowIso(),
+      );
       db.prepare(
         `UPDATE payment_notification_outbox
          SET status = 'sent', sent_at = ?, last_error = NULL,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE id = ? AND status = 'processing' AND lease_owner = ?`
       ).run(nowIso(), nowIso(), row.id, OUTBOX_WORKER_ID);
+      db.prepare(
+        `UPDATE domain_event_outbox
+         SET status = 'published', published_at = COALESCE(published_at, ?), last_error = NULL, updated_at = ?
+         WHERE id = ?`
+      ).run(nowIso(), nowIso(), domainEvent.id);
       result.sent += 1;
+      if (delivered < 1) result.no_active_client += 1;
     } catch (error) {
       const message = String(error.message || error).slice(0, 240);
       const deadLetter = attempt >= NOTIFICATION_OUTBOX_MAX_ATTEMPTS;
@@ -10018,6 +10401,13 @@ function dispatchPaymentNotificationOutboxOnce({ limit = 50 } = {}) {
         row.id,
         OUTBOX_WORKER_ID,
       );
+      if (row.domain_event_id) {
+        db.prepare(
+          `UPDATE domain_event_outbox
+           SET status = ?, last_error = ?, updated_at = ?
+           WHERE id = ?`
+        ).run(deadLetter ? "failed" : "pending", message, nowIso(), row.domain_event_id);
+      }
       if (deadLetter) result.dead_lettered += 1;
       else result.retried += 1;
     }
@@ -10539,7 +10929,7 @@ const PAYMENT_RECEIPT_VERSION = "payment_receipt_v1";
 // always uses the active key selected through the registry above.
 const PAYMENT_RECEIPT_KID = PAYMENT_RECEIPT_ACTIVE_KID;
 
-function buildSignedPaymentReceipt(invoice, store = null) {
+function buildSignedPaymentReceipt(invoice, store = null, { persist = false } = {}) {
   if (!invoice || !["paid", "settled"].includes(String(invoice.status || ""))) return null;
   if (Number(invoice.integrity_hold || 0) === 1) return null;
   const openReview = db.prepare(
@@ -10582,11 +10972,9 @@ function buildSignedPaymentReceipt(invoice, store = null) {
   if (existing?.revoked_at) return null;
   if (existing) {
     if (String(existing.content_sha256) !== contentSha256) {
-      db.prepare(
-        `UPDATE payment_receipts
-         SET revoked_at = COALESCE(revoked_at, ?), revocation_reason = COALESCE(revocation_reason, 'receipt_content_changed')
-         WHERE id = ?`
-      ).run(nowIso(), existing.id);
+      // A public read must never mutate receipt history.  Content drift is an
+      // integrity failure for the caller and is handled by the financial
+      // transaction that owns receipt issuance.
       return null;
     }
     const existingSecret = paymentReceiptSecretForKid(existing.kid);
@@ -10609,6 +10997,7 @@ function buildSignedPaymentReceipt(invoice, store = null) {
       signed_message: existing.signed_message,
     };
   }
+  if (!persist) return null;
   const signingKid = PAYMENT_RECEIPT_KID;
   const signingSecret = paymentReceiptSecretForKid(signingKid);
   if (!signingSecret) return null;
@@ -10660,6 +11049,34 @@ function buildSignedPaymentReceipt(invoice, store = null) {
     signature_algorithm: "HMAC-SHA256",
     signed_message: signedMessage,
   };
+}
+
+function issueSignedPaymentReceipt(invoice, store = null, auditContext = {}) {
+  const existing = db.prepare(`SELECT id FROM payment_receipts WHERE invoice_id = ?`).get(invoice?.id);
+  const receiptStore = store || db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice?.store_id);
+  const receipt = buildSignedPaymentReceipt(invoice, receiptStore, { persist: true });
+  if (!receipt) throw new Error("RECEIPT_NOT_READY");
+  if (!existing) {
+    audit({
+      storeId: invoice.store_id,
+      actorType: auditContext.actorType || "service",
+      actorId: auditContext.actorId || "payment-finality",
+      action: "receipt.issued",
+      targetType: "invoice",
+      targetId: invoice.id,
+      requestId: auditContext.requestId || null,
+      idempotencyKey: auditContext.idempotencyKey || null,
+      beforeState: null,
+      afterState: {
+        receipt_version: receipt.receipt_version,
+        content_sha256: receipt.content_sha256,
+        kid: receipt.kid,
+        blockchain_transfer_id: receipt.blockchain_transfer_id,
+      },
+      ip: auditContext.ip || null,
+    });
+  }
+  return receipt;
 }
 
 function listReviewIncidents(invoiceId) {
@@ -11182,6 +11599,85 @@ function settlementPrimaryPaymentEvent(invoice) {
     .get(invoice.id, String(invoice.chain_id || ""), invoice.paid_tx_hash) || null;
 }
 
+function buildSettlementFrozenEvidence(invoiceId) {
+  // SQLite does not provide a SHA-256 function.  Keep raw payloads out of the
+  // frozen export and add hashes below from the stored JSON.
+  const paymentAttemptRows = db.prepare(
+    `SELECT id, chain_id, tx_hash, log_index, status, source, verified_onchain,
+            amount_scale_version, token_decimals, ledger_decimals, token_amount_atomic,
+            ledger_amount_base, display_amount, block_number, block_hash, block_timestamp,
+            confirmations, canonical_status, recognition_status, payload_json, created_at
+     FROM payment_attempts
+     WHERE invoice_id = ?
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoiceId).map((row) => ({
+    ...row,
+    payload_json: undefined,
+    payload_hash: sha256(String(row.payload_json || "")),
+  }));
+  const paymentEvents = db.prepare(
+    `SELECT id, event_type, chain_id, tx_hash, log_index, block_number, confirmations,
+            token_contract, amount_atomic, ledger_amount_base, display_amount,
+            canonical_status, recognition_status, observed_at, block_hash,
+            block_timestamp, detected_at, created_at, raw_payload
+     FROM payment_events
+     WHERE invoice_id = ?
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoiceId).map((row) => ({
+    ...row,
+    raw_payload: undefined,
+    raw_payload_hash: sha256(String(row.raw_payload || "")),
+  }));
+  const reviewIncidents = db.prepare(
+    `SELECT id, invoice_version, incident_type, evidence_fingerprint, primary_reason,
+            status, resolution_status, disposition, created_at
+     FROM review_incidents
+     WHERE invoice_id = ?
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoiceId);
+  const reviewIncidentEvents = db.prepare(
+    `SELECT rie.id, rie.review_incident_id, rie.event_type, rie.actor_id,
+            rie.payload_hash, rie.created_at
+     FROM review_incident_events rie
+     JOIN review_incidents ri ON ri.id = rie.review_incident_id
+     WHERE ri.invoice_id = ?
+     ORDER BY rie.created_at ASC, rie.id ASC`
+  ).all(invoiceId);
+  const refunds = db.prepare(
+    `SELECT id, review_case_id, refund_case_id, invoice_id, original_invoice_id,
+            checkout_session_id, original_tx_hash, reason, requested_by, approved_by,
+            status, refund_amount_jpyc_base, refund_to_address, refund_chain_id,
+            refund_tx_hash, refund_tx_log_index, blockchain_transfer_id,
+            executed_by, executor_type, execution_ref, chain_id, token_contract,
+            block_number, block_timestamp, finality_confirmations,
+            finality_required_confirmations, canonical_status, reorg_hold,
+            finalized_at, detected_at, verified_at, audit_log_refs, created_at, updated_at
+     FROM refund_requests
+     WHERE invoice_id = ?
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoiceId);
+  const adjustments = db.prepare(
+    `SELECT id, related_review_case_id, adjustment_type, amount_jpyc_base,
+            reason, created_by, approved_by, status, created_at, approved_at,
+            evidence_json
+     FROM accounting_adjustments
+     WHERE invoice_id = ?
+     ORDER BY created_at ASC, id ASC`
+  ).all(invoiceId).map((row) => ({
+    ...row,
+    evidence_json: undefined,
+    evidence_hash: sha256(String(row.evidence_json || "")),
+  }));
+  return {
+    payment_attempts: paymentAttemptRows,
+    payment_events: paymentEvents,
+    review_incidents: reviewIncidents,
+    review_incident_events: reviewIncidentEvents,
+    refunds,
+    adjustments,
+  };
+}
+
 function buildSettlementExportRow({
   invoice,
   paymentSession,
@@ -11191,6 +11687,7 @@ function buildSettlementExportRow({
   refundSummary,
   refundAttribution,
   hasRefunds,
+  settlementId = null,
   exportRunId,
   businessDate,
   createdAt,
@@ -11302,6 +11799,7 @@ function buildSettlementExportRow({
   ]);
   const externalSyncRefs = [...new Set([providerPaymentRef, providerSettlementRef].filter(Boolean))];
   const accountingEventRefs = settlementAccountingEventRefs(invoice.id, businessDate);
+  const frozenEvidence = buildSettlementFrozenEvidence(invoice.id);
   const evidenceHash = hashProviderEvidence({
     invoice_id: invoice.id,
     payment_session_id: paymentSession?.id || null,
@@ -11313,13 +11811,14 @@ function buildSettlementExportRow({
     refund_references: refundSummary.refund_references,
     refund_attribution: refundAttribution,
     accounting_status: accountingStatus,
+    frozen_evidence: frozenEvidence,
   });
 
   const rowId = uuid();
   return {
     id: rowId,
     export_reference: `settlement-export-run:${exportRunId}`,
-    settlement_id: invoice.settlement_id || null,
+    settlement_id: settlementId || invoice.settlement_id || null,
     settlement_export_run_id: exportRunId,
     settlement_export_row_id: rowId,
     export_run_id: exportRunId,
@@ -11365,6 +11864,7 @@ function buildSettlementExportRow({
     exception_amount_jpyc_base: exceptionAmount,
     refund_amount_jpyc_base: refundAmount,
     refund_attribution: refundAttribution,
+    frozen_evidence: frozenEvidence,
     ...refundSummary,
     void_amount_jpyc_base: voidAmount,
     provider_payment_ref: providerPaymentRef,
@@ -11379,6 +11879,7 @@ function buildSettlementExportRow({
 }
 
 function createSettlementExportSnapshot({
+  settlementId = null,
   businessDate,
   store,
   terminalId = null,
@@ -11392,9 +11893,9 @@ function createSettlementExportSnapshot({
   const createdAt = nowIso();
   db.prepare(
     `INSERT INTO settlement_export_runs
-     (id, export_version, business_date, store_id, terminal_id, status, exported_at, created_by, created_at)
-     VALUES (?, 'v2', ?, ?, ?, 'created', ?, ?, ?)`
-  ).run(runId, businessDate, store.id, terminalId || null, createdAt, actorId || null, createdAt);
+     (id, settlement_id, export_version, business_date, store_id, terminal_id, status, exported_at, created_by, created_at)
+     VALUES (?, ?, 'v2', ?, ?, ?, 'created', ?, ?, ?)`
+  ).run(runId, settlementId || null, businessDate, store.id, terminalId || null, createdAt, actorId || null, createdAt);
 
   audit({
     actorType: actorId ? "admin" : "system",
@@ -11446,6 +11947,7 @@ function createSettlementExportSnapshot({
         refundSummary: rowRefundSummary,
         refundAttribution,
         hasRefunds,
+        settlementId,
         exportRunId: runId,
         businessDate,
         createdAt,
@@ -12179,6 +12681,24 @@ function postPaymentMonitorUntil() {
   return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
 }
 
+function ensureConfirmationWaitWindow(invoice, observedAt = null) {
+  if (!invoice?.id || String(invoice.status || "") !== "confirming") return invoice;
+  const startedAtRaw = String(invoice.confirmation_started_at || observedAt || nowIso());
+  const startedAtMs = Date.parse(startedAtRaw);
+  const startedAt = Number.isFinite(startedAtMs) ? new Date(startedAtMs).toISOString() : nowIso();
+  const deadlineAt = new Date(
+    (Number.isFinite(startedAtMs) ? startedAtMs : Date.now()) + CONFIRMATION_SLA_SEC * 1000
+  ).toISOString();
+  db.prepare(
+    `UPDATE invoices
+     SET confirmation_started_at = COALESCE(confirmation_started_at, ?),
+         confirmation_deadline_at = COALESCE(confirmation_deadline_at, ?),
+         confirmation_sla_sec = COALESCE(confirmation_sla_sec, ?)
+     WHERE id = ?`
+  ).run(startedAt, deadlineAt, CONFIRMATION_SLA_SEC, invoice.id);
+  return db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+}
+
 function enqueuePaymentNotificationOutbox({ invoice, paymentEventId, notificationType, confirmations, amountBase, txHash, status, reason }) {
   if (!invoice?.id || !paymentEventId || !notificationType) return { queued: false, id: null };
   const timestamp = nowIso();
@@ -12206,15 +12726,37 @@ function enqueuePaymentNotificationOutbox({ invoice, paymentEventId, notificatio
         : `JPYC支払いを検知しました。確認数 ${Number(confirmations || 0)}/${FULFILLMENT_REQUIRED_CONFIRMATIONS}。`,
     reason: reason || null,
   };
+  const domainEventId = sha256(`payment.notification:${invoice.id}:${paymentEventId}:${notificationType}`);
+  db.prepare(
+    `INSERT INTO domain_event_outbox
+     (id, aggregate_type, aggregate_id, aggregate_version, event_type, payload_json,
+      status, available_at, published_at, last_error, created_at, updated_at)
+     VALUES (?, 'invoice', ?, ?, 'payment.notification', ?, 'pending', ?, NULL, NULL, ?, ?)
+     ON CONFLICT(id) DO NOTHING`
+  ).run(
+    domainEventId,
+    invoice.id,
+    Number(invoice.version || invoice.invoice_version || 1),
+    JSON.stringify(payload),
+    timestamp,
+    timestamp,
+    timestamp,
+  );
+  const domainEvent = db.prepare(`SELECT id, event_sequence FROM domain_event_outbox WHERE id = ?`).get(domainEventId);
+  if (!domainEvent) throw new Error("DOMAIN_EVENT_OUTBOX_INSERT_FAILED");
+  const outboxId = uuid();
   const queued = db.prepare(
     `INSERT OR IGNORE INTO payment_notification_outbox
-     (id, invoice_id, payment_event_id, notification_type, audience, status, attempt_count,
+     (id, invoice_id, payment_event_id, domain_event_id, domain_event_sequence,
+      notification_type, audience, status, attempt_count,
       available_at, payload_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`
   ).run(
-    uuid(),
+    outboxId,
     invoice.id,
     paymentEventId,
+    domainEvent.id,
+    domainEvent.event_sequence,
     notificationType,
     "customer_and_staff",
     timestamp,
@@ -12222,7 +12764,14 @@ function enqueuePaymentNotificationOutbox({ invoice, paymentEventId, notificatio
     timestamp,
     timestamp,
   );
-  return { queued: queued.changes === 1, id: queued.changes === 1 ? queued.lastInsertRowid || null : null };
+  if (queued.changes === 0) {
+    const existing = db.prepare(
+      `SELECT id FROM payment_notification_outbox
+       WHERE payment_event_id = ? AND notification_type = ? AND audience = ?`
+    ).get(paymentEventId, notificationType, "customer_and_staff");
+    return { queued: false, id: existing?.id || null };
+  }
+  return { queued: true, id: outboxId };
 }
 
 function processPaymentEvent({
@@ -12584,12 +13133,22 @@ function processPaymentEvent({
                       nowIso(),
                       invoice.id
           );
-          const confirmationAfterUpdate = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+          let confirmationAfterUpdate = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+          if (outcome.nextStatus === "confirming") {
+            confirmationAfterUpdate = ensureConfirmationWaitWindow(confirmationAfterUpdate, nextBlockTimestamp || nextDetectedAt);
+          }
           if (outcome.nextStatus === "paid") {
             resolveEligibleReviewIncidentsAsPaid({
               invoice: confirmationAfterUpdate,
               primaryTransferId: globalTransfer.transferId || null,
               actorId: "chain-monitor",
+              requestId,
+              idempotencyKey,
+              ip,
+            });
+            issueSignedPaymentReceipt(confirmationAfterUpdate, null, {
+              actorType,
+              actorId,
               requestId,
               idempotencyKey,
               ip,
@@ -12792,19 +13351,7 @@ function processPaymentEvent({
         },
       });
     } else if (outcome.nextStatus === "confirming") {
-      // Confirmation waiting is an auditable incident, not an invisible
-      // transitional status.  It is intentionally eligible for automatic
-      // resolution only when this exact transfer later reaches the paid
-      // recognition threshold.
-      upsertReviewCase(update.invoice, REVIEW_REASON_CODES.OTHER, {
-        txHash: event.tx_hash,
-        eventAmountBase: parsedAmountBase,
-        blockTimestamp: eventBlockTimestamp,
-        detectedAt: nowIso(),
-        transferId: globalTransfer.transferId || null,
-        incidentType: "AWAITING_CONFIRMATIONS",
-        suggestedAction: "wait_for_confirmations",
-      });
+      ensureConfirmationWaitWindow(update.invoice, eventObservedAt || eventBlockTimestamp);
     }
 
     const appliedIntegrityHoldReason = integrityHoldReason
@@ -12871,12 +13418,22 @@ function processPaymentEvent({
       nowIso(),
       invoice.id
     );
-    const refreshed = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+    let refreshed = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoice.id);
+    if (outcome.nextStatus === "confirming") {
+      refreshed = ensureConfirmationWaitWindow(refreshed, eventObservedAt || eventBlockTimestamp);
+    }
     if (outcome.nextStatus === "paid") {
       resolveEligibleReviewIncidentsAsPaid({
         invoice: refreshed,
         primaryTransferId: globalTransfer.transferId || null,
         actorId: "chain-monitor",
+        requestId,
+        idempotencyKey,
+        ip,
+      });
+      issueSignedPaymentReceipt(refreshed, null, {
+        actorType,
+        actorId,
         requestId,
         idempotencyKey,
         ip,
@@ -14385,8 +14942,18 @@ app.use((req, res, next) => {
     "/api/v1/invoices",
     "/api/v1/streams/",
   ];
-  if (noStorePaths.some((prefix) => String(req.path || "").startsWith(prefix))) {
-    res.setHeader("Cache-Control", "no-store");
+  const noStore = noStorePaths.some((prefix) => String(req.path || "").startsWith(prefix));
+  if (noStore) {
+    res.setHeader("Cache-Control", "no-store, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+  }
+  const publicPath = String(req.path || "").startsWith("/api/v1/public/")
+    || ["/terminal.html", "/terminal-entry.html", "/mobile.html", "/pay"].some((prefix) => String(req.path || "").startsWith(prefix));
+  if (publicPath) {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'");
   }
   next();
 });
@@ -14408,15 +14975,18 @@ app.get("/", (_req, res) => {
 
 app.get("/pay", (req, res) => {
   const parsed = parseSignedPayRef(req.query.ref);
-  if (!parsed || !parsed.invoiceId || !parsed.exp || !parsed.nonce || !parsed.sig) {
+  const legacyDevelopmentRef = parsed && !parsed.purpose && !IS_PRODUCTION;
+  if (!parsed || (!parsed.purpose && !legacyDevelopmentRef) || (parsed.purpose && parsed.purpose !== "payment_link") || !parsed.invoiceId || !parsed.exp || !parsed.nonce || !parsed.sig) {
     return jsonError(res, 400, "INVALID_PAYMENT_REF", "Invalid payment reference");
   }
-  const verified = verifySig(parsed.invoiceId, parsed.exp, parsed.nonce, parsed.sig);
+  const verified = verifySig(parsed.invoiceId, parsed.exp, parsed.nonce, parsed.sig, parsed.kid, parsed.iat, parsed.purpose);
   if (!verified.ok) {
     return jsonError(res, 401, "UNAUTHORIZED", "Invalid payment reference signature");
   }
   return res.redirect(
-    `/mobile.html?invoiceId=${encodeURIComponent(parsed.invoiceId)}&exp=${encodeURIComponent(parsed.exp)}&nonce=${encodeURIComponent(
+    `/mobile.html?invoiceId=${encodeURIComponent(parsed.invoiceId)}&exp=${encodeURIComponent(parsed.exp)}&iat=${encodeURIComponent(
+      parsed.iat
+    )}&kid=${encodeURIComponent(parsed.kid)}&purpose=${encodeURIComponent(parsed.purpose)}&nonce=${encodeURIComponent(
       parsed.nonce
     )}&sig=${encodeURIComponent(parsed.sig)}`
   );
@@ -14689,11 +15259,16 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
     db.prepare(`UPDATE staff_users SET pin_hash = ?, updated_at = ? WHERE id = ?`).run(hashPin(staffPin), nowIso(), staff.id);
   }
 
-  const rawToken = `${uuid()}-${uuid()}`;
-  const tokenHash = sha256(rawToken);
   const sid = uuid();
   const ts = nowIso();
   const expiresAt = new Date(new Date(ts).getTime() + SESSION_TTL_SEC * 1000).toISOString();
+  const rawToken = createSessionToken({
+    sessionId: sid,
+    terminalId: terminal.id,
+    staffUserId: staff.id,
+    expiresAtIso: expiresAt,
+  });
+  const tokenHash = sha256(rawToken);
   db.prepare(
     `INSERT INTO terminal_sessions (id, terminal_id, staff_user_id, token_hash, started_at)
      VALUES (?, ?, ?, ?, ?)`
@@ -15478,7 +16053,7 @@ app.post("/api/v1/terminals", requirePermission("terminal.manage"), (req, res) =
     }
     const terminalId = uuid();
     const ts = nowIso();
-    const publicEntryToken = generateTerminalPublicEntryToken();
+    const publicEntryToken = generateTerminalPublicEntryToken(terminalId);
     db.prepare(
       `INSERT INTO terminals(id, store_id, terminal_code, public_entry_token, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -15652,6 +16227,7 @@ app.post("/api/v1/terminal-sessions/:sessionId/revoke", requirePermission("sessi
 });
 
 app.delete("/api/v1/terminal-sessions/current", (req, res) => {
+  res.setHeader("Clear-Site-Data", '"cache", "cookies", "storage"');
   const actorId = req.session.staff_user_id;
   return idempotent(req, res, "DELETE:/api/v1/terminal-sessions/current", actorId, () => {
     const requestId = requestIdFromReq(req);
@@ -16106,6 +16682,8 @@ app.post("/api/v1/invoices", (req, res) => {
     }
     const issuanceBlocked = getInvoiceIssuanceBlockReason({ store, session: req.session });
     if (issuanceBlocked) {
+      const acceptanceUnavailable = getPaymentAcceptanceUnavailableError(issuanceBlocked);
+      if (acceptanceUnavailable) return { status: 503, body: { error: acceptanceUnavailable } };
       const status = issuanceBlocked.code === "NOT_FOUND" || issuanceBlocked.code === "TERMINAL_NOT_FOUND" ? 404 : 503;
       return { status, body: { error: issuanceBlocked } };
     }
@@ -16618,6 +17196,8 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
     }
     const issuanceBlocked = getInvoiceIssuanceBlockReason({ store, session: req.session });
     if (issuanceBlocked) {
+      const acceptanceUnavailable = getPaymentAcceptanceUnavailableError(issuanceBlocked);
+      if (acceptanceUnavailable) return { status: 503, body: { error: acceptanceUnavailable } };
       const status = issuanceBlocked.code === "NOT_FOUND" || issuanceBlocked.code === "TERMINAL_NOT_FOUND" ? 404 : 503;
       return { status, body: { error: issuanceBlocked } };
     }
@@ -20001,6 +20581,7 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
         ip: req.ip
       });
       const snapshot = createSettlementExportSnapshot({
+        settlementId,
         businessDate,
         store,
         terminalId: null,
@@ -20520,6 +21101,10 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
   const terminalId = String(req.params.terminalId || "");
   const invoiceId = String(req.query.invoice_id || "");
   const sseToken = String(req.query.sse_token || "");
+  const requestedLastEventId = Number(req.header("last-event-id") || req.query.last_event_id);
+  const lastEventId = Number.isInteger(requestedLastEventId) && requestedLastEventId >= 0
+    ? requestedLastEventId
+    : null;
   const verified = verifySseToken(sseToken, { invoiceId, terminalId });
   if (!verified.ok) {
     const status = verified.code === "SSE_TOKEN_EXPIRED" ? 401 : 403;
@@ -20546,7 +21131,7 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     return jsonError(res, 403, "FORBIDDEN", "Session is no longer active");
   }
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Cache-Control", "no-store, private");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
@@ -20567,7 +21152,7 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     store_id: invoice.store_id,
     details: {
       client_count: clients.size,
-      last_event_id: req.header("last-event-id") || null,
+      last_event_id: lastEventId,
     },
   });
 
@@ -20598,8 +21183,35 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     fulfillment_hold: Number(row.integrity_hold || 0) === 1 || row.status === "review_required",
     fulfillment_decision: buildAuthoritativeFulfillmentDecision(row),
     status_version: row.updated_at || null,
-    last_event_id: req.header("last-event-id") || null,
+    last_event_id: lastEventId,
   });
+  const writeReplay = () => {
+    if (lastEventId === null || res.writableEnded) return;
+    const replayRows = db.prepare(
+      `SELECT event_sequence, event_type, payload_json
+       FROM domain_event_outbox
+       WHERE aggregate_type = 'invoice'
+         AND aggregate_id = ?
+         AND event_sequence > ?
+         AND status IN ('published', 'applied')
+       ORDER BY event_sequence ASC
+       LIMIT 200`
+    ).all(invoiceId, lastEventId);
+    for (const row of replayRows) {
+      let payload;
+      try {
+        payload = JSON.parse(String(row.payload_json || "{}"));
+      } catch (_error) {
+        continue;
+      }
+      const replayPayload = {
+        ...payload,
+        invoiceId: payload.invoiceId || payload.invoice_id || invoiceId,
+        replayed: true,
+      };
+      res.write(`id: ${row.event_sequence}\nevent: ${row.event_type}\ndata: ${JSON.stringify(replayPayload)}\n\n`);
+    }
+  };
   let lastStreamSnapshot = JSON.stringify(buildStreamSnapshot(invoice));
   const writeStreamSnapshotIfChanged = () => {
     if (res.writableEnded) return;
@@ -20633,6 +21245,7 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     }
   };
   try {
+    writeReplay();
     const snapshotPayload = buildStreamSnapshot(invoice);
     res.write(`event: snapshot\ndata: ${JSON.stringify(snapshotPayload)}\n\n`);
     res.write(`event: invoice.updated\ndata: ${JSON.stringify(snapshotPayload)}\n\n`);
@@ -20669,26 +21282,25 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
   res.on("error", cleanup);
 });
 
-app.get("/api/v1/public/config", (_req, res) => {
-  const commercial = evaluateCommercialRuntimeGate();
+app.get("/api/v1/public/config", (req, res) => {
+  if (publicRequestPreflight(req, res)) return;
   return res.json({
-    app_env: APP_ENV,
-    commercial_go_mode: commercial.commercial_go_mode,
-    commercial_verdict: commercial.commercial_verdict,
-    demo_controls_enabled: DEMO_CONTROLS_ENABLED,
     public_payment_simulation_enabled: ENABLE_PUBLIC_PAYMENT_SIMULATION,
-    diagnostic_mode_enabled: DIAGNOSTIC_MODE_ENABLED,
-    wallet_adapter: WALLET_ADAPTER
+    prototype_demo_enabled: DEMO_CONTROLS_ENABLED && !IS_PRODUCTION,
+    wallet_adapter: {
+      adapter_type: WALLET_ADAPTER.adapter_type || null,
+      available: WALLET_ADAPTER.available === true,
+      status: WALLET_ADAPTER.status || null,
+      reason: WALLET_ADAPTER.reason || null,
+    },
   });
 });
 
 app.get("/api/v1/public/terminal-entry/:publicEntryToken", (req, res) => {
+  if (publicRequestPreflight(req, res)) return;
   const publicEntryToken = String(req.params.publicEntryToken || "").trim();
   if (!publicEntryToken) {
     return jsonError(res, 400, "VALIDATION_ERROR", "Terminal entry token is required");
-  }
-  if (isPublicRateLimited(`public:terminal-entry:${req.ip}:${publicEntryToken}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
   }
   const entry = buildPublicTerminalEntryState(publicEntryToken);
   if (!entry) {
@@ -20698,11 +21310,9 @@ app.get("/api/v1/public/terminal-entry/:publicEntryToken", (req, res) => {
 });
 
 app.post("/api/v1/public/terminal-entry/:publicEntryToken/claim", (req, res) => {
+  if (publicRequestPreflight(req, res)) return;
   const publicEntryToken = String(req.params.publicEntryToken || "").trim();
   if (!publicEntryToken) return jsonError(res, 400, "VALIDATION_ERROR", "Terminal entry token is required");
-  if (isPublicRateLimited(`public:terminal-entry-claim:${req.ip}:${publicEntryToken}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
   const result = createTerminalCheckoutClaim({
     publicEntryToken,
     anonymousDeviceId: req.body?.anonymous_device_id,
@@ -20730,11 +21340,9 @@ app.post("/api/v1/public/terminal-entry/:publicEntryToken/claim", (req, res) => 
 });
 
 app.post("/api/v1/public/terminal-entry/:publicEntryToken/claim/:claimId/consume", (req, res) => {
+  if (publicRequestPreflight(req, res)) return;
   const publicEntryToken = String(req.params.publicEntryToken || "").trim();
   if (!publicEntryToken) return jsonError(res, 400, "VALIDATION_ERROR", "Terminal entry token is required");
-  if (isPublicRateLimited(`public:terminal-entry-claim-consume:${req.ip}:${publicEntryToken}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
   const result = consumeTerminalCheckoutClaim({
     publicEntryToken,
     claimId: req.params.claimId,
@@ -20764,15 +21372,11 @@ app.post("/api/v1/public/terminal-entry/:publicEntryToken/claim/:claimId/consume
 });
 
 app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
-  const invoiceId = req.params.invoiceId;
-  if (isPublicRateLimited(`public:get:${req.ip}:${invoiceId}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
-  const sig = String(req.query.sig || "");
-  const exp = String(req.query.exp || "");
-  const nonce = String(req.query.nonce || "");
-  const verified = verifySig(invoiceId, exp, nonce, sig);
+  const invoiceId = String(req.params.invoiceId || "");
+  if (publicRequestPreflight(req, res, { invoiceId })) return;
+  const verified = verifyPublicInvoiceSignature(req, invoiceId);
   if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  if (publicInvoiceRateLimit(req, res, invoiceId)) return;
   const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);
@@ -20858,14 +21462,10 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
 
 app.get("/api/v1/public/invoices/:invoiceId/receipt", (req, res) => {
   const invoiceId = String(req.params.invoiceId || "");
-  if (isPublicRateLimited(`public:receipt:${req.ip}:${invoiceId}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
-  const sig = String(req.query.sig || "");
-  const exp = String(req.query.exp || "");
-  const nonce = String(req.query.nonce || "");
-  const verified = verifySig(invoiceId, exp, nonce, sig);
+  if (publicRequestPreflight(req, res, { invoiceId })) return;
+  const verified = verifyPublicInvoiceSignature(req, invoiceId);
   if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  if (publicInvoiceRateLimit(req, res, invoiceId)) return;
   const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);
@@ -20873,30 +21473,11 @@ app.get("/api/v1/public/invoices/:invoiceId/receipt", (req, res) => {
   if (!receipt) {
     return jsonError(res, 409, "RECEIPT_NOT_READY", "A signed receipt is issued only after canonical payment recognition and review closure");
   }
-  audit({
-    storeId: invoice.store_id,
-    actorType: "customer",
-    actorId: invoice.id,
-    action: "receipt.issued",
-    targetType: "invoice",
-    targetId: invoice.id,
-    requestId: requestIdFromReq(req),
-    beforeState: null,
-    afterState: {
-      receipt_version: receipt.receipt_version,
-      content_sha256: receipt.content_sha256,
-      kid: receipt.kid,
-      blockchain_transfer_id: receipt.blockchain_transfer_id,
-    },
-    ip: req.ip,
-  });
   return res.json({ receipt });
 });
 
 app.post("/api/v1/public/payment-receipts/verify", (req, res) => {
-  if (isPublicRateLimited(`public:receipt-verify:${req.ip}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
+  if (publicRequestPreflight(req, res)) return;
   const input = req.body?.receipt && typeof req.body.receipt === "object"
     ? req.body.receipt
     : req.body;
@@ -20951,14 +21532,10 @@ app.post("/api/v1/public/payment-receipts/verify", (req, res) => {
 
 app.post("/api/v1/public/invoices/:invoiceId/payment-recovery", async (req, res) => {
   const invoiceId = String(req.params.invoiceId || "").trim();
-  if (isPublicRateLimited(`public:payment-recovery:${req.ip}:${invoiceId}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
-  const sig = String(req.query.sig || "");
-  const exp = String(req.query.exp || "");
-  const nonce = String(req.query.nonce || "");
-  const verified = verifySig(invoiceId, exp, nonce, sig);
+  if (publicRequestPreflight(req, res, { invoiceId })) return;
+  const verified = verifyPublicInvoiceSignature(req, invoiceId);
   if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  if (publicInvoiceRateLimit(req, res, invoiceId)) return;
   const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
   const result = await createPaymentRecoveryReport({
@@ -20978,21 +21555,17 @@ app.post("/api/v1/public/invoices/:invoiceId/payment-recovery", async (req, res)
 });
 
 app.post("/api/v1/public/invoices/:invoiceId/pay", (req, res) => {
+  const invoiceId = String(req.params.invoiceId || "");
+  if (publicRequestPreflight(req, res, { invoiceId })) return;
   if (!ENABLE_PUBLIC_PAYMENT_SIMULATION) {
     return jsonError(res, 403, "SIMULATION_DISABLED", "Public payment simulation is disabled in this environment");
   }
   if (isPaymentsDisabled()) {
     return jsonError(res, 503, "PAYMENTS_DISABLED", "Payments are temporarily disabled");
   }
-  const invoiceId = req.params.invoiceId;
-  if (isPublicRateLimited(`public:pay:${req.ip}:${invoiceId}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
-  const sig = String(req.query.sig || "");
-  const exp = String(req.query.exp || "");
-  const nonce = String(req.query.nonce || "");
-  const verified = verifySig(invoiceId, exp, nonce, sig);
+  const verified = verifyPublicInvoiceSignature(req, invoiceId);
   if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  if (publicInvoiceRateLimit(req, res, invoiceId)) return;
 
   const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
@@ -21050,15 +21623,11 @@ app.post("/api/v1/public/invoices/:invoiceId/pay", (req, res) => {
 });
 
 app.post("/api/v1/public/invoices/:invoiceId/consent", (req, res) => {
-  const invoiceId = req.params.invoiceId;
-  if (isPublicRateLimited(`public:consent:${req.ip}:${invoiceId}`)) {
-    return jsonError(res, 429, "RATE_LIMITED", "Too many requests");
-  }
-  const sig = String(req.query.sig || "");
-  const exp = String(req.query.exp || "");
-  const nonce = String(req.query.nonce || "");
-  const verified = verifySig(invoiceId, exp, nonce, sig);
+  const invoiceId = String(req.params.invoiceId || "");
+  if (publicRequestPreflight(req, res, { invoiceId })) return;
+  const verified = verifyPublicInvoiceSignature(req, invoiceId);
   if (!verified.ok) return jsonError(res, 401, "UNAUTHORIZED", "Invalid invoice signature");
+  if (publicInvoiceRateLimit(req, res, invoiceId)) return;
   const invoice = db.prepare(`SELECT * FROM invoices WHERE id = ?`).get(invoiceId);
   if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
   const store = db.prepare(`SELECT * FROM stores WHERE id = ?`).get(invoice.store_id);

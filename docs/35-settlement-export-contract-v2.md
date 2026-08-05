@@ -24,6 +24,7 @@ Extend the immutable settlement export with complete refund lineage and reproduc
 - Each new v2 row also freezes `amount_scale_version`, token/ledger decimals, the exact token atomic string, the ledger base-unit string, and the display amount. Accounting adapters must use `ledger_amount_base`; they must not derive it from JavaScript numbers or from the token atomic field.
 - Each new v2 row includes `accounting_event_refs`, the immutable IDs of payment-confirmed, refund-succeeded, and approved human-accounting-adjustment journal entries recognized for the invoice. A later adjustment therefore remains traceable through the original invoice without rewriting its payment state.
 - `settlement_export_rows.payload_json` stores the generated row payload. A later download reads this frozen payload rather than joining mutable operational tables.
+- The internal frozen payload may include `frozen_evidence` for the settlement evidence pack. Formal v2 downloads expose only the canonical contract fields and never export raw stored payloads.
 - Chain identity is explicit: `chain_id`, network, official funds-transfer JPYC contract, and recipient address are part of every new row.
 - JSON hashes cover the exact UTF-8 bytes of the canonical v2 payload and exclude self-referential content-hash fields and internal storage annotations.
 - CSV hashes cover the exact UTF-8 BOM v2 CSV download bytes.

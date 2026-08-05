@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
+import Database from "better-sqlite3";
 
 import {
   apiRequest,
@@ -18,7 +19,11 @@ import {
 test("public paid invoice exposes and audits a server-signed payment receipt", async (t) => {
   const env = baseServerEnv();
   const started = await startServerProcess(process.cwd(), env);
-  t.after(async () => stopServerProcess(started.proc));
+  const db = new Database(env.DB_PATH);
+  t.after(async () => {
+    db.close();
+    await stopServerProcess(started.proc);
+  });
   const staff = await loginAs(started.baseUrl, {
     terminalCode: env.TERMINAL_CODE,
     pin: env.STAFF_PIN,
@@ -41,6 +46,15 @@ test("public paid invoice exposes and audits a server-signed payment receipt", a
   });
   assert.equal(paid.status, 200);
   assert.equal(paid.data.status, "paid");
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM payment_receipts WHERE invoice_id = ?`).get(created.data.invoice_id).count,
+    1,
+    "receipt must be issued inside payment finality transaction"
+  );
+  const auditCountAfterPayment = db
+    .prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'receipt.issued' AND target_id = ?`)
+    .get(created.data.invoice_id).count;
+  assert.equal(auditCountAfterPayment, 1);
 
   const signed = parsePaymentUrl(created.data.payment_url);
   const publicQuery = `sig=${encodeURIComponent(signed.sig)}&exp=${encodeURIComponent(signed.exp)}&nonce=${encodeURIComponent(signed.nonce)}`;
@@ -70,6 +84,17 @@ test("public paid invoice exposes and audits a server-signed payment receipt", a
   );
   assert.equal(receiptEndpoint.status, 200);
   assert.deepEqual(receiptEndpoint.data.receipt, receipt);
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM payment_receipts WHERE invoice_id = ?`).get(created.data.invoice_id).count,
+    1,
+    "public receipt reads must not create additional receipt rows"
+  );
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'receipt.issued' AND target_id = ?`)
+      .get(created.data.invoice_id).count,
+    1,
+    "public receipt reads must not append issuance audit rows"
+  );
 
   const verifiedReceipt = await apiRequest(started.baseUrl, "/api/v1/public/payment-receipts/verify", {
     method: "POST",

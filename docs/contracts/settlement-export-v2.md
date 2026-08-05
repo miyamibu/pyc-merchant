@@ -14,6 +14,7 @@ Canonical contract summary for `settlement_export_v2`.
 - `accounting_event_refs` freezes the append-only payment/refund/manual-accounting-adjustment journal rows recognized for the invoice; the references preserve the adjustment trail without treating a human adjustment as a payment transition.
 - Refund references include the independent `refund_case_id`, optional related `review_case_id`, and optional `funding_lineage_id` so refund ownership and receive-address-to-treasury sweep evidence remain traceable.
 - The frozen row payload is stored at snapshot creation; downloads do not rebuild historical lineage from the current operational ledger.
+- Internal frozen evidence is retained with the row snapshot for evidence-pack generation; formal v2 JSON/CSV remains limited to the schema-defined canonical fields.
 - The JPYC rail is limited to chain IDs `1`, `43114`, and `137` with funds-transfer JPYC contract `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29`.
 - Daily-close exports bind to `settlement_id`; missing legacy bindings are reported as `legacy_export_missing` without guessing.
 - Vendor adapters may transform v2 but must preserve invoice, payment, refund, review, settlement, audit, and external-reference traceability.

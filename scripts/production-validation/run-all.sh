@@ -33,6 +33,11 @@ if [[ "$PRODUCTION_LIKE_VALIDATION" == "false" \
   export PAYMENT_RECEIPT_KEY_RING="app-secret-v1=${APP_SECRET}"
 fi
 
+if [[ "$PRODUCTION_LIKE_VALIDATION" == "false" ]]; then
+  export PAY_LINK_SIGNING_KEYS="${PAY_LINK_SIGNING_KEYS:-pay-v1=${APP_SECRET}}"
+  export SSE_SIGNING_KEYS="${SSE_SIGNING_KEYS:-sse-v1=${APP_SECRET}}"
+fi
+
 if [[ -z "${BASE_URL:-}" ]]; then
   case "${APP_HOST:-}" in
     http://127.0.0.1:*|http://localhost:*)

@@ -15,7 +15,7 @@ import {
   stopServerProcess,
 } from "./helpers/server-process.mjs";
 
-test("confirmation-waiting incidents resolve with the exact transfer when paid", async (t) => {
+test("confirmation waiting stays out of review incidents and blocks settlement explicitly", async (t) => {
   const env = baseServerEnv();
   const started = await startServerProcess(process.cwd(), env);
   const db = new Database(env.DB_PATH);
@@ -55,16 +55,21 @@ test("confirmation-waiting incidents resolve with the exact transfer when paid",
   assert.equal(pending.status, 200);
   assert.equal(pending.data.status, "confirming");
 
-  const openReview = db.prepare(
-    `SELECT id, status, reason_type FROM review_cases WHERE invoice_id = ?`
+  const pendingReview = db.prepare(
+    `SELECT id FROM review_cases WHERE invoice_id = ?`
   ).get(created.data.invoice_id);
-  assert.equal(openReview.status, "open");
-  assert.equal(openReview.reason_type, "OTHER");
-  const openIncident = db.prepare(
-    `SELECT id, incident_type, status FROM review_incidents WHERE invoice_id = ?`
+  assert.equal(pendingReview, undefined);
+  const pendingIncidentCount = db.prepare(
+    `SELECT COUNT(*) AS count FROM review_incidents WHERE invoice_id = ?`
+  ).get(created.data.invoice_id).count;
+  assert.equal(pendingIncidentCount, 0);
+  const pendingInvoice = db.prepare(
+    `SELECT confirmation_started_at, confirmation_deadline_at, confirmation_sla_sec
+     FROM invoices WHERE id = ?`
   ).get(created.data.invoice_id);
-  assert.equal(openIncident.incident_type, "AWAITING_CONFIRMATIONS");
-  assert.equal(openIncident.status, "open");
+  assert.ok(pendingInvoice.confirmation_started_at);
+  assert.ok(pendingInvoice.confirmation_deadline_at);
+  assert.equal(pendingInvoice.confirmation_sla_sec, 900);
 
   const paid = await ingestManualPayment(
     started.baseUrl,
@@ -75,34 +80,11 @@ test("confirmation-waiting incidents resolve with the exact transfer when paid",
   assert.equal(paid.status, 200);
   assert.equal(paid.data.status, "paid");
 
-  const closedReview = db.prepare(
-    `SELECT status, resolution_status, disposition FROM review_cases WHERE id = ?`
-  ).get(openReview.id);
-  assert.deepEqual(closedReview, {
-    status: "resolved",
-    resolution_status: "settled",
-    disposition: "accepted_as_paid",
-  });
-  const closedIncident = db.prepare(
-    `SELECT status, resolution_status, disposition FROM review_incidents WHERE id = ?`
-  ).get(openIncident.id);
-  assert.deepEqual(closedIncident, {
-    status: "resolved",
-    resolution_status: "settled",
-    disposition: "accepted_as_paid",
-  });
-  const resolutionEvent = db.prepare(
-    `SELECT event_type, payload_json FROM review_incident_events
-     WHERE review_incident_id = ? AND event_type = 'incident.resolved'`
-  ).get(openIncident.id);
-  assert.equal(resolutionEvent.event_type, "incident.resolved");
-  assert.equal(JSON.parse(resolutionEvent.payload_json).incident_id, openIncident.id);
-
   const reviews = await apiRequest(started.baseUrl, "/api/v1/reviews", {
     headers: authHeaders(staff.token),
   });
   assert.equal(reviews.status, 200);
-  assert.equal(reviews.data.reviews.find((row) => row.invoice_id === created.data.invoice_id).status, "resolved");
+  assert.equal(reviews.data.reviews.some((row) => row.invoice_id === created.data.invoice_id), false);
 
   const dailyStatus = await apiRequest(started.baseUrl, "/api/v1/settlements/daily-status", {
     headers: authHeaders(staff.token),

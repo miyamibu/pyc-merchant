@@ -282,6 +282,8 @@ const state = {
   sseReason: "未接続",
   sseUpdatedAt: "",
   lastStreamEventAt: "",
+  lastStreamEventId: 0,
+  processedStreamEventKeys: new Set(),
   sseReconnectTimer: null,
   fallbackPollTimer: null,
   fallbackPollingStatus: "idle",
@@ -2709,7 +2711,11 @@ function renderAmountCompare(invoice) {
 function renderInvoice(invoice) {
   const previousInvoiceId = state.invoiceId;
   const nextInvoiceId = String(invoice?.invoice_id || "");
-  if (previousInvoiceId && previousInvoiceId !== nextInvoiceId) state.pendingDangerAction = "";
+  if (previousInvoiceId && previousInvoiceId !== nextInvoiceId) {
+    state.pendingDangerAction = "";
+    state.lastStreamEventId = 0;
+    state.processedStreamEventKeys.clear();
+  }
   state.currentInvoice = invoice;
   state.invoiceDiagnostics = invoice.diagnostics || null;
   state.invoiceId = invoice.invoice_id || "";
@@ -2765,6 +2771,8 @@ function clearInvoiceView() {
   state.selectedReviewId = "";
   state.selectedReviewDetail = null;
   state.sseToken = "";
+  state.lastStreamEventId = 0;
+  state.processedStreamEventKeys.clear();
   setInvoiceStatusPill("");
   el.invoiceIdText.textContent = "-";
   el.paymentUrlLink.textContent = "-";
@@ -2910,7 +2918,8 @@ async function connectTerminalStream() {
 
   const streamUrl =
     `/api/v1/streams/terminals/${encodeURIComponent(terminalId)}` +
-    `?invoice_id=${encodeURIComponent(invoiceId)}&sse_token=${encodeURIComponent(sseToken)}`;
+    `?invoice_id=${encodeURIComponent(invoiceId)}&sse_token=${encodeURIComponent(sseToken)}` +
+    (state.lastStreamEventId > 0 ? `&last_event_id=${encodeURIComponent(state.lastStreamEventId)}` : "");
 
   const stream = new EventSource(streamUrl);
   state.sse = stream;
@@ -2935,6 +2944,17 @@ async function connectTerminalStream() {
       return;
     }
     try {
+      const eventId = Number(event.lastEventId || 0);
+      if (Number.isInteger(eventId) && eventId > 0) {
+        const eventKey = `${eventId}:${event.type}`;
+        if (state.processedStreamEventKeys.has(eventKey)) return;
+        state.processedStreamEventKeys.add(eventKey);
+        state.lastStreamEventId = Math.max(state.lastStreamEventId, eventId);
+        if (state.processedStreamEventKeys.size > 512) {
+          const oldestKey = state.processedStreamEventKeys.values().next().value;
+          if (oldestKey) state.processedStreamEventKeys.delete(oldestKey);
+        }
+      }
       const payload = JSON.parse(event.data || "{}");
       const updatedInvoiceId = payload.invoiceId || payload.invoice_id;
       if (!updatedInvoiceId) return;

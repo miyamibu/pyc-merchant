@@ -264,6 +264,47 @@ test("commit crash leaves committed outbox pending and restart dispatches it", a
   assert.ok(sent.sent_at);
 });
 
+test("offline SSE is a published event with a recorded no-active-client delivery attempt", async (t) => {
+  const env = baseServerEnv();
+  const started = await startServerProcess(CWD, env);
+  const db = new Database(env.DB_PATH);
+  t.after(async () => {
+    db.close();
+    await stopServerProcess(started.proc);
+  });
+
+  const staff = await loginAs(started.baseUrl, {
+    terminalCode: env.TERMINAL_CODE,
+    pin: env.STAFF_PIN,
+  });
+  const created = await createInvoice(started.baseUrl, staff.token, 1000, `offline-sse-${Date.now()}`);
+  assert.equal(created.status, 201);
+  const paid = await ingestManualPayment(
+    started.baseUrl,
+    staff.token,
+    paymentPayload(created.data.invoice_id, env, randomTxHash("offline-sse")),
+    `offline-sse-payment-${Date.now()}`,
+  );
+  assert.equal(paid.status, 200);
+  assert.equal(paid.data.status, "paid");
+
+  const delivery = db.prepare(
+    `SELECT pno.status AS notification_status, pno.dead_lettered_at,
+            deo.status AS domain_status, sda.status AS delivery_status
+     FROM payment_notification_outbox pno
+     JOIN domain_event_outbox deo ON deo.id = pno.domain_event_id
+     JOIN sse_delivery_attempts sda ON sda.event_sequence = deo.event_sequence
+     WHERE pno.invoice_id = ?
+     ORDER BY sda.created_at DESC, sda.id DESC LIMIT 1`
+  ).get(created.data.invoice_id);
+  assert.deepEqual(delivery, {
+    notification_status: "sent",
+    dead_lettered_at: null,
+    domain_status: "published",
+    delivery_status: "no_active_client",
+  });
+});
+
 test("dispatch crash leaves a leased outbox row that restart reclaims and retries", async (t) => {
   const env = baseServerEnv({
     TEST_CRASH_FAULT_INJECTION: "payment_outbox_after_lease_claim",

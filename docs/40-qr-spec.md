@@ -15,8 +15,9 @@
 
 ## Invoice-bound Payment URL
 - invoice ごとの支払い導線は引き続き signed `/pay?ref=...` を使う。
-- 必須: `invoiceId`, `exp`, `nonce`, `sig`
-- 署名: `HMAC-SHA256(APP_SECRET, invoiceId.exp.nonce)`
+- 必須: `purpose=payment_link`, `invoiceId`, `kid`, `iat`, `exp`, `nonce`, `sig`
+- 署名: `HMAC-SHA256(PAY_LINK_SIGNING_KEYS[kid], pay.kid.invoiceId.exp.nonce)`
+- 旧形式は、設定済みの旧payment-link keyによる移行期間の検証に限り受け付け、新規発行ではactive `kid`を使う。
 - これが支払いページを `invoice` に固定する境界になる。
 
 ## Current Invoice Pointer

@@ -15,6 +15,7 @@ const RECIPIENT = process.env.RECIPIENT_ADDRESS || "0x22222222222222222222222222
 const CUSTOMER_ADDRESS = process.env.CUSTOMER_ADDRESS || "0x3333333333333333333333333333333333333333";
 const SERVICE_INGEST_ID = process.env.SERVICE_INGEST_ID || "chain-monitor";
 const SERVICE_INGEST_SECRET = process.env.SERVICE_INGEST_SECRET || "replace-with-very-long-random-ingest-secret";
+const SERVICE_HMAC_ACTIVE_KID = process.env.SERVICE_HMAC_ACTIVE_KID || "service-v1";
 const SESSION_EXPIRE_WAIT_MS = Number(process.env.SESSION_EXPIRE_WAIT_MS || 0);
 const SMOKE_AUTO_START = String(process.env.SMOKE_AUTO_START || "true").toLowerCase() !== "false";
 const SMOKE_REUSE_EXISTING = String(process.env.SMOKE_REUSE_EXISTING || "false").toLowerCase() === "true";
@@ -54,6 +55,7 @@ function buildServerEnv(targetBaseUrl) {
   mkdirSync(path.resolve(process.cwd(), env.BACKUP_DIR), { recursive: true });
   env.APP_SECRET = env.APP_SECRET || crypto.randomBytes(32).toString("hex");
   env.SERVICE_INGEST_SECRET = env.SERVICE_INGEST_SECRET || SERVICE_INGEST_SECRET;
+  env.SERVICE_HMAC_KEYS = env.SERVICE_HMAC_KEYS || `${SERVICE_HMAC_ACTIVE_KID}=${env.SERVICE_INGEST_SECRET}`;
   env.METRICS_SECRET = env.METRICS_SECRET || crypto.randomBytes(32).toString("hex");
   env.TERMINAL_CODE = env.TERMINAL_CODE || TERMINAL_CODE;
   env.STAFF_PIN = env.STAFF_PIN || STAFF_PIN;
@@ -204,7 +206,12 @@ function createServiceHeaders(payload, options = {}) {
   const timestamp = options.timestamp ?? Math.floor(Date.now() / 1000);
   const jti = options.jti || crypto.randomUUID();
   const payloadHash = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
-  let signature = crypto.createHmac("sha256", SERVICE_INGEST_SECRET).update(`${SERVICE_INGEST_ID}.${timestamp}.${jti}.${payloadHash}`).digest("hex");
+  const serviceSecret = String(process.env.SERVICE_HMAC_KEYS || `${SERVICE_HMAC_ACTIVE_KID}=${SERVICE_INGEST_SECRET}`)
+    .split(",")
+    .map((value) => value.trim())
+    .find((value) => value.startsWith(`${SERVICE_HMAC_ACTIVE_KID}=`))
+    ?.slice(SERVICE_HMAC_ACTIVE_KID.length + 1) || SERVICE_INGEST_SECRET;
+  let signature = crypto.createHmac("sha256", serviceSecret).update(`service.${SERVICE_HMAC_ACTIVE_KID}.${SERVICE_INGEST_ID}.${timestamp}.${jti}.${payloadHash}`).digest("hex");
   if (options.mismatchSignature) {
     signature = signature.slice(0, -1) + (signature.endsWith("0") ? "1" : "0");
   }
@@ -212,6 +219,7 @@ function createServiceHeaders(payload, options = {}) {
     "content-type": "application/json",
     "idempotency-key": options.idempotencyKey || `svc-${createNonce()}`,
     "x-service-id": SERVICE_INGEST_ID,
+    "x-service-kid": SERVICE_HMAC_ACTIVE_KID,
     "x-service-timestamp": String(timestamp),
     "x-service-jti": jti,
     "x-service-signature": signature
