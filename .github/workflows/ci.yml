@@ -318,8 +318,34 @@ jobs:
       - name: Prepare safe compose env
         run: cp .env.production.example .env.production
 
+      - name: Start isolated validation server
+        run: |
+          node src/server.mjs > /tmp/jpyc-production-validation-server.log 2>&1 &
+          echo "$!" > /tmp/jpyc-production-validation-server.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "${APP_HOST}/healthz" >/dev/null; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/jpyc-production-validation-server.pid)" 2>/dev/null; then
+              cat /tmp/jpyc-production-validation-server.log
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/jpyc-production-validation-server.log
+          exit 1
+
       - name: Run production validation pack
         run: npm run production:validate
+
+      - name: Stop isolated validation server
+        if: always()
+        run: |
+          if test -f /tmp/jpyc-production-validation-server.pid; then
+            SERVER_PID="$(cat /tmp/jpyc-production-validation-server.pid)"
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+          fi
 
       - name: Detect latest evidence dir
         id: evidence
