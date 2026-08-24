@@ -161,7 +161,12 @@ test("refund evidence registry enforces two-person rule and keeps recorded state
   assert.equal(blockedClose.data.error.code, "SETTLEMENT_HARD_GATE_BLOCKED");
   assert.ok(blockedClose.data.error.details.blockers.some((blocker) => blocker.code === "OPEN_REVIEW_INCIDENTS"));
 
-  db.prepare(`UPDATE refund_requests SET status = 'succeeded', verified_at = ?, updated_at = ? WHERE id = ?`).run(
+  db.prepare(
+    `UPDATE refund_requests
+     SET status = 'succeeded', verified_at = ?, finality_confirmations = 2,
+         finality_required_confirmations = 2, canonical_status = 'canonical', reorg_hold = 0, updated_at = ?
+     WHERE id = ?`
+  ).run(
     new Date().toISOString(),
     new Date().toISOString(),
     request.data.refund_request_id

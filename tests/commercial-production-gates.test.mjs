@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   apiRequest,
   authHeaders,
-  baseServerEnv,
+  productionServerEnv,
   loginAs,
   startServerProcess,
   stopServerProcess,
@@ -12,7 +12,7 @@ import {
 const CWD = process.cwd();
 
 test("commercial mode blocks invoice issuance but keeps read-only ops endpoints", async (t) => {
-  const env = baseServerEnv({
+  const env = productionServerEnv({
     COMMERCIAL_GO_MODE: "true",
     SETTLEMENT_UNRESOLVED_REVIEW_POLICY: "block",
   });
@@ -23,8 +23,8 @@ test("commercial mode blocks invoice issuance but keeps read-only ops endpoints"
   });
 
   const admin = await loginAs(started.baseUrl, {
-    terminalCode: env.TERMINAL_CODE,
-    pin: env.STAFF_PIN,
+    terminalCode: env.BOOTSTRAP_TERMINAL_CODE,
+    pin: env.BOOTSTRAP_ADMIN_PIN,
   });
 
   const blockedInvoice = await apiRequest(started.baseUrl, "/api/v1/invoices", {

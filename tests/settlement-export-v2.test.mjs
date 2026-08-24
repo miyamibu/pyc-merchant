@@ -234,11 +234,15 @@ test("Settlement Export v1 compatibility and v2 refund integrity", async (t) => 
     const refund = await createRefund(started.baseUrl, token, review.id, 300, `v2-refund-${Date.now()}`);
     assert.equal(refund.status, 201);
     const refundTxHash = randomTxHash("v2-refund-success");
+    const businessDate = currentBusinessDateJst();
+    const periodStartUtc = new Date(`${businessDate}T00:00:00+09:00`).toISOString();
     db.prepare(
       `UPDATE refund_requests
-       SET status = 'succeeded', refund_tx_hash = ?, verified_at = ?, updated_at = ?
+       SET status = 'verified', refund_tx_hash = ?, verified_at = ?, created_at = ?,
+           finality_confirmations = 2, finality_required_confirmations = 2,
+           canonical_status = 'canonical', reorg_hold = 0, updated_at = ?
        WHERE id = ?`
-    ).run(refundTxHash, new Date().toISOString(), new Date().toISOString(), refund.data.refund_request_id);
+    ).run(refundTxHash, periodStartUtc, periodStartUtc, periodStartUtc, refund.data.refund_request_id);
     const providerPaymentSessionId = `provider-session-${Date.now()}`;
     const ts = new Date().toISOString();
     db.prepare(
@@ -263,18 +267,89 @@ test("Settlement Export v1 compatibility and v2 refund integrity", async (t) => 
     );
     assert.equal(resolvedReview.status, 200);
 
-    const created = await apiRequest(started.baseUrl, "/api/v1/settlement-exports", {
+    const preFinalityExport = await apiRequest(started.baseUrl, "/api/v1/settlement-exports", {
       method: "POST",
-      headers: jsonHeaders(token, `v2-export-${Date.now()}`),
-      body: JSON.stringify({ business_date: currentBusinessDateJst(), format: "json" }),
+      headers: jsonHeaders(token, `v2-prefinality-export-${Date.now()}`),
+      body: JSON.stringify({ business_date: businessDate, format: "json" }),
     });
-    assert.equal(created.status, 201);
+    assert.equal(preFinalityExport.status, 201, JSON.stringify(preFinalityExport.data));
+    const preFinalityManifest = preFinalityExport.data.refund_manifest.find(
+      (entry) => entry.invoice_id === invoice.data.invoice_id,
+    );
+    assert.equal(preFinalityManifest.refund_succeeded_amount_jpyc_base, 0);
+    const preFinalityRead = await apiRequest(
+      started.baseUrl,
+      `/api/v1/settlement-exports/${preFinalityExport.data.export_id}`,
+      { headers: authHeaders(token) },
+    );
+    const preFinalityRow = preFinalityRead.data.rows.find(
+      (row) => row.invoice_id === invoice.data.invoice_id && row.refund_attribution === "invoice_primary",
+    );
+    assert.notEqual(preFinalityRow.accounting_status, "refunded_onchain");
+    assert.equal(preFinalityRow.refund_amount_jpyc_base, 0);
+
+    const blockedClose = await apiRequest(started.baseUrl, "/api/v1/settlements/daily:close", {
+      method: "POST",
+      headers: jsonHeaders(token, `v2-prefinality-close-${Date.now()}`),
+      body: JSON.stringify({ business_date: businessDate, admin_approval: true }),
+    });
+    assert.equal(blockedClose.status, 409, JSON.stringify(blockedClose.data));
+    assert.equal(blockedClose.data.error.code, "UNRESOLVED_REFUNDS");
+
+    db.prepare(
+      `UPDATE refund_requests
+       SET status = 'succeeded', finality_confirmations = 1,
+           finality_required_confirmations = 2, canonical_status = 'canonical', reorg_hold = 0, updated_at = ?
+       WHERE id = ?`
+    ).run(new Date().toISOString(), refund.data.refund_request_id);
+    const insufficientClose = await apiRequest(started.baseUrl, "/api/v1/settlements/daily:close", {
+      method: "POST",
+      headers: jsonHeaders(token, `v2-insufficient-close-${Date.now()}`),
+      body: JSON.stringify({ business_date: businessDate, admin_approval: true }),
+    });
+    assert.equal(insufficientClose.status, 409);
+    assert.equal(insufficientClose.data.error.code, "UNRESOLVED_REFUNDS");
+
+    db.prepare(
+      `UPDATE refund_requests
+       SET finality_confirmations = 2, reorg_hold = 1, updated_at = ?
+       WHERE id = ?`
+    ).run(new Date().toISOString(), refund.data.refund_request_id);
+    const reorgHeldClose = await apiRequest(started.baseUrl, "/api/v1/settlements/daily:close", {
+      method: "POST",
+      headers: jsonHeaders(token, `v2-reorg-close-${Date.now()}`),
+      body: JSON.stringify({ business_date: businessDate, admin_approval: true }),
+    });
+    assert.equal(reorgHeldClose.status, 409);
+    assert.equal(reorgHeldClose.data.error.code, "UNRESOLVED_REFUNDS");
+
+    db.prepare(
+      `UPDATE refund_requests
+       SET reorg_hold = 0, finalized_at = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(new Date().toISOString(), new Date().toISOString(), refund.data.refund_request_id);
+    const created = await apiRequest(started.baseUrl, "/api/v1/settlements/daily:close", {
+      method: "POST",
+      headers: jsonHeaders(token, `v2-final-close-${Date.now()}`),
+      body: JSON.stringify({ business_date: businessDate, admin_approval: true }),
+    });
+    assert.equal(created.status, 200, JSON.stringify(created.data));
     assert.equal(created.data.contract_version, "settlement_export_v2");
     assert.equal(created.data.refund_manifest.filter((entry) => entry.invoice_id === invoice.data.invoice_id).length, 1);
     const manifest = created.data.refund_manifest.find((entry) => entry.invoice_id === invoice.data.invoice_id);
     assert.equal(manifest.refund_reference_count, 1);
     assert.equal(manifest.refund_succeeded_amount_jpyc_base, 300000000);
     assert.equal(created.data.refund_totals.refund_succeeded_amount_jpyc_base >= 300000000, true);
+
+    const frozenPreFinalityRead = await apiRequest(
+      started.baseUrl,
+      `/api/v1/settlement-exports/${preFinalityExport.data.export_id}`,
+      { headers: authHeaders(token) },
+    );
+    const frozenPreFinalityManifest = frozenPreFinalityRead.data.refund_manifest.find(
+      (entry) => entry.invoice_id === invoice.data.invoice_id,
+    );
+    assert.equal(frozenPreFinalityManifest.refund_succeeded_amount_jpyc_base, 0);
 
     const read = await apiRequest(started.baseUrl, `/api/v1/settlement-exports/${created.data.export_id}`, {
       headers: authHeaders(token),

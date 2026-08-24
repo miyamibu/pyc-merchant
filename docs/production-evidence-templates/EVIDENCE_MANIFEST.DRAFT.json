@@ -1,0 +1,24 @@
+{
+  "schema_version": "commercial_evidence_manifest_v1",
+  "release": {
+    "release_id": "",
+    "commit": "",
+    "source_hash": "",
+    "app_image_digest": "",
+    "environment_id": ""
+  },
+  "issued_at": "",
+  "expires_at": "",
+  "revocation_status": "draft",
+  "artifacts": [
+    { "evidence_id": "EXT-001", "path": "EXT-001-real-jpyc-payment.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "EXT-002", "path": "EXT-002-wallet-device-launch.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "EXT-003", "path": "EXT-003-public-fqdn-tls.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "EXT-004", "path": "EXT-004-store-ops-drill.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "POC-001", "path": "POC-001.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "POC-002", "path": "POC-002.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "POC-003", "path": "POC-003.md", "sha256": "", "media_type": "text/markdown" },
+    { "evidence_id": "PERF-001", "path": "PERF-001-scale-soak.md", "sha256": "", "media_type": "text/markdown" }
+  ],
+  "signatures": []
+}

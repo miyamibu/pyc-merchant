@@ -97,7 +97,7 @@ async function ensureServer() {
     throw new Error("target server is not reachable and SMOKE_AUTO_START=false");
   }
   const logs = [];
-  const proc = spawn("node", ["src/server.mjs"], {
+  const proc = spawn(process.execPath, ["src/server.mjs"], {
     cwd: process.cwd(),
     env: buildServerEnv(ACTIVE_BASE_URL),
     stdio: ["ignore", "pipe", "pipe"],
@@ -306,7 +306,7 @@ async function main() {
       "idempotency-key": `smoke-reject-admin-create-${nonce}`
     },
     body: JSON.stringify({
-      staff_name: `Smoke Admin Candidate ${nonce}`,
+      staff_name: `Smoke Admin ${nonce}`,
       role: "admin",
       pin: "7789",
       status: "active"

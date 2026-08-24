@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_SCAN_ROOTS = ["src", "scripts", "tests", "migrations"];
+export const DEFAULT_SCAN_ROOTS = ["src", "scripts", "tests", "migrations", "public"];
 export const DEFAULT_DIRECT_FILES = ["package.json"];
 export const SCANNABLE_EXTENSIONS = new Set([
   ".js",
@@ -28,6 +28,9 @@ export const PROTECTED_PATH_PREFIXES = [
 
 export const SELF_EXCLUDED_RELATIVE_PATHS = new Set([
   "scripts/security/check-destructive-ops.mjs",
+  // The scanner's own negative-test file intentionally embeds destructive
+  // statement fixtures; production surfaces remain fully scanned.
+  "tests/security/destructive-ops.test.mjs",
 ]);
 
 export const PROTECTED_DELETE_TABLES = new Set([
@@ -126,6 +129,11 @@ const DANGEROUS_LINE_RULES = [
     regex: /\brm\b[^\n]*(?:runtime\/?|data\/?|docs\/production\/evidence\/?|deploy\/nginx\/certs\/?|\.env(?:\.production)?\b|[^\s"'`]+\.(?:db|sqlite|sqlite3)\b)/i,
     message: "delete command targets a protected path or DB artifact",
   },
+  {
+    id: "node.fs-protected-delete",
+    regex: /\brm(?:Sync|dirSync)?\s*\([^)\n]*(?:runtime\/?|data\/?|docs\/production\/evidence\/?|deploy\/nginx\/certs\/?|\.env(?:\.production)?\b|[^\s"'`(),]+\.(?:db|sqlite|sqlite3)\b)/i,
+    message: "fs delete call targets a protected path or DB artifact",
+  },
 ];
 
 function normalizeRelativePath(rootDir, candidatePath) {
@@ -213,11 +221,8 @@ function buildFinding({ rootDir, filePath, lineNumber, ruleId, message, excerpt 
   };
 }
 
-function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
+function classifyDeleteStatement({ rootDir, filePath, tableName, guardText, excerpt, lineNumber }) {
   const findings = [];
-  const match = line.match(/\bdelete\s+from\s+[`"[]?([a-zA-Z_][\w]*)[`"\]]?/i);
-  if (!match) return findings;
-  const tableName = String(match[1] || "").toLowerCase();
   const relativePath = normalizeRelativePath(rootDir, filePath);
 
   if (relativePath.startsWith("tests/") && TEST_ONLY_DELETE_TABLES.has(tableName)) {
@@ -226,7 +231,7 @@ function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
 
   if (ALLOWED_DELETE_RULES.has(tableName)) {
     const allowRule = ALLOWED_DELETE_RULES.get(tableName);
-    const hasAllGuards = allowRule.guards.every((guard) => guard.test(line));
+    const hasAllGuards = allowRule.guards.every((guard) => guard.test(guardText));
     if (!hasAllGuards) {
       findings.push(
         buildFinding({
@@ -235,7 +240,7 @@ function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
           lineNumber,
           ruleId: "sql.delete.allowlist-guard-missing",
           message: `DELETE FROM ${tableName} is only allowed with explicit guard fragments (${allowRule.reason})`,
-          excerpt: line,
+          excerpt,
         })
       );
     }
@@ -250,7 +255,7 @@ function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
         lineNumber,
         ruleId: "sql.delete.protected-table",
         message: `DELETE FROM ${tableName} targets protected business/audit/settlement data`,
-        excerpt: line,
+        excerpt,
       })
     );
     return findings;
@@ -263,9 +268,80 @@ function scanLineForDeleteStatements(rootDir, filePath, line, lineNumber) {
       lineNumber,
       ruleId: "sql.delete.unclassified-table",
       message: `DELETE FROM ${tableName} is not covered by an explicit safe cleanup rule`,
-      excerpt: line,
+      excerpt,
     })
   );
+
+  return findings;
+}
+
+const DANGEROUS_MULTILINE_RULES = [
+  { id: "sql.drop-table", regex: /\bdrop\s+table\b/gi },
+  { id: "sql.truncate", regex: /\btruncate\b/gi },
+];
+
+export function scanMultilineStatements(rootDir, filePath, content) {
+  const collapsed = content.replace(/\s+/g, " ");
+  const lineOffsets = [];
+  let offset = 0;
+  for (const line of content.split(/\r?\n/)) {
+    lineOffsets.push(offset);
+    offset += line.length + 1;
+  }
+  const lineOf = (index) => {
+    let low = 0;
+    let high = lineOffsets.length - 1;
+    while (low < high) {
+      const mid = (low + high + 1) >> 1;
+      if (lineOffsets[mid] <= index) low = mid;
+      else high = mid - 1;
+    }
+    return low + 1;
+  };
+  const findings = [];
+
+  const deleteRe = /\bdelete\s+from\s+[`"[]?([a-zA-Z_][\w]*)[`"\]]?/gi;
+  for (const match of collapsed.matchAll(deleteRe)) {
+    findings.push(
+      ...classifyDeleteStatement({
+        rootDir,
+        filePath,
+        tableName: String(match[1] || "").toLowerCase(),
+        guardText: collapsed,
+        excerpt: match[0],
+        lineNumber: lineOf(match.index),
+      })
+    );
+  }
+
+  for (const rule of DANGEROUS_MULTILINE_RULES) {
+    for (const match of collapsed.matchAll(rule.regex)) {
+      findings.push(
+        buildFinding({
+          rootDir,
+          filePath,
+          lineNumber: lineOf(match.index),
+          ruleId: rule.id,
+          message: rule.id === "sql.drop-table" ? "DROP TABLE detected" : "TRUNCATE detected",
+          excerpt: match[0],
+        })
+      );
+    }
+  }
+
+  const dynamicConcatRe = /\bdelete\s+from\b["'`]\s*\+\s*[a-zA-Z_$]|\bdelete\s+from\s*\$\{/gi;
+  for (const match of collapsed.matchAll(dynamicConcatRe)) {
+    findings.push(
+      buildFinding({
+        rootDir,
+        filePath,
+        lineNumber: lineOf(match.index),
+        ruleId: "sql.delete.dynamic-concat",
+        message: "dynamically concatenated DELETE statement detected; table names must be static and allowlisted",
+        excerpt: match[0],
+      })
+    );
+  }
 
   return findings;
 }
@@ -274,6 +350,14 @@ export function scanFile(rootDir, filePath) {
   const content = fs.readFileSync(filePath, "utf8");
   const lines = content.split(/\r?\n/);
   const findings = [];
+  const seen = new Set();
+
+  const pushUnique = (finding) => {
+    const key = `${normalizeRelativePath(rootDir, filePath)}:${finding.line}:${finding.ruleId}:${finding.message}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    findings.push(finding);
+  };
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -281,7 +365,7 @@ export function scanFile(rootDir, filePath) {
 
     for (const rule of DANGEROUS_LINE_RULES) {
       if (rule.regex.test(line)) {
-        findings.push(
+        pushUnique(
           buildFinding({
             rootDir,
             filePath,
@@ -293,8 +377,10 @@ export function scanFile(rootDir, filePath) {
         );
       }
     }
+  }
 
-    findings.push(...scanLineForDeleteStatements(rootDir, filePath, line, lineNumber));
+  for (const finding of scanMultilineStatements(rootDir, filePath, content)) {
+    pushUnique(finding);
   }
 
   return findings;

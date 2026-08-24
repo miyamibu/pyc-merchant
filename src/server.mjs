@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { Worker } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -82,8 +83,14 @@ import {
   validateOfficialJpycContract,
 } from "./jpyc-contract-policy.mjs";
 import { validateCommercialEvidence } from "../scripts/production-validation/validate-commercial-evidence.mjs";
+import { loadReleaseManifest } from "../scripts/production-validation/validate-commercial-go.mjs";
+import {
+  evaluateReleaseBoundApproval,
+  validateSignedReleaseEvidence,
+} from "../scripts/production-validation/signed-release-evidence.mjs";
 import { APPROVED_LEDGER_BASE_UNIT_SCALE, APPROVED_TOKEN_DECIMALS } from "./token-metadata.mjs";
 import { assessChainRuntimeRegistry } from "./chain-runtime-registry.mjs";
+import { validatePublicHttpsUrl } from "./public-endpoint-security.mjs";
 import {
   buildReceiveAddressControlMessage,
   isReceiveAddressAllocatable,
@@ -172,9 +179,23 @@ const DEFAULTS = {
   COMMERCIAL_EVIDENCE_ROOT: "./docs/production/evidence",
   COMMERCIAL_EVIDENCE_DIR: "",
   RELEASE_ID: "",
+  RELEASE_MODE: "",
   RELEASE_MANIFEST: "",
+  RELEASE_ENVIRONMENT_ID: "",
   RELEASE_TRUSTED_PUBLIC_KEY_PATHS: "",
   RELEASE_REVOKED_KEY_IDS: "",
+  RELEASE_SIGNER_REGISTRY_JSON: "[]",
+  EVIDENCE_TRUSTED_PUBLIC_KEY_PATHS: "",
+  EVIDENCE_REVOKED_KEY_IDS: "",
+  EVIDENCE_SIGNER_REGISTRY_JSON: "[]",
+  APPROVAL_TRUSTED_PUBLIC_KEY_PATHS: "",
+  APPROVAL_REVOKED_KEY_IDS: "",
+  APPROVAL_SIGNER_REGISTRY_JSON: "[]",
+  APP_IMAGE_REF: "",
+  NGINX_IMAGE_REF: "",
+  LIMITED_PILOT_MAX_TOTAL_VOLUME_JPYC_BASE: "",
+  LIMITED_PILOT_MAX_TRANSACTION_AMOUNT_JPYC_BASE: "",
+  LIMITED_PILOT_MAX_TRANSACTIONS: "",
   SESSION_TTL_SEC: "43200",
   CORS_ALLOW_ORIGINS: "http://localhost:4173,http://127.0.0.1:4173",
   SERVICE_INGEST_ID: "chain-monitor",
@@ -186,6 +207,9 @@ const DEFAULTS = {
   PIN_LOCKOUT_MAX_ATTEMPTS: "5",
   PIN_LOCKOUT_SEC: "900",
   SSE_TOKEN_MAX_TTL_SEC: "900",
+  SSE_MAX_CLIENTS_PER_TERMINAL: "16",
+  OPS_ALERT_WEBHOOK_URL: "",
+  OPS_ALERT_MAX_ATTEMPTS: "5",
   LEDGER_DECIMALS: "6",
   LEDGER_BASE_UNIT_SCALE: "1000000",
   ENABLE_AUTO_SPLIT_PAYMENT: "false",
@@ -428,6 +452,37 @@ const DEPLOYMENT_STAGE = String(
   ENV.DEPLOYMENT_STAGE || DEFAULTS.DEPLOYMENT_STAGE || (IS_PRODUCTION ? "commercial" : "development")
 ).trim().toLowerCase();
 const PRODUCTION_LIKE_RUNTIME = IS_PRODUCTION || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE) || COMMERCIAL_GO_MODE;
+
+function validateProductionLikePublicOrigins() {
+  if (!PRODUCTION_LIKE_RUNTIME) return;
+  const values = {
+    APP_HOST: String(process.env.APP_HOST || "").trim(),
+    PAY_BASE_URL: String(process.env.PAY_BASE_URL || "").trim(),
+    PUBLIC_BASE_URL: String(process.env.PUBLIC_BASE_URL || "").trim(),
+  };
+  const origins = [];
+  for (const [key, raw] of Object.entries(values)) {
+    if (!raw) {
+      console.error(`FATAL: ${key} must be explicitly configured for production-like runtime.`);
+      process.exit(1);
+    }
+    const validation = validatePublicHttpsUrl(raw);
+    if (!validation.ok
+      || validation.url.pathname !== "/"
+      || validation.url.search
+      || validation.url.hash) {
+      console.error(`FATAL: ${key} must be an origin-only public HTTPS URL on port 443 for production-like runtime.`);
+      process.exit(1);
+    }
+    origins.push(validation.url.origin);
+  }
+  if (new Set(origins).size !== 1) {
+    console.error("FATAL: APP_HOST, PAY_BASE_URL, and PUBLIC_BASE_URL must use the same public origin in production-like runtime.");
+    process.exit(1);
+  }
+}
+
+validateProductionLikePublicOrigins();
 const TEST_CRASH_FAULT_INJECTION = String(
   ENV.TEST_CRASH_FAULT_INJECTION || DEFAULTS.TEST_CRASH_FAULT_INJECTION || ""
 ).trim().toLowerCase();
@@ -467,7 +522,15 @@ if (!PAYMENT_RECEIPT_KEY_RING.keys.has(PAYMENT_RECEIPT_ACTIVE_KID)) {
 const COMMERCIAL_EVIDENCE_ROOT = path.resolve(CWD, ENV.COMMERCIAL_EVIDENCE_ROOT || DEFAULTS.COMMERCIAL_EVIDENCE_ROOT);
 const COMMERCIAL_EVIDENCE_DIR = String(ENV.COMMERCIAL_EVIDENCE_DIR || DEFAULTS.COMMERCIAL_EVIDENCE_DIR || "").trim();
 const RELEASE_ID = String(ENV.RELEASE_ID || DEFAULTS.RELEASE_ID || "").trim();
+const RELEASE_MODE = String(
+  ENV.RELEASE_MODE
+    || DEFAULTS.RELEASE_MODE
+    || (COMMERCIAL_GO_MODE ? "commercial" : DEPLOYMENT_STAGE === "pilot" ? "limited" : "development")
+).trim().toLowerCase();
 const RELEASE_MANIFEST = String(ENV.RELEASE_MANIFEST || DEFAULTS.RELEASE_MANIFEST || "").trim();
+const RELEASE_ENVIRONMENT_ID = String(
+  ENV.RELEASE_ENVIRONMENT_ID || DEFAULTS.RELEASE_ENVIRONMENT_ID || ""
+).trim();
 const RELEASE_TRUSTED_PUBLIC_KEY_PATHS = String(
   ENV.RELEASE_TRUSTED_PUBLIC_KEY_PATHS || DEFAULTS.RELEASE_TRUSTED_PUBLIC_KEY_PATHS || ""
 ).split(",").map((value) => value.trim()).filter(Boolean);
@@ -514,6 +577,15 @@ const REVIEW_STEP_UP_SEC = Math.max(60, Number(
 const PIN_LOCKOUT_MAX_ATTEMPTS = Number(ENV.PIN_LOCKOUT_MAX_ATTEMPTS || DEFAULTS.PIN_LOCKOUT_MAX_ATTEMPTS);
 const PIN_LOCKOUT_SEC = Number(ENV.PIN_LOCKOUT_SEC || DEFAULTS.PIN_LOCKOUT_SEC);
 const SSE_TOKEN_MAX_TTL_SEC = Number(ENV.SSE_TOKEN_MAX_TTL_SEC || DEFAULTS.SSE_TOKEN_MAX_TTL_SEC);
+const SSE_MAX_CLIENTS_PER_TERMINAL = Math.max(1, Number(ENV.SSE_MAX_CLIENTS_PER_TERMINAL || DEFAULTS.SSE_MAX_CLIENTS_PER_TERMINAL) || 16);
+
+// M-046: durable ops alert delivery. Alerts are recorded first (audit +
+// outbox row) and then delivered to the configured webhook; an unconfigured
+// webhook dead-letters immediately instead of retrying forever.
+const OPS_ALERT_WEBHOOK_URL = String(ENV.OPS_ALERT_WEBHOOK_URL || "").trim();
+const OPS_ALERT_MAX_ATTEMPTS = Math.max(1, Number(ENV.OPS_ALERT_MAX_ATTEMPTS || 5) || 5);
+const OPS_ALERT_LEASE_SEC = 30;
+const OPS_ALERT_WORKER_ID = `ops-alerts-${process.pid}-${crypto.randomUUID()}`;
 const legacyLedgerScaleKey = ["JPYC", "BASE", "UNIT", "SCALE"].join("_");
 const LEDGER_BASE_UNIT_SCALE = String(
   ENV.LEDGER_BASE_UNIT_SCALE || ENV[legacyLedgerScaleKey] || DEFAULTS.LEDGER_BASE_UNIT_SCALE || ""
@@ -796,7 +868,7 @@ function isDummyAddress(value) {
   return DUMMY_ADDRESS_SET.has(normalized);
 }
 
-if (IS_PRODUCTION) {
+if (PRODUCTION_LIKE_RUNTIME) {
   if (ENABLE_PUBLIC_PAYMENT_SIMULATION) {
     console.error("FATAL: ENABLE_PUBLIC_PAYMENT_SIMULATION must be false in production.");
     process.exit(1);
@@ -1121,6 +1193,25 @@ CREATE TABLE IF NOT EXISTS payment_notification_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_payment_notification_outbox_pending
 ON payment_notification_outbox(status, available_at, created_at);
+
+CREATE TABLE IF NOT EXISTS ops_alert_outbox (
+  id TEXT PRIMARY KEY,
+  alert_code TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  available_at TEXT,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  sent_at TEXT,
+  dead_lettered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ops_alert_outbox_pending
+ON ops_alert_outbox(status, available_at, created_at);
 
 CREATE TABLE IF NOT EXISTS payment_attempts (
   id TEXT PRIMARY KEY,
@@ -1844,6 +1935,20 @@ ON payment_recovery_reports(invoice_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_recovery_reports_dedupe
 ON payment_recovery_reports(invoice_id, requested_chain_id, tx_hash, reporter_type);
 
+CREATE TABLE IF NOT EXISTS payment_recovery_report_history (
+  id TEXT PRIMARY KEY,
+  report_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  invoice_id TEXT NOT NULL,
+  requested_chain_id TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  reporter_type TEXT NOT NULL,
+  prior_row_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_recovery_report_history_report
+ON payment_recovery_report_history(report_id, revision DESC);
+
 CREATE TABLE IF NOT EXISTS chain_reorgs (
   id TEXT PRIMARY KEY,
   chain_id TEXT NOT NULL,
@@ -1926,6 +2031,7 @@ addColumnIfMissing("invoices", "checkout_session_id", "checkout_session_id TEXT"
 addColumnIfMissing("invoices", "reissued_from_invoice_id", "reissued_from_invoice_id TEXT");
 addColumnIfMissing("invoices", "reissue_root_invoice_id", "reissue_root_invoice_id TEXT");
 addColumnIfMissing("invoices", "primary_recognized_transfer_id", "primary_recognized_transfer_id TEXT");
+addColumnIfMissing("payment_recovery_reports", "revision", "revision INTEGER NOT NULL DEFAULT 1");
 addColumnIfMissing("invoices", "latest_observed_transfer_id", "latest_observed_transfer_id TEXT");
 addColumnIfMissing("invoices", "recognized_at", "recognized_at TEXT");
 addColumnIfMissing("invoices", "recognition_policy_version", "recognition_policy_version TEXT");
@@ -2543,6 +2649,12 @@ function registerGlobalTransferObservation({ invoice, event, providerId = null }
     receipt_status: event.receipt_status == null ? null : String(event.receipt_status).trim().toLowerCase(),
     canonical_status: String(event.canonical_status || "unknown").trim().toLowerCase(),
   };
+  if (candidate.token_amount_atomic == null && event.amount_conversion_exact !== false) {
+    const eventLedgerBase = String(event.amount_jpyc_base ?? event.ledger_amount_base ?? "").trim();
+    if (/^\d+$/.test(eventLedgerBase)) {
+      candidate.token_amount_atomic = tokenAmountAtomicFromLedgerBase(eventLedgerBase);
+    }
+  }
   let transfer = existing;
   if (!transfer) {
     const transferId = uuid();
@@ -2846,7 +2958,7 @@ function accountingAdjustmentResponse(row, invoice, accountingEvent = null) {
 }
 
 function recordFinalRefundAccountingEvent(refund, storeId = null) {
-  if (!refund || !["succeeded", "finalized"].includes(String(refund.status))) return null;
+  if (!isRefundAccountingFinal(refund)) return null;
   const resolvedStoreId = storeId || db.prepare(`SELECT store_id FROM invoices WHERE id = ?`).get(refund.invoice_id)?.store_id;
   return recordAccountingEvent({
     storeId: resolvedStoreId,
@@ -2876,6 +2988,62 @@ const TERMINAL_ACTIVE_INVOICE_STATUSES = new Set(["issued", "payment_detected", 
 
 function isTerminalActiveInvoiceStatus(status) {
   return TERMINAL_ACTIVE_INVOICE_STATUSES.has(String(status || ""));
+}
+
+// N-025: explicit length / Unicode boundaries for operator-supplied free-text
+// and identifier fields. NFC keeps visually identical names comparable; the
+// control-character ban blocks log-injection and homoglyph tricks.
+const FIELD_BOUNDARIES = Object.freeze({
+  staffNameMax: 40,
+  terminalCodeMin: 3,
+  terminalCodeMax: 32,
+  refundMemoMax: 500,
+  idempotencyKeyMax: 200,
+});
+
+function hasControlChars(value) {
+  return /[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validateStaffName(value) {
+  const name = String(value ?? "").trim().normalize("NFC");
+  if (!name) return { ok: false, reason: "staff_name is required" };
+  if ([...name].length > FIELD_BOUNDARIES.staffNameMax) return { ok: false, reason: `staff_name must be at most ${FIELD_BOUNDARIES.staffNameMax} characters` };
+  if (hasControlChars(name)) return { ok: false, reason: "staff_name contains control characters" };
+  return { ok: true, value: name };
+}
+
+function validateTerminalCodeFormat(value) {
+  const code = String(value ?? "").trim();
+  const pattern = new RegExp(`^[A-Za-z0-9_-]{${FIELD_BOUNDARIES.terminalCodeMin},${FIELD_BOUNDARIES.terminalCodeMax}}$`);
+  if (!pattern.test(code)) {
+    return { ok: false, reason: `terminal_code must match [A-Za-z0-9_-]{${FIELD_BOUNDARIES.terminalCodeMin},${FIELD_BOUNDARIES.terminalCodeMax}}` };
+  }
+  return { ok: true, value: code };
+}
+
+function validateRefundMemo(value, { required = false } = {}) {
+  const memo = String(value ?? "").trim().normalize("NFC");
+  if (!memo) return required ? { ok: false, reason: "memo is required" } : { ok: true, value: "" };
+  if (memo.length > FIELD_BOUNDARIES.refundMemoMax) return { ok: false, reason: `memo must be at most ${FIELD_BOUNDARIES.refundMemoMax} characters` };
+  if (hasControlChars(memo)) return { ok: false, reason: "memo contains control characters" };
+  return { ok: true, value: memo };
+}
+
+const IDEMPOTENCY_KEY_MAX = FIELD_BOUNDARIES.idempotencyKeyMax;
+
+function parsePaginationQuery(req, defaultLimit, maxLimit) {
+  const rawLimit = req.query.limit == null || String(req.query.limit).trim() === ""
+    ? String(defaultLimit)
+    : String(req.query.limit).trim();
+  const rawOffset = req.query.offset == null || String(req.query.offset).trim() === ""
+    ? "0"
+    : String(req.query.offset).trim();
+  if (!/^\d{1,9}$/.test(rawLimit) || !/^\d{1,12}$/.test(rawOffset)) return null;
+  return {
+    limit: Math.min(Math.max(Number(rawLimit), 1), maxLimit),
+    offset: Number(rawOffset),
+  };
 }
 
 function hasProviderSettlementPath(invoiceId) {
@@ -3020,9 +3188,42 @@ function createTerminalCheckoutClaim({
   }
 
   const claim = db.transaction(() => {
-    const active = db
+    let active = db
       .prepare(`SELECT * FROM terminal_checkout_claims WHERE invoice_id = ? AND status IN ('claimed', 'consumed') LIMIT 1`)
       .get(invoice.id);
+    if (
+      active
+      && String(active.status) === "claimed"
+      && Number.isFinite(Date.parse(String(active.expires_at || "")))
+      && Date.parse(String(active.expires_at)) <= Date.now()
+    ) {
+      const expiredAt = nowIso();
+      const expired = db.prepare(
+        `UPDATE terminal_checkout_claims
+         SET status = 'expired', updated_at = ?
+         WHERE id = ? AND status = 'claimed' AND expires_at <= ?`
+      ).run(expiredAt, active.id, expiredAt);
+      if (expired.changes === 1) {
+        const expiredClaim = db.prepare(`SELECT * FROM terminal_checkout_claims WHERE id = ?`).get(active.id);
+        requiredAudit({
+          storeId: terminal.store_id,
+          actorType: "system",
+          actorId: "terminal.checkout_claim",
+          action: "terminal.checkout_claim_expired",
+          targetType: "invoice",
+          targetId: invoice.id,
+          requestId,
+          beforeState: { claim: active },
+          afterState: { claim: expiredClaim, reason: "claim_ttl_elapsed" },
+          ip,
+        });
+        active = null;
+      } else {
+        active = db
+          .prepare(`SELECT * FROM terminal_checkout_claims WHERE invoice_id = ? AND status IN ('claimed', 'consumed') LIMIT 1`)
+          .get(invoice.id);
+      }
+    }
     if (active) {
       if (String(active.anonymous_device_id) === anonymousDeviceHash) {
         return { claim: active, reused: true };
@@ -3320,7 +3521,7 @@ function auditTerminalCurrentInvoiceChange({
   if (!beforeInvoiceId && afterInvoiceId) action = "terminal.current_invoice.assigned";
   if (beforeInvoiceId && !afterInvoiceId) action = "terminal.current_invoice.cleared";
   if (beforeInvoiceId && afterInvoiceId && beforeInvoiceId !== afterInvoiceId) action = "terminal.current_invoice.swapped";
-  audit({
+  requiredAudit({
     actorType,
     actorId,
     action,
@@ -4377,13 +4578,62 @@ function hashPin(pin) {
   return bcrypt.hashSync(String(pin), 12);
 }
 
+const LOGIN_DECOY_PIN_HASH = hashPin("0000");
+
+// N-020: bcrypt cost-12 is CPU-heavy; run it in a worker thread so login and
+// step-up verification never block the event loop under concurrent load.
+const BCRYPT_WORKER_CODE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const bcrypt = require("bcryptjs");
+if (workerData.op === "hash") {
+  parentPort.postMessage(bcrypt.hashSync(String(workerData.value), workerData.rounds || 12));
+} else {
+  parentPort.postMessage(bcrypt.compareSync(String(workerData.value), String(workerData.hash)));
+}
+`;
+
+function runBcryptInWorker(task) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(BCRYPT_WORKER_CODE, { eval: true, workerData: task });
+    worker.once("message", (message) => { worker.terminate().catch(() => {}); resolve(message === true); });
+    worker.once("error", (error) => { worker.terminate().catch(() => {}); reject(error); });
+  });
+}
+
+async function verifyPinAsync(staffPin, storedHash) {
+  const value = String(staffPin);
+  if (!storedHash) return false;
+  const hashText = String(storedHash);
+  if (hashText.startsWith("$2a$") || hashText.startsWith("$2b$") || hashText.startsWith("$2y$")) {
+    try {
+      return await runBcryptInWorker({ op: "compare", value, hash: hashText });
+    } catch (_) {
+      // Worker failure must not weaken authentication; fall back to sync.
+      return verifyPin(value, hashText);
+    }
+  }
+  return verifyPin(value, hashText);
+}
+
+async function hashPinAsync(pin) {
+  try {
+    const hashed = await runBcryptInWorker({ op: "hash", value: String(pin), rounds: 12 });
+    return typeof hashed === "string" && hashed.startsWith("$2") ? hashed : hashPin(pin);
+  } catch (_) {
+    return hashPin(pin);
+  }
+}
+
 function verifyPin(staffPin, storedHash) {
   const value = String(staffPin);
   if (!storedHash) return false;
   if (storedHash.startsWith("$2a$") || storedHash.startsWith("$2b$") || storedHash.startsWith("$2y$")) {
     return bcrypt.compareSync(value, storedHash);
   }
-  return sha256(value) === storedHash;
+  // Legacy sha256 fallback: keep the comparison constant-time so a
+  // non-bcrypt hash cannot become a timing oracle. Still upgraded to bcrypt
+  // on the next successful login.
+  return safeHexEqual(sha256(value), String(storedHash).toLowerCase());
 }
 
 function toHexBuffer(value) {
@@ -4452,8 +4702,14 @@ function cleanupRateLimitEvents(nowMs) {
   db.prepare(`DELETE FROM rate_limit_events WHERE created_at_unix_ms <= ?`).run(nowMs - RATE_LIMIT_RETENTION_MS);
 }
 
+const RATE_LIMIT_MAX_BUCKETS = Math.max(
+  256,
+  Number(process.env.RATE_LIMIT_MAX_BUCKETS || 20000)
+);
+
 function makeHybridRateLimiter(scope, windowMs, maxRequests) {
   const buckets = new Map();
+  let bucketSweepCounter = 0;
   return function isRateLimited(key) {
     const nowMs = Date.now();
     const windowStart = nowMs - windowMs;
@@ -4462,6 +4718,18 @@ function makeHybridRateLimiter(scope, windowMs, maxRequests) {
     const fresh = bucket.filter((ts) => ts > windowStart);
     fresh.push(nowMs);
     buckets.set(keyHash, fresh);
+    if ((bucketSweepCounter = (bucketSweepCounter + 1) % 64) === 0 || buckets.size > RATE_LIMIT_MAX_BUCKETS) {
+      for (const [existingKeyHash, existingBucket] of buckets) {
+        if (existingKeyHash === keyHash) continue;
+        const latest = existingBucket.length > 0 ? existingBucket[existingBucket.length - 1] : 0;
+        if (latest <= windowStart) buckets.delete(existingKeyHash);
+      }
+      while (buckets.size > RATE_LIMIT_MAX_BUCKETS) {
+        const oldestKey = buckets.keys().next().value;
+        if (oldestKey === undefined) break;
+        buckets.delete(oldestKey);
+      }
+    }
     cleanupRateLimitEvents(nowMs);
     try {
       db.prepare(
@@ -5019,6 +5287,9 @@ function issueInvoiceRecord({
   requestId = null,
   idempotencyKey = null,
   ip = null,
+  requiredInvoiceAuditAction = "invoice.created",
+  requiredInvoiceAuditBeforeState = null,
+  requiredInvoiceAuditAfterState = null,
 }) {
   const result = db.transaction(() => {
     const issuanceBlocked = getInvoiceIssuanceBlockReason({ store, session });
@@ -5158,6 +5429,41 @@ function issueInvoiceRecord({
       ip,
       reason: reissuedFromInvoiceId ? "reissue_new_active_invoice" : "invoice_created",
     });
+    if (requiredInvoiceAuditAction) {
+      requiredAudit({
+        storeId: session.store_id,
+        actorType,
+        actorId,
+        action: requiredInvoiceAuditAction,
+        targetType: "invoice",
+        targetId: createdInvoice.id,
+        requestId,
+        idempotencyKey,
+        beforeState: requiredInvoiceAuditBeforeState,
+        afterState: requiredInvoiceAuditAfterState
+          ? { ...requiredInvoiceAuditAfterState, new_invoice: createdInvoice }
+          : createdInvoice,
+        ip,
+      });
+    }
+    if (allocatedAddress) {
+      requiredAudit({
+        storeId: session.store_id,
+        actorType,
+        actorId,
+        action: "receive_address.allocated",
+        targetType: "receive_address",
+        targetId: allocatedAddress.id,
+        requestId,
+        idempotencyKey,
+        beforeState: {
+          status: "available",
+          address: allocatedAddress.address,
+        },
+        afterState: allocatedAddress,
+        ip,
+      });
+    }
     return {
       invoice: createdInvoice,
       checkoutSessionId: effectiveCheckoutSessionId,
@@ -6135,7 +6441,7 @@ function resolveSettlementUnresolvedReviewPolicy(store = null) {
   if (storePolicy) return storePolicy;
   const envPolicy = normalizeSettlementUnresolvedReviewPolicy(SETTLEMENT_UNRESOLVED_REVIEW_POLICY);
   if (envPolicy) return envPolicy;
-  if (IS_PRODUCTION || SETTLEMENT_BLOCK_ON_UNRESOLVED_REVIEWS) return "block";
+  if (PRODUCTION_LIKE_RUNTIME || SETTLEMENT_BLOCK_ON_UNRESOLVED_REVIEWS) return "block";
   return "warn";
 }
 
@@ -6349,135 +6655,6 @@ function evaluatePolicyUrlsGate({ sourcePath = path.join(CWD, "public/mobile.js"
   }
 }
 
-function stableJson(value) {
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-function releaseManifestSigningPayload(manifest) {
-  const unsigned = { ...(manifest || {}) };
-  delete unsigned.signatures;
-  delete unsigned.signature;
-  return Buffer.from(stableJson(unsigned), "utf8");
-}
-
-function resolveReleaseArtifactPath(rawPath) {
-  const candidate = String(rawPath || "").trim();
-  if (!candidate) return null;
-  const resolved = path.resolve(CWD, candidate);
-  const relative = path.relative(CWD, resolved);
-  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
-  return resolved;
-}
-
-function verifyReleaseManifestArtifacts(manifest) {
-  const rawEntries = manifest?.artifact_hashes ?? manifest?.artifacts ?? manifest?.files;
-  const entries = [];
-  if (Array.isArray(rawEntries)) {
-    for (const entry of rawEntries) {
-      if (!entry || typeof entry !== "object") continue;
-      entries.push({
-        field: String(entry.field || entry.name || "").trim(),
-        path: String(entry.path || entry.file || entry.relative_path || "").trim(),
-        expected: String(entry.sha256 || entry.hash || "").trim().toLowerCase(),
-      });
-    }
-  } else if (rawEntries && typeof rawEntries === "object") {
-    for (const [field, entry] of Object.entries(rawEntries)) {
-      if (typeof entry === "string") {
-        entries.push({ field: String(field), path: String(field), expected: entry.trim().toLowerCase() });
-      } else if (entry && typeof entry === "object") {
-        entries.push({
-          field: String(entry.field || field).trim(),
-          path: String(entry.path || entry.file || entry.relative_path || "").trim(),
-          expected: String(entry.sha256 || entry.hash || "").trim().toLowerCase(),
-        });
-      }
-    }
-  }
-
-  const blockers = [];
-  const verifiedFields = [];
-  const requiredFields = ["source_hash", "lockfile_hash", "migration_hash", "env_hash", "db_snapshot_hash", "backup_hash"];
-  for (const field of requiredFields) {
-    const entry = entries.find((candidate) => candidate.field === field);
-    const declared = String(manifest?.[field] || "").trim().toLowerCase();
-    if (!entry || !entry.path || !entry.expected || !declared) {
-      blockers.push(`manifest_hash_unverifiable_${field}`);
-      continue;
-    }
-    if (entry.expected !== declared) {
-      blockers.push(`manifest_hash_declaration_mismatch_${field}`);
-      continue;
-    }
-    const artifactPath = resolveReleaseArtifactPath(entry.path);
-    if (!artifactPath || !fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
-      blockers.push(`manifest_artifact_missing_${field}`);
-      continue;
-    }
-    const actual = crypto.createHash("sha256").update(fs.readFileSync(artifactPath)).digest("hex");
-    if (actual !== declared) {
-      blockers.push(`manifest_artifact_hash_mismatch_${field}`);
-      continue;
-    }
-    verifiedFields.push(field);
-  }
-  return { ok: blockers.length === 0, verified_fields: verifiedFields, blockers };
-}
-
-function verifyReleaseManifestSignatures(manifest) {
-  const signatures = Array.isArray(manifest?.signatures) ? manifest.signatures : [];
-  const payload = releaseManifestSigningPayload(manifest);
-  const trustedKeys = new Map();
-  for (const rawPath of RELEASE_TRUSTED_PUBLIC_KEY_PATHS) {
-    const trustedPath = path.resolve(CWD, rawPath);
-    try {
-      const publicKey = fs.readFileSync(trustedPath, "utf8").trim();
-      if (publicKey) trustedKeys.set(sha256(publicKey), publicKey);
-    } catch (_error) {
-      // Missing trusted keys are reported as a fail-closed blocker below.
-    }
-  }
-  const validSignatures = [];
-  const blockers = [];
-  if (trustedKeys.size === 0) blockers.push("manifest_trusted_key_set_missing");
-  for (const [index, entry] of signatures.entries()) {
-    if (!entry || typeof entry !== "object") {
-      blockers.push(`manifest_signature_${index}_invalid_shape`);
-      continue;
-    }
-    const algorithm = String(entry.algorithm || "").trim().toLowerCase();
-    const publicKey = entry.public_key_pem || entry.public_key;
-    const encodedSignature = entry.signature_base64 || entry.signature;
-    const keyId = String(entry.key_id || "").trim();
-    const trustedPublicKey = trustedKeys.get(keyId);
-    if (algorithm !== "ed25519" || !publicKey || !encodedSignature || !keyId) {
-      blockers.push(`manifest_signature_${index}_unsupported`);
-      continue;
-    }
-    if (!trustedPublicKey || trustedPublicKey.trim() !== String(publicKey).trim()) {
-      blockers.push(`manifest_signature_${index}_untrusted_key`);
-      continue;
-    }
-    if (RELEASE_REVOKED_KEY_IDS.has(keyId)) {
-      blockers.push(`manifest_signature_${index}_revoked_key`);
-      continue;
-    }
-    try {
-      const signature = Buffer.from(String(encodedSignature), String(entry.encoding || "base64"));
-      if (crypto.verify(null, payload, publicKey, signature)) validSignatures.push(index);
-      else blockers.push(`manifest_signature_${index}_invalid`);
-    } catch (_error) {
-      blockers.push(`manifest_signature_${index}_invalid`);
-    }
-  }
-  if (validSignatures.length === 0) blockers.push("manifest_no_valid_signature");
-  return { ok: blockers.length === 0, valid_signature_indexes: validSignatures, blockers };
-}
-
 function evaluateReleaseSelectionGate() {
   const releaseIdValid = /^[0-9A-HJKMNP-TV-Z]{26}$/.test(RELEASE_ID)
     || /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(RELEASE_ID);
@@ -6486,62 +6663,66 @@ function evaluateReleaseSelectionGate() {
   if (!releaseIdValid) blockers.push("release_id_invalid_or_missing");
   if (!COMMERCIAL_EVIDENCE_DIR) blockers.push("commercial_evidence_dir_missing");
   if (!RELEASE_MANIFEST) blockers.push("release_manifest_missing");
-  let manifest = null;
-  if (RELEASE_MANIFEST) {
-    const manifestPath = path.resolve(CWD, RELEASE_MANIFEST);
-    if (!fs.existsSync(manifestPath)) {
-      blockers.push("release_manifest_file_missing");
-    } else {
-      try {
-        manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-      } catch (_error) {
-        blockers.push("release_manifest_invalid_json");
-      }
-    }
-  }
-  const requiredFields = [
-    "release_id",
-    "commit",
-    "source_hash",
-    "lockfile_hash",
-    "migration_hash",
-    "runtime",
-    "base_image_digest",
-    "app_image_digest",
-    "env_hash",
-    "db_snapshot_hash",
-    "backup_hash",
-    "audit_root",
-    "issued_at",
-    "expires_at",
-    "revocation_status",
-    "signatures",
-  ];
-  if (manifest && typeof manifest === "object") {
-    for (const field of requiredFields) {
-      if (manifest[field] == null || manifest[field] === "" || (Array.isArray(manifest[field]) && manifest[field].length === 0)) {
-        blockers.push(`manifest_missing_${field}`);
-      }
-    }
-    if (String(manifest.release_id || "") !== RELEASE_ID) blockers.push("manifest_release_id_mismatch");
-    if (String(manifest.revocation_status || "").toLowerCase() !== "valid") blockers.push("manifest_revocation_not_valid");
-    const expiresAt = Date.parse(String(manifest.expires_at || ""));
-    if (!Number.isFinite(expiresAt)) blockers.push("manifest_expires_at_invalid");
-    else if (expiresAt <= Date.now()) blockers.push("manifest_expired");
-  }
-  const artifactVerification = manifest ? verifyReleaseManifestArtifacts(manifest) : { ok: false, verified_fields: [], blockers: ["manifest_missing"] };
-  const signatureVerification = manifest ? verifyReleaseManifestSignatures(manifest) : { ok: false, valid_signature_indexes: [], blockers: ["manifest_missing"] };
-  blockers.push(...artifactVerification.blockers, ...signatureVerification.blockers);
+  const releaseEnv = {
+    ...ENV,
+    RELEASE_ENVIRONMENT_ID,
+    RELEASE_TRUSTED_PUBLIC_KEY_PATHS: RELEASE_TRUSTED_PUBLIC_KEY_PATHS.join(","),
+    RELEASE_REVOKED_KEY_IDS: [...RELEASE_REVOKED_KEY_IDS].join(","),
+  };
+  const manifestResult = loadReleaseManifest(RELEASE_MANIFEST, releaseEnv, { root: CWD });
+  const manifest = manifestResult.manifest || null;
+  blockers.push(...manifestResult.blockers);
+  if (manifest && String(manifest.release_id || "") !== RELEASE_ID) blockers.push("manifest_release_id_mismatch");
+  if (!['limited', 'commercial'].includes(RELEASE_MODE)) blockers.push("release_mode_invalid");
+  if (manifest && String(manifest.mode || "").trim().toLowerCase() !== RELEASE_MODE) blockers.push("manifest_release_mode_mismatch");
+  const signedEvidence = validateSignedReleaseEvidence({
+    releaseManifestResult: manifestResult,
+    evidenceDir: COMMERCIAL_EVIDENCE_DIR || null,
+    env: releaseEnv,
+    root: CWD,
+    releaseMode: RELEASE_MODE,
+  });
+  blockers.push(...signedEvidence.blockers);
   return {
     release_selection_gate: selectionOk,
     release_manifest_gate: selectionOk && blockers.length === 0,
+    release_evidence_binding_gate: signedEvidence.ok,
+    release_mode_gate: ['limited', 'commercial'].includes(RELEASE_MODE)
+      && String(manifest?.mode || "").trim().toLowerCase() === RELEASE_MODE,
+    limited_pilot_cap_gate: RELEASE_MODE !== "limited" || Boolean(signedEvidence.limited_pilot_cap?.ok),
     release_id: RELEASE_ID || null,
+    release_mode: RELEASE_MODE || null,
     evidence_dir: COMMERCIAL_EVIDENCE_DIR || null,
     manifest_path: RELEASE_MANIFEST || null,
     blockers: [...new Set(blockers)],
-    artifact_verification: artifactVerification,
-    signature_verification: signatureVerification,
+    manifest_result: manifestResult,
+    signed_evidence: signedEvidence,
   };
+}
+
+function evaluateFunctionalApprovalGate(approvalId, releaseGate = null) {
+  const normalizedApprovalId = String(approvalId || "").trim();
+  if (!PRODUCTION_LIKE_RUNTIME) {
+    const legacyApprovals = {
+      legal: LEGAL_GATE_APPROVED,
+      aml: AML_POLICY_APPROVED,
+      privacy: PRIVACY_POLICY_APPROVED,
+      appi: APPI_POLICY_APPROVED,
+    };
+    const ok = Boolean(legacyApprovals[normalizedApprovalId]);
+    return {
+      ok,
+      approval_id: normalizedApprovalId || null,
+      source: "development_legacy_flag",
+      blockers: ok ? [] : [`${normalizedApprovalId || "unknown"}_legacy_approval_not_enabled`],
+    };
+  }
+  const selectedReleaseGate = releaseGate || evaluateReleaseSelectionGate();
+  return evaluateReleaseBoundApproval({
+    releaseManifestResult: selectedReleaseGate.manifest_result,
+    signedEvidence: selectedReleaseGate.signed_evidence,
+    approvalId: normalizedApprovalId,
+  });
 }
 
 function evaluateExternalEvidenceGates() {
@@ -6550,15 +6731,14 @@ function evaluateExternalEvidenceGates() {
     evidenceDir: COMMERCIAL_EVIDENCE_DIR || null,
   });
   const ext = report.ext || {};
-  const poc = report.poc || {};
+  const poc = Array.isArray(report.poc) ? report.poc : [];
   const empty = (key) => ({
     ok: false,
     status: "missing",
     file: null,
     errors: [`${key} evidence is missing`],
   });
-  const pocItems = Object.entries(poc);
-  const pocErrors = pocItems.flatMap(([key, item]) => (item?.ok ? [] : [`${key}: ${(item?.errors || ["missing"]).join("; ")}`]));
+  const pocErrors = poc.flatMap((item) => (item?.ok ? [] : [`${item?.id || "POC"}: ${(item?.errors || ["missing"]).join("; ")}`]));
 
   return {
     latest_dir: report.latest_evidence_dir || null,
@@ -6647,6 +6827,7 @@ function evaluateCommercialRuntimeGate(metrics = null) {
   const settlementPolicy = resolveSettlementUnresolvedReviewPolicy(null);
   const auditChainOk = Boolean(runtimeMetrics.audit_chain?.ok);
   const chainRuntimeRegistryOk = Boolean(runtimeMetrics.chain_runtime_registry?.ok);
+  const signedApproval = (approvalId) => evaluateFunctionalApprovalGate(approvalId, releaseGate).ok;
 
   const gates = {
     database_gate: Boolean(runtimeMetrics.db_ok),
@@ -6657,29 +6838,34 @@ function evaluateCommercialRuntimeGate(metrics = null) {
     app_env: APP_ENV,
     payments_disabled: isPaymentsDisabled(),
     commercial_go_mode: COMMERCIAL_GO_MODE,
-    legal_gate: LEGAL_GATE_APPROVED && !isPlaceholderLike(LEGAL_GATE_APPROVAL_REF),
-    aml_gate: AML_POLICY_APPROVED && !isPlaceholderLike(AML_POLICY_APPROVAL_REF),
-    privacy_gate: PRIVACY_POLICY_APPROVED && !isPlaceholderLike(PRIVACY_POLICY_APPROVAL_REF),
-    appi_gate: APPI_POLICY_APPROVED && !isPlaceholderLike(APPI_POLICY_APPROVAL_REF),
+    legal_gate: signedApproval("legal"),
+    aml_gate: signedApproval("aml"),
+    privacy_gate: signedApproval("privacy"),
+    appi_gate: signedApproval("appi"),
     jpyc_contract_gate:
-      !isPlaceholderLike(JPYC_CONTRACT_APPROVAL_REF)
+      signedApproval("jpyc_contract")
       && CHAIN_ID === "137"
       && !!APPROVED_JPYC_TOKEN_CONTRACT
       && String(TOKEN_CONTRACT).toLowerCase() === APPROVED_JPYC_TOKEN_CONTRACT
       && TOKEN_DECIMALS === APPROVED_TOKEN_DECIMALS
       && LEDGER_BASE_UNIT_SCALE === APPROVED_LEDGER_BASE_UNIT_SCALE,
     confirmation_policy_gate:
-      !isPlaceholderLike(CONFIRMATIONS_POLICY_APPROVAL_REF)
+      signedApproval("confirmation_policy")
       && REQUIRED_CONFIRMATIONS >= MIN_REQUIRED_CONFIRMATIONS,
-    backscan_policy_gate: !isPlaceholderLike(BACKSCAN_POLICY_APPROVAL_REF) && MONITOR_BACKSCAN_BLOCKS >= MIN_MONITOR_BACKSCAN_BLOCKS,
+    backscan_policy_gate: signedApproval("backscan_policy") && MONITOR_BACKSCAN_BLOCKS >= MIN_MONITOR_BACKSCAN_BLOCKS,
+    refund_treasury_approval_gate: signedApproval("refund_treasury"),
     policy_urls_gate: policyUrlsGate.ok,
     release_selection_gate: releaseGate.release_selection_gate,
     release_manifest_gate: releaseGate.release_manifest_gate,
+    release_evidence_binding_gate: releaseGate.release_evidence_binding_gate,
+    release_mode_gate: releaseGate.release_mode_gate,
+    limited_pilot_cap_gate: releaseGate.limited_pilot_cap_gate,
     wallet_evidence_gate: externalEvidence.wallet_evidence_gate.ok,
     real_payment_evidence_gate: externalEvidence.real_payment_evidence_gate.ok,
     tls_evidence_gate: externalEvidence.tls_evidence_gate.ok,
     store_ops_drill_gate: externalEvidence.store_ops_drill_gate.ok,
     poc_package_gate: externalEvidence.poc_package_gate.ok,
+    performance_evidence_gate: Boolean(externalEvidence.strict_report?.performance_pass),
     audit_chain_gate: auditChainOk,
     settlement_policy_gate: settlementPolicy === "block",
     refund_policy_gate: REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR,
@@ -6696,6 +6882,7 @@ function evaluateCommercialRuntimeGate(metrics = null) {
   if (!gates.jpyc_contract_gate) blockers.push("jpyc_contract_gate");
   if (!gates.confirmation_policy_gate) blockers.push("confirmation_policy_gate");
   if (!gates.backscan_policy_gate) blockers.push("backscan_policy_gate");
+  if (!gates.refund_treasury_approval_gate) blockers.push("refund_treasury_approval_gate");
   if (!gates.audit_chain_gate) blockers.push("audit_chain_gate");
   if (!gates.settlement_policy_gate) blockers.push("settlement_policy_gate");
   if (!gates.refund_policy_gate) blockers.push("refund_policy_gate");
@@ -6713,6 +6900,17 @@ function evaluateCommercialRuntimeGate(metrics = null) {
     if (!gates.release_manifest_gate) blockers.push("release_manifest_gate");
     if (!gates.policy_urls_gate) blockers.push("policy_urls_gate");
   }
+  if (releaseGateRequired) {
+    if (!gates.release_evidence_binding_gate) blockers.push("release_evidence_binding_gate");
+    if (!gates.release_mode_gate) blockers.push("release_mode_gate");
+    if (!gates.limited_pilot_cap_gate) blockers.push("limited_pilot_cap_gate");
+    if (!gates.wallet_evidence_gate) blockers.push("wallet_evidence_gate");
+    if (!gates.real_payment_evidence_gate) blockers.push("real_payment_evidence_gate");
+    if (!gates.tls_evidence_gate) blockers.push("tls_evidence_gate");
+    if (!gates.store_ops_drill_gate) blockers.push("store_ops_drill_gate");
+    if (!gates.poc_package_gate) blockers.push("poc_package_gate");
+    if (!gates.performance_evidence_gate) blockers.push("performance_evidence_gate");
+  }
   if (gates.commercial_go_mode) {
     if (!gates.policy_urls_gate) blockers.push("policy_urls_gate");
     if (!gates.wallet_evidence_gate) blockers.push("wallet_evidence_gate");
@@ -6722,11 +6920,11 @@ function evaluateCommercialRuntimeGate(metrics = null) {
     if (!gates.poc_package_gate) blockers.push("poc_package_gate");
   }
 
-  let commercialVerdict = "LIMITED_PILOT_MODE";
+  let commercialVerdict = "NO_GO";
   if (gates.commercial_go_mode) {
-    commercialVerdict = blockers.length === 0 ? "COMMERCIAL_GO_10" : "CONDITIONAL_NO_GO_FOR_COMMERCIAL";
-  } else if (blockers.length === 0) {
-    commercialVerdict = "READY_FOR_LIMITED_PILOT";
+    commercialVerdict = blockers.length === 0 ? "COMMERCIAL_GO_10" : "NO_GO";
+  } else if (releaseGateRequired && RELEASE_MODE === "limited" && blockers.length === 0) {
+    commercialVerdict = "LIMITED_PILOT_GO";
   } else {
     commercialVerdict = "NO_GO";
   }
@@ -6745,7 +6943,7 @@ function evaluateCommercialRuntimeGate(metrics = null) {
 
 function getCommercialGateBlockedError() {
   const gate = evaluateCommercialRuntimeGate();
-  if (!gate.commercial_go_mode) return null;
+  if (!PRODUCTION_LIKE_RUNTIME) return null;
   if (!gate.blockers.length) return null;
   return {
     code: "COMMERCIAL_GATE_BLOCKED",
@@ -6842,6 +7040,27 @@ const recoveryRpcProvidersByChain = new Map(
       return [chainId, providers];
     })
 );
+
+function listPublicPaymentRecoveryChains() {
+  return listSupportedPaymentChains()
+    .filter((chain) => READ_ONLY_RECOVERY_CHAIN_IDS.includes(String(chain.chain_id)))
+    .filter((chain) => (recoveryRpcProvidersByChain.get(String(chain.chain_id)) || []).length > 0)
+    .flatMap((chain) => {
+      const officialToken = validateOfficialJpycContract(
+        chain.token_contract,
+        `payment recovery chain ${chain.chain_id}`,
+      );
+      if (!officialToken.ok) return [];
+      return [{
+        chain_id: String(chain.chain_id),
+        network: String(chain.network),
+        short_name: String(chain.short_name),
+        native_symbol: String(chain.native_symbol),
+        token_symbol: String(chain.token_symbol),
+        official_token_contract: officialToken.value,
+      }];
+    });
+}
 
 function normalizeAddress(value) {
   if (!isEvmAddress(value)) return null;
@@ -7033,7 +7252,7 @@ function importReceiveAddresses({ storeId, actorId, addresses, sourceLabel, chai
       chain_id: chainId,
       token_contract: policy.tokenContract,
     };
-    let control = validateReceiveAddressControl(controlInput, { allowTestFixture: !IS_PRODUCTION && RECEIVE_ADDRESS_DEV_AUTO_VERIFY });
+    let control = validateReceiveAddressControl(controlInput, { allowTestFixture: !PRODUCTION_LIKE_RUNTIME && RECEIVE_ADDRESS_DEV_AUTO_VERIFY });
     if (!control.ok && !IS_PRODUCTION && RECEIVE_ADDRESS_DEV_AUTO_VERIFY && !entryObject.control_proof_type) {
       const fixturePayload = { address, chain_id: chainId, token_contract: policy.tokenContract, source_label: source || "ops_import" };
       control = validateReceiveAddressControl({
@@ -7551,44 +7770,76 @@ async function createPaymentRecoveryReport({ invoice, body, reporterType, report
   const timestamp = nowIso();
   const reportId = uuid();
   const row = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO payment_recovery_reports
-       (id, invoice_id, reporter_type, reporter_id, requested_chain_id, tx_hash, reported_issue,
-        status, verified_chain_id, rpc_verified, receipt_found, canonical_status, confirmations,
-        evidence_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(invoice_id, requested_chain_id, tx_hash, reporter_type) DO UPDATE SET
-         reporter_id = excluded.reporter_id,
-         reported_issue = excluded.reported_issue,
-         status = excluded.status,
-         verified_chain_id = excluded.verified_chain_id,
-         rpc_verified = excluded.rpc_verified,
-         receipt_found = excluded.receipt_found,
-         canonical_status = excluded.canonical_status,
-         confirmations = excluded.confirmations,
-         evidence_json = excluded.evidence_json,
-         updated_at = excluded.updated_at`
-    ).run(
-      reportId,
-      invoice.id,
-      normalized.reporterType,
-      reporterId || null,
-      normalized.chainId,
-      normalized.txHash,
-      normalized.reportedIssue,
-      classification.status,
-      verification.rpcVerified ? normalized.chainId : null,
-      verification.rpcVerified ? 1 : 0,
-      verification.receiptFound ? 1 : 0,
-      verification.canonicalStatus || "unknown",
-      Number(verification.confirmations || 0),
-      JSON.stringify(evidence),
-      timestamp,
-      timestamp,
-    );
+    const existing = db
+      .prepare(
+        `SELECT * FROM payment_recovery_reports
+         WHERE invoice_id = ? AND requested_chain_id = ? AND tx_hash = ? AND reporter_type = ?`
+      )
+      .get(invoice.id, normalized.chainId, normalized.txHash, normalized.reporterType);
+    if (existing) {
+      db.prepare(
+        `INSERT INTO payment_recovery_report_history
+         (id, report_id, revision, invoice_id, requested_chain_id, tx_hash, reporter_type, prior_row_json, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        uuid(),
+        existing.id,
+        Number(existing.revision || 1),
+        existing.invoice_id,
+        existing.requested_chain_id,
+        existing.tx_hash,
+        existing.reporter_type,
+        JSON.stringify(existing),
+        timestamp,
+      );
+      db.prepare(
+        `UPDATE payment_recovery_reports
+         SET reporter_id = ?, reported_issue = ?, status = ?, verified_chain_id = ?, rpc_verified = ?,
+             receipt_found = ?, canonical_status = ?, confirmations = ?, evidence_json = ?,
+             updated_at = ?, revision = revision + 1
+         WHERE id = ?`
+      ).run(
+        reporterId || null,
+        normalized.reportedIssue,
+        classification.status,
+        verification.rpcVerified ? normalized.chainId : null,
+        verification.rpcVerified ? 1 : 0,
+        verification.receiptFound ? 1 : 0,
+        verification.canonicalStatus || "unknown",
+        Number(verification.confirmations || 0),
+        JSON.stringify(evidence),
+        timestamp,
+        existing.id,
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO payment_recovery_reports
+         (id, invoice_id, reporter_type, reporter_id, requested_chain_id, tx_hash, reported_issue,
+          status, verified_chain_id, rpc_verified, receipt_found, canonical_status, confirmations,
+          evidence_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        reportId,
+        invoice.id,
+        normalized.reporterType,
+        reporterId || null,
+        normalized.chainId,
+        normalized.txHash,
+        normalized.reportedIssue,
+        classification.status,
+        verification.rpcVerified ? normalized.chainId : null,
+        verification.rpcVerified ? 1 : 0,
+        verification.receiptFound ? 1 : 0,
+        verification.canonicalStatus || "unknown",
+        Number(verification.confirmations || 0),
+        JSON.stringify(evidence),
+        timestamp,
+        timestamp,
+      );
+    }
     return db.prepare(
       `SELECT id, invoice_id, reporter_type, requested_chain_id, tx_hash, reported_issue, status,
-              verified_chain_id, rpc_verified, receipt_found, canonical_status, confirmations,
+              verified_chain_id, rpc_verified, receipt_found, canonical_status, confirmations, revision,
               created_at, updated_at
        FROM payment_recovery_reports
        WHERE invoice_id = ? AND requested_chain_id = ? AND tx_hash = ? AND reporter_type = ?`
@@ -8192,6 +8443,13 @@ function sanitizeAuditState(value, seen = new WeakSet()) {
   return sanitized;
 }
 
+function sanitizeEvidenceTextForStorage(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const sanitized = sanitizeAuditState(raw);
+  return typeof sanitized === "string" ? sanitized : "[REDACTED_SENSITIVE_VALUE]";
+}
+
 function sanitizeAuditMetadataValue(value) {
   if (value == null || value === "") return null;
   const sanitized = sanitizeAuditState(String(value));
@@ -8309,15 +8567,58 @@ function audit({
   );
 }
 
+function requiredAudit(entry) {
+  try {
+    audit(entry);
+  } catch (cause) {
+    const error = new Error("A required audit entry could not be appended");
+    error.code = "REQUIRED_AUDIT_APPEND_FAILED";
+    error.cause = cause;
+    throw error;
+  }
+}
+
 // `verified` means the destination/transaction evidence passed validation;
 // it is deliberately not an accounting-final state.  A refund remains open
 // until the required chain finality is recorded as `succeeded`/`finalized`.
-const RESOLVED_REFUND_STATUSES = new Set(["succeeded", "finalized", "cancelled", "rejected"]);
+const TERMINAL_NON_ACCOUNTING_REFUND_STATUSES = new Set(["cancelled", "rejected"]);
 const REFUND_RESERVATION_RELEASED_STATUSES = new Set(["cancelled", "rejected"]);
 
-function isUnresolvedRefundStatus(status) {
-  const value = String(status || "").trim();
-  return !RESOLVED_REFUND_STATUSES.has(value);
+function refundAccountingFinalityState(refund) {
+  const status = String(refund?.status || "").trim().toLowerCase();
+  const confirmations = Number(refund?.finality_confirmations || 0);
+  const requiredConfirmations = Math.max(
+    ACCOUNTING_FINALITY_CONFIRMATIONS,
+    Number(refund?.finality_required_confirmations || 0),
+  );
+  const canonicalStatus = String(refund?.canonical_status || "unknown").trim().toLowerCase();
+  const reorgHold = Number(refund?.reorg_hold || 0) === 1;
+  const hasTransactionEvidence = Boolean(String(refund?.refund_tx_hash || "").trim());
+  const final = ["succeeded", "finalized"].includes(status)
+    && Number.isFinite(confirmations)
+    && confirmations >= requiredConfirmations
+    && canonicalStatus === "canonical"
+    && !reorgHold
+    && hasTransactionEvidence;
+  return {
+    final,
+    status,
+    confirmations: Number.isFinite(confirmations) ? confirmations : 0,
+    requiredConfirmations,
+    canonicalStatus,
+    reorgHold,
+    hasTransactionEvidence,
+  };
+}
+
+function isRefundAccountingFinal(refund) {
+  return refundAccountingFinalityState(refund).final;
+}
+
+function isUnresolvedRefund(refund) {
+  const status = String(refund?.status || "").trim().toLowerCase();
+  if (TERMINAL_NON_ACCOUNTING_REFUND_STATUSES.has(status)) return false;
+  return !isRefundAccountingFinal(refund);
 }
 
 function syncInvoiceRefundStatus(invoiceId) {
@@ -8424,7 +8725,7 @@ function findActiveRefundBySemantic({ reviewCaseId, refundCaseId, refundAmountBa
          AND refund_amount_jpyc_base = ?
          AND lower(refund_to_address) = lower(?)
          AND refund_chain_id = ?
-         AND status IN ('approved', 'recorded', 'pending_verification', 'verification_failed', 'failed', 'succeeded', 'verified', 'finalized')
+         AND status IN ('requested', 'approved', 'recorded', 'pending_verification', 'verification_failed', 'failed', 'succeeded', 'verified', 'finalized')
        ORDER BY rowid ASC
        LIMIT 1`
     )
@@ -9055,13 +9356,15 @@ function buildDailySettlementPreview({ storeId, businessDate, store, range, unre
   const unresolvedPolicy = resolveSettlementUnresolvedReviewPolicy(store);
   const refunds = db
     .prepare(
-      `SELECT rr.id, rr.status, rr.invoice_id, rr.reason, rr.refund_amount_jpyc, rr.refund_tx_hash, rr.updated_at
+      `SELECT rr.id, rr.status, rr.invoice_id, rr.reason, rr.refund_amount_jpyc, rr.refund_tx_hash,
+              rr.finality_confirmations, rr.finality_required_confirmations,
+              rr.canonical_status, rr.reorg_hold, rr.updated_at
        FROM refund_requests rr
        JOIN invoices i ON i.id = rr.invoice_id
        WHERE i.store_id = ? AND rr.created_at BETWEEN ? AND ?`
     )
     .all(storeId, range.fromUtc, range.toUtc);
-  const unresolvedRefunds = refunds.filter((row) => isUnresolvedRefundStatus(row.status));
+  const unresolvedRefunds = refunds.filter((row) => isUnresolvedRefund(row));
   const refundCounts = {
     requested: refunds.filter((row) => String(row.status) === "requested").length,
     approved: refunds.filter((row) => String(row.status) === "approved").length,
@@ -9539,6 +9842,9 @@ function replayStoredIdempotencyResponse(res, record, label) {
 
 function idempotentWithLease(req, res, endpoint, actorId, logicFn) {
   const key = req.header("Idempotency-Key");
+  if (key && key.length > IDEMPOTENCY_KEY_MAX) {
+    return jsonError(res, 400, "VALIDATION_ERROR", `Idempotency-Key must be at most ${IDEMPOTENCY_KEY_MAX} characters`);
+  }
   if (!key) {
     console.warn(
       JSON.stringify({
@@ -9680,7 +9986,11 @@ function idempotentWithLease(req, res, endpoint, actorId, logicFn) {
     );
     const responseBody = { error: { code: "INTERNAL_ERROR", message: "Unexpected server error", details: {} } };
     try {
-      finalizeAsyncIdempotencyClaim(claim.claimId, 500, responseBody);
+      if (error?.code === "REQUIRED_AUDIT_APPEND_FAILED") {
+        releaseFailedIdempotencyClaim(claim.claimId);
+      } else {
+        finalizeAsyncIdempotencyClaim(claim.claimId, 500, responseBody);
+      }
     } catch (finalizeError) {
       console.error(
         JSON.stringify({
@@ -9725,6 +10035,29 @@ function idempotent(req, res, endpoint, actorId, logicFn) {
 const IDEMPOTENCY_PENDING_STATUS_CODE = 0;
 const IDEMPOTENCY_PENDING_RESPONSE_JSON = JSON.stringify({ _idempotency_state: "pending" });
 
+function releaseFailedIdempotencyClaim(claimId) {
+  const released = db.prepare(
+    `UPDATE idempotency_records
+     SET status = 'in_progress', status_code = ?, response_json = ?,
+         response_status = NULL, response_headers_json = ?, response_body_bytes = NULL,
+         completed_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+         record_version = COALESCE(record_version, 1) + 1
+     WHERE id = ? AND status_code = ? AND response_json = ?`
+  ).run(
+    IDEMPOTENCY_PENDING_STATUS_CODE,
+    IDEMPOTENCY_PENDING_RESPONSE_JSON,
+    JSON.stringify({ "content-type": "application/json; charset=utf-8" }),
+    claimId,
+    IDEMPOTENCY_PENDING_STATUS_CODE,
+    IDEMPOTENCY_PENDING_RESPONSE_JSON,
+  );
+  if (released.changes !== 1) {
+    const error = new Error("Failed idempotency claim could not be released for retry");
+    error.code = "IDEMPOTENCY_CLAIM_RELEASE_FAILED";
+    throw error;
+  }
+}
+
 function finalizeAsyncIdempotencyClaim(claimId, statusCode, responseBody) {
   const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_SEC * 1000).toISOString();
   const responseJson = JSON.stringify(responseBody);
@@ -9755,6 +10088,9 @@ function finalizeAsyncIdempotencyClaim(claimId, statusCode, responseBody) {
 
 async function idempotentAsync(req, res, endpoint, actorId, logicFn) {
   const key = req.header("Idempotency-Key");
+  if (key && key.length > IDEMPOTENCY_KEY_MAX) {
+    return jsonError(res, 400, "VALIDATION_ERROR", `Idempotency-Key must be at most ${IDEMPOTENCY_KEY_MAX} characters`);
+  }
   if (!key) {
     return jsonError(res, 400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required");
   }
@@ -9946,6 +10282,107 @@ function sendEvent(terminalId, event, payload) {
 }
 
 const OUTBOX_WORKER_ID = `app-outbox:${process.pid}:${uuid()}`;
+
+function enqueueOpsAlert({ alertCode, severity = "warning", payload = {} }) {
+  const now = nowIso();
+  const id = uuid();
+  db.prepare(
+    `INSERT INTO ops_alert_outbox(id, alert_code, severity, payload_json, status, attempt_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)`
+  ).run(id, String(alertCode), String(severity), JSON.stringify(payload), now, now);
+  return id;
+}
+
+async function deliverOpsAlertWebhook(row) {
+  if (!OPS_ALERT_WEBHOOK_URL) throw new Error("OPS_ALERT_WEBHOOK_UNCONFIGURED");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(OPS_ALERT_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        alert_id: row.id,
+        alert_code: row.alert_code,
+        severity: row.severity,
+        payload: JSON.parse(String(row.payload_json || "{}")),
+        created_at: row.created_at,
+        attempt: Number(row.attempt_count || 0),
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`OPS_ALERT_HTTP_${response.status}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function dispatchOpsAlertsOnce({ limit = 50 } = {}) {
+  const now = nowIso();
+  db.prepare(
+    `UPDATE ops_alert_outbox
+     SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+     WHERE status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`
+  ).run(now, now);
+  const rows = db.prepare(
+    `SELECT * FROM ops_alert_outbox
+     WHERE status = 'pending'
+       AND (available_at IS NULL OR available_at <= ?)
+       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+     ORDER BY created_at ASC, id ASC
+     LIMIT ?`
+  ).all(now, now, Math.max(1, Math.min(Number(limit) || 50, 200)));
+  const result = { claimed: 0, sent: 0, retried: 0, dead_lettered: 0 };
+  for (const row of rows) {
+    const leaseUntil = new Date(Date.now() + OPS_ALERT_LEASE_SEC * 1000).toISOString();
+    const claimed = db.prepare(
+      `UPDATE ops_alert_outbox
+       SET status = 'processing', attempt_count = attempt_count + 1,
+           lease_owner = ?, lease_expires_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'pending'
+         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`
+    ).run(OPS_ALERT_WORKER_ID, leaseUntil, now, row.id, now);
+    if (claimed.changes !== 1) continue;
+    result.claimed += 1;
+    const attempt = Number(row.attempt_count || 0) + 1;
+    try {
+      await deliverOpsAlertWebhook(row);
+      db.prepare(
+        `UPDATE ops_alert_outbox
+         SET status = 'sent', sent_at = ?, last_error = NULL,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?`
+      ).run(nowIso(), nowIso(), row.id, OPS_ALERT_WORKER_ID);
+      result.sent += 1;
+    } catch (error) {
+      const message = String(error.message || error).slice(0, 240);
+      // An unconfigured webhook is a deployment gap, not a transient failure:
+      // dead-letter immediately so the queue cannot grow forever.
+      const deadLetter = message === "OPS_ALERT_WEBHOOK_UNCONFIGURED" || attempt >= OPS_ALERT_MAX_ATTEMPTS;
+      const nextAvailableAt = deadLetter
+        ? null
+        : new Date(Date.now() + 30_000 * 2 ** Math.min(attempt - 1, 8)).toISOString();
+      db.prepare(
+        `UPDATE ops_alert_outbox
+         SET status = ?, available_at = COALESCE(?, available_at),
+             last_error = ?, dead_lettered_at = CASE WHEN ? = 'dead_letter' THEN ? ELSE dead_lettered_at END,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?`
+      ).run(
+        deadLetter ? "dead_letter" : "pending",
+        nextAvailableAt,
+        message,
+        deadLetter ? "dead_letter" : "retry",
+        deadLetter ? nowIso() : null,
+        nowIso(),
+        row.id,
+        OPS_ALERT_WORKER_ID,
+      );
+      if (deadLetter) result.dead_lettered += 1; else result.retried += 1;
+    }
+  }
+  return result;
+}
 
 function dispatchPaymentNotificationOutboxOnce({ limit = 50 } = {}) {
   const now = nowIso();
@@ -10969,7 +11406,8 @@ function findRefundRequests(invoiceId) {
 }
 
 function buildSettlementRefundSummary(refunds) {
-  const references = (Array.isArray(refunds) ? refunds : []).map((refund) => {
+  const refundRows = Array.isArray(refunds) ? refunds : [];
+  const references = refundRows.map((refund) => {
     const amount = parseRefundAmountBaseStrict(refund);
     return {
       refund_id: refund.id,
@@ -10989,9 +11427,9 @@ function buildSettlementRefundSummary(refunds) {
     if (REFUND_RESERVATION_RELEASED_STATUSES.has(row.status)) return sum;
     return sum + BigInt(String(row.refund_amount_jpyc_base || 0));
   }, 0n);
-  const succeededAmount = references.reduce((sum, row) => {
-    if (!["succeeded", "verified", "finalized"].includes(row.status) || !row.refund_tx_hash) return sum;
-    return sum + BigInt(String(row.refund_amount_jpyc_base || 0));
+  const succeededAmount = refundRows.reduce((sum, refund) => {
+    if (!isRefundAccountingFinal(refund)) return sum;
+    return sum + parseRefundAmountBaseStrict(refund);
   }, 0n);
   return {
     refund_reference_status: "complete",
@@ -11151,8 +11589,7 @@ function settlementAuditRefs(invoiceId, relatedIds = []) {
     .prepare(
       `SELECT id FROM audit_logs
        WHERE target_id IN (${targetIds.map(() => "?").join(",")})
-       ORDER BY created_at ASC, id ASC
-       LIMIT 100`
+       ORDER BY created_at ASC, id ASC`
     )
     .all(...targetIds)
     .map((row) => row.id);
@@ -11170,16 +11607,53 @@ function settlementAccountingEventRefs(invoiceId, businessDate) {
 }
 
 function settlementPrimaryPaymentEvent(invoice) {
-  if (!invoice?.paid_tx_hash) return null;
-  return db
+  if (!invoice?.paid_tx_hash || !invoice?.primary_recognized_transfer_id) return null;
+  const transfer = findCanonicalRecognizedTransfer(invoice);
+  if (!transfer || String(transfer.id) !== String(invoice.primary_recognized_transfer_id)) return null;
+  const logIndex = Number(transfer.log_index);
+  if (!Number.isSafeInteger(logIndex) || logIndex < 0) return null;
+  if (String(transfer.chain_id || "") !== String(invoice.chain_id || "")) return null;
+  if (String(transfer.tx_hash || "").toLowerCase() !== String(invoice.paid_tx_hash).toLowerCase()) return null;
+  if (normalizeAddress(transfer.token_contract) !== normalizeAddress(invoice.token_contract)) return null;
+  if (normalizeAddress(transfer.to_address) !== normalizeAddress(invoice.recipient_address)) return null;
+  const transferAtomic = String(transfer.token_amount_atomic || "").trim();
+  if (!/^\d+$/.test(transferAtomic)) return null;
+
+  const event = db
     .prepare(
-      `SELECT log_index, block_timestamp, detected_at
+      `SELECT *
        FROM payment_events
        WHERE invoice_id = ? AND chain_id = ? AND lower(tx_hash) = lower(?)
-       ORDER BY created_at ASC, id ASC
+         AND log_index = ?
+         AND canonical_status = 'canonical'
+         AND recognition_status = 'eligible'
+         AND chain_verified = 1
+         AND token_verified = 1
+         AND recipient_verified = 1
+         AND within_expiry = 1
+         AND COALESCE(deadline_eligible, 1) = 1
+         AND confirmations >= ?
+       ORDER BY confirmations DESC, created_at ASC, id ASC
        LIMIT 1`
     )
-    .get(invoice.id, String(invoice.chain_id || ""), invoice.paid_tx_hash) || null;
+    .get(
+      invoice.id,
+      String(transfer.chain_id),
+      transfer.tx_hash,
+      logIndex,
+      FULFILLMENT_REQUIRED_CONFIRMATIONS,
+    ) || null;
+  if (!event) return null;
+  if (normalizeAddress(event.token_contract) !== normalizeAddress(transfer.token_contract)) return null;
+  if (normalizeAddress(event.to_address) !== normalizeAddress(transfer.to_address)) return null;
+  const eventAtomic = String(event.token_amount_atomic ?? event.amount_atomic ?? "").trim();
+  if (eventAtomic !== transferAtomic) return null;
+  return {
+    ...event,
+    blockchain_transfer_id: transfer.id,
+    log_index: logIndex,
+    token_amount_atomic: transferAtomic,
+  };
 }
 
 function buildSettlementExportRow({
@@ -11288,11 +11762,25 @@ function buildSettlementExportRow({
 
   const providerPaymentRef = providerSession?.provider_payment_id || providerSession?.provider_session_id || null;
   const providerSettlementRef = providerAllocation?.external_provider_settlement_id || providerAllocation?.batch_reference || null;
-  const onchainTransferRef = invoice.paid_tx_hash || null;
   const paymentAttemptIds = settlementPaymentAttemptIds(invoice.id);
   const primaryEvent = settlementPrimaryPaymentEvent(invoice);
+  if (invoice.paid_tx_hash && !primaryEvent) {
+    throw ledgerIntegrityError(`invoice:${invoice.id}:primary_payment_evidence`);
+  }
+  const primaryPaymentEvidence = primaryEvent ? {
+    blockchain_transfer_id: primaryEvent.blockchain_transfer_id,
+    payment_event_id: primaryEvent.id,
+    chain_id: String(primaryEvent.chain_id),
+    tx_hash: String(primaryEvent.tx_hash),
+    log_index: Number(primaryEvent.log_index),
+    token_contract: String(primaryEvent.token_contract).toLowerCase(),
+    recipient_address: String(primaryEvent.to_address).toLowerCase(),
+    token_amount_atomic: String(primaryEvent.token_amount_atomic),
+    canonical_status: String(primaryEvent.canonical_status),
+  } : null;
+  const onchainTransferRef = primaryPaymentEvidence?.tx_hash || null;
   const primaryRefund = refundSummary.refund_references.find((refund) =>
-    ["succeeded", "verified", "finalized"].includes(String(refund.status)) && refund.refund_tx_hash
+    ["succeeded", "finalized"].includes(String(refund.status)) && refund.refund_tx_hash
   ) || refundSummary.refund_references[0] || null;
   const auditLogRefs = settlementAuditRefs(invoice.id, [
     exportRunId,
@@ -11308,11 +11796,13 @@ function buildSettlementExportRow({
     provider_payment_ref: providerPaymentRef,
     provider_settlement_ref: providerSettlementRef,
     onchain_transfer_ref: onchainTransferRef,
+    primary_payment_evidence: primaryPaymentEvidence,
     invoice_status: invoice.status,
     review_status: review?.status || null,
     refund_references: refundSummary.refund_references,
     refund_attribution: refundAttribution,
     accounting_status: accountingStatus,
+    audit_log_refs: auditLogRefs,
   });
 
   const rowId = uuid();
@@ -11339,7 +11829,7 @@ function buildSettlementExportRow({
     token_contract: invoice.token_contract || null,
     recipient_address: invoice.recipient_address || null,
     payment_attempt_ids: paymentAttemptIds,
-    primary_tx_hash: invoice.paid_tx_hash || null,
+    primary_tx_hash: primaryPaymentEvidence?.tx_hash || null,
     primary_tx_log_index: primaryEvent?.log_index ?? null,
     review_case_id: review?.id || null,
     review_reason_type: review?.reason_type || null,
@@ -14038,7 +14528,7 @@ function ensureSeedData() {
     );
   }
 
-  if (!IS_PRODUCTION) {
+  if (!PRODUCTION_LIKE_RUNTIME) {
     const terminal = db.prepare(`SELECT * FROM terminals WHERE id = 'terminal-001'`).get();
     if (!terminal) {
       db.prepare(
@@ -14160,26 +14650,41 @@ console.info(
   })
 );
 
+const INVOICE_EXPIRY_SWEEP_BATCH = Math.max(1, Number(process.env.INVOICE_EXPIRY_SWEEP_BATCH || 200));
+
 function runInvoiceExpirySweepOnce() {
   const now = nowIso();
+  // N-019: bounded batch per tick plus one aggregate evidence query for the
+  // whole batch instead of a per-invoice COUNT, so the sweeper can never
+  // perform unbounded synchronous N+1 work on the event loop.
   const candidates = db
     .prepare(
       `SELECT * FROM invoices
        WHERE status IN ('issued', 'payment_detected', 'confirming')
-         AND expires_at < ?`
+         AND expires_at < ?
+       ORDER BY expires_at ASC
+       LIMIT ?`
     )
-    .all(now);
+    .all(now, INVOICE_EXPIRY_SWEEP_BATCH);
+  if (candidates.length === 0) return { scanned: 0, updated: 0 };
+  const candidateIds = candidates.map((invoice) => invoice.id);
+  const evidencePlaceholders = candidateIds.map(() => "?").join(",");
+  const evidenceRows = db
+    .prepare(
+      `SELECT invoice_id,
+              COUNT(*) AS count,
+              MIN(block_timestamp) AS earliest_block_timestamp,
+              MIN(observed_at) AS earliest_observed_at
+       FROM payment_events
+       WHERE invoice_id IN (${evidencePlaceholders})
+       GROUP BY invoice_id`
+    )
+    .all(...candidateIds);
+  const evidenceById = new Map(evidenceRows.map((row) => [row.invoice_id, row]));
   let updated = 0;
   for (const invoice of candidates) {
-    const paymentEvidence = db
-      .prepare(
-        `SELECT COUNT(*) AS count,
-                MIN(block_timestamp) AS earliest_block_timestamp,
-                MIN(observed_at) AS earliest_observed_at
-         FROM payment_events
-         WHERE invoice_id = ?`
-      )
-      .get(invoice.id);
+    const paymentEvidence = evidenceById.get(invoice.id)
+      || { count: 0, earliest_block_timestamp: null, earliest_observed_at: null };
     const hasPaymentEvidence = invoice.status !== "issued" || Number(paymentEvidence?.count || 0) > 0 || !!invoice.paid_tx_hash;
     const expiresMs = new Date(invoice.expires_at).getTime();
     const earliestCanonicalMs = paymentEvidence?.earliest_block_timestamp
@@ -14243,6 +14748,11 @@ function runInvoiceExpirySweepOnce() {
                updated_at = ?
            WHERE id = ?`
         ).run("TIMESTAMP_UNVERIFIED", now, now, invoice.id);
+        enqueueOpsAlert({
+          alertCode: "invoice_integrity_hold",
+          severity: "warning",
+          payload: { invoice_id: invoice.id, reason: "TIMESTAMP_UNVERIFIED" },
+        });
       }
     }
     audit({
@@ -14287,6 +14797,18 @@ const notificationOutboxTimer = setInterval(() => {
         ...result,
       }));
     }
+    void dispatchOpsAlertsOnce({ limit: 50 })
+      .then((opsResult) => {
+        if (opsResult.dead_lettered > 0) {
+          console.error(JSON.stringify({
+            ts: nowIso(),
+            level: "error",
+            type: "ops.alert_outbox_dead_lettered",
+            ...opsResult,
+          }));
+        }
+      })
+      .catch(() => {});
   } catch (error) {
     console.error(JSON.stringify({
       ts: nowIso(),
@@ -14594,6 +15116,9 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     app_env: APP_ENV,
     payments_disabled: commercial.payments_disabled,
     commercial_go_mode: commercial.commercial_go_mode,
+    release_id: commercial.release_gate?.release_id || null,
+    release_mode: commercial.release_gate?.release_mode || null,
+    release_blockers: commercial.release_gate?.blockers || [],
     acceptance_gate_required: acceptanceGateRequired,
     database_gate: commercial.database_gate,
     worker_gate: commercial.worker_gate,
@@ -14607,12 +15132,19 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     jpyc_contract_gate: commercial.jpyc_contract_gate,
     confirmation_policy_gate: commercial.confirmation_policy_gate,
     backscan_policy_gate: commercial.backscan_policy_gate,
+    refund_treasury_approval_gate: commercial.refund_treasury_approval_gate,
+    release_selection_gate: commercial.release_selection_gate,
+    release_manifest_gate: commercial.release_manifest_gate,
+    release_evidence_binding_gate: commercial.release_evidence_binding_gate,
+    release_mode_gate: commercial.release_mode_gate,
+    limited_pilot_cap_gate: commercial.limited_pilot_cap_gate,
     policy_urls_gate: commercial.policy_urls_gate,
     wallet_evidence_gate: commercial.wallet_evidence_gate,
     real_payment_evidence_gate: commercial.real_payment_evidence_gate,
     tls_evidence_gate: commercial.tls_evidence_gate,
     store_ops_drill_gate: commercial.store_ops_drill_gate,
     poc_package_gate: commercial.poc_package_gate,
+    performance_evidence_gate: commercial.performance_evidence_gate,
     audit_chain_gate: commercial.audit_chain_gate,
     settlement_policy_gate: commercial.settlement_policy_gate,
     refund_policy_gate: commercial.refund_policy_gate,
@@ -14624,15 +15156,7 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     checks: metrics,
     policy_urls: commercial.policy_urls,
     external_evidence: commercial.external_evidence,
-    approvals: {
-      legal_gate_approved: LEGAL_GATE_APPROVED,
-      aml_policy_approved: AML_POLICY_APPROVED,
-      privacy_policy_approved: PRIVACY_POLICY_APPROVED,
-      appi_policy_approved: APPI_POLICY_APPROVED,
-      jpyc_contract_ref_configured: !isPlaceholderLike(JPYC_CONTRACT_APPROVAL_REF),
-      confirmations_policy_ref_configured: !isPlaceholderLike(CONFIRMATIONS_POLICY_APPROVAL_REF),
-      backscan_policy_ref_configured: !isPlaceholderLike(BACKSCAN_POLICY_APPROVAL_REF),
-    },
+    approvals: commercial.release_gate?.signed_evidence?.approval_gates || {},
   });
 });
 
@@ -14652,11 +15176,23 @@ app.get("/metrics", requireMetricsAuth, (_req, res) => {
   return res.send(renderPrometheusMetrics(metrics));
 });
 
-app.post("/api/v1/terminal-sessions", (req, res) => {
+app.post("/api/v1/terminal-sessions", async (req, res) => {
   const requestId = requestIdFromReq(req);
   const { terminalCode, staffPin, staffName } = req.body || {};
   if (!terminalCode || !staffPin) {
     return jsonError(res, 400, "VALIDATION_ERROR", "terminalCode and staffPin are required");
+  }
+  const terminalCodeCheck = validateTerminalCodeFormat(terminalCode);
+  if (!terminalCodeCheck.ok) {
+    // Same generic shape as credential failures so the format rule does not
+    // become a new enumeration oracle.
+    return jsonError(res, 401, "UNAUTHORIZED", "Invalid staff credentials");
+  }
+  if (staffName != null && String(staffName).trim() !== "") {
+    const staffNameCheck = validateStaffName(staffName);
+    if (!staffNameCheck.ok) {
+      return jsonError(res, 400, "VALIDATION_ERROR", staffNameCheck.reason);
+    }
   }
   if (!/^\d{4,8}$/.test(String(staffPin))) {
     return jsonError(res, 400, "VALIDATION_ERROR", "staffPin must be 4-8 digits");
@@ -14674,11 +15210,18 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
   }
 
   const terminal = db.prepare(`SELECT * FROM terminals WHERE terminal_code = ? AND status = 'active'`).get(terminalCode);
-  if (!terminal) return jsonError(res, 401, "UNAUTHORIZED", "Invalid terminal code");
+  if (!terminal) {
+    await verifyPinAsync(String(staffPin), LOGIN_DECOY_PIN_HASH);
+    return jsonError(res, 401, "UNAUTHORIZED", "Invalid staff credentials");
+  }
   const candidateRows = staffName
     ? db.prepare(`SELECT * FROM staff_users WHERE store_id = ? AND status = 'active' AND staff_name = ?`).all(terminal.store_id, String(staffName))
     : db.prepare(`SELECT * FROM staff_users WHERE store_id = ? AND status = 'active'`).all(terminal.store_id);
-  const matchingStaff = candidateRows.filter((row) => verifyPin(String(staffPin), row.pin_hash));
+  const matchingStaff = [];
+  for (const row of candidateRows) {
+    // Verification is intentionally sequential per candidate row.
+    if (await verifyPinAsync(String(staffPin), row.pin_hash)) matchingStaff.push(row);
+  }
   if (matchingStaff.length !== 1) {
     if (matchingStaff.length === 0) registerPinFailure(terminalCode);
     return jsonError(res, 401, "UNAUTHORIZED", "Invalid staff credentials");
@@ -14686,7 +15229,7 @@ app.post("/api/v1/terminal-sessions", (req, res) => {
   const staff = matchingStaff[0];
   clearPinFailures(terminalCode);
   if (!staff.pin_hash.startsWith("$2")) {
-    db.prepare(`UPDATE staff_users SET pin_hash = ?, updated_at = ? WHERE id = ?`).run(hashPin(staffPin), nowIso(), staff.id);
+    db.prepare(`UPDATE staff_users SET pin_hash = ?, updated_at = ? WHERE id = ?`).run(await hashPinAsync(staffPin), nowIso(), staff.id);
   }
 
   const rawToken = `${uuid()}-${uuid()}`;
@@ -14866,6 +15409,11 @@ function applyChainReorgToFinancialLedger(payload = {}, auditContext = {}) {
       afterState: { reorg: afterReorg, affected_invoice_ids: affectedInvoiceIds },
       ip: null,
     });
+    enqueueOpsAlert({
+      alertCode: "chain_reorg_detected",
+      severity: "critical",
+      payload: { reorg_id: reorg.id, affected_invoice_ids: affectedInvoiceIds },
+    });
     return { reorg_id: reorg.id, affected_invoice_ids: affectedInvoiceIds };
   })();
   return result;
@@ -14881,6 +15429,13 @@ app.post("/api/v1/internal/chain/candidates:read", requireServiceSignature, (req
   if (normalizedTokenContract !== APPROVED_TOKEN_CONTRACT) {
     return jsonError(res, 400, "TOKEN_CONTRACT_MISMATCH", "candidate token contract is not the approved JPYC contract");
   }
+  // M-030: cursor pagination with explicit truncation metadata so a large
+  // ledger can never be silently cut at a fixed row cap.
+  const rawLimit = Number(payload.limit);
+  const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0
+    ? Math.min(rawLimit, 50000)
+    : 10000;
+  const cursor = String(payload.cursor || "").trim();
   const invoices = db
     .prepare(
       `SELECT id, amount_jpyc, amount_jpyc_base, recipient_address, status, monitor_until,
@@ -14888,18 +15443,28 @@ app.post("/api/v1/internal/chain/candidates:read", requireServiceSignature, (req
        FROM invoices
        WHERE chain_id = ?
          AND lower(token_contract) = ?
+         AND (? = '' OR id > ?)
          AND status IN ('issued', 'payment_detected', 'confirming', 'expired', 'review_required', 'paid', 'settled', 'refunded', 'cancelled')
        ORDER BY id ASC
-       LIMIT 10000`
+       LIMIT ?`
     )
-    .all(normalizedChainId, normalizedTokenContract);
+    .all(normalizedChainId, normalizedTokenContract, cursor, cursor, limit + 1);
+  const hasMore = invoices.length > limit;
+  const pageInvoices = hasMore ? invoices.slice(0, limit) : invoices;
   return res.json({
     schema_version: 1,
     source: "api-server",
     financial_reader: "api-server",
     chain_id: normalizedChainId,
     token_contract: normalizedTokenContract,
-    invoices,
+    invoices: pageInvoices,
+    page: {
+      limit,
+      returned: pageInvoices.length,
+      has_more: hasMore,
+      next_cursor: hasMore ? pageInvoices[pageInvoices.length - 1].id : null,
+    },
+    truncated: hasMore,
   });
 });
 
@@ -15129,6 +15694,57 @@ app.post("/api/v1/payment-recovery/reports", requireSession, requirePermission("
   });
 });
 
+app.get("/api/v1/payment-recovery/reports", requireSession, requirePermission("invoice.read"), (req, res) => {
+  const queuePage = parsePaginationQuery(req, 100, 500);
+  if (!queuePage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const status = req.query.status ? String(req.query.status).trim() : null;
+  const where = ["i.store_id = ?"];
+  const args = [req.session.store_id];
+  if (status) {
+    where.push("r.status = ?");
+    args.push(status);
+  }
+  const rows = db
+    .prepare(
+      `SELECT r.id, r.invoice_id, i.invoice_no, r.reporter_type, r.requested_chain_id, r.tx_hash,
+              r.reported_issue, r.status, r.verified_chain_id, r.rpc_verified, r.receipt_found,
+              r.canonical_status, r.confirmations, r.revision, r.created_at, r.updated_at
+       FROM payment_recovery_reports r
+       JOIN invoices i ON i.id = r.invoice_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY r.updated_at DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...args, queuePage.limit, queuePage.offset);
+  return res.json({ reports: rows, page: { limit: queuePage.limit, offset: queuePage.offset, returned: rows.length } });
+});
+
+app.get("/api/v1/payment-recovery/reports/:reportId/history", requireSession, requirePermission("invoice.read"), (req, res) => {
+  const report = db
+    .prepare(
+      `SELECT r.id FROM payment_recovery_reports r JOIN invoices i ON i.id = r.invoice_id
+       WHERE r.id = ? AND i.store_id = ?`
+    )
+    .get(String(req.params.reportId || ""), req.session.store_id);
+  if (!report) return jsonError(res, 404, "NOT_FOUND", "Recovery report not found");
+  const history = db
+    .prepare(
+      `SELECT id, report_id, revision, prior_row_json AS prior_row, recorded_at
+       FROM payment_recovery_report_history
+       WHERE report_id = ?
+       ORDER BY revision DESC`
+    )
+    .all(report.id)
+    .map((entry) => ({
+      id: entry.id,
+      report_id: entry.report_id,
+      revision: entry.revision,
+      recorded_at: entry.recorded_at,
+      prior_row: JSON.parse(entry.prior_row),
+    }));
+  return res.json({ report_id: report.id, revisions: history });
+});
+
 app.post("/api/v1/provider-rail/mock/events:ingest", requireServiceSignature, (req, res) => {
   if (!ENABLE_PROVIDER_RAIL_MOCK) {
     return jsonError(res, 403, "PROVIDER_RAIL_MOCK_DISABLED", "provider rail mock is disabled");
@@ -15222,7 +15838,7 @@ app.use("/api/v1", requireSession);
 app.post(
   "/api/v1/terminal-sessions/current/step-up",
   requireAnyPermission("review.update", "accounting.adjustment.create", "accounting.adjustment.approve"),
-  (req, res) => {
+  async (req, res) => {
     const staffPin = String(req.body?.staff_pin ?? req.body?.staffPin ?? "");
     if (!/^\d{4,8}$/.test(staffPin)) {
       return jsonError(res, 400, "VALIDATION_ERROR", "staff_pin must be 4-8 digits");
@@ -15235,7 +15851,7 @@ app.post(
        FROM staff_users
        WHERE id = ? AND store_id = ? AND status = 'active'`
     ).get(req.session.staff_user_id, req.session.store_id);
-    if (!staff || !verifyPin(staffPin, staff.pin_hash)) {
+    if (!staff || !(await verifyPinAsync(staffPin, staff.pin_hash))) {
       audit({
         storeId: req.session.store_id,
         actorType: "staff",
@@ -15292,14 +15908,15 @@ app.post("/api/v1/staff", requirePermission("staff.manage"), (req, res) => {
   return idempotent(req, res, "POST:/api/v1/staff", actorId, () => {
     const requestId = requestIdFromReq(req);
     const idemKey = req.header("Idempotency-Key");
-    const staffName = String(req.body?.staff_name || "").trim();
+    const staffNameCheck = validateStaffName(req.body?.staff_name);
     const role = String(req.body?.role || "staff");
     const pin = String(req.body?.pin || "");
     const status = String(req.body?.status || "active");
     const permissionsOverride = Array.isArray(req.body?.permissions_override) ? req.body.permissions_override : null;
-    if (!staffName || !["staff", "operator", "manager", "accounting", "admin"].includes(role) || !/^\d{4,8}$/.test(pin) || !["active", "inactive"].includes(status)) {
-      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "Invalid staff payload" } } };
+    if (!staffNameCheck.ok || !["staff", "operator", "manager", "accounting", "admin"].includes(role) || !/^\d{4,8}$/.test(pin) || !["active", "inactive"].includes(status)) {
+      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: staffNameCheck.ok ? "Invalid staff payload" : staffNameCheck.reason } } };
     }
+    const staffName = staffNameCheck.value;
     const securityValidation = validateDirectStaffSecurityChange({ role, permissionsOverride });
     if (!securityValidation.ok) {
       return rejectStaffSecurityChange(req, {
@@ -15359,7 +15976,14 @@ app.patch("/api/v1/staff/:staffId", requirePermission("staff.manage"), (req, res
       });
     }
 
-    const nextName = req.body?.staff_name != null ? String(req.body.staff_name).trim() : before.staff_name;
+    let nextName = before.staff_name;
+    if (req.body?.staff_name != null) {
+      const nextNameCheck = validateStaffName(req.body.staff_name);
+      if (!nextNameCheck.ok) {
+        return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: nextNameCheck.reason } } };
+      }
+      nextName = nextNameCheck.value;
+    }
     const nextRole = req.body?.role != null ? String(req.body.role) : before.role;
     const nextStatus = req.body?.status != null ? String(req.body.status) : before.status;
     const storedOverride = parseStoredPermissionsOverride(before.permissions_override);
@@ -15473,8 +16097,9 @@ app.post("/api/v1/terminals", requirePermission("terminal.manage"), (req, res) =
     const idemKey = req.header("Idempotency-Key");
     const terminalCode = String(req.body?.terminal_code || "").trim();
     const status = String(req.body?.status || "active");
-    if (!terminalCode || !["active", "inactive"].includes(status)) {
-      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "terminal_code and valid status are required" } } };
+    const terminalCodeCreateCheck = validateTerminalCodeFormat(terminalCode);
+    if (!terminalCodeCreateCheck.ok || !["active", "inactive"].includes(status)) {
+      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: terminalCodeCreateCheck.ok ? "terminal_code and valid status are required" : terminalCodeCreateCheck.reason } } };
     }
     const terminalId = uuid();
     const ts = nowIso();
@@ -15581,8 +16206,9 @@ app.get("/api/v1/terminal-sessions", requirePermission("session.read"), (req, re
   const terminalId = req.query.terminal_id ? String(req.query.terminal_id) : null;
   const staffUserId = req.query.staff_user_id ? String(req.query.staff_user_id) : null;
   const includeEnded = String(req.query.include_ended || "true") === "true";
-  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
-  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const page = parsePaginationQuery(req, 100, 500);
+  if (!page) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const { limit, offset } = page;
   const where = ["t.store_id = ?"];
   const args = [req.session.store_id];
   if (terminalId) {
@@ -15701,6 +16327,11 @@ app.post("/api/v1/admin/payments/disable", requirePlatformPermission("payments.c
       afterState: after,
       ip: req.ip,
     });
+    enqueueOpsAlert({
+      alertCode: "payments_kill_switch",
+      severity: "critical",
+      payload: { action: "disabled", reason, actor_id: actorId, env_forced: PAYMENTS_DISABLED_ENV },
+    });
     return { status: 200, body: after };
   });
 });
@@ -15726,8 +16357,38 @@ app.post("/api/v1/admin/payments/enable", requirePlatformPermission("payments.co
       afterState: after,
       ip: req.ip,
     });
+    enqueueOpsAlert({
+      alertCode: "payments_kill_switch",
+      severity: "info",
+      payload: { action: "enabled", reason, actor_id: actorId },
+    });
+    });
     return { status: 200, body: after };
   });
+
+app.get("/api/v1/admin/ops-alerts", requireAnyPermission("monitor.read", "payments.control"), (req, res) => {
+  const alertsPage = parsePaginationQuery(req, 100, 500);
+  if (!alertsPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const status = req.query.status ? String(req.query.status).trim() : null;
+  const where = ["1=1"];
+  const args = [];
+  if (status) { where.push("status = ?"); args.push(status); }
+  const rows = db.prepare(
+    `SELECT id, alert_code, severity, status, attempt_count, last_error, created_at, updated_at, sent_at, dead_lettered_at
+     FROM ops_alert_outbox
+     WHERE ${where.join(" AND ")}
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`
+  ).all(...args, alertsPage.limit, alertsPage.offset);
+  const counts = db.prepare(
+    `SELECT status, COUNT(*) AS count FROM ops_alert_outbox GROUP BY status`
+  ).all();
+  return res.json({ alerts: rows, counts, page: { limit: alertsPage.limit, offset: alertsPage.offset, returned: rows.length } });
+});
+
+app.post("/api/v1/admin/ops-alerts:dispatch", requireAnyPermission("monitor.read", "payments.control"), async (req, res) => {
+  const result = await dispatchOpsAlertsOnce({ limit: Number(req.body?.limit) || 50 });
+  return res.json(result);
 });
 
 app.post("/api/v1/admin/stores/:storeId/payments/disable", requirePermission("payments.control"), (req, res) => {
@@ -15761,6 +16422,11 @@ app.post("/api/v1/admin/stores/:storeId/payments/disable", requirePermission("pa
       beforeState: before,
       afterState: after,
       ip: req.ip,
+    });
+    enqueueOpsAlert({
+      alertCode: "payments_kill_switch",
+      severity: "critical",
+      payload: { action: "disabled", scope: "store", store_id: store.id, reason, actor_id: actorId },
     });
     return { status: 200, body: after };
   });
@@ -15797,6 +16463,11 @@ app.post("/api/v1/admin/stores/:storeId/payments/enable", requirePermission("pay
       beforeState: before,
       afterState: after,
       ip: req.ip,
+    });
+    enqueueOpsAlert({
+      alertCode: "payments_kill_switch",
+      severity: "info",
+      payload: { action: "enabled", scope: "store", store_id: store.id, reason, actor_id: actorId },
     });
     return { status: 200, body: after };
   });
@@ -16011,7 +16682,7 @@ app.post("/api/v1/admin/receive-addresses/:receiveAddressId/control-proof", requ
       controlInput.control_proof_message = message;
       controlInput._proof_verified = true;
     }
-    const control = validateReceiveAddressControl(controlInput, { allowTestFixture: !IS_PRODUCTION && RECEIVE_ADDRESS_DEV_AUTO_VERIFY });
+    const control = validateReceiveAddressControl(controlInput, { allowTestFixture: !PRODUCTION_LIKE_RUNTIME && RECEIVE_ADDRESS_DEV_AUTO_VERIFY });
     if (!control.ok) {
       return {
         status: 400,
@@ -16148,13 +16819,20 @@ app.post("/api/v1/invoices", (req, res) => {
     if (paymentChainResult.error) {
       return { status: 400, body: { error: paymentChainResult.error } };
     }
-    if (!AML_POLICY_APPROVED && amountJpy >= AML_HIGH_VALUE_THRESHOLD_JPY) {
+    const amlApproval = amountJpy >= AML_HIGH_VALUE_THRESHOLD_JPY
+      ? evaluateFunctionalApprovalGate("aml")
+      : null;
+    if (amlApproval && !amlApproval.ok) {
       return {
         status: 503,
         body: {
           error: {
             code: "AML_POLICY_NOT_APPROVED",
             message: "High-value invoice creation is disabled until AML policy approval",
+            details: {
+              approval_source: amlApproval.source,
+              blockers: amlApproval.blockers,
+            },
           },
         },
       };
@@ -16210,34 +16888,6 @@ app.post("/api/v1/invoices", (req, res) => {
       sessionId: req.session.session_id,
       expiresAtIso: created.expires_at,
     });
-    audit({
-      actorType: "staff",
-      actorId,
-      action: "invoice.created",
-      targetType: "invoice",
-      targetId: created.id,
-      requestId,
-      idempotencyKey: idemKey,
-      afterState: created,
-      ip: req.ip
-    });
-    if (issued.allocatedAddress) {
-      audit({
-        actorType: "staff",
-        actorId,
-        action: "receive_address.allocated",
-        targetType: "receive_address",
-        targetId: issued.allocatedAddress.id,
-        requestId,
-        idempotencyKey: idemKey,
-        beforeState: {
-          status: "available",
-          address: issued.allocatedAddress.address,
-        },
-        afterState: issued.allocatedAddress,
-        ip: req.ip,
-      });
-    }
     if (amountJpy >= AML_HIGH_VALUE_THRESHOLD_JPY) {
       recordSuspiciousActivity({
         storeId: req.session.store_id,
@@ -16384,6 +17034,7 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
       confirmations: Number(paymentRecovery.confirmations || 0),
       updated_at: paymentRecovery.updated_at,
     } : null,
+    payment_recovery_chains: listPublicPaymentRecoveryChains(),
     customer_payment_mode: providerSummary.customer_payment_mode,
     review_case_id: review?.id || null,
     events,
@@ -16689,6 +17340,9 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
         requestId,
         idempotencyKey: idemKey,
         ip: req.ip,
+        requiredInvoiceAuditAction: "invoice.reissued",
+        requiredInvoiceAuditBeforeState: original,
+        requiredInvoiceAuditAfterState: { previous_invoice: previousInvoice },
       });
       if (issued.error) {
         return { status: 409, body: { error: issued.error } };
@@ -16726,35 +17380,6 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
       sessionId: req.session.session_id,
       expiresAtIso: issued.invoice.expires_at,
     });
-    audit({
-      actorType: "staff",
-      actorId,
-      action: "invoice.reissued",
-      targetType: "invoice",
-      targetId: issued.invoice.id,
-      requestId,
-      idempotencyKey: idemKey,
-      beforeState: original,
-      afterState: {
-        previous_invoice: previousInvoice,
-        new_invoice: issued.invoice,
-      },
-      ip: req.ip,
-    });
-    if (issued.allocatedAddress) {
-      audit({
-        actorType: "staff",
-        actorId,
-        action: "receive_address.allocated",
-        targetType: "receive_address",
-        targetId: issued.allocatedAddress.id,
-        requestId,
-        idempotencyKey: idemKey,
-        beforeState: { status: "available", address: issued.allocatedAddress.address },
-        afterState: issued.allocatedAddress,
-        ip: req.ip,
-      });
-    }
     sendEvent(req.session.terminal_id, "invoice.updated", { invoiceId: original.id, status: previousInvoice.status });
     sendEvent(req.session.terminal_id, "invoice.updated", { invoiceId: issued.invoice.id, status: issued.invoice.status });
     logCorrelationEvent("invoice.reissued", issued.invoice, {
@@ -16851,7 +17476,7 @@ app.post("/api/v1/invoices/:invoiceId/expire", requirePermission("invoice.create
 });
 
 app.post("/api/v1/payments/events:ingest", requirePermission("payment.ingest.manual"), async (req, res) => {
-  if (IS_PRODUCTION && !ALLOW_MANUAL_PAYMENT_INGEST) {
+  if (PRODUCTION_LIKE_RUNTIME && !ALLOW_MANUAL_PAYMENT_INGEST) {
     return jsonError(res, 403, "MANUAL_INGEST_DISABLED", "manual ingest is disabled in production");
   }
   const actorId = req.session.staff_user_id;
@@ -16864,7 +17489,7 @@ app.post("/api/v1/payments/events:ingest", requirePermission("payment.ingest.man
       return { status: 404, body: { error: { code: "NOT_FOUND", message: "Invoice not found" } } };
     }
     const invoiceProviders = rpcProvidersByChain.get(String(invoice.chain_id || CHAIN_ID)) || [];
-    const shouldVerifyOnChain = IS_PRODUCTION || (invoiceProviders.length > 0 && parseTxHash(req.body?.tx_hash));
+    const shouldVerifyOnChain = PRODUCTION_LIKE_RUNTIME || (invoiceProviders.length > 0 && parseTxHash(req.body?.tx_hash));
     const parsed = shouldVerifyOnChain
       ? await buildVerifiedManualIngestEvent(invoice, req.body || {})
       : buildIngestEvent(req.body || {});
@@ -16890,39 +17515,119 @@ app.post("/api/v1/payments/events:ingest", requirePermission("payment.ingest.man
 
 app.get("/api/v1/reviews", requirePermission("review.read"), (req, res) => {
   const status = req.query.status ? String(req.query.status) : null;
+  // M-031: bounded page size plus batched incident loading. The list can no
+  // longer scan/render the whole table and incidents no longer run one query
+  // per row.
+  const reviewPage = parsePaginationQuery(req, 100, 500);
+  if (!reviewPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const baseSelect = `SELECT r.*,
+                  r.reason_type AS reason_code,
+                  i.invoice_no,
+                  i.amount_jpy,
+                  i.amount_jpyc_base AS billed_amount_jpyc_base,
+                  i.paid_amount_jpyc,
+                  i.paid_amount_jpyc_base
+           FROM review_cases r JOIN invoices i ON i.id = r.invoice_id`;
   const rows = status
     ? db
         .prepare(
-          `SELECT r.*,
-                  r.reason_type AS reason_code,
-                  i.invoice_no,
-                  i.amount_jpy,
-                  i.amount_jpyc_base AS billed_amount_jpyc_base,
-                  i.paid_amount_jpyc,
-                  i.paid_amount_jpyc_base
-           FROM review_cases r JOIN invoices i ON i.id = r.invoice_id
+          `${baseSelect}
            WHERE i.store_id = ? AND r.status = ?
-           ORDER BY r.created_at DESC`
+           ORDER BY r.created_at DESC
+           LIMIT ? OFFSET ?`
         )
-        .all(req.session.store_id, status)
+        .all(req.session.store_id, status, reviewPage.limit, reviewPage.offset)
     : db
         .prepare(
-          `SELECT r.*,
-                  r.reason_type AS reason_code,
-                  i.invoice_no,
-                  i.amount_jpy,
-                  i.amount_jpyc_base AS billed_amount_jpyc_base,
-                  i.paid_amount_jpyc,
-                  i.paid_amount_jpyc_base
-           FROM review_cases r JOIN invoices i ON i.id = r.invoice_id
+          `${baseSelect}
            WHERE i.store_id = ?
-           ORDER BY r.created_at DESC`
+           ORDER BY r.created_at DESC
+           LIMIT ? OFFSET ?`
         )
-        .all(req.session.store_id);
+        .all(req.session.store_id, reviewPage.limit, reviewPage.offset);
+  const invoiceIds = [...new Set(rows.map((row) => row.invoice_id))];
+  const incidentsByInvoice = new Map();
+  if (invoiceIds.length > 0) {
+    const incidentPlaceholders = invoiceIds.map(() => "?").join(",");
+    const incidentRows = db
+      .prepare(`SELECT * FROM review_incidents WHERE invoice_id IN (${incidentPlaceholders}) ORDER BY created_at DESC, id DESC`)
+      .all(...invoiceIds);
+    if (incidentRows.length > 0) {
+      const incidentIds = incidentRows.map((incident) => incident.id);
+      const incidentIdPlaceholders = incidentIds.map(() => "?").join(",");
+      const reasonsByIncident = new Map();
+      for (const reason of db
+        .prepare(`SELECT reason_code, priority, evidence_json, created_at, review_incident_id FROM review_incident_reasons WHERE review_incident_id IN (${incidentIdPlaceholders}) ORDER BY priority DESC, created_at ASC, id ASC`)
+        .all(...incidentIds)) {
+        const list = reasonsByIncident.get(reason.review_incident_id) || [];
+        list.push({
+          reason_code: reason.reason_code,
+          priority: reason.priority,
+          evidence_json: reason.evidence_json,
+          created_at: reason.created_at,
+          evidence: parseJsonWithWarning(reason.evidence_json, `review_incident.reason:${reason.review_incident_id}`, {}),
+        });
+        reasonsByIncident.set(reason.review_incident_id, list);
+      }
+      const transfersByIncident = new Map();
+      for (const transfer of db
+        .prepare(`SELECT rit.review_incident_id, rit.blockchain_transfer_id, rit.relation_type, rit.created_at,
+                          bt.chain_id, bt.tx_hash, bt.log_index, bt.canonical_status, bt.integrity_status
+                   FROM review_incident_transfers rit
+                   JOIN blockchain_transfers bt ON bt.id = rit.blockchain_transfer_id
+                   WHERE rit.review_incident_id IN (${incidentIdPlaceholders})
+                   ORDER BY rit.created_at ASC, rit.blockchain_transfer_id ASC`)
+        .all(...incidentIds)) {
+        const list = transfersByIncident.get(transfer.review_incident_id) || [];
+        list.push({
+          blockchain_transfer_id: transfer.blockchain_transfer_id,
+          relation_type: transfer.relation_type,
+          created_at: transfer.created_at,
+          chain_id: transfer.chain_id,
+          tx_hash: transfer.tx_hash,
+          log_index: transfer.log_index,
+          canonical_status: transfer.canonical_status,
+          integrity_status: transfer.integrity_status,
+        });
+        transfersByIncident.set(transfer.review_incident_id, list);
+      }
+      const eventsByIncident = new Map();
+      for (const event of db
+        .prepare(`SELECT id, event_type, actor_id, payload_hash, payload_json, created_at, review_incident_id
+                  FROM review_incident_events
+                  WHERE review_incident_id IN (${incidentIdPlaceholders})
+                  ORDER BY created_at DESC, id DESC`)
+        .all(...incidentIds)) {
+        const list = eventsByIncident.get(event.review_incident_id) || [];
+        if (list.length >= 100) continue;
+        list.push({
+          id: event.id,
+          event_type: event.event_type,
+          actor_id: event.actor_id,
+          payload_hash: event.payload_hash,
+          payload_json: event.payload_json,
+          created_at: event.created_at,
+          payload: parseJsonWithWarning(event.payload_json, `review_incident.event:${event.id}`, {}),
+        });
+        eventsByIncident.set(event.review_incident_id, list);
+      }
+      for (const incident of incidentRows) {
+        const enriched = {
+          ...incident,
+          reasons: reasonsByIncident.get(incident.id) || [],
+          transfers: transfersByIncident.get(incident.id) || [],
+          events: eventsByIncident.get(incident.id) || [],
+        };
+        const list = incidentsByInvoice.get(incident.invoice_id) || [];
+        list.push(enriched);
+        incidentsByInvoice.set(incident.invoice_id, list);
+      }
+    }
+  }
   res.json({
     reviews: rows.map((row) => ({
       ...row,
-      incidents: listReviewIncidents(row.invoice_id),
+      incidents: incidentsByInvoice.get(row.invoice_id) || [],
       reason_type: normalizeReviewReasonCode(row.reason_type),
       reason_code: normalizeReviewReasonCode(row.reason_type),
       reason_label: reasonCodeLabelJa(row.reason_type),
@@ -16930,6 +17635,7 @@ app.get("/api/v1/reviews", requirePermission("review.read"), (req, res) => {
       refundable_candidate_jpyc_base:
         row.refundable_candidate_jpyc_base || computeReviewRefundableCandidateBase(row.reason_type, row.billed_amount_jpyc_base, row.paid_amount_jpyc_base),
     })),
+    page: { limit: reviewPage.limit, offset: reviewPage.offset, returned: rows.length },
   });
 });
 
@@ -17537,6 +18243,14 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
     if ((!review_case_id && !invoice_id) || parsedRefundBase.error || !refund_to_address || !refund_chain_id) {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "review_case_id or invoice_id and refund fields are required" } } };
     }
+    const customerNoteCheck = validateRefundMemo(customer_note);
+    if (!customerNoteCheck.ok) {
+      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: customerNoteCheck.reason } } };
+    }
+    const evidenceNoteCheck = validateRefundMemo(evidence_note_path, { required: false });
+    if (!evidenceNoteCheck.ok) {
+      return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: evidenceNoteCheck.reason } } };
+    }
     if (!isEvmAddress(refund_to_address)) {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "refund_to_address must be valid EVM address" } } };
     }
@@ -17881,6 +18595,9 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
     const ts = nowIso();
     const refundDisplay = Number(formatJpyc(parsedRefundBase.value));
     const normalizedReason = String(reason || normalizeReviewReasonCode(review.reason_type || REVIEW_REASON_CODES.OTHER)).trim();
+    const storedEvidenceScreenshot = sanitizeEvidenceTextForStorage(evidence_screenshot);
+    const storedEvidenceNotePath = sanitizeEvidenceTextForStorage(evidence_note_path);
+    const storedCustomerNote = sanitizeEvidenceTextForStorage(customer_note);
     try {
       db.transaction(() => {
         if (destinationChallenge) {
@@ -17928,9 +18645,9 @@ app.post("/api/v1/refunds", requirePermission("refund.request"), (req, res) => {
           String(refund_to_address),
           String(refund_chain_id),
           String(review.token_contract || APPROVED_TOKEN_CONTRACT || TOKEN_CONTRACT || ""),
-          String(evidence_screenshot || "").trim() || null,
-          String(evidence_note_path || "").trim() || null,
-          String(customer_note || "").trim() || null,
+          storedEvidenceScreenshot,
+          storedEvidenceNotePath,
+          storedCustomerNote,
           ts,
           ts,
           ts
@@ -18374,11 +19091,23 @@ app.post("/api/v1/refunds/:refundId/execute", requirePermission("refund.execute"
     if (!executor) {
       return { status: 400, body: { error: { code: "VALIDATION_ERROR", message: "Unsupported executor_type" } } };
     }
-    if (["external_signer", "custody_provider"].includes(executorType) && !LEGAL_GATE_APPROVED) {
-      return {
-        status: 503,
-        body: { error: { code: "LEGAL_GATE_NOT_APPROVED", message: "external signer/custody execution disabled until legal gate approval" } },
-      };
+    if (["external_signer", "custody_provider"].includes(executorType)) {
+      const legalApproval = evaluateFunctionalApprovalGate("legal");
+      if (!legalApproval.ok) {
+        return {
+          status: 503,
+          body: {
+            error: {
+              code: "LEGAL_GATE_NOT_APPROVED",
+              message: "external signer/custody execution disabled until legal gate approval",
+              details: {
+                approval_source: legalApproval.source,
+                blockers: legalApproval.blockers,
+              },
+            },
+          },
+        };
+      }
     }
     const refund = db
       .prepare(
@@ -19009,8 +19738,10 @@ app.patch("/api/v1/admin/stores/:storeId/customer-policies", requirePermission("
 app.get("/api/v1/audit-logs", requirePermission("audit.read"), (req, res) => {
   const targetType = req.query.target_type ? String(req.query.target_type) : null;
   const targetId = req.query.target_id ? String(req.query.target_id) : null;
-  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
-  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const auditPage = parsePaginationQuery(req, 50, 500);
+  if (!auditPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const limit = auditPage.limit;
+  const offset = auditPage.offset;
   const platformWide = isPlatformOperator(req.session);
   let rows;
   if (targetType && targetId) {
@@ -19034,13 +19765,30 @@ app.get("/api/v1/audit-logs/verify-chain", requirePlatformPermission("audit.read
 });
 
 app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, res) => {
-  if (IS_PRODUCTION && (!PRIVACY_POLICY_APPROVED || !APPI_POLICY_APPROVED)) {
-    return jsonError(res, 503, "PRIVACY_POLICY_NOT_APPROVED", "audit export is disabled until privacy and APPI approvals are enabled");
+  if (PRODUCTION_LIKE_RUNTIME) {
+    const releaseGate = evaluateReleaseSelectionGate();
+    const privacyApproval = evaluateFunctionalApprovalGate("privacy", releaseGate);
+    const appiApproval = evaluateFunctionalApprovalGate("appi", releaseGate);
+    if (!privacyApproval.ok || !appiApproval.ok) {
+      return jsonError(
+        res,
+        503,
+        "PRIVACY_POLICY_NOT_APPROVED",
+        "audit export is disabled until release-bound privacy and APPI approvals are verified",
+        {
+          privacy: privacyApproval,
+          appi: appiApproval,
+        },
+      );
+    }
   }
   const requestId = requestIdFromReq(req);
   const format = String(req.query.format || "json").toLowerCase();
-  const requestedLimit = Number(req.query.limit || 500);
-  const limit = Math.min(Math.max(requestedLimit, 1), 5000);
+  const exportPage = parsePaginationQuery(req, 500, 5000);
+  if (!exportPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit must be a non-negative integer");
+  const limit = exportPage.limit;
+  const rawLimitText = req.query.limit == null || String(req.query.limit).trim() === "" ? "" : String(req.query.limit).trim();
+  const requestedLimit = rawLimitText === "" ? 500 : Number(rawLimitText);
   const platformWide = isPlatformOperator(req.session);
   const totalCount = Number(
     platformWide
@@ -19048,16 +19796,47 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
       : db.prepare(`SELECT COUNT(*) AS count FROM audit_logs_scoped WHERE store_id = ?`).get(req.session.store_id).count
     || 0
   );
-  const truncated = totalCount > limit || requestedLimit > limit;
-  if (truncated) {
+  // M-032: opaque cursor continuation so a complete export can be assembled
+  // page by page instead of silently stopping at the row cap.
+  const cursorText = String(req.query.cursor || "").trim();
+  let cursorTuple = null;
+  if (cursorText) {
+    try {
+      const decodedCursor = JSON.parse(Buffer.from(cursorText, "base64url").toString("utf8"));
+      if (typeof decodedCursor?.c === "string" && typeof decodedCursor?.i === "string") {
+        cursorTuple = { c: decodedCursor.c, i: decodedCursor.i };
+      }
+    } catch (_) { /* invalid cursor falls through to validation error */ }
+    if (!cursorTuple) {
+      return jsonError(res, 400, "VALIDATION_ERROR", "cursor is invalid");
+    }
+  }
+  const scopeWhere = platformWide ? "" : " WHERE store_id = ?";
+  const scopeArgsBase = platformWide ? [] : [req.session.store_id];
+  const tupleWhere = cursorTuple ? `${scopeWhere ? " AND" : " WHERE"} (created_at < ? OR (created_at = ? AND id < ?))` : "";
+  const tupleArgs = cursorTuple ? [cursorTuple.c, cursorTuple.c, cursorTuple.i] : [];
+  const exportRows = db
+    .prepare(
+      `SELECT * FROM audit_logs_scoped${scopeWhere}${tupleWhere}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`
+    )
+    .all(...scopeArgsBase, ...tupleArgs, limit + 1);
+  const hasMore = exportRows.length > limit;
+  const rows = hasMore ? exportRows.slice(0, limit) : exportRows;
+  const nextCursor = hasMore && rows.length > 0
+    ? Buffer.from(JSON.stringify({ c: rows[rows.length - 1].created_at, i: rows[rows.length - 1].id })).toString("base64url")
+    : null;
+  if (nextCursor) res.setHeader("X-Audit-Export-Next-Cursor", nextCursor);
+  const truncated = cursorText
+    ? hasMore
+    : totalCount > limit || requestedLimit > limit;
+  if (truncated && !cursorText) {
     res.setHeader(
       "X-Audit-Export-Warning",
       `export truncated: requested=${requestedLimit}, applied_limit=${limit}, total=${totalCount}`
     );
   }
-  const rows = platformWide
-    ? db.prepare(`SELECT * FROM audit_logs_scoped ORDER BY created_at DESC LIMIT ?`).all(limit)
-    : db.prepare(`SELECT * FROM audit_logs_scoped WHERE store_id = ? ORDER BY created_at DESC LIMIT ?`).all(req.session.store_id, limit);
   const sanitizedRows = rows.map(sanitizeAuditLogRowForResponse);
   audit({
     storeId: platformWide ? null : req.session.store_id,
@@ -19118,6 +19897,8 @@ app.get("/api/v1/audit-logs/export", requirePermission("audit.export"), (req, re
       applied_limit: limit,
       total_count: totalCount,
       truncated,
+      has_more: hasMore,
+      next_cursor: nextCursor,
     },
   });
 });
@@ -19155,8 +19936,10 @@ app.get("/api/v1/chain-monitor/status", requirePlatformPermission("monitor.read"
 });
 
 app.get("/api/v1/chain-monitor/reorgs", requirePlatformPermission("monitor.read"), (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
-  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const monitorPage = parsePaginationQuery(req, 100, 1000);
+  if (!monitorPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const limit = monitorPage.limit;
+  const offset = monitorPage.offset;
   const rows = db
     .prepare(`SELECT * FROM chain_reorgs WHERE chain_id = ? ORDER BY detected_at DESC LIMIT ? OFFSET ?`)
     .all(CHAIN_ID, limit, offset);
@@ -19618,8 +20401,10 @@ app.post("/api/v1/chain-monitor/reorgs/:id/resolve", requirePlatformPermission("
 });
 
 app.get("/api/v1/chain-monitor/unmatched", requirePlatformPermission("monitor.read"), (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
-  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const monitorPage = parsePaginationQuery(req, 100, 1000);
+  if (!monitorPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const limit = monitorPage.limit;
+  const offset = monitorPage.offset;
   const rows = workerStateAll(
     `SELECT * FROM chain_unmatched_events WHERE chain_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
     CHAIN_ID,
@@ -19630,8 +20415,10 @@ app.get("/api/v1/chain-monitor/unmatched", requirePlatformPermission("monitor.re
 });
 
 app.get("/api/v1/chain-monitor/dead-letters", requirePlatformPermission("monitor.read"), (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
-  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const monitorPage = parsePaginationQuery(req, 100, 1000);
+  if (!monitorPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const limit = monitorPage.limit;
+  const offset = monitorPage.offset;
   const rows = workerStateAll(
     `SELECT * FROM chain_dead_letters WHERE chain_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
     CHAIN_ID,
@@ -19878,7 +20665,9 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
 
       const refunds = db
         .prepare(
-          `SELECT rr.id, rr.status, rr.invoice_id, rr.reason, rr.refund_amount_jpyc, rr.refund_tx_hash, rr.updated_at
+          `SELECT rr.id, rr.status, rr.invoice_id, rr.reason, rr.refund_amount_jpyc, rr.refund_tx_hash,
+                  rr.finality_confirmations, rr.finality_required_confirmations,
+                  rr.canonical_status, rr.reorg_hold, rr.updated_at
            FROM refund_requests rr
            JOIN invoices i ON i.id = rr.invoice_id
            WHERE i.store_id = ?
@@ -19894,7 +20683,7 @@ app.post("/api/v1/settlements/daily:close", requirePermission("settlement.close"
         failed: refunds.filter((row) => String(row.status) === "failed").length,
         completed: refunds.filter((row) => ["succeeded", "finalized"].includes(String(row.status))).length,
       };
-      const unresolvedRefunds = refunds.filter((row) => isUnresolvedRefundStatus(row.status));
+      const unresolvedRefunds = refunds.filter((row) => isUnresolvedRefund(row));
       if (unresolvedRefunds.length > 0) {
         return {
           status: 409,
@@ -20422,6 +21211,33 @@ app.post("/api/v1/settlement-exports", requirePermission("settlement.export"), (
   });
 });
 
+app.get("/api/v1/settlement-exports", requirePermission("settlement.export"), (req, res) => {
+  // M-033: server-side rediscovery so a lost terminal-local pointer can be
+  // recovered without knowing the export id up front.
+  const listPage = parsePaginationQuery(req, 100, 500);
+  if (!listPage) return jsonError(res, 400, "VALIDATION_ERROR", "limit and offset must be non-negative integers");
+  const businessDate = String(req.query.business_date || "").trim();
+  const where = ["store_id = ?"];
+  const args = [req.session.store_id];
+  if (businessDate) {
+    where.push("business_date = ?");
+    args.push(businessDate);
+  }
+  const rows = db
+    .prepare(
+      `SELECT id, business_date, format, generated_at, output_path
+       FROM settlement_exports
+       WHERE ${where.join(" AND ")}
+       ORDER BY business_date DESC, generated_at DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...args, listPage.limit, listPage.offset);
+  return res.json({
+    exports: rows,
+    page: { limit: listPage.limit, offset: listPage.offset, returned: rows.length },
+  });
+});
+
 app.get("/api/v1/settlement-exports/:id", requirePermission("settlement.export"), (req, res) => {
   const exportRow = db
     .prepare(`SELECT * FROM settlement_exports WHERE id = ? AND store_id = ?`)
@@ -20545,6 +21361,10 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
   if (!activeSession) {
     return jsonError(res, 403, "FORBIDDEN", "Session is no longer active");
   }
+  const existingClients = clientsByTerminal.get(terminalId);
+  if ((existingClients?.size || 0) >= SSE_MAX_CLIENTS_PER_TERMINAL) {
+    return jsonError(res, 429, "SSE_CONNECTION_LIMIT", "Too many live streams for this terminal");
+  }
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Connection", "keep-alive");
@@ -20570,6 +21390,14 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
       last_event_id: req.header("last-event-id") || null,
     },
   });
+
+  // N-018: bound the stream lifetime to the SSE token TTL so sockets cannot
+  // stay open indefinitely, and stop polling while the socket buffer is full.
+  const streamDeadlineMs = (() => {
+    const expSec = Number(verified.payload?.exp);
+    const fromToken = Number.isFinite(expSec) && expSec > 0 ? expSec * 1000 : Number.POSITIVE_INFINITY;
+    return Math.min(fromToken, Date.now() + SSE_TOKEN_MAX_TTL_SEC * 1000);
+  })();
 
   const writeHeartbeat = () => {
     if (res.writableEnded) return;
@@ -20617,8 +21445,13 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
       const serialized = JSON.stringify(payload);
       if (serialized === lastStreamSnapshot) return;
       lastStreamSnapshot = serialized;
-      res.write(`event: invoice.updated\ndata: ${serialized}\n\n`);
-      res.write(`event: status_changed\ndata: ${serialized}\n\n`);
+      const queued = res.write(`event: invoice.updated\ndata: ${serialized}\n\n`);
+      const queued2 = res.write(`event: status_changed\ndata: ${serialized}\n\n`);
+      if ((!queued || !queued2) && !snapshotPollingPaused) {
+        // Backpressure: the socket buffer is full; stop polling until it drains.
+        snapshotPollingPaused = true;
+        clearInterval(snapshotTimer);
+      }
     } catch (error) {
       console.warn(
         JSON.stringify({
@@ -20640,14 +21473,29 @@ app.get("/api/v1/streams/terminals/:terminalId", (req, res) => {
     return jsonError(res, 500, "SSE_SNAPSHOT_FAILED", String(error.message || error));
   }
   writeHeartbeat();
+  let snapshotPollingPaused = false;
+  res.on("drain", () => {
+    if (!snapshotPollingPaused || res.writableEnded) return;
+    snapshotPollingPaused = false;
+    snapshotTimer = setInterval(writeStreamSnapshotIfChanged, 2_000);
+  });
+  const lifetimeTimer = setTimeout(() => {
+    if (res.writableEnded) return;
+    try {
+      res.write(`event: stream_expired\ndata: {"reason":"sse_token_ttl"}\n\n`);
+    } catch (_) { /* client already gone */ }
+    res.end();
+    cleanup();
+  }, Math.max(1_000, streamDeadlineMs - Date.now()));
   const heartbeatTimer = setInterval(writeHeartbeat, 30_000);
   // chain-monitor is a separate process and updates SQLite directly. Poll the
   // row while the stream is open so an integrity hold is pushed to the terminal
   // without waiting for a user action or relying on the API process to emit an
   // in-process event.
-  const snapshotTimer = setInterval(writeStreamSnapshotIfChanged, 2_000);
+  let snapshotTimer = setInterval(writeStreamSnapshotIfChanged, 2_000);
 
   const cleanup = () => {
+    clearTimeout(lifetimeTimer);
     clearInterval(heartbeatTimer);
     clearInterval(snapshotTimer);
     const set = clientsByTerminal.get(terminalId);
@@ -20848,6 +21696,7 @@ app.get("/api/v1/public/invoices/:invoiceId", (req, res) => {
       confirmations: Number(paymentRecovery.confirmations || 0),
       updated_at: paymentRecovery.updated_at,
     } : null,
+    payment_recovery_chains: listPublicPaymentRecoveryChains(),
     public_payment_simulation_enabled: ENABLE_PUBLIC_PAYMENT_SIMULATION,
     payment_url: invoice.payment_url,
     pay_url: invoice.payment_url,

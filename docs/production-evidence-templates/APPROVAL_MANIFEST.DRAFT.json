@@ -1,0 +1,15 @@
+{
+  "schema_version": "commercial_approval_manifest_v1",
+  "release": {
+    "release_id": "",
+    "commit": "",
+    "source_hash": "",
+    "app_image_digest": "",
+    "environment_id": ""
+  },
+  "issued_at": "",
+  "expires_at": "",
+  "revocation_status": "draft",
+  "approvals": [],
+  "signatures": []
+}

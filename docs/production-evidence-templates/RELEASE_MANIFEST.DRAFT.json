@@ -1,0 +1,38 @@
+{
+  "schema_version": "release_manifest_v1",
+  "release_id": "",
+  "mode": "limited",
+  "commit": "",
+  "source_hash": "",
+  "lockfile_hash": "",
+  "migration_hash": "",
+  "runtime": { "node": "24.17.0" },
+  "base_image_digest": "",
+  "app_image_digest": "",
+  "nginx_image_digest": "",
+  "env_hash": "",
+  "db_snapshot_hash": "",
+  "backup_hash": "",
+  "audit_root": "",
+  "environment_id": "",
+  "evidence_manifest_hash": "",
+  "approval_manifest_hash": "",
+  "artifact_hashes": [],
+  "trust_policy": {
+    "release_signer_key_ids": [],
+    "evidence_signer_key_ids": [],
+    "approval_signers": {
+      "legal_accountable": [],
+      "aml_accountable": [],
+      "privacy_accountable": [],
+      "appi_accountable": [],
+      "technology_accountable": [],
+      "operations_accountable": []
+    },
+    "revoked_key_ids": []
+  },
+  "issued_at": "",
+  "expires_at": "",
+  "revocation_status": "draft",
+  "signatures": []
+}

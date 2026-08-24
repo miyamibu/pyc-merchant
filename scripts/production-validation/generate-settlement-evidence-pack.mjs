@@ -52,7 +52,7 @@ function utcRangeForBusinessDate(date, timezone) {
 }
 
 function verifyAuditChain(dbPath) {
-  const run = spawnSync("node", ["scripts/verify-audit-chain.mjs"], {
+  const run = spawnSync(process.execPath, ["scripts/verify-audit-chain.mjs"], {
     cwd: process.cwd(),
     env: { ...process.env, DB_PATH: dbPath },
     encoding: "utf8",

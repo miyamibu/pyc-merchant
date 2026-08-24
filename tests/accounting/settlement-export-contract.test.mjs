@@ -126,6 +126,10 @@ test("Settlement Export Contract v2 pins invoice-scoped refund manifest and prim
     type: "array",
     items: { type: "string", minLength: 1 },
   });
+  assert.match(schema.$defs.row.properties.audit_log_refs.description, /Complete ordered audit reference set/);
+  assert.match(schema.$defs.row.properties.audit_log_refs.description, /never silently truncated/);
+  assert.match(schema.$defs.row.properties.source_ledger_snapshot_hash.description, /complete audit_log_refs/);
+  assert.match(schema.$defs.row.properties.source_ledger_snapshot_hash.description, /canonical primary transfer/);
 });
 
 test("buildDailyAccountingSummary aggregates cancelled rows alongside other accounting statuses", () => {
@@ -187,6 +191,8 @@ test("settlement export docs state provider accepted/captured is not paid", () =
   assert.doesNotMatch(contractDoc, /refund_manifest|refund_references/);
   assert.match(v2ContractDoc, /Every refund case linked to an invoice is frozen once in the top-level `refund_manifest`/);
   assert.match(v2ContractDoc, /`failed` and `verification_failed` remain reserved/);
+  assert.match(v2ContractDoc, /`verified` is evidence-only and is never included in `refund_succeeded_amount_jpyc_base`/);
+  assert.match(v2ContractDoc, /no reorg hold is active/);
   assert.match(v2ContractDoc, /legacy_export_missing/);
   assert.match(v2ContractDoc, /approved human-accounting-adjustment journal entries/);
 });

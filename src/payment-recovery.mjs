@@ -1,3 +1,5 @@
+import { SUPPORTED_JPYC_PAYMENT_CHAINS } from "./jpyc-contract-policy.mjs";
+
 export const RECOVERY_REPORT_STATUSES = Object.freeze({
   VERIFIED_WRONG_CHAIN: "verified_wrong_chain",
   VERIFIED_WRONG_TOKEN: "verified_wrong_token",
@@ -12,7 +14,9 @@ export const RECOVERY_REPORT_ISSUES = Object.freeze({
   WRONG_TOKEN: "wrong_token",
 });
 
-export const READ_ONLY_RECOVERY_CHAIN_IDS = Object.freeze(["1", "43114"]);
+export const READ_ONLY_RECOVERY_CHAIN_IDS = Object.freeze(
+  SUPPORTED_JPYC_PAYMENT_CHAINS.map((chain) => chain.chain_id)
+);
 
 const RECOVERY_CHAIN_SET = new Set(READ_ONLY_RECOVERY_CHAIN_IDS);
 const TX_HASH_RE = /^0x[0-9a-f]{64}$/i;
@@ -33,7 +37,9 @@ export function normalizeRecoveryReportInput(input = {}) {
   const reportedIssue = normalize(input.reported_issue ?? input.reportedIssue).toLowerCase();
   const reporterType = normalize(input.reporter_type ?? input.reporterType).toLowerCase() || "customer";
   const errors = [];
-  if (!RECOVERY_CHAIN_SET.has(chainId)) errors.push("chain_id must be 1 or 43114");
+  if (!RECOVERY_CHAIN_SET.has(chainId)) {
+    errors.push(`chain_id must be one of ${READ_ONLY_RECOVERY_CHAIN_IDS.join(", ")}`);
+  }
   if (!TX_HASH_RE.test(txHash)) errors.push("tx_hash must be a 0x-prefixed 32-byte hash");
   if (reportedIssue && !Object.values(RECOVERY_REPORT_ISSUES).includes(reportedIssue)) {
     errors.push("reported_issue must be wrong_chain or wrong_token");

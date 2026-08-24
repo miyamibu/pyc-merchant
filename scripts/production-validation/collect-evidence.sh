@@ -21,6 +21,20 @@ if [[ -f docs/production/BLOCKED_EXTERNAL_VALIDATION.md ]]; then
   cp docs/production/BLOCKED_EXTERNAL_VALIDATION.md "$EVIDENCE_DIR/BLOCKED_EXTERNAL_VALIDATION.snapshot.md"
 fi
 
-bash ./scripts/deploy/collect-logs.sh "$EVIDENCE_DIR/deploy-logs" >/dev/null 2>&1 || true
+if bash ./scripts/deploy/collect-logs.sh "$EVIDENCE_DIR/deploy-logs" >/dev/null 2>&1; then
+  :
+else
+  collect_exit=$?
+  printf 'collect-logs: failed (exit %s); see %s\n' "$collect_exit" "$EVIDENCE_DIR/deploy-logs/collection-failures.txt" \
+    > "$EVIDENCE_DIR/deploy-logs-collection-failure.txt"
+  cat "$EVIDENCE_DIR/deploy-logs-collection-failure.txt" >&2
+fi
+
+if [[ -s "$EVIDENCE_DIR/deploy-logs/collection-failures.txt" ]]; then
+  cp "$EVIDENCE_DIR/deploy-logs/collection-failures.txt" "$EVIDENCE_DIR/evidence-collection-failures.txt"
+  echo "collect-evidence: evidence collected with recorded failures:" >&2
+  cat "$EVIDENCE_DIR/evidence-collection-failures.txt" >&2
+fi
 
 echo "$EVIDENCE_DIR"
+[[ ! -s "$EVIDENCE_DIR/evidence-collection-failures.txt" ]]

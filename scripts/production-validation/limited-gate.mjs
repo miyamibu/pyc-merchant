@@ -32,4 +32,4 @@ try {
   process.exit(EXIT_TOOL_FAILURE);
 }
 
-process.exit(["READY_FOR_LIMITED_PILOT", "COMMERCIAL_GO", "COMMERCIAL_GO_10"].includes(parsed.verdict) ? 0 : EXIT_NO_GO);
+process.exit(parsed.verdict === "LIMITED_PILOT_GO" ? 0 : EXIT_NO_GO);

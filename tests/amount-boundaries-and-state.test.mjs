@@ -11,6 +11,7 @@ import {
 import {
   classifyRecoveryReport,
   normalizeRecoveryReportInput,
+  READ_ONLY_RECOVERY_CHAIN_IDS,
   RECOVERY_REPORT_STATUSES,
 } from "../src/payment-recovery.mjs";
 import { deriveInvoiceStateAxes } from "../src/state-axes.mjs";
@@ -149,6 +150,12 @@ test("invoice state axes derive independently from the compatibility status", ()
 });
 
 test("recovery reports distinguish verified wrong chain/token from customer reports", () => {
+  assert.equal(READ_ONLY_RECOVERY_CHAIN_IDS.includes("137"), true);
+  assert.equal(normalizeRecoveryReportInput({
+    chain_id: "137",
+    tx_hash: `0x${"b".repeat(64)}`,
+    reported_issue: "wrong_token",
+  }).ok, true);
   const normalized = normalizeRecoveryReportInput({
     chain_id: "1",
     tx_hash: `0x${"a".repeat(64)}`,

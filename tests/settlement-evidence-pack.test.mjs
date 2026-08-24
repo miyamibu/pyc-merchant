@@ -22,7 +22,7 @@ const CWD = process.cwd();
 function runNode(scriptPath, args = [], env = {}) {
   return new Promise((resolve) => {
     execFile(
-      "node",
+      process.execPath,
       [scriptPath, ...args],
       {
         cwd: CWD,

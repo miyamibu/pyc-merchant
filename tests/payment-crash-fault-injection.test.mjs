@@ -134,7 +134,7 @@ async function openInvoiceStream(baseUrl, staffToken, terminalId, invoiceId) {
 
 function spawnServerForStartupCheck(env) {
   const output = [];
-  const proc = spawn("node", ["src/server.mjs"], {
+  const proc = spawn(process.execPath, ["src/server.mjs"], {
     cwd: CWD,
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],

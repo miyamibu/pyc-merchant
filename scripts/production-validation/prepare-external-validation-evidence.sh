@@ -30,5 +30,8 @@ cp "$EVIDENCE_DIR/EXT-002-wallet-device-launch.md" "$EVIDENCE_DIR/EXT-002-hashpo
 copy_template "POC-001-template.md" "POC-001.md"
 copy_template "POC-002-template.md" "POC-002.md"
 copy_template "POC-003-template.md" "POC-003.md"
+copy_template "PERF-001-scale-soak.md" "PERF-001-scale-soak.md"
+copy_template "EVIDENCE_MANIFEST.DRAFT.json" "EVIDENCE_MANIFEST.DRAFT.json"
+copy_template "APPROVAL_MANIFEST.DRAFT.json" "APPROVAL_MANIFEST.DRAFT.json"
 
 printf '%s\n' "$EVIDENCE_DIR"

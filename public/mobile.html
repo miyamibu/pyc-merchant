@@ -19,6 +19,7 @@
     <p id="liveStatus" class="visually-hidden live-region" role="status" aria-live="polite" aria-atomic="true"></p>
     <div id="errorBanner" class="error-banner error-banner-row hidden" role="alert">
       <span id="errorBannerText" class="flex-1"></span>
+      <button id="retryLoadBtn" type="button" class="btn btn-primary btn-compact hidden">請求を再取得</button>
       <button id="closeErrorBannerBtn" type="button" class="btn btn-secondary btn-compact" aria-label="エラー表示を閉じる">閉じる</button>
     </div>
 
@@ -45,7 +46,7 @@
         <p class="helper-text payment-safety-note">送金は1回のみ有効です。金額・ネットワーク・送金先を確認してから進んでください。</p>
         <p id="paymentGateHint" class="helper-text" role="status" aria-live="polite" aria-atomic="true">最新の請求状態を確認しています。</p>
         <button id="goToConsentBtn" type="button" class="btn btn-secondary btn-compact hidden">確認・同意へ</button>
-        <div class="secondary-action-row">
+        <div id="secondaryPaymentActions" class="secondary-action-row">
           <button id="copyInfoBtn" class="btn btn-ghost btn-compact" disabled>支払い情報をコピー</button>
           <button id="showMethodsBtn" class="btn btn-ghost btn-compact" disabled>手動送金を表示</button>
         </div>
@@ -66,7 +67,7 @@
     <section id="receiptCard" class="card stack mt-16 hidden" aria-labelledby="receiptTitle">
       <div class="section-header">
         <h2 id="receiptTitle" class="title title-lg">お支払い状況</h2>
-        <span id="receiptStatusBadge" class="status-pill s-gray">証跡確認中</span>
+        <span id="receiptStatusBadge" class="status-pill s-gray">確認情報を準備中</span>
       </div>
       <div class="info-list">
         <div class="info-item">
@@ -98,7 +99,7 @@
       <div class="inline-action-group">
         <button id="copyReceiptBtn" class="btn btn-secondary btn-compact" aria-label="お支払い状況をコピー" disabled>状況メモをコピー</button>
       </div>
-      <p class="helper-text">取引番号とサーバー確認日時が表示された場合のみ、お支払い確認書として保管できます。</p>
+      <p class="helper-text">取引番号とサーバー確認日時が表示された場合のみ、お支払い確認情報として保管できます。</p>
     </section>
 
     <section class="card stack mt-16" aria-labelledby="paymentActionTitle">
@@ -177,7 +178,7 @@
           </div>
           <div class="verify-item verify-item-wide">
             <span class="info-label">送金先</span>
-            <p id="verifyAddressText" class="info-value mono address-text">-</p>
+            <p id="verifyAddressText" class="info-value mono contract-address-text">-</p>
           </div>
         </div>
         <p id="manualRiskText" class="helper-text">手動送金する場合は、金額・送金先・チェーンを必ず目視で照合してください。</p>
@@ -192,7 +193,7 @@
       <section id="customerActionCard" class="panel stack" aria-labelledby="customerActionTitleHeading">
         <div class="section-header">
           <h3 id="customerActionTitleHeading" class="title title-md">いまの状況と次の行動</h3>
-          <span id="customerActionBadge" class="badge">確認中</span>
+          <span id="customerActionBadge" class="status-pill s-gray">確認中</span>
         </div>
         <p id="customerActionTitle" class="title title-md">請求内容を読み込み中です</p>
         <p id="customerActionBody" class="helper-text">この画面は、お客様のウォレット送金と店舗側の確認導線を合わせて案内します。</p>
@@ -204,9 +205,8 @@
           <div class="details-content stack">
             <p class="helper-text">誤チェーン・誤トークンの可能性がある場合だけ、送金したチェーンと取引番号を入力してください。これは確認依頼であり、追加送金は行いません。</p>
             <label class="info-label" for="recoveryChainId">送金したチェーン</label>
-            <select id="recoveryChainId" class="input">
-              <option value="1">Ethereum</option>
-              <option value="43114">Avalanche C-Chain</option>
+            <select id="recoveryChainId" class="input" disabled>
+              <option value="">利用可能なチェーンを確認中</option>
             </select>
             <label class="info-label" for="recoveryTxHash">取引番号（tx hash）</label>
             <input id="recoveryTxHash" class="input mono" inputmode="text" autocomplete="off" spellcheck="false" placeholder="0x..." aria-describedby="recoveryHint" />
@@ -217,7 +217,7 @@
               <option value="wrong_token">誤トークンかもしれない</option>
             </select>
             <p id="recoveryHint" class="helper-text">取引番号はウォレットの送金履歴からコピーしてください。シードフレーズや秘密鍵は入力しないでください。</p>
-            <button id="submitRecoveryBtn" type="button" class="btn btn-secondary btn-compact">送金済み取引を確認依頼する</button>
+            <button id="submitRecoveryBtn" type="button" class="btn btn-secondary btn-compact" disabled>送金済み取引を確認依頼する</button>
             <p id="recoveryStatus" class="helper-text" role="status" aria-live="polite" aria-atomic="true"></p>
           </div>
         </details>

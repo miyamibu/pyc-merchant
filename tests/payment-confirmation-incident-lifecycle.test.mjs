@@ -363,13 +363,21 @@ test("human accounting adjustment requires two fresh staff step-ups and never ch
     paid_amount_jpyc_base: invoiceBefore.paid_amount_jpyc_base,
   });
   const journal = db.prepare(
-    `SELECT event_type, status, source_ref, payload_json
+    `SELECT event_type, status, source_ref, payload_json, business_date, occurred_at
      FROM accounting_event_journal
      WHERE invoice_id = ? AND event_type = 'accounting_adjustment'`
   ).get(created.data.invoice_id);
   assert.equal(journal.status, "approved");
   assert.equal(journal.source_ref, `accounting_adjustment:${adjustmentId}`);
   assert.equal(JSON.parse(journal.payload_json).invoice_transition, "none");
+  // M-056: the journal keeps the invoice business date even when the
+  // approval happens on a later calendar day; the approval instant is
+  // recorded separately as occurred_at.
+  const invoiceBusinessDate = db.prepare(
+    `SELECT business_date FROM invoices WHERE id = ?`
+  ).get(created.data.invoice_id)?.business_date;
+  assert.ok(invoiceBusinessDate);
+  assert.equal(journal.business_date, invoiceBusinessDate);
   const auditActions = db.prepare(
     `SELECT action FROM audit_logs WHERE target_type = 'accounting_adjustment' AND target_id = ? ORDER BY rowid`
   ).all(adjustmentId).map((row) => row.action);

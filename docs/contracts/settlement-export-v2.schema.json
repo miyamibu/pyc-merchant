@@ -283,10 +283,18 @@
         "review_status": { "type": ["string", "null"] },
         "refund_request_id": { "type": ["string", "null"] },
         "refund_tx_hash": { "type": ["string", "null"] },
-        "audit_log_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "audit_log_refs": {
+          "type": "array",
+          "description": "Complete ordered audit reference set for the row's invoice and related review, refund, and export-run identities; never silently truncated.",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "external_sync_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "accounting_event_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "source_ledger_snapshot_hash": { "type": "string", "minLength": 1 },
+        "source_ledger_snapshot_hash": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SHA-256 binding of the source-ledger evidence, complete audit_log_refs, and exact canonical primary transfer/payment-event identity when present."
+        },
         "amount_scale_version": { "type": "string", "minLength": 1 },
         "token_decimals": { "type": "integer", "minimum": 0, "maximum": 36 },
         "ledger_decimals": { "type": "integer", "minimum": 0, "maximum": 36 },

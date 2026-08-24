@@ -59,14 +59,14 @@ jobs:
       CHECKOUT_SESSION_IMPLEMENTED: "true"
       DOCKER_BUILDKIT: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Verify exact source SHA
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -78,7 +78,7 @@ jobs:
         run: cp .env.production.example .env.production
 
       - name: Secrets scan
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -179,10 +179,76 @@ jobs:
             > /tmp/jpyc-ci/build-metadata.json
 
       - name: Upload CI build metadata
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-build-metadata-${{ github.sha }}
           path: /tmp/jpyc-ci/build-metadata.json
+          if-no-files-found: error
+
+  # M-015: rendered browser/UI validation for the exact pushed SHA. Playwright
+  # is installed at a pinned npm version with --no-save so repository
+  # dependencies stay untouched, and evidence lands in a deterministic
+  # run-id/attempt/job directory that is verified fail-closed before upload.
+  ui-evidence:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_PINNED_VERSION: "1.62.1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact source SHA
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Install pinned Playwright without changing repo dependencies
+        run: |
+          npm install --package-lock=false --no-save --no-audit --no-fund "playwright@${PLAYWRIGHT_PINNED_VERSION}"
+          node node_modules/playwright/cli.js install --with-deps chromium
+          installed="$(node -p "require('./node_modules/playwright/package.json').version")"
+          test "${installed}" = "${PLAYWRIGHT_PINNED_VERSION}"
+          git diff --exit-code -- package.json package-lock.json
+
+      - name: Resolve pinned browser executable from the installed registry
+        id: browser
+        run: |
+          BROWSER="$(node -p "require('playwright').chromium.executablePath()")"
+          test -n "$BROWSER" && test -x "$BROWSER"
+          echo "executable=${BROWSER}" >> "$GITHUB_OUTPUT"
+
+      - name: Run rendered UI evidence suite
+        env:
+          PLAYWRIGHT_MODULE_PATH: ${{ github.workspace }}/node_modules/playwright/index.mjs
+        run: |
+          node scripts/story-ui-retest.mjs \
+            --browser-executable "${{ steps.browser.outputs.executable }}"
+
+      # The suite writes to a deterministic directory derived from the CI run
+      # identity (see scripts/ui-evidence-contract.mjs). There is intentionally
+      # no find/latest scan: only the known path may be uploaded.
+      - name: Verify UI evidence with dedicated CLI
+        id: ui_evidence
+        run: |
+          test "${GITHUB_JOB}" = "ui-evidence"
+          EVIDENCE_DIR="output/playwright/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          node scripts/verify-ui-evidence.mjs --evidence-dir "${EVIDENCE_DIR}"
+          echo "path=${EVIDENCE_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload UI evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui-evidence-${{ github.sha }}
+          path: ${{ steps.ui_evidence.outputs.path }}
           if-no-files-found: error
 
   production-validation-evidence:
@@ -234,14 +300,14 @@ jobs:
       ENABLE_REOWN: "false"
       CHECKOUT_SESSION_IMPLEMENTED: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Verify exact source SHA
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -263,7 +329,7 @@ jobs:
           test -n "${EVIDENCE_DIR}"
 
       - name: Upload production validation evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: production-validation-evidence-${{ github.sha }}
           path: ${{ steps.evidence.outputs.path }}

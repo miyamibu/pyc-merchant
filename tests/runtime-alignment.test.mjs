@@ -18,7 +18,10 @@ test("runtime alignment pins Node 24.17.0 across local metadata, CI, and Docker"
   assert.equal(read(".node-version").trim(), "24.17.0");
 
   const ci = read(".github/workflows/ci.yml");
-  assert.equal((ci.match(/node-version-file:\s*\.node-version/g) || []).length, 2);
+  const setupNodeSteps = (ci.match(/uses:\s*actions\/setup-node@[a-f0-9]+/g) || []).length;
+  assert.ok(setupNodeSteps >= 1, "at least one SHA-pinned actions/setup-node step");
+  const nodeVersionFileUses = (ci.match(/node-version-file:\s*\.node-version/g) || []).length;
+  assert.equal(nodeVersionFileUses, setupNodeSteps, "every setup-node step uses .node-version");
   assert.doesNotMatch(ci, /node-version:\s*20(?:\.\d+)?/);
 
   const dockerfile = read("Dockerfile");

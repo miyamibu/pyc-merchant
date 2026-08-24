@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
+import { READ_ONLY_RECOVERY_CHAIN_IDS } from "../src/payment-recovery.mjs";
 
 const ROOT = process.cwd();
 
@@ -140,6 +141,65 @@ test("invoice refresh rejects stale responses and refreshes on browser recovery 
   assert.match(mobileJs, /renderReceiptCard\(state\.invoice\)/);
   assert.match(mobileJs, /renderStatus\(state\.invoice\)/);
   assert.match(mobileJs, /state\.observationFreshnessTimer = setTimeout/);
+  assert.match(mobileJs, /MOBILE_REQUEST_TIMEOUT_MS\s*=\s*10_000/);
+  assert.match(mobileJs, /INITIAL_RETRY_DELAYS_MS\s*=\s*Object\.freeze\(\[1_000, 2_000, 4_000\]\)/);
+  assert.match(mobileJs, /requestTimedOut = true;\s*controller\.abort\(\)/);
+  assert.match(mobileJs, /automaticRetryCount >= INITIAL_RETRY_DELAYS_MS\.length/);
+  assert.match(mobileJs, /自動再試行に失敗しました/);
+  assert.match(mobileJs, /retryLoadBtn\.addEventListener\("click"/);
+  assert.match(read("public/mobile.html"), /id="retryLoadBtn"[^>]*>請求を再取得/);
+});
+
+test("payment recovery renders only server-supplied chains and stays disabled without that contract", () => {
+  const mobileJs = read("public/mobile.js");
+  const mobileHtml = read("public/mobile.html");
+  const source = between(mobileJs, "function normalizeRecoveryChains", "function renderPaymentRecovery");
+  const makeSelect = () => ({
+    value: "",
+    disabled: false,
+    children: [],
+    replaceChildren() { this.children = []; },
+    appendChild(node) { this.children.push(node); },
+  });
+  const el = { recoveryChainId: makeSelect() };
+  const context = vm.createContext({
+    state: { recoveryChains: [], recoverySubmitting: false },
+    el,
+    document: { createElement: () => ({ value: "", textContent: "" }) },
+  });
+  vm.runInContext(
+    `${source}\nthis.normalizeForTest = normalizeRecoveryChains; this.syncForTest = syncRecoveryChainOptions;`,
+    context,
+  );
+
+  context.syncForTest({});
+  assert.equal(el.recoveryChainId.disabled, true);
+  assert.deepEqual(Array.from(el.recoveryChainId.children, (option) => option.value), [""]);
+  assert.match(el.recoveryChainId.children[0].textContent, /確認できません/);
+
+  context.syncForTest({
+    payment_recovery_chains: [
+      { chain_id: "137", network: "Polygon" },
+      { chain_id: "43114", network: "Avalanche" },
+      { chain_id: "137", network: "重複" },
+      { chain_id: "not-a-chain", network: "不正" },
+    ],
+  });
+  assert.equal(el.recoveryChainId.disabled, false);
+  assert.deepEqual(
+    Array.from(el.recoveryChainId.children, (option) => option.value),
+    ["", "137", "43114"],
+  );
+  assert.match(el.recoveryChainId.children[1].textContent, /Polygon.*137/);
+  assert.equal(el.recoveryChainId.children.some((option) => option.value === "1"), false);
+  assert.match(mobileHtml, /id="recoveryChainId"[^>]*disabled/);
+  assert.match(mobileHtml, /id="submitRecoveryBtn"[^>]*disabled/);
+
+  const submit = between(mobileJs, "async function submitPaymentRecovery", "async function refreshAfterBrowserRecovery");
+  assert.match(submit, /state\.recoveryChains\.some/);
+  assert.doesNotMatch(submit, /\["1",\s*"43114"(?:,\s*"137")?\]\.includes/);
+  assert.match(submit, /chain_id:\s*chainId/);
+  assert.ok(READ_ONLY_RECOVERY_CHAIN_IDS.includes("137"), "canonical recovery policy must include Polygon 137");
 });
 
 test("mobile observation age and failures remove stale completion state", () => {
@@ -195,6 +255,10 @@ test("policy and consent recording gates fail closed until server persistence su
   assert.match(recordConsent, /if \(!response\.ok\)/);
   assert.match(recordConsent, /!state\.consented \|\| !el\.consentCheckbox\?\.checked/);
   assert.match(recordConsent, /signal: controller\.signal/);
+  assert.match(recordConsent, /MOBILE_REQUEST_TIMEOUT_MS/);
+  assert.match(recordConsent, /timedOut = true/);
+  assert.match(recordConsent, /CONSENT_RECORD_TIMEOUT/);
+  assert.match(recordConsent, /clearTimeout\(timeoutId\)/);
   assert.match(recordConsent, /consentSequence !== state\.consentSequence/);
   assert.match(recordConsent, /consentRecordStatus = "failed"/);
   assert.match(recordConsent, /return false/);
@@ -210,6 +274,24 @@ test("policy and consent recording gates fail closed until server persistence su
   assert.match(mobileHtml, /id="consentRecordError"[^>]*role="alert"/);
   assert.match(mobileHtml, /id="retryConsentBtn"/);
   assert.match(mobileHtml, /id="consentCheckbox"[^>]*aria-describedby="consentRequirementHint"/);
+});
+
+test("customer and review risk badges expose semantic status tones", () => {
+  const mobileJs = read("public/mobile.js");
+  const mobileHtml = read("public/mobile.html");
+  const terminalJs = read("public/terminal.js");
+  const terminalHtml = read("public/terminal.html");
+  const customerAction = between(mobileJs, "function renderCustomerAction", "function updateRemainingAnnouncement");
+
+  assert.match(mobileHtml, /id="customerActionBadge" class="status-pill s-gray"/);
+  assert.match(mobileJs, /function setCustomerActionBadge\(label, tone = "s-gray"\)/);
+  for (const tone of ["s-blue", "s-green", "s-yellow", "s-red"]) {
+    assert.match(customerAction, new RegExp(`tone: "${tone}"`));
+  }
+  assert.match(customerAction, /setCustomerActionBadge\(verified \? "要確認" : "申告受付済み", verified \? "s-red" : "s-yellow"\)/);
+  assert.match(customerAction, /setCustomerActionBadge\("要確認", "s-red"\)/);
+  assert.match(terminalHtml, /id="reviewDetailBadge" class="status-pill s-gray"/);
+  assert.match(terminalJs, /review\.status === "resolved" \? "s-green" : review\.status === "rejected" \? "s-red" : priority\.className/);
 });
 
 test("published policy URLs reject local, reserved, credentialed, and IP-literal destinations", () => {
@@ -242,23 +324,99 @@ test("published policy URLs reject local, reserved, credentialed, and IP-literal
   }
 });
 
-test("paid receipt requires server transaction hash and confirmation time", () => {
+test("paid confirmation keeps complete evidence requirements while hiding internal signing fields", async () => {
   const mobileJs = read("public/mobile.js");
   const mobileHtml = read("public/mobile.html");
-  const receipt = between(mobileJs, "function getReceiptEvidence", "function renderStatus");
+  const receiptSource = between(mobileJs, "function getReceiptEvidence", "function renderStatus");
+  const copySource = between(mobileJs, "async function handleCopyReceipt", "async function loadInvoice");
+  const makeClassList = () => ({
+    hidden: false,
+    toggle(_name, force) { this.hidden = Boolean(force); },
+  });
+  const makeElement = () => ({
+    textContent: "",
+    className: "",
+    disabled: false,
+    classList: makeClassList(),
+    setAttribute(name, value) { this[name] = value; },
+  });
+  const el = {
+    receiptCard: makeElement(),
+    copyReceiptBtn: makeElement(),
+    receiptTitle: makeElement(),
+    receiptStatusBadge: makeElement(),
+    receiptStoreName: makeElement(),
+    receiptAmount: makeElement(),
+    receiptInvoiceId: makeElement(),
+    receiptTxHash: makeElement(),
+    receiptChainRecordedAt: makeElement(),
+    receiptConfirmedAt: makeElement(),
+    receiptEvidenceNotice: makeElement(),
+  };
+  let copiedText = "";
+  let announced = "";
+  const context = vm.createContext({
+    state: { invoice: null },
+    el,
+    Date,
+    Number,
+    String,
+    canonicalInvoiceStatus: (value) => value,
+    hasIntegrityHold: () => false,
+    hasFreshInvoiceObservation: () => true,
+    formatDateTime: (value) => `日時:${value}`,
+    formatJpy: (value) => `JPY:${value}`,
+    toNumber: Number,
+    getTokenSymbol: () => "JPYC",
+    copyText: async (value) => { copiedText = value; },
+    announce: (value) => { announced = value; },
+    showError: (error) => { throw new Error(String(error)); },
+    customerFacingError: (error) => String(error),
+  });
+  vm.runInContext(
+    `${receiptSource}\n${copySource}\nthis.evidenceForTest = getReceiptEvidence; this.renderForTest = renderReceiptCard; this.copyForTest = handleCopyReceipt;`,
+    context,
+  );
+  const completeInvoice = {
+    status: "paid",
+    store_name: "テスト店舗",
+    amount_jpy: 1250,
+    amount_jpyc: 1250,
+    invoice_id: "invoice-1",
+    paid_tx_hash: `0x${"a".repeat(64)}`,
+    chain_recorded_at: "2026-08-13T00:00:00.000Z",
+    confirmed_at: "2026-08-13T00:00:01.000Z",
+    receipt: {
+      signature: "private-signature-material",
+      kid: "internal-key-id",
+      content_sha256: "internal-content-hash",
+      tx_hash: `0x${"a".repeat(64)}`,
+    },
+  };
 
-  assert.match(receipt, /invoice\?\.paid_tx_hash/);
-  assert.match(receipt, /invoice\?\.chain_recorded_at/);
-  assert.match(receipt, /invoice\?\.confirmed_at/);
-  assert.match(receipt, /complete: Boolean\(signedReceipt\?\.signature\)/);
-  assert.match(receipt, /Boolean\(signedReceipt\?\.kid\)/);
-  assert.match(receipt, /Boolean\(signedReceipt\?\.content_sha256\)/);
-  assert.match(receipt, /Boolean\(signedReceipt\?\.tx_hash\)/);
-  assert.match(receipt, /Number\.isFinite\(confirmedAtMs\)/);
-  assert.match(receipt, /hasFreshInvoiceObservation\(invoice\)/);
-  assert.match(receipt, /copyReceiptBtn\.disabled = !isPaid/);
-  assert.match(receipt, /evidence\.complete \? "\u304a\u652f\u6255\u3044\u78ba\u8a8d\u66f8" : "\u304a\u652f\u6255\u3044\u72b6\u6cc1\u30e1\u30e2"/);
-  assert.match(mobileJs, /`\u30b3\u30d4\u30fc\u65e5\u6642: \$\{copyTimestamp\}`/);
+  assert.equal(context.evidenceForTest(completeInvoice).complete, true);
+  for (const missingField of ["signature", "kid", "content_sha256", "tx_hash"]) {
+    const invoice = { ...completeInvoice, receipt: { ...completeInvoice.receipt, [missingField]: "" } };
+    assert.equal(context.evidenceForTest(invoice).complete, false, `${missingField} is required internally`);
+  }
+  assert.equal(context.evidenceForTest({ ...completeInvoice, confirmed_at: "" }).complete, false);
+
+  context.renderForTest(completeInvoice);
+  assert.equal(el.receiptTitle.textContent, "お支払い確認情報");
+  assert.equal(el.receiptStatusBadge.textContent, "支払い確認済み");
+  for (const internalTerm of ["receipt", "kid", "signature", "sha256", "internal-key-id"]) {
+    assert.equal(el.receiptEvidenceNotice.textContent.includes(internalTerm), false, internalTerm);
+  }
+
+  context.state.invoice = completeInvoice;
+  await context.copyForTest();
+  assert.match(copiedText, /お支払い確認情報/);
+  assert.match(copiedText, /取引番号/);
+  assert.match(copiedText, /サーバー確認日時/);
+  for (const internalTerm of ["receipt_version", "receipt_content_sha256", "receipt_signature", "receipt_kid", "private-signature-material", "internal-key-id", "internal-content-hash"]) {
+    assert.equal(copiedText.includes(internalTerm), false, internalTerm);
+  }
+  assert.match(announced, /確認情報をコピーしました/);
   assert.match(mobileHtml, /id="receiptConfirmedAt"/);
   assert.match(mobileHtml, /id="receiptChainRecordedAt"/);
   assert.match(mobileHtml, /id="receiptEvidenceNotice"[^>]*aria-live="polite"/);

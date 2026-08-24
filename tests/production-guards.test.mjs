@@ -7,7 +7,7 @@ const CWD = process.cwd();
 
 function spawnServer(envMap) {
   const logs = [];
-  const proc = spawn("node", ["src/server.mjs"], {
+  const proc = spawn(process.execPath, ["src/server.mjs"], {
     cwd: CWD,
     env: { ...process.env, ...envMap },
     stdio: ["ignore", "pipe", "pipe"],
@@ -155,9 +155,8 @@ test("production fatal guards reject unsafe startup configs", async (t) => {
   }
 });
 
-test("production manual ingest is disabled by default", async () => {
+test("production manual ingest and unsigned audit export are disabled by default", async () => {
   const env = productionServerEnv({
-    APP_HOST: `http://127.0.0.2:${47001 + Math.floor(Math.random() * 1000)}`,
     ALLOW_MANUAL_PAYMENT_INGEST: "false",
   });
   const port = Number(env.APP_PORT);
@@ -193,9 +192,11 @@ test("production manual ingest is disabled by default", async () => {
     const exportAudit = await apiRequest(`http://127.0.0.1:${port}`, "/api/v1/audit-logs/export?format=json&limit=10", {
       headers: authHeaders(login.token),
     });
-    assert.equal(exportAudit.status, 200);
-    assert.equal(exportAudit.data.format, "json");
-    assert.ok(Array.isArray(exportAudit.data.audit_logs));
+    assert.equal(exportAudit.status, 503);
+    assert.equal(exportAudit.data.error.code, "PRIVACY_POLICY_NOT_APPROVED");
+    assert.equal(exportAudit.data.error.details.privacy.source, "release_bound_signed_manifest");
+    assert.equal(exportAudit.data.error.details.privacy.ok, false);
+    assert.equal(exportAudit.data.error.details.appi.ok, false);
   } finally {
     await stopProc(proc);
   }

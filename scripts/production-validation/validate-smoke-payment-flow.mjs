@@ -25,7 +25,7 @@ function runCommand(cmd, args, env = process.env) {
   });
 }
 
-const smoke = await runCommand("node", ["scripts/smoke-test.mjs"]);
+const smoke = await runCommand(process.execPath, ["scripts/smoke-test.mjs"]);
 
 let smokeSummary = null;
 try {

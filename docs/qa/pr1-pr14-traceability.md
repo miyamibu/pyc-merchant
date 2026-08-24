@@ -2,12 +2,12 @@
 
 status: draft
 owner: engineering
-last_verified_commit: `8d5130b456bebf8e40e5d772ab8a1c6c42dabb44`（今回の検証基準となる親コミット）
-last_reviewed_at: `2026-07-28`
-verification_scope: 2026-07-28時点の作業ツリー最終変更をコミット前に確認。最終コミットSHAはGit履歴で確認する。
+last_verified_commit: `7be4531dc6b4a80dd8d66620a96a7c3455050bf5`（今回の検証基準となる親コミット）
+last_reviewed_at: `2026-08-22`
+verification_scope: branch `codex/full-audit-remediation-20260813`、base HEAD `7be4531dc6b4a80dd8d66620a96a7c3455050bf5`、107 dirty entries（75 tracked変更、32 untracked）の未コミット差分を対象。最終コミットSHAはGit履歴で確認する。
 release_decision: `NO_GO`（実JPYC、実機wallet、公開FQDN/TLS、外部承認、release artifactの外部証跡は未確認）
 
-latest_local_validation: `PATH="/opt/homebrew/opt/node@24/bin:$PATH" npm run test:serial` = `377/377 PASS`、`npm run audit` = 0 vulnerabilities、`npm run deploy:check` = preflight PASS（Node `v24.14.1`; repository baseline `24.17.0`）
+latest_local_validation: Node 24.17.0 公式で実作業ツリー **522/522 pass・0 fail/skip**、`npm run check` pass、`npm audit` 0 vulnerabilities、dependency/docker hygiene pass、公開ホスト `root/healthz/readyz` **HTTP 530**
 
 ## 判定の意味
 

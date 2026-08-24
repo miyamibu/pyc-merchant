@@ -136,21 +136,56 @@ test("backend P0 safety guards preserve audit secrecy, refund balance, and publi
     requestRefund(started.baseUrl, adminToken, review.id, 300, parallelKeyA, refundAuditSecretFixture),
     requestRefund(started.baseUrl, adminToken, review.id, 300, parallelKeyB, refundAuditSecretFixture),
   ]);
-  assert.deepEqual(parallel.map((result) => result.status).sort(), [201, 400]);
+  assert.deepEqual(parallel.map((result) => result.status).sort(), [200, 201]);
   const successful = parallel.find((result) => result.status === 201);
-  const blocked = parallel.find((result) => result.status === 400);
-  assert.equal(blocked.data.error.code, "OVER_REFUND");
-  assert.equal(blocked.data.error.details.reserved_refund_amount_jpyc_base, "300000000");
-  assert.equal(blocked.data.error.details.remaining_refund_amount_jpyc_base, "200000000");
+  const deduplicated = parallel.find((result) => result.status === 200);
+  assert.ok(successful);
+  assert.ok(deduplicated);
+  assert.equal(deduplicated.data.refund_request_id, successful.data.refund_request_id);
 
-  const replay = await requestRefund(started.baseUrl, adminToken, review.id, 300, parallelKeyA, refundAuditSecretFixture);
-  if (successful.data.refund_request_id === replay.data.refund_request_id) {
-    assert.equal(replay.status, 201);
-  } else {
-    const replayOther = await requestRefund(started.baseUrl, adminToken, review.id, 300, parallelKeyB, refundAuditSecretFixture);
-    assert.equal(replayOther.status, 201);
-    assert.equal(replayOther.data.refund_request_id, successful.data.refund_request_id);
+  const semanticRows = db
+    .prepare(
+      `SELECT id, refund_amount_jpyc_base, customer_note, evidence_screenshot, evidence_note_path
+       FROM refund_requests WHERE invoice_id = ? ORDER BY rowid ASC`
+    )
+    .all(refundInvoice.data.invoice_id);
+  assert.equal(semanticRows.length, 1, "semantic duplicate must reserve exactly one refund row");
+  assert.equal(semanticRows[0].id, successful.data.refund_request_id);
+  assert.equal(String(semanticRows[0].refund_amount_jpyc_base), "300000000");
+  assert.equal(semanticRows[0].customer_note, "[REDACTED_SIGNED_URL]");
+  assert.doesNotMatch(JSON.stringify(semanticRows[0]), /\/pay\?ref=|[?&](?:sig|nonce)=/i);
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM refund_cases WHERE invoice_id = ?`).get(refundInvoice.data.invoice_id).count,
+    1,
+  );
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'refund.requested' AND target_id = ?`)
+      .get(successful.data.refund_request_id).count,
+    1,
+  );
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'refund.request_deduplicated' AND target_id = ?`)
+      .get(successful.data.refund_request_id).count,
+    1,
+  );
+
+  for (const [index, key] of [parallelKeyA, parallelKeyB].entries()) {
+    const replay = await requestRefund(started.baseUrl, adminToken, review.id, 300, key, refundAuditSecretFixture);
+    assert.equal(replay.status, parallel[index].status);
+    assert.equal(replay.data.refund_request_id, successful.data.refund_request_id);
   }
+
+  const overBeforeRemaining = await requestRefund(
+    started.baseUrl,
+    adminToken,
+    review.id,
+    201,
+    `refund-cap-over-before-remaining-${Date.now()}`
+  );
+  assert.equal(overBeforeRemaining.status, 400);
+  assert.equal(overBeforeRemaining.data.error.code, "OVER_REFUND");
+  assert.equal(overBeforeRemaining.data.error.details.reserved_refund_amount_jpyc_base, "300000000");
+  assert.equal(overBeforeRemaining.data.error.details.remaining_refund_amount_jpyc_base, "200000000");
 
   const remaining = await requestRefund(
     started.baseUrl,
@@ -275,6 +310,7 @@ test("backend P0 safety guards preserve audit secrecy, refund balance, and publi
       to_address: env.RECIPIENT_ADDRESS,
       confirmations: 2,
       tx_hash: paidTxHash,
+      token_amount_atomic: "777000000000000000000",
       from_address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       observed_at: "2026-07-15T01:02:03.000Z",
       block_timestamp: "2026-07-15T01:02:00.000Z",

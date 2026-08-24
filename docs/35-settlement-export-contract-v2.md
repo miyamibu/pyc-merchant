@@ -18,9 +18,11 @@ Extend the immutable settlement export with complete refund lineage and reproduc
 - Refund amounts and references may be attributed to exactly one deterministic primary row per invoice. Other payment-session rows must use `refund_attribution: invoice_manifest_only` with zero refund totals and an empty reference list.
 - Wallet-direct is preferred as the primary row. Ties are resolved by stable provider code and payment-session identity.
 - `refund_reserved_amount_jpyc_base` releases only `cancelled` and `rejected`. `failed` and `verification_failed` remain reserved.
+- `verified` is evidence-only and is never included in `refund_succeeded_amount_jpyc_base` or `refunded_onchain`. A refund is recognized only when status is `succeeded` or `finalized`, a transaction hash exists, canonical status is `canonical`, confirmations meet the greater of the runtime and row-specific accounting-finality requirements, and no reorg hold is active.
 - Invalid or non-safe-integer refund base-unit values stop refund creation and export creation with `REFUND_LEDGER_INTEGRITY_ERROR`.
 - Rows are hashed and downloaded in the persisted deterministic order: invoice, payment session, rail, provider, then row ID.
 - Each new v2 row additively freezes the v1 40-field traceability set. The v2 refund manifest and totals remain authoritative for invoice-scoped refund aggregation.
+- `audit_log_refs` freezes every ordered audit reference for the invoice and related review/refund/export-run identities without a fixed-count truncation. `source_ledger_snapshot_hash` includes the full reference array and the exact canonical primary transfer/payment-event identity (including `log_index`) so an earlier noncanonical event sharing a transaction hash cannot be substituted.
 - Each new v2 row also freezes `amount_scale_version`, token/ledger decimals, the exact token atomic string, the ledger base-unit string, and the display amount. Accounting adapters must use `ledger_amount_base`; they must not derive it from JavaScript numbers or from the token atomic field.
 - Each new v2 row includes `accounting_event_refs`, the immutable IDs of payment-confirmed, refund-succeeded, and approved human-accounting-adjustment journal entries recognized for the invoice. A later adjustment therefore remains traceable through the original invoice without rewriting its payment state.
 - `settlement_export_rows.payload_json` stores the generated row payload. A later download reads this frozen payload rather than joining mutable operational tables.
@@ -40,6 +42,8 @@ Each manifest entry contains:
 - `attribution: invoice_primary_row`
 - every refund reference and its audit-log references
 - requested, reserved, and succeeded base-unit totals
+
+`succeeded` totals use the accounting-finality rule above. A pre-finality immutable snapshot keeps a zero succeeded total even if the operational row later reaches finality; a later snapshot records the new final state without rewriting the earlier artifact.
 
 `refund_totals` sums manifest entries once per invoice. Row-level accounting summaries therefore do not multiply refunds when an invoice has multiple payment sessions.
 
