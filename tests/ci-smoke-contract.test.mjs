@@ -90,3 +90,26 @@ test("CI isolates smoke runtime data and delays build metadata until required ch
   assert.equal((CI_WORKFLOW.match(/node-version-file: \.node-version/g) || []).length, 3);
   assert.doesNotMatch(CI_WORKFLOW, /node-version:\s*20(?:\.\d+)?/);
 });
+
+test("push production evidence starts a healthchecked isolated server and always stops it", () => {
+  const productionEvidenceBlock = CI_WORKFLOW.slice(CI_WORKFLOW.indexOf("  production-validation-evidence:"));
+  const prepareIndex = productionEvidenceBlock.indexOf("      - name: Prepare safe compose env");
+  const startIndex = productionEvidenceBlock.indexOf("      - name: Start isolated validation server");
+  const validateIndex = productionEvidenceBlock.indexOf("      - name: Run production validation pack");
+  const stopIndex = productionEvidenceBlock.indexOf("      - name: Stop isolated validation server");
+  const detectIndex = productionEvidenceBlock.indexOf("      - name: Detect latest evidence dir");
+
+  assert.ok(prepareIndex >= 0 && prepareIndex < startIndex);
+  assert.ok(startIndex < validateIndex && validateIndex < stopIndex && stopIndex < detectIndex);
+
+  const startBlock = productionEvidenceBlock.slice(startIndex, validateIndex);
+  assert.match(startBlock, /node src\/server\.mjs/);
+  assert.match(startBlock, /jpyc-production-validation-server\.pid/);
+  assert.match(startBlock, /curl --fail --silent --show-error "\$\{APP_HOST\}\/healthz"/);
+  assert.match(startBlock, /kill -0/);
+
+  const stopBlock = productionEvidenceBlock.slice(stopIndex, detectIndex);
+  assert.match(stopBlock, /if: always\(\)/);
+  assert.match(stopBlock, /kill "\$SERVER_PID" 2>\/dev\/null \|\| true/);
+  assert.match(stopBlock, /wait "\$SERVER_PID" 2>\/dev\/null \|\| true/);
+});
