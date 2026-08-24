@@ -39,7 +39,8 @@ test("P0-UX-02 mobile shows receipt card after payment with all fields and copy 
   assert.match(mobileHtml, /id="receiptInvoiceId"/);
   assert.match(mobileHtml, /id="receiptTxHash"/);
   assert.match(mobileHtml, /id="copyReceiptBtn"/);
-  assert.match(mobileHtml, /お支払い確認書/);
+  assert.match(mobileHtml, /id="receiptTitle"/);
+  assert.match(mobileHtml, /状況メモをコピー/);
 
   assert.match(mobileJs, /renderReceiptCard/);
   assert.match(mobileJs, /receiptCard/);

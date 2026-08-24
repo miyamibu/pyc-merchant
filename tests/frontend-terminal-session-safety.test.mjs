@@ -39,7 +39,11 @@ test("terminal session identity and effective permissions fail closed", () => {
   assert.match(js, /logoutIdempotencyKey/);
   assert.match(js, /bindToSession: false/);
   assert.match(js, /el\.staffPin\.value = ""/);
-  assert.match(js, /el\.staffPinConfirm\.value = ""/);
+  assert.doesNotMatch(html, /id="staffPinConfirm"/);
+  assert.doesNotMatch(js, /staffPinConfirm/);
+  assert.match(html, /id="staffPin"[^>]*aria-describedby="loginError"/);
+  assert.match(html, /id="loginError"[^>]*role="alert"/);
+  assert.match(js, /showLoginError\(loginErrorMessage\(error\)/);
   assert.doesNotMatch(js, /function isAdminRole/);
 });
 
@@ -157,7 +161,7 @@ test("paid terminal invoices stay observable for post-payment reorg holds", () =
   assert.match(server, /monitor_until: invoice\.monitor_until \|\| null/);
   assert.match(server, /integrity_hold: Number\(invoice\.integrity_hold \|\| 0\) === 1/);
   assert.match(server, /const writeStreamSnapshotIfChanged = \(\) =>/);
-  assert.match(server, /const snapshotTimer = setInterval\(writeStreamSnapshotIfChanged, 2_000\)/);
+  assert.match(server, /[cl]et snapshotTimer = setInterval\(writeStreamSnapshotIfChanged, 2_000\)/);
   assert.match(js, /const FULFILLMENT_FRESHNESS_MS = 30_000/);
   assert.match(js, /function hasFreshFulfillmentObservation/);
   assert.match(js, /function isFulfillmentObservationUnavailable/);
@@ -367,13 +371,29 @@ test("refund request uses one stable operation key and server read-back", () => 
   assert.match(js, /await tryReadBackRefund\(refundId, "返金申請の作成"\)/);
 });
 
-test("business dates are timezone-aware and audit viewing remains authenticated", () => {
+test("business dates render with the store timezone and audit viewing remains authenticated", () => {
   const html = read("public/terminal.html");
   const js = read("public/terminal.js");
 
   assert.match(html, /id="businessTimezoneText"/);
-  assert.match(js, /timeZone: safeTimeZone\(state\.storeTimezone\)/);
-  assert.match(js, /\$\{businessDate\}（\$\{state\.storeTimezone\}）/);
+  const timeZoneSource = extractSourceBlock(js, "function safeTimeZone", "function idempotencyKey");
+  const dateTimeSource = extractSourceBlock(js, "function formatDateTime", "function formatJpy");
+  const context = vm.createContext({
+    state: { storeTimezone: "Asia/Tokyo" },
+    Intl,
+    Date,
+  });
+  vm.runInContext(
+    `${timeZoneSource}\n${dateTimeSource}\nthis.formatDateTimeForTest = formatDateTime; this.safeTimeZoneForTest = safeTimeZone;`,
+    context
+  );
+  const tokyo = context.formatDateTimeForTest("2026-01-01T00:00:00.000Z");
+  context.state.storeTimezone = "America/New_York";
+  const newYork = context.formatDateTimeForTest("2026-01-01T00:00:00.000Z");
+  assert.notEqual(tokyo, newYork);
+  assert.match(tokyo, /9:00/);
+  assert.match(newYork, /19:00/);
+  assert.equal(context.safeTimeZoneForTest("Not/A_Timezone"), "Asia/Tokyo");
   assert.match(html, /id="openAuditLogBtn"/);
   assert.doesNotMatch(html, /href="\/api\/v1\/audit-logs/);
   assert.match(js, /requestJson\("\/api\/v1\/audit-logs\?limit=50"\)/);
@@ -393,9 +413,14 @@ test("fixed terminal entry requires explicit confirmation and rechecks before na
   assert.match(js, /const latestEntry = await requestEntryState\(\)/);
   assert.match(js, /readyFingerprint\(latestEntry\) !== readyFingerprint\(selectedEntry\)/);
   assert.match(js, /requiresReconfirmation/);
-  assert.match(js, /変更内容を確認/);
+  assert.match(js, /変更内容を確認して進む/);
   assert.match(js, /REQUEST_TIMEOUT_MS = 8000/);
   assert.match(js, /signal: controller\.signal/);
+  assert.match(js, /function stableClaimNonce/);
+  assert.match(js, /ENTRY_CLAIM_TIMEOUT/);
+  assert.match(js, /ENTRY_CONSUME_TIMEOUT/);
+  assert.doesNotMatch(js, /もう一度ボタンを押すと最新状態を照合して開きます/);
+  assert.doesNotMatch(js, /会計内容を確保しました。もう一度確認/);
   assert.match(js, /function isExpectedPayDestination/);
   assert.match(js, /destination\.pathname === "\/pay"/);
   assert.match(js, /destination\.searchParams\.getAll\("ref"\)\.length === 1/);
@@ -490,6 +515,9 @@ function createRequestHarness() {
   const context = vm.createContext({
     AbortController,
     Headers,
+    API_REQUEST_TIMEOUT_MS: 5_000,
+    setTimeout,
+    clearTimeout,
     state: {
       token: "old-token",
       sessionEpoch: 1,
@@ -505,7 +533,7 @@ function createRequestHarness() {
     },
   });
   vm.runInContext(
-    `${source}\nthis.requestJsonForTest = requestJson; this.advanceSessionEpochForTest = advanceSessionEpoch;`,
+    `${source}\nthis.requestJsonForTest = requestJson; this.requestTextForTest = requestText; this.advanceSessionEpochForTest = advanceSessionEpoch;`,
     context
   );
   return { context, getResetCalls: () => resetCalls };
@@ -546,18 +574,145 @@ test("current-session 401 still fails closed and clears the active session", asy
   assert.equal(context.state.token, "");
 });
 
-test("ops review uncertainty blocks settlement close instead of rendering zero", () => {
+test("terminal JSON/text requests merge abort signals and fail with a bounded Japanese timeout", async () => {
+  for (const method of ["requestJsonForTest", "requestTextForTest"]) {
+    const { context } = createRequestHarness();
+    let receivedSignal = null;
+    context.fetch = (_pathname, options) => {
+      receivedSignal = options.signal;
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    };
+    await assert.rejects(
+      context[method]("/timeout", {}, { bindToSession: false, timeoutMs: 5 }),
+      (error) => error?.code === "REQUEST_TIMEOUT"
+        && error?.retryable === true
+        && /タイムアウト/.test(error?.message)
+        && /もう一度/.test(error?.message)
+    );
+    assert.equal(receivedSignal?.aborted, true);
+  }
+
+  const { context } = createRequestHarness();
+  const externalController = new AbortController();
+  let mergedSignal = null;
+  context.fetch = (_pathname, options) => {
+    mergedSignal = options.signal;
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const pending = context.requestJsonForTest(
+    "/external-abort",
+    { signal: externalController.signal },
+    { bindToSession: false, timeoutMs: 1_000 }
+  );
+  externalController.abort();
+  await assert.rejects(pending, (error) => error?.code === "STALE_SESSION_RESPONSE");
+  assert.notEqual(mergedSignal, externalController.signal);
+  assert.equal(mergedSignal?.aborted, true);
+});
+
+test("settlement close remains disabled until a matching ready preview is explicitly confirmed", async () => {
   const js = read("public/terminal.js");
-  const opsSource = extractSourceBlock(js, "async function loadOpsSnapshot", "function startOpsAutoRefresh");
-  assert.match(js, /const reviewsAvailable = Boolean/);
-  assert.match(js, /state\.opsReviewReadState = reviewsAvailable \? "ok"/);
-  assert.match(js, /reviewsAvailable\s*\? `\$\{openReviewCount\}件`\s*:\s*"取得失敗"/);
-  assert.match(js, /state\.opsReviewReadState !== "ok"/);
-  assert.match(js, /state\.opsSettlementReadState !== "ok"/);
-  assert.match(js, /締め前提の運用状態が不明なため、日次締めは実行できません/);
-  assert.match(opsSource, /snapshotSequence !== state\.opsSnapshotSequence/);
-  assert.match(opsSource, /state\.opsSnapshotBusinessDate !== businessDate/);
-  assert.match(opsSource, /String\(el\.businessDateInput\.value \|\| ""\)\.trim\(\) !== businessDate/);
+  const source = extractSourceBlock(js, "function settlementBlockerLabel", "function settlementExportPointerKey");
+  const makeClassList = () => ({
+    values: new Set(),
+    add(value) { this.values.add(value); },
+    remove(value) { this.values.delete(value); },
+    toggle(value, force) { force ? this.values.add(value) : this.values.delete(value); },
+  });
+  const makeTextElement = () => ({
+    textContent: "",
+    className: "",
+    disabled: false,
+    checked: false,
+    classList: makeClassList(),
+  });
+  const el = {
+    businessDateInput: { value: "2026-08-13" },
+    loadSettlementPreviewBtn: makeTextElement(),
+    closeSettlementBtn: makeTextElement(),
+    settlementPreviewConfirm: makeTextElement(),
+    settlementConfirmPanel: makeTextElement(),
+    settlementPreviewBadge: makeTextElement(),
+    settlementPreviewState: makeTextElement(),
+    settlementPreviewBusinessDate: makeTextElement(),
+    settlementPreviewInvoiceCount: makeTextElement(),
+    settlementPreviewPaidCount: makeTextElement(),
+    settlementPreviewReviewCount: makeTextElement(),
+    settlementPreviewBilledTotal: makeTextElement(),
+    settlementPreviewPaidTotal: makeTextElement(),
+    settlementPreviewBlockers: {
+      children: [],
+      replaceChildren() { this.children = []; },
+      appendChild(node) { this.children.push(node); },
+    },
+  };
+  const state = {
+    storeTimezone: "Asia/Tokyo",
+    settlementPreview: null,
+    settlementPreviewSignature: "",
+    pendingSettlementClose: "",
+    settlementPreviewInFlight: false,
+    settlementCloseInFlight: false,
+  };
+  let responsePreview = null;
+  const context = vm.createContext({
+    state,
+    el,
+    document: { createElement: () => makeTextElement() },
+    hasPermission: (permission) => permission === "settlement.close",
+    safeTimeZone: (value) => value || "Asia/Tokyo",
+    shortId: (value) => String(value || ""),
+    formatJpy: (value) => `JPY:${value}`,
+    formatJpyc: (value) => `JPYC:${value}`,
+    requestJson: async () => responsePreview,
+    encodeURIComponent,
+  });
+  vm.runInContext(
+    `${source}\nthis.syncForTest = syncSettlementCloseControl; this.renderForTest = renderSettlementPreview; this.loadForTest = loadSettlementPreview;`,
+    context
+  );
+
+  context.syncForTest();
+  assert.equal(el.loadSettlementPreviewBtn.disabled, false, "preview取得操作は利用可能であること");
+  assert.equal(el.closeSettlementBtn.disabled, true, "preview未取得では確定不可であること");
+
+  context.renderForTest({ business_date: "2026-08-12", timezone: "Asia/Tokyo", ready: true, closed: false, blockers: [], totals: {} });
+  assert.equal(el.closeSettlementBtn.disabled, true, "別営業日のpreviewでは確定不可であること");
+
+  context.renderForTest({ business_date: "2026-08-13", timezone: "Asia/Tokyo", ready: false, closed: false, blockers: [{ code: "UNRESOLVED_REVIEWS" }], totals: {} });
+  assert.equal(el.settlementPreviewConfirm.disabled, true);
+  assert.equal(el.closeSettlementBtn.disabled, true, "ready=falseでは確定不可であること");
+
+  const readyPreview = {
+    business_date: "2026-08-13",
+    timezone: "Asia/Tokyo",
+    ready: true,
+    closed: false,
+    blockers: [],
+    totals: { invoice_count: 2 },
+  };
+  context.renderForTest(readyPreview);
+  assert.equal(el.settlementPreviewBusinessDate.textContent, "2026-08-13（Asia/Tokyo）");
+  assert.equal(el.closeSettlementBtn.disabled, true, "確認チェック前は確定不可であること");
+  el.settlementPreviewConfirm.checked = true;
+  context.syncForTest();
+  assert.equal(el.closeSettlementBtn.disabled, false, "同一営業日のready previewを確認した場合だけ確定可能であること");
+
+  responsePreview = { ...readyPreview, business_date: "2026-08-12" };
+  await assert.rejects(context.loadForTest("2026-08-13"), /対象営業日が一致しないpreview/);
+  assert.equal(el.closeSettlementBtn.disabled, false, "不一致応答は確認済みpreviewを上書きしないこと");
 });
 
 test("same-session late invoice and review responses cannot overwrite the latest target", async () => {
@@ -886,7 +1041,7 @@ test("toast queue deduplicates, replaces old success, and stays at two items", (
   assert.doesNotMatch(hostRule, /bottom:/);
 });
 
-test("fixed entry poll change requires one acknowledgement before navigation", async () => {
+test("fixed entry poll change uses one explicit acknowledgement before navigation", async () => {
   const source = read("public/terminal-entry.js");
   const elements = new Map();
   const getElement = (id) => {
@@ -945,22 +1100,47 @@ test("fixed entry poll change requires one acknowledgement before navigation", a
 
   responses.push(readyB);
   await vm.runInContext("refreshEntryState()", context);
-  assert.equal(getElement("openInvoiceBtn").textContent, "変更内容を確認");
+  assert.equal(getElement("openInvoiceBtn").textContent, "変更内容を確認して進む");
   assert.equal(vm.runInContext("state.requiresReconfirmation", context), true);
-
-  await vm.runInContext("handleOpenInvoice()", context);
-  assert.equal(navigations.length, 0);
-  assert.equal(getElement("openInvoiceBtn").textContent, "この会計を確認して進む");
-  assert.equal(vm.runInContext("state.requiresReconfirmation", context), false);
 
   responses.push(readyB);
   responses.push({ claim_id: "claim-b", claim_status: "claimed", invoice_id: "invoice-b" });
-  await vm.runInContext("handleOpenInvoice()", context);
-  assert.equal(navigations.length, 0);
-  assert.equal(getElement("openInvoiceBtn").textContent, "確認して支払い画面へ");
-
-  responses.push(readyB);
   responses.push({ claim_status: "consumed", invoice_id: "invoice-b", pay_url: "/pay?ref=invoice-b" });
   await vm.runInContext("handleOpenInvoice()", context);
   assert.deepEqual(navigations, ["https://merchant.example/pay?ref=invoice-b"]);
+  assert.equal(vm.runInContext("state.requiresReconfirmation", context), false);
+});
+
+test("terminal settings are versioned and scoped to authenticated store, terminal, and operator", () => {
+  const js = read("public/terminal.js");
+  const settingsSource = extractSourceBlock(js, "function defaultTerminalSettings", "function renderAmountPresetButtons");
+
+  assert.match(js, /const SETTINGS_NAMESPACE = `\$\{LEGACY_SETTINGS_KEY\}:v2`/);
+  assert.match(js, /const SETTINGS_SCHEMA_VERSION = 2/);
+  assert.match(settingsSource, /if \(!state\.token \|\| !storeId \|\| !terminalId \|\| !operatorIdentity\) return ""/);
+  assert.match(settingsSource, /encodeURIComponent\(storeId\)/);
+  assert.match(settingsSource, /encodeURIComponent\(terminalId\)/);
+  assert.match(settingsSource, /settingsScopeHash\(operatorIdentity\)/);
+  assert.match(settingsSource, /schema_version: SETTINGS_SCHEMA_VERSION/);
+  // Legacy global settings cannot be attributed to a specific operator
+  // identity, so they must never be migrated or reused: operators without
+  // v2 scoped settings intentionally start from defaults instead of
+  // inheriting another operator's values.
+  assert.doesNotMatch(settingsSource, /readSettingsStorage\(LEGACY_SETTINGS_KEY\)/);
+  assert.doesNotMatch(js, /migrateLegacyTerminalSettings|legacy-migration/);
+  assert.match(js, /const SETTINGS_NAMESPACE = `\$\{LEGACY_SETTINGS_KEY\}:v2`/);
+  assert.match(js, /const LEGACY_SETTINGS_KEY = "jpyc_terminal_settings";/);
+  assert.match(settingsSource, /Boolean\(storageKey\) && writeSettingsStorage/);
+  assert.doesNotMatch(js, /readSettingsStorage\(SETTINGS_KEY\)|writeSettingsStorage\(SETTINGS_KEY/);
+  assert.match(js, /setLoggedInUi\(true\);\s*loadTerminalSettings\(\)/);
+  assert.match(js, /state\.staffCode = "";[\s\S]*?loadTerminalSettings\(\)/);
+});
+
+// M-031: the review list follows API pagination pages instead of assuming a
+// single unbounded response, so operators keep full visibility.
+test("review list follows pagination pages with a bounded loop", () => {
+  const js = read("public/terminal.js");
+  assert.match(js, /REVIEW_LIST_PAGE_LIMIT = 100/);
+  assert.match(js, /REVIEW_LIST_MAX_PAGES = 20/);
+  assert.match(js, /offset=\$\{offset\}/);
 });

@@ -41,14 +41,16 @@
   - env key一覧
 
 ## Controlled stop
-- 新規受付停止:
-  - `.env.production` の `PAYMENTS_DISABLED=true`
-  - `docker compose -f docker-compose.prod.yml restart app`
+- 本番（systemd管理ホスト）では、unitのimmutable運用（`--no-build --pull never` + `verify-release-image.mjs`）に従う。`docker compose down` や `--build` を含む手作業のcompose操作は行わない。
+- 新規受付停止（推奨・監査ログ付き）:
+  - kill switch APIで請求発行を停止する（`docs/74-runbook.md` の「インシデント時 kill switch 手順」参照）。
+  - 代替手段として `.env.production` の `PAYMENTS_DISABLED=true` 変更後、`sudo systemctl reload jpyc-payment-terminal.service`（ExecReload = `up -d --no-build --pull never --force-recreate app worker nginx`）を適用する。
 - 全停止:
-  - `docker compose -f docker-compose.prod.yml down`
+  - `sudo systemctl stop jpyc-payment-terminal.service`
+  - `docker compose down` はsystemd管理外でのみ使用し、実行した場合はevidenceに理由を記録する。
 
 ## Controlled restart
-- `docker compose -f docker-compose.prod.yml up -d --build`
+- `sudo systemctl restart jpyc-payment-terminal.service`（ホスト上のrebuildは行わない。イメージは `verify-release-image.mjs` が検証済みのdigestのみ使用する）
 - `bash scripts/deploy/healthcheck.sh`
 - `/readyz` と `/metrics?format=json` を再確認する。
 - PC hosting の場合は app / worker / Caddy または cloudflared の restart 後に `bash scripts/deploy/check-public-host.sh .env.production` を再実行する。

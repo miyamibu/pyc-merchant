@@ -150,7 +150,7 @@ label {
 }
 
 :where(a, button, input, select, textarea):focus-visible {
-  outline: 3px solid rgba(30, 91, 206, 0.62);
+  outline: 3px solid #0b47b5;
   outline-offset: 2px;
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.98);
 }
@@ -269,6 +269,7 @@ label {
   border-radius: var(--radius-md);
   padding: var(--space-4);
   box-shadow: var(--shadow-card);
+  min-width: 0;
 }
 
 .sticky-stack {
@@ -599,10 +600,13 @@ label {
 
 .amount-primary {
   margin: 0;
+  min-width: 0;
+  max-width: 100%;
   font-size: var(--font-size-amount);
   line-height: 1.04;
   font-weight: 900;
   letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 .amount-hero {
@@ -724,6 +728,10 @@ label {
   gap: var(--space-2);
 }
 
+.mobile-surface .payment-surface-blocked {
+  display: none !important;
+}
+
 .payment-safety-note {
   color: var(--color-warning);
   font-weight: 700;
@@ -840,7 +848,13 @@ label {
   margin-top: var(--space-3);
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-3);
+}
+
+.error-banner-row .flex-1 {
+  min-width: min(100%, 16rem);
+  overflow-wrap: anywhere;
 }
 
 .empty-state,
@@ -989,6 +1003,11 @@ label {
 .step-panel.current {
   border-color: #b8caea;
   background: #eef4ff;
+}
+
+.step-panel.completed {
+  border-color: #a5d9bf;
+  background: var(--color-success-soft);
 }
 
 #qrCanvas {
@@ -1281,11 +1300,16 @@ tbody tr:last-child td {
 }
 
 .address-text {
-  display: inline-block;
-  max-width: min(100%, 46ch);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.login-inline-error {
+  text-align: left;
 }
 
 .contract-address-text {
@@ -2038,6 +2062,50 @@ tbody tr:last-child td {
     padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
   }
 
+  .terminal-surface .sticky-stack {
+    position: static;
+  }
+
+  .terminal-surface .fulfillment-banner {
+    position: sticky;
+    top: max(var(--space-2), env(safe-area-inset-top));
+    z-index: 40;
+    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+  }
+
+  .terminal-surface .fulfillment-banner .helper-text {
+    font-size: var(--font-size-xs);
+  }
+
+  .terminal-surface .fulfillment-banner .status-pill {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .terminal-surface :where(.card, .panel, .row, .split-layout, .amount-compare, .fulfillment-banner, .store-payments-control) {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .terminal-surface :where(.mono, .info-value, .helper-text, a) {
+    overflow-wrap: anywhere;
+  }
+
+  .terminal-surface .nowrap {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .amount-primary {
+    font-size: clamp(28px, 10vw, 44px);
+  }
+
+  #qrCanvas {
+    scroll-margin-top: 10rem;
+  }
+
   .store-payments-control {
     grid-template-columns: 1fr;
   }
@@ -2069,6 +2137,12 @@ tbody tr:last-child td {
 
   .mobile-surface .btn {
     width: 100%;
+  }
+
+  .mobile-surface .error-banner-row .btn {
+    flex: 1 1 9rem;
+    width: auto;
+    min-height: var(--tap-target-min);
   }
 
   .terminal-surface .btn-main-action {
@@ -2109,7 +2183,13 @@ tbody tr:last-child td {
 
   .motion-scene-btn,
   .motion-phase {
-    min-height: 0;
+    min-height: var(--tap-target-min);
+  }
+}
+
+@media (max-width: 430px) {
+  .terminal-surface .fulfillment-banner {
+    position: static;
   }
 }
 

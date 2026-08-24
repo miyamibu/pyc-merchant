@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/contracts/commercial-approval-manifest-v1.schema.json",
+  "title": "Commercial Approval Manifest v1",
+  "x-clock-skew-seconds": 60,
+  "x-max-validity-seconds": 7776000,
+  "x-accountable-signers-require-distinct-keys": true,
+  "x-required-role-by-approval-id": {
+    "legal": "legal_accountable",
+    "aml": "aml_accountable",
+    "privacy": "privacy_accountable",
+    "appi": "appi_accountable",
+    "jpyc_contract": "technology_accountable",
+    "confirmation_policy": "technology_accountable",
+    "backscan_policy": "operations_accountable",
+    "refund_treasury": "operations_accountable",
+    "limited_pilot_cap": "operations_accountable"
+  },
+  "x-manual-cross-field-constraints": [
+    "the six accountable signer roles use six distinct key_id values",
+    "each approval_id maps to its required approver_role and approver_key_id is a valid signature key_id for that role",
+    "issued_at is before expires_at and validity is no more than 90 days",
+    "each approval approved_at is before expires_at and validity is no more than 90 days"
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "release", "issued_at", "expires_at", "revocation_status", "approvals", "signatures"],
+  "properties": {
+    "schema_version": { "const": "commercial_approval_manifest_v1" },
+    "release": { "$ref": "commercial-evidence-manifest-v1.schema.json#/$defs/releaseFingerprint" },
+    "issued_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "revocation_status": { "const": "valid" },
+    "approvals": { "type": "array", "minItems": 8, "items": { "$ref": "#/$defs/approval" } },
+    "signatures": { "type": "array", "minItems": 6, "items": { "$ref": "#/$defs/signature" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "approval": {
+      "x-max-validity-seconds": 7776000,
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approval_id", "status", "approval_ref", "scope", "approver_id", "approver_role", "approver_key_id", "approved_at", "expires_at", "revoked_at", "document_path", "document_sha256"],
+      "properties": {
+        "approval_id": { "enum": ["legal", "aml", "privacy", "appi", "jpyc_contract", "confirmation_policy", "backscan_policy", "refund_treasury", "limited_pilot_cap"] },
+        "status": { "const": "approved" },
+        "approval_ref": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "approver_id": { "type": "string", "minLength": 1 },
+        "approver_role": { "enum": ["legal_accountable", "aml_accountable", "privacy_accountable", "appi_accountable", "technology_accountable", "operations_accountable"] },
+        "approver_key_id": { "$ref": "#/$defs/sha256" },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "revoked_at": { "type": ["string", "null"], "format": "date-time" },
+        "document_path": { "type": "string", "minLength": 1 },
+        "document_sha256": { "$ref": "#/$defs/sha256" },
+        "procedure_refs": { "type": "object" },
+        "release": { "type": "object" },
+        "constraints": { "type": "object" }
+      }
+    },
+    "signature": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "encoding", "key_id", "signer_role", "public_key_pem", "signature_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" }, "encoding": { "const": "base64" },
+        "key_id": { "$ref": "#/$defs/sha256" },
+        "signer_role": { "enum": ["legal_accountable", "aml_accountable", "privacy_accountable", "appi_accountable", "technology_accountable", "operations_accountable"] },
+        "public_key_pem": { "type": "string", "minLength": 1 },
+        "signature_base64": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9+/]{4}){21}[A-Za-z0-9+/][AQgw]==$"
+        }
+      }
+    }
+  }
+}

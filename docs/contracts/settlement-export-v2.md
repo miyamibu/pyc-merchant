@@ -10,9 +10,11 @@ Canonical contract summary for `settlement_export_v2`.
 - Invalid refund base-unit values fail closed.
 - Rows use a stable persisted order for hashing and download.
 - Every new row freezes the v1 40-field lineage set additively, including chain/token/recipient, payment attempt, review/refund, audit, external sync, and source-ledger hash references.
+- `audit_log_refs` contains the complete ordered set for the invoice and related review/refund/export-run identities; it is never silently capped or sampled. `source_ledger_snapshot_hash` binds that complete set and, when a paid transfer exists, the exact canonical transfer/payment-event identity including `log_index`.
 - Every new row freezes the amount scale explicitly: `amount_scale_version`, `token_decimals`, `ledger_decimals`, `token_amount_atomic`, `ledger_amount_base`, and `display_amount`. The atomic token string is never reconstructed from a JavaScript number or an accounting integer column.
 - `accounting_event_refs` freezes the append-only payment/refund/manual-accounting-adjustment journal rows recognized for the invoice; the references preserve the adjustment trail without treating a human adjustment as a payment transition.
 - Refund references include the independent `refund_case_id`, optional related `review_case_id`, and optional `funding_lineage_id` so refund ownership and receive-address-to-treasury sweep evidence remain traceable.
+- `verified` is evidence-only. `refund_succeeded_amount_jpyc_base` and `refunded_onchain` require status `succeeded` or `finalized`, a refund transaction hash, canonical evidence, confirmations at or above the effective accounting-finality requirement, and no reorg hold. Earlier frozen snapshots remain unchanged when a refund later reaches finality.
 - The frozen row payload is stored at snapshot creation; downloads do not rebuild historical lineage from the current operational ledger.
 - The JPYC rail is limited to chain IDs `1`, `43114`, and `137` with funds-transfer JPYC contract `0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29`.
 - Daily-close exports bind to `settlement_id`; missing legacy bindings are reported as `legacy_export_missing` without guessing.

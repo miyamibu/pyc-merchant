@@ -15,7 +15,7 @@ function read(filePath) {
 function runNode(scriptPath, args = [], env = {}) {
   return new Promise((resolve) => {
     execFile(
-      "node",
+      process.execPath,
       [scriptPath, ...args],
       { cwd: ROOT, env: { ...process.env, ...env } },
       (error, stdout, stderr) => {

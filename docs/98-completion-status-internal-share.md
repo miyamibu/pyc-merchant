@@ -14,7 +14,34 @@ JPYC決済端末プロジェクトについて、現時点で「repo内で完了
 - protected path の証跡は参照のみとし、本書は共有用の要約として扱う。
 
 ## Snapshot
-- Snapshot date: `2026-04-28`
+- Snapshot date: `2026-08-22`（2026-04-28版の内容は本セクション以降に履歴として保持）
+- 本書は完全監査（2026-08-13完了）とその後のremediation作業を反映した最新版である。
+
+### 2026-08-22 時点の状態（最新）
+
+**判定: `NO_GO`（公開·配布·本番運用は不可 / ローカル開発·隔離検証は可）**
+
+実施済み（repo内で確認可能）:
+
+- 完全監査: Blocker4/Critical1/Major61/Minor29 を確定
+  - [final-audit-report.md](/Users/mimac/.codex/visualizations/2026/08/09/019fe6b9-dac3-7c43-a20a-48e80850a521/jpyc-complete-audit/final-audit-report.md)
+- Remediation（branch `codex/full-audit-remediation-20260813`, 未コミット差分）:
+  - release gate署名束縛（C-001/B-001〜003相当）、settlement lineage/canonical transfer/invoice-atomicity、cursor pagination群、ops alert delivery、rollback identity手順、SSE/TTL・rate-limit上限、フィールド境界、UI pagination 等
+  - 全Finding台帳: [remediation-finding-status.md](/Users/mimac/.codex/visualizations/2026/08/09/019fe6b9-dac3-7c43-a20a-48e80850a521/jpyc-complete-audit/remediation-finding-status.md)
+- 検証: Node 24.17.0 Darwin arm64 公式で実作業ツリー **522/522 pass・0 fail/skip**、隔離公式Node 24.17.0 Dockerでも **522/522 pass**、**npm run check pass**、**npm audit 0 vulnerabilities**、**dependency/docker hygiene pass**
+  - Chrome151の48幅・実機iPhone証拠は履歴証拠として維持。現在のpublic UI/server 8ランタイムファイルのSHAがその視覚証拠に一致するが、現行CI verifierはlocal evidenceを受理しないためcurrent CI visual evidenceは別途必要
+  - 公開ホストは2026-08-22再測定で `root/healthz/readyz` 全て **HTTP 530**、Cloudflare **1033** と維持
+  - 現スナップショット: branch `codex/full-audit-remediation-20260813`, HEAD `7be4531dc6b4a80dd8d66620a96a7c3455050bf5`, **107 dirty entries（75 tracked変更、32 untracked）**（本文書更新直前の基準値）
+
+未完了（外部依存·人間承認。捏造禁止のため正直に残す）:
+
+1. 公開ホスト `pay.miyamibu.xyz` が HTTP 530（Cloudflare 1033）— tunnel/origin修復に本番権限が必要
+2. 法務·AML·Privacy·APPI承認の署名証跡（9項目の人間判定）
+3. 外部証拠: 実JPYC送金·実refund·DR drill(RPO/RTO実測)·alert配信実運用·店舗訓練
+4. iPhone 12 Safariでのfail-closed描画は2026-08-22に確認済み。ただしHashPort Wallet実機起動、実JPYC送金、Dynamic Type/VoiceOver等を含む完全実機matrixは未確認。
+
+### 履歴（2026-04-28時点の記録）
+
 - Latest canonical commercial verdict:
   - [COMMERCIAL_GO_SUMMARY.md](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/production/evidence/20260427T233711Z/COMMERCIAL_GO_SUMMARY.md)
 - Fresh non-protected commercial verdict:

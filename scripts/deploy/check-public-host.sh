@@ -35,6 +35,7 @@ bash ./scripts/deploy/healthcheck.sh "${APP_HOST%/}/healthz"
 
 node --input-type=module - "$PUBLIC_ENTRY_TOKEN" "$SIGNED_PAY_URL" <<'NODE'
 import { fetchPinnedPublicHttps } from "./src/public-endpoint-security.mjs";
+import { validatePublicReadinessPayload } from "./scripts/deploy/validate-readiness-payload.mjs";
 
 const publicEntryToken = process.argv[2] || "";
 const signedPayUrl = process.argv[3] || "";
@@ -68,8 +69,12 @@ async function fetchOk(label, url, options = {}) {
     } catch {
       throw new Error(`${label} failed: response was not valid JSON`);
     }
-    if (payload?.ok !== true || payload?.commercial_verdict === "NO_GO" || payload?.commercial_verdict === "CONDITIONAL_NO_GO_FOR_COMMERCIAL") {
-      throw new Error(`${label} failed: readiness payload is not ready (${response.body})`);
+    const validation = validatePublicReadinessPayload(payload, {
+      expectedReleaseId: process.env.RELEASE_ID || "",
+      expectedReleaseMode: process.env.RELEASE_MODE || "",
+    });
+    if (!validation.ok) {
+      throw new Error(`${label} failed: readiness payload is not ready (${validation.errors.join(", ")})`);
     }
   }
   console.log(`${label} ok: ${url}`);

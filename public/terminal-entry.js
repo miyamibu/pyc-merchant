@@ -24,9 +24,12 @@ const state = {
   refreshInFlight: false,
   opening: false,
   requestController: null,
+  openController: null,
   requestSequence: 0,
   claim: null,
   claimFingerprint: "",
+  claimNonce: "",
+  claimNonceFingerprint: "",
 };
 
 const el = {
@@ -56,9 +59,17 @@ const TERMINAL_ENTRY_ERROR_CATALOG = Object.freeze({
     message: "この会計を確保できません。会計状態を更新して、もう一度確認してください。",
     supportCode: "CUST-ENTRY-CLAIM",
   },
+  ENTRY_CLAIM_TIMEOUT: {
+    message: "この会計の確保が時間内に完了しませんでした。会計状態を更新して、もう一度確認してください。",
+    supportCode: "CUST-ENTRY-CLAIM-TIMEOUT",
+  },
   ENTRY_CONSUME_FAILED: {
     message: "この会計を確定できません。会計状態を更新して、もう一度確認してください。",
     supportCode: "CUST-ENTRY-CONSUME",
+  },
+  ENTRY_CONSUME_TIMEOUT: {
+    message: "支払い画面の準備が時間内に完了しませんでした。会計状態を更新して、もう一度確認してください。",
+    supportCode: "CUST-ENTRY-CONSUME-TIMEOUT",
   },
   CHECKOUT_ALREADY_CLAIMED: {
     message: "この会計は別の端末で確認中です。追加操作をせず、店舗スタッフへお声がけください。",
@@ -178,6 +189,15 @@ function readyFingerprint(entry) {
     .join("|");
 }
 
+function stableClaimNonce(entry) {
+  const fingerprint = readyFingerprint(entry);
+  if (!state.claimNonce || state.claimNonceFingerprint !== fingerprint) {
+    state.claimNonce = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    state.claimNonceFingerprint = fingerprint;
+  }
+  return state.claimNonce;
+}
+
 async function requestEntryState() {
   if (!terminalToken) {
     throw terminalEntryError("ENTRY_REFRESH_FAILED");
@@ -210,47 +230,78 @@ async function requestEntryState() {
 
 async function claimCurrentInvoice(entry) {
   const invoice = entry?.active_invoice || {};
-  const nonce = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const response = await fetch(`/api/v1/public/terminal-entry/${encodeURIComponent(terminalToken)}/claim`, {
-    method: "POST",
-    cache: "no-store",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      anonymous_device_id: ANONYMOUS_DEVICE_ID,
-      nonce,
-      invoice_version: invoice.invoice_version,
-      amount_scale_version: invoice.amount_scale_version,
-      token_amount_atomic: invoice.token_amount_atomic,
-      ledger_amount_base: invoice.ledger_amount_base,
-    }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw terminalEntryErrorFromResponse(payload, "ENTRY_CLAIM_FAILED");
-  }
-  return payload;
-}
-
-async function consumeCheckoutClaim(entry, claim) {
-  const invoice = entry?.active_invoice || {};
-  const response = await fetch(
-    `/api/v1/public/terminal-entry/${encodeURIComponent(terminalToken)}/claim/${encodeURIComponent(claim.claim_id)}/consume`,
-    {
+  const controller = new AbortController();
+  if (state.openController) state.openController.abort();
+  state.openController = controller;
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`/api/v1/public/terminal-entry/${encodeURIComponent(terminalToken)}/claim`, {
       method: "POST",
       cache: "no-store",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         anonymous_device_id: ANONYMOUS_DEVICE_ID,
+        nonce: stableClaimNonce(entry),
         invoice_version: invoice.invoice_version,
         amount_scale_version: invoice.amount_scale_version,
         token_amount_atomic: invoice.token_amount_atomic,
         ledger_amount_base: invoice.ledger_amount_base,
       }),
-    },
-  );
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw terminalEntryErrorFromResponse(payload, "ENTRY_CONSUME_FAILED");
-  return payload;
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw terminalEntryErrorFromResponse(payload, "ENTRY_CLAIM_FAILED");
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError" && timedOut) throw terminalEntryError("ENTRY_CLAIM_TIMEOUT");
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    if (state.openController === controller) state.openController = null;
+  }
+}
+
+async function consumeCheckoutClaim(entry, claim) {
+  const invoice = entry?.active_invoice || {};
+  const controller = new AbortController();
+  if (state.openController) state.openController.abort();
+  state.openController = controller;
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(
+      `/api/v1/public/terminal-entry/${encodeURIComponent(terminalToken)}/claim/${encodeURIComponent(claim.claim_id)}/consume`,
+      {
+        method: "POST",
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          anonymous_device_id: ANONYMOUS_DEVICE_ID,
+          invoice_version: invoice.invoice_version,
+          amount_scale_version: invoice.amount_scale_version,
+          token_amount_atomic: invoice.token_amount_atomic,
+          ledger_amount_base: invoice.ledger_amount_base,
+        }),
+        signal: controller.signal,
+      },
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw terminalEntryErrorFromResponse(payload, "ENTRY_CONSUME_FAILED");
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError" && timedOut) throw terminalEntryError("ENTRY_CONSUME_TIMEOUT");
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    if (state.openController === controller) state.openController = null;
+  }
 }
 
 function isExpectedPayDestination(destination) {
@@ -316,6 +367,10 @@ function renderReady(entry, { changed = false, requireReconfirmation = changed }
     state.claim = null;
     state.claimFingerprint = "";
   }
+  if (state.claimNonceFingerprint && state.claimNonceFingerprint !== fingerprint) {
+    state.claimNonce = "";
+    state.claimNonceFingerprint = "";
+  }
   const changedSinceConfirmation = Boolean(
     state.presentedFingerprint && fingerprint !== state.presentedFingerprint
   );
@@ -335,11 +390,7 @@ function renderReady(entry, { changed = false, requireReconfirmation = changed }
   el.entryInvoiceText.textContent = shortInvoiceReference(invoice);
   el.entryReadyPanel.classList.remove("hidden");
   el.openInvoiceBtn.disabled = !entry.pay_url || state.opening;
-  el.openInvoiceBtn.textContent = mustReconfirm
-    ? "変更内容を確認"
-    : state.claim?.invoice_id === invoice.invoice_id
-      ? "確認して支払い画面へ"
-      : "この会計を確認して進む";
+  el.openInvoiceBtn.textContent = mustReconfirm ? "変更内容を確認して進む" : "この会計を確認して進む";
   setHelp([
     "表示された店舗・金額・会計番号がご自身の会計か確認してください。",
     "確認ボタンを押す直前にも最新状態を照合します。",
@@ -394,11 +445,7 @@ async function handleOpenInvoice() {
   if (state.requiresReconfirmation) {
     state.presentedFingerprint = readyFingerprint(selectedEntry);
     state.requiresReconfirmation = false;
-    renderReady(selectedEntry);
-    el.headlineText.textContent = "更新後の会計内容を確認しました。";
-    el.bodyText.textContent = "表示中の店舗・金額・会計番号が正しければ確認ボタンを押してください。";
-    announce("更新後の会計内容を確認しました。もう一度ボタンを押すと最新状態を照合して開きます。");
-    return;
+    announce("更新後の会計内容を確認し、最新状態を照合しています。");
   }
   state.refreshInFlight = true;
   el.openInvoiceBtn.disabled = true;
@@ -420,12 +467,6 @@ async function handleOpenInvoice() {
       state.claim = claim;
       state.claimFingerprint = latestFingerprint;
       state.readyEntry = latestEntry;
-      renderReady(latestEntry);
-      el.headlineText.textContent = "会計内容を確保しました。";
-      el.bodyText.textContent = "店舗・金額・会計番号をもう一度確認してから、支払い画面へ進んでください。";
-      el.openInvoiceBtn.textContent = "確認して支払い画面へ";
-      announce("会計内容を確保しました。もう一度確認して支払い画面へ進んでください。");
-      return;
     }
     const consumed = await consumeCheckoutClaim(latestEntry, state.claim);
     const destination = new URL(consumed.pay_url, window.location.origin);
@@ -441,6 +482,10 @@ async function handleOpenInvoice() {
     window.location.replace(destination.href);
   } catch (error) {
     state.opening = false;
+    if (["CHECKOUT_CLAIM_EXPIRED", "CHECKOUT_CLAIM_STALE"].includes(String(error?.customerCode || ""))) {
+      state.claimNonce = "";
+      state.claimNonceFingerprint = "";
+    }
     clearReadyState();
     setBadge("再確認が必要", "s-yellow");
     el.headlineText.textContent = "会計ページを開けませんでした。";
@@ -461,6 +506,7 @@ el.refreshEntryBtn.addEventListener("click", () => void refreshEntryState());
 window.addEventListener("beforeunload", () => {
   stopPolling();
   if (state.requestController) state.requestController.abort();
+  if (state.openController) state.openController.abort();
 });
 
 void refreshEntryState();

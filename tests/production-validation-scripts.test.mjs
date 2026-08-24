@@ -12,7 +12,7 @@ const ROOT = process.cwd();
 function runNode(scriptPath, args = [], env = {}) {
   return new Promise((resolve) => {
     execFile(
-      "node",
+      process.execPath,
       [scriptPath, ...args],
       {
         cwd: ROOT,

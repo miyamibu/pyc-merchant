@@ -67,6 +67,18 @@ required_keys=(
   APPI_DELETION_PROCEDURE_REF
   APPI_DISCLOSURE_PROCEDURE_REF
   RPC_URLS
+  DEPLOYMENT_STAGE
+  COMMERCIAL_EVIDENCE_DIR
+  RELEASE_ID
+  RELEASE_MODE
+  RELEASE_MANIFEST
+  RELEASE_ENVIRONMENT_ID
+  RELEASE_TRUSTED_PUBLIC_KEY_PATHS
+  RELEASE_SIGNER_REGISTRY_JSON
+  EVIDENCE_TRUSTED_PUBLIC_KEY_PATHS
+  EVIDENCE_SIGNER_REGISTRY_JSON
+  APPROVAL_TRUSTED_PUBLIC_KEY_PATHS
+  APPROVAL_SIGNER_REGISTRY_JSON
 )
 
 missing=()
@@ -87,6 +99,21 @@ done
 if [[ "${#missing[@]}" -gt 0 ]]; then
   printf 'preflight failed: missing required values: %s\n' "${missing[*]}" >&2
   exit 1
+fi
+
+if [[ -n "${RELEASE_MODE:-}" && "${RELEASE_MODE}" != "limited" && "${RELEASE_MODE}" != "commercial" ]]; then
+  echo "preflight failed: RELEASE_MODE must be limited or commercial" >&2
+  exit 1
+fi
+
+if [[ "${RELEASE_MODE:-}" == "limited" && "$ALLOW_EMPTY" != "--allow-empty" ]]; then
+  for key in LIMITED_PILOT_MAX_TOTAL_VOLUME_JPYC_BASE LIMITED_PILOT_MAX_TRANSACTION_AMOUNT_JPYC_BASE LIMITED_PILOT_MAX_TRANSACTIONS; do
+    value="${!key:-}"
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+      echo "preflight failed: $key must be a positive integer for limited mode" >&2
+      exit 1
+    fi
+  done
 fi
 
 if [[ "$ALLOW_EMPTY" != "--allow-empty" ]]; then

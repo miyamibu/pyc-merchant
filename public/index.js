@@ -1016,35 +1016,42 @@ function renderOpsCard(card, titleNode, bodyNode, payload) {
 
 function renderMotionPhaseTrack(scene, activeIndex) {
   if (!el.motionPhaseTrack) return;
-  el.motionPhaseTrack.innerHTML = "";
+  const existingButtons = Array.from(el.motionPhaseTrack.querySelectorAll("[data-motion-phase-index]"));
+  if (existingButtons.length !== scene.phases.length) el.motionPhaseTrack.replaceChildren();
   scene.phases.forEach((phase, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
+    let button = el.motionPhaseTrack.querySelector(`[data-motion-phase-index="${index}"]`);
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.dataset.motionPhaseIndex = String(index);
+      const step = document.createElement("span");
+      step.className = "motion-phase-step";
+      const label = document.createElement("span");
+      label.className = "motion-phase-label";
+      const hint = document.createElement("span");
+      hint.className = "motion-phase-hint";
+      button.append(step, label, hint);
+      el.motionPhaseTrack.appendChild(button);
+    }
     button.className = "motion-phase";
     if (index === activeIndex) button.classList.add("is-active");
     if (index < activeIndex) button.classList.add("is-complete");
-    button.dataset.motionPhaseIndex = String(index);
-
-    const step = document.createElement("span");
-    step.className = "motion-phase-step";
+    if (index === activeIndex) button.setAttribute("aria-current", "step");
+    else button.removeAttribute("aria-current");
+    const step = button.querySelector(".motion-phase-step");
     step.textContent = `0${index + 1}`;
-
-    const label = document.createElement("span");
-    label.className = "motion-phase-label";
+    const label = button.querySelector(".motion-phase-label");
     label.textContent = phase.label;
-
-    const hint = document.createElement("span");
-    hint.className = "motion-phase-hint";
+    const hint = button.querySelector(".motion-phase-hint");
     hint.textContent = phase.hint;
-
-    button.append(step, label, hint);
-    el.motionPhaseTrack.appendChild(button);
   });
 }
 
 function syncMotionButtons(sceneId) {
   for (const button of el.motionSceneButtons) {
-    button.classList.toggle("is-active", button.dataset.motionSceneTrigger === sceneId);
+    const active = button.dataset.motionSceneTrigger === sceneId;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
   }
 }
 
@@ -1115,6 +1122,10 @@ function scheduleMotionAdvance() {
   stopMotionTimer();
   if (!motionState.playing || !el.motionCanvas) return;
   motionState.timer = setTimeout(() => {
+    if (el.motionPhaseTrack?.contains(document.activeElement)) {
+      scheduleMotionAdvance();
+      return;
+    }
     const scene = MOTION_SCENES[motionState.sceneIndex];
     if (motionState.phaseIndex < scene.phases.length - 1) {
       motionState.phaseIndex += 1;

@@ -12,9 +12,15 @@ import {
 import { validateCommercialEvidence } from "./validate-commercial-evidence.mjs";
 import { renderCommercialScorecard } from "./validate-commercial-scorecard.mjs";
 import {
+  RELEASE_MANIFEST_SCHEMA_VERSION,
+  RELEASE_MANIFEST_MAX_VALIDITY_MS,
   resolveSafeExistingFile,
+  validateManifestValidityWindow,
+  validateReleaseManifestShape,
+  verifySignedManifestEnvelope,
   verifyReleaseImageReferenceContract,
 } from "./release-identity.mjs";
+import { validateSignedReleaseEvidence } from "./signed-release-evidence.mjs";
 import {
   APPROVED_LEDGER_BASE_UNIT_SCALE,
   APPROVED_TOKEN_DECIMALS,
@@ -129,7 +135,7 @@ function runAuditChainVerification(env) {
       db_path: dbPath,
     };
   }
-  const run = spawnSync("node", ["scripts/verify-audit-chain.mjs"], {
+  const run = spawnSync(process.execPath, ["scripts/verify-audit-chain.mjs"], {
     cwd: process.cwd(),
     env: { ...process.env, ...env, DB_PATH: dbPath },
     encoding: "utf8",
@@ -157,21 +163,6 @@ function validateReleaseId(value) {
     || /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
 }
 
-function stableJson(value) {
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-function releaseSigningPayload(manifest) {
-  const unsigned = { ...(manifest || {}) };
-  delete unsigned.signatures;
-  delete unsigned.signature;
-  return Buffer.from(stableJson(unsigned), "utf8");
-}
-
 export function verifyManifestArtifacts(manifest, { root = process.cwd() } = {}) {
   const rawEntries = manifest?.artifact_hashes ?? manifest?.artifacts ?? manifest?.files;
   const entries = Array.isArray(rawEntries)
@@ -179,21 +170,38 @@ export function verifyManifestArtifacts(manifest, { root = process.cwd() } = {})
       field: String(entry.field || entry.name || "").trim(),
       path: String(entry.path || entry.file || entry.relative_path || "").trim(),
       expected: String(entry.sha256 || entry.hash || "").trim().toLowerCase(),
+      artifactType: String(entry.artifact_type || "").trim().toLowerCase(),
+      mediaType: String(entry.media_type || entry.type || "").trim().toLowerCase(),
     }))
     : Object.entries(rawEntries || {}).map(([field, entry]) => ({
       field: String(entry?.field || field).trim(),
       path: String(entry?.path || entry?.file || entry?.relative_path || (typeof entry === "string" ? field : "")).trim(),
       expected: String(entry?.sha256 || entry?.hash || (typeof entry === "string" ? entry : "")).trim().toLowerCase(),
+      artifactType: String(entry?.artifact_type || "").trim().toLowerCase(),
+      mediaType: String(entry?.media_type || entry?.type || "").trim().toLowerCase(),
     }));
   const blockers = [];
   const verifiedFields = [];
-  for (const field of ["source_hash", "lockfile_hash", "migration_hash", "env_hash", "db_snapshot_hash", "backup_hash"]) {
+  const artifactContracts = {
+    source_hash: { artifactType: "source_archive", path: /(?:^|\/)source(?:[-_.][^/]*)?\.(?:tar|tar\.gz|tgz)$/i, mediaTypes: ["application/x-tar", "application/gzip"] },
+    lockfile_hash: { artifactType: "npm_lockfile", path: /(?:^|\/)package-lock\.json$/i, mediaTypes: ["application/json"] },
+    migration_hash: { artifactType: "migration_bundle", path: /(?:^|\/)migrations?(?:[-_.][^/]*)?\.(?:tar|tar\.gz|tgz|json|txt)$/i, mediaTypes: ["application/x-tar", "application/gzip", "application/json", "text/plain"] },
+    env_hash: { artifactType: "nonsecret_environment", path: /(?:^|\/)(?:production[-_.])?env(?:[-_.][^/]*)?\.(?:json|txt|env)$/i, mediaTypes: ["application/json", "text/plain"] },
+    db_snapshot_hash: { artifactType: "database_snapshot", path: /(?:^|\/)db[-_.]snapshot(?:[-_.][^/]*)?\.(?:db|sqlite|sqlite3)$/i, mediaTypes: ["application/vnd.sqlite3", "application/octet-stream"] },
+    backup_hash: { artifactType: "backup_archive", path: /(?:^|\/)backup(?:[-_.][^/]*)?\.(?:tar|tar\.gz|tgz|zip)$/i, mediaTypes: ["application/x-tar", "application/gzip", "application/zip"] },
+  };
+  for (const [field, contract] of Object.entries(artifactContracts)) {
     const declared = String(manifest?.[field] || "").trim().toLowerCase();
-    const entry = entries.find((candidate) => candidate.field === field);
+    const matchingEntries = entries.filter((candidate) => candidate.field === field);
+    const entry = matchingEntries[0];
+    if (matchingEntries.length !== 1) blockers.push(`manifest_artifact_entry_count_invalid_${field}`);
     if (!declared || !entry?.path || entry.expected !== declared) {
       blockers.push(`manifest_hash_unverifiable_${field}`);
       continue;
     }
+    if (entry.artifactType !== contract.artifactType) blockers.push(`manifest_artifact_type_mismatch_${field}`);
+    if (!contract.mediaTypes.includes(entry.mediaType)) blockers.push(`manifest_artifact_media_type_mismatch_${field}`);
+    if (!contract.path.test(entry.path)) blockers.push(`manifest_artifact_path_mismatch_${field}`);
     const artifactPath = resolveSafeExistingFile(entry.path, { root });
     if (!artifactPath.ok) {
       const suffix = artifactPath.reason === "missing" ? "missing" : `unsafe_${artifactPath.reason}`;
@@ -208,54 +216,24 @@ export function verifyManifestArtifacts(manifest, { root = process.cwd() } = {})
 }
 
 function verifyManifestSignatures(manifest, env = {}, { root = process.cwd() } = {}) {
-  const signatures = Array.isArray(manifest?.signatures) ? manifest.signatures : [];
-  const validSignatureIndexes = [];
-  const blockers = [];
-  const payload = releaseSigningPayload(manifest);
-  const trustedKeys = new Map();
-  for (const rawPath of String(env.RELEASE_TRUSTED_PUBLIC_KEY_PATHS || "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean)) {
-    const trustedPath = resolveSafeExistingFile(rawPath, { root });
-    try {
-      if (!trustedPath.ok) continue;
-      const publicKey = fs.readFileSync(trustedPath.path, "utf8").trim();
-      if (publicKey) trustedKeys.set(crypto.createHash("sha256").update(publicKey).digest("hex"), publicKey);
-    } catch (_error) {
-      // Missing trusted keys remain a hard blocker below.
-    }
+  const result = verifySignedManifestEnvelope(manifest, env, {
+    root,
+    blockerPrefix: "manifest",
+    signerRegistryEnv: "RELEASE_SIGNER_REGISTRY_JSON",
+    requiredSignerRoles: ["release_authority"],
+    additionalRevokedKeyIds: manifest?.trust_policy?.revoked_key_ids || [],
+    allowedSignerKeyIds: manifest?.trust_policy?.release_signer_key_ids || [],
+    maxValidityMs: RELEASE_MANIFEST_MAX_VALIDITY_MS,
+  });
+  const allowedReleaseKeys = new Set(manifest?.trust_policy?.release_signer_key_ids || []);
+  if (!result.valid_signatures.some((entry) => (
+    entry.signer_role === "release_authority" && allowedReleaseKeys.has(entry.key_id)
+  ))) {
+    result.blockers.push("manifest_release_authority_not_bound_by_trust_policy");
+    result.ok = false;
   }
-  const revokedKeyIds = new Set(String(env.RELEASE_REVOKED_KEY_IDS || "").split(",").map((value) => value.trim()).filter(Boolean));
-  if (trustedKeys.size === 0) blockers.push("manifest_trusted_key_set_missing");
-  for (const [index, entry] of signatures.entries()) {
-    const algorithm = String(entry?.algorithm || "").trim().toLowerCase();
-    const publicKey = entry?.public_key_pem || entry?.public_key;
-    const encodedSignature = entry?.signature_base64 || entry?.signature;
-    const keyId = String(entry?.key_id || "").trim();
-    const trustedPublicKey = trustedKeys.get(keyId);
-    if (algorithm !== "ed25519" || !publicKey || !encodedSignature || !keyId) {
-      blockers.push(`manifest_signature_${index}_unsupported`);
-      continue;
-    }
-    if (!trustedPublicKey || trustedPublicKey.trim() !== String(publicKey).trim()) {
-      blockers.push(`manifest_signature_${index}_untrusted_key`);
-      continue;
-    }
-    if (revokedKeyIds.has(keyId)) {
-      blockers.push(`manifest_signature_${index}_revoked_key`);
-      continue;
-    }
-    try {
-      const signature = Buffer.from(String(encodedSignature), String(entry.encoding || "base64"));
-      if (crypto.verify(null, payload, publicKey, signature)) validSignatureIndexes.push(index);
-      else blockers.push(`manifest_signature_${index}_invalid`);
-    } catch (_error) {
-      blockers.push(`manifest_signature_${index}_invalid`);
-    }
-  }
-  if (validSignatureIndexes.length === 0) blockers.push("manifest_no_valid_signature");
-  return { ok: blockers.length === 0, valid_signature_indexes: validSignatureIndexes, blockers };
+  result.blockers = [...new Set(result.blockers)];
+  return result;
 }
 
 export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd() } = {}) {
@@ -277,6 +255,7 @@ export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd
   }
 
   const required = [
+    "schema_version",
     "release_id",
     "mode",
     "commit",
@@ -291,10 +270,14 @@ export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd
     "db_snapshot_hash",
     "backup_hash",
     "audit_root",
+    "environment_id",
+    "evidence_manifest_hash",
+    "approval_manifest_hash",
     "issued_at",
     "expires_at",
     "revocation_status",
     "signatures",
+    "trust_policy",
   ];
   const blockers = [];
   for (const key of required) {
@@ -302,8 +285,15 @@ export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd
       blockers.push(`manifest_missing_${key}`);
     }
   }
+  if (manifest.schema_version !== RELEASE_MANIFEST_SCHEMA_VERSION) blockers.push("manifest_schema_version_invalid");
+  blockers.push(...validateReleaseManifestShape(manifest).blockers);
   if (String(manifest.app_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_app_image_digest_null");
   if (String(manifest.base_image_digest || "").trim().toLowerCase() === "null") blockers.push("manifest_base_image_digest_null");
+  const configuredEnvironmentId = String(env.RELEASE_ENVIRONMENT_ID || "").trim();
+  if (!configuredEnvironmentId) blockers.push("manifest_release_environment_id_missing");
+  if (configuredEnvironmentId && String(manifest.environment_id || "").trim() !== configuredEnvironmentId) {
+    blockers.push("manifest_release_environment_id_mismatch");
+  }
   const imageReferenceVerification = verifyReleaseImageReferenceContract({
     manifest,
     appImageRef: env.APP_IMAGE_REF,
@@ -322,12 +312,10 @@ export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd
   }).stdout?.trim() || "";
   if (currentCommit && String(manifest.commit || "").trim() !== currentCommit) blockers.push("manifest_commit_mismatch_current_HEAD");
   if (currentTree) blockers.push("manifest_requires_clean_worktree");
-  const issuedAt = Date.parse(String(manifest.issued_at || ""));
-  const expiresAt = Date.parse(String(manifest.expires_at || ""));
-  if (!Number.isFinite(issuedAt)) blockers.push("manifest_issued_at_invalid");
-  if (!Number.isFinite(expiresAt)) blockers.push("manifest_expires_at_invalid");
-  if (Number.isFinite(issuedAt) && issuedAt > Date.now() + 60_000) blockers.push("manifest_issued_at_in_future");
-  if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) blockers.push("manifest_expired");
+  blockers.push(...validateManifestValidityWindow(manifest, {
+    blockerPrefix: "manifest",
+    maxValidityMs: RELEASE_MANIFEST_MAX_VALIDITY_MS,
+  }).blockers);
   const artifactVerification = verifyManifestArtifacts(manifest, { root });
   const signatureVerification = verifyManifestSignatures(manifest, env, { root });
   blockers.push(...artifactVerification.blockers, ...signatureVerification.blockers);
@@ -335,7 +323,7 @@ export function loadReleaseManifest(manifestPath, env = {}, { root = process.cwd
     ok: blockers.length === 0,
     path: resolved,
     manifest,
-    blockers,
+    blockers: [...new Set(blockers)],
     image_reference_verification: imageReferenceVerification,
     artifact_verification: artifactVerification,
     signature_verification: signatureVerification,
@@ -415,6 +403,8 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     releaseManifest.ok = false;
   }
   const explicitReleaseSelectionGate = validateReleaseId(releaseId) && Boolean(evidenceDir) && Boolean(manifestPath);
+  const releaseModeGate = ["limited", "commercial"].includes(releaseMode)
+    && String(releaseManifest.manifest?.mode || "").trim().toLowerCase() === releaseMode;
   const chainId = String(env.CHAIN_ID || "").trim();
   const tokenContract = String(env.TOKEN_CONTRACT || "").trim().toLowerCase();
   const approvedTokenContract = String(env.APPROVED_JPYC_TOKEN_CONTRACT || "").trim().toLowerCase();
@@ -431,13 +421,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     && /^0x[0-9a-f]{64}$/.test(approvedTokenCodeHash)
     && /^0x[0-9a-f]{64}$/.test(approvedImplementationCodeHash);
 
-  const legalGate = boolFlag(env.LEGAL_GATE_APPROVED, false) && !isPlaceholderLike(env.LEGAL_GATE_APPROVAL_REF);
-  const amlGate = boolFlag(env.AML_POLICY_APPROVED, false) && !isPlaceholderLike(env.AML_POLICY_APPROVAL_REF);
-  const privacyGate = boolFlag(env.PRIVACY_POLICY_APPROVED, false) && !isPlaceholderLike(env.PRIVACY_POLICY_APPROVAL_REF);
-  const appiGate = boolFlag(env.APPI_POLICY_APPROVED, false) && !isPlaceholderLike(env.APPI_POLICY_APPROVAL_REF);
-
-  const jpycContractGate = !isPlaceholderLike(env.JPYC_CONTRACT_APPROVAL_REF)
-    && chainId === "137"
+  const jpycConfigurationGate = chainId === "137"
     && !!approvedTokenContract
     && tokenContract === approvedTokenContract
     && Number.isFinite(tokenDecimals)
@@ -452,13 +436,11 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   const backscanBlocks = Number(env.MONITOR_BACKSCAN_BLOCKS || 12);
   const minBackscanBlocks = Number(env.MIN_MONITOR_BACKSCAN_BLOCKS || 12);
 
-  const confirmationPolicyGate = !isPlaceholderLike(env.CONFIRMATIONS_POLICY_APPROVAL_REF)
-    && Number.isFinite(requiredConfirmations)
+  const confirmationConfigurationGate = Number.isFinite(requiredConfirmations)
     && Number.isFinite(minRequiredConfirmations)
     && requiredConfirmations >= minRequiredConfirmations;
 
-  const backscanPolicyGate = !isPlaceholderLike(env.BACKSCAN_POLICY_APPROVAL_REF)
-    && Number.isFinite(backscanBlocks)
+  const backscanConfigurationGate = Number.isFinite(backscanBlocks)
     && Number.isFinite(minBackscanBlocks)
     && backscanBlocks >= minBackscanBlocks;
 
@@ -484,6 +466,20 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   }
   const auditChain = runAuditChainVerification(env);
   const evidence = validateCommercialEvidence({ evidenceRoot, evidenceDir: evidenceDir || null });
+  const signedReleaseEvidence = validateSignedReleaseEvidence({
+    releaseManifestResult: releaseManifest,
+    evidenceDir: evidenceDir || null,
+    env,
+    releaseMode,
+  });
+  const signedApproval = (approvalId) => Boolean(signedReleaseEvidence.approval_gates?.[approvalId]?.ok);
+  const legalGate = signedApproval("legal");
+  const amlGate = signedApproval("aml");
+  const privacyGate = signedApproval("privacy");
+  const appiGate = signedApproval("appi");
+  const jpycContractGate = jpycConfigurationGate && signedApproval("jpyc_contract");
+  const confirmationPolicyGate = confirmationConfigurationGate && signedApproval("confirmation_policy");
+  const backscanPolicyGate = backscanConfigurationGate && signedApproval("backscan_policy");
   const signedConditionalWaiverRef = String(env.SIGNED_CONDITIONAL_GO_WAIVER_REF || "").trim();
 
   const gates = {
@@ -503,12 +499,19 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     settlement_policy_gate: settlementPolicyGate,
     policy_urls_gate: policyUrls.ok,
     explicit_release_selection_gate: explicitReleaseSelectionGate,
+    release_mode_gate: releaseModeGate,
     release_manifest_gate: releaseManifest.ok,
+    evidence_manifest_gate: Boolean(signedReleaseEvidence.evidence_manifest?.ok),
+    approval_manifest_gate: Boolean(signedReleaseEvidence.approval_manifest?.ok),
+    release_evidence_binding_gate: signedReleaseEvidence.ok,
+    limited_pilot_cap_gate: releaseMode !== "limited" || Boolean(signedReleaseEvidence.limited_pilot_cap?.ok),
+    refund_treasury_approval_gate: signedApproval("refund_treasury"),
     wallet_evidence_gate: Boolean(evidence.ext?.EXT_002?.ok),
     real_payment_evidence_gate: Boolean(evidence.ext?.EXT_001?.ok),
     tls_evidence_gate: Boolean(evidence.ext?.EXT_003?.ok),
     store_ops_drill_gate: Boolean(evidence.ext?.EXT_004?.ok),
     poc_package_gate: Boolean(evidence.poc_all_pass),
+    performance_evidence_gate: Boolean(evidence.performance_pass),
   };
 
   const blockers = { P0: [], P1: [], P2: [] };
@@ -535,7 +538,11 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.refund_policy_gate) blockers.P0.push("REFUND_EXECUTION_REQUIRES_DISTINCT_ACTOR must be true");
   if (!gates.settlement_policy_gate) blockers.P0.push("settlement_unresolved_review_policy must be block in commercial mode");
   if (!gates.explicit_release_selection_gate) blockers.P0.push("release gate requires explicit --release-id, --evidence-dir, and --manifest");
+  if (!gates.release_mode_gate) blockers.P0.push("release mode must be limited/commercial and match the signed release manifest");
   if (!gates.release_manifest_gate) blockers.P0.push(...releaseManifest.blockers);
+  if (!gates.release_evidence_binding_gate) blockers.P0.push(...signedReleaseEvidence.blockers);
+  if (!gates.refund_treasury_approval_gate) blockers.P0.push("refund treasury approval is not present in the signed approval manifest");
+  if (!gates.limited_pilot_cap_gate) blockers.P0.push("limited pilot limits are not bounded by a signed release-scoped maximum");
   if (evidence.evidence_dir_selection !== "explicit") blockers.P0.push("latest evidence auto-selection is forbidden for real-money release gates");
   if (signedConditionalWaiverRef) blockers.P0.push("real-money release mode forbids conditional waivers");
 
@@ -548,6 +555,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   if (!gates.store_ops_drill_gate) blockers.P1.push("EXT-004 non-crypto staff drill is not pass");
 
   if (!gates.poc_package_gate) blockers.P2.push("POC-001..003 KPI evidence not fully pass");
+  if (!gates.performance_evidence_gate) blockers.P2.push("PERF-001 scale/performance/soak evidence is not pass");
 
   const weights = {
     production_env_gate: 0.5,
@@ -569,6 +577,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     tls_evidence_gate: 0.6,
     store_ops_drill_gate: 0.6,
     poc_package_gate: 1.1,
+    performance_evidence_gate: 0.5,
   };
 
   let score = 0;
@@ -577,20 +586,16 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
   }
   score = Math.max(0, Math.min(10, Number(score.toFixed(1))));
 
-  const p0Count = blockers.P0.length;
+  const allBlockerCount = blockers.P0.length + blockers.P1.length + blockers.P2.length;
   const extAllPass = gates.wallet_evidence_gate && gates.real_payment_evidence_gate && gates.tls_evidence_gate && gates.store_ops_drill_gate;
 
   let verdict = "NO_GO";
-  if (p0Count > 0) {
+  if (allBlockerCount > 0) {
     verdict = "NO_GO";
-  } else if (gates.production_env_gate && gates.commercial_go_mode_gate && gates.policy_urls_gate && extAllPass && gates.poc_package_gate) {
+  } else if (releaseMode === "commercial" && gates.production_env_gate && gates.commercial_go_mode_gate && gates.policy_urls_gate && extAllPass && gates.poc_package_gate && gates.performance_evidence_gate) {
     verdict = "COMMERCIAL_GO_10";
-  } else if (gates.production_env_gate && gates.commercial_go_mode_gate && gates.policy_urls_gate && extAllPass) {
-    verdict = "COMMERCIAL_GO";
-  } else if (gates.commercial_go_mode_gate) {
-    verdict = "CONDITIONAL_NO_GO_FOR_COMMERCIAL";
-  } else {
-    verdict = "READY_FOR_LIMITED_PILOT";
+  } else if (releaseMode === "limited" && gates.limited_pilot_cap_gate && gates.release_evidence_binding_gate) {
+    verdict = "LIMITED_PILOT_GO";
   }
 
   return {
@@ -606,7 +611,7 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     latest_evidence_dir: evidence.latest_evidence_dir || null,
     score,
     verdict,
-    commercial_9_ready: verdict === "COMMERCIAL_GO" || verdict === "COMMERCIAL_GO_10",
+    commercial_9_ready: verdict === "COMMERCIAL_GO_10",
     commercial_10_ready: verdict === "COMMERCIAL_GO_10",
     gates,
     blockers,
@@ -614,10 +619,13 @@ function evaluateCommercialGo({ env, evidenceRoot, policyUrlSource }) {
     audit_chain: auditChain,
     policy_urls: policyUrls,
     release_manifest_gate: releaseManifest,
+    signed_release_evidence: signedReleaseEvidence,
     external_evidence: evidence.ext,
     poc_evidence: evidence.poc,
     ext_all_pass: evidence.ext_all_pass,
     poc_all_pass: evidence.poc_all_pass,
+    performance_evidence: evidence.performance,
+    performance_pass: evidence.performance_pass,
   };
 }
 

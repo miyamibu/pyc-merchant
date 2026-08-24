@@ -81,7 +81,7 @@ export function createValidationEnv(overrides = {}) {
 }
 
 export async function startValidationServer(cwd, envMap) {
-  const proc = spawn("node", ["src/server.mjs"], {
+  const proc = spawn(process.execPath, ["src/server.mjs"], {
     cwd,
     env: { ...process.env, ...envMap },
     stdio: ["ignore", "pipe", "pipe"],
@@ -89,7 +89,12 @@ export async function startValidationServer(cwd, envMap) {
   const logs = [];
   proc.stdout.on("data", (chunk) => logs.push(String(chunk)));
   proc.stderr.on("data", (chunk) => logs.push(String(chunk)));
-  await waitForHealth(envMap.APP_HOST, proc, logs);
+  try {
+    await waitForHealth(envMap.APP_HOST, proc, logs);
+  } catch (error) {
+    await stopValidationServer(proc);
+    throw error;
+  }
   return { proc, baseUrl: envMap.APP_HOST, logs, env: envMap };
 }
 

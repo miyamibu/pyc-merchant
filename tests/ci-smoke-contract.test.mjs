@@ -87,6 +87,6 @@ test("CI isolates smoke runtime data and delays build metadata until required ch
 
   const dockerBuildBlock = sliceBetween(CI_WORKFLOW, "      - name: Docker build", "      - name: Verify image source label");
   assert.doesNotMatch(dockerBuildBlock, /build-metadata\.json/);
-  assert.equal((CI_WORKFLOW.match(/node-version-file: \.node-version/g) || []).length, 2);
+  assert.equal((CI_WORKFLOW.match(/node-version-file: \.node-version/g) || []).length, 3);
   assert.doesNotMatch(CI_WORKFLOW, /node-version:\s*20(?:\.\d+)?/);
 });

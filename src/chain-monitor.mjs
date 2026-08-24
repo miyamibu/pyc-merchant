@@ -585,15 +585,26 @@ async function recordReorg({ fromBlock, toBlock, previousHash, observedHash, rea
 }
 
 async function getCandidateInvoices() {
-  const rows = await postSignedServiceJson(
-    CANDIDATES_API_PATH,
-    { chain_id: CHAIN_ID, token_contract: ACTIVE_TOKEN_CONTRACT },
-    `chain-candidates:${CHAIN_ID}:${crypto.randomUUID()}`
-  );
-  if (!Array.isArray(rows?.invoices)) {
-    throw new Error("chain_candidates_response_invalid");
+  // M-030: follow cursor pages until has_more=false so no candidate is
+  // silently truncated by a server-side row cap.
+  const all = [];
+  let cursor = "";
+  for (let page = 0; page < 10000; page += 1) {
+    const body = { chain_id: CHAIN_ID, token_contract: ACTIVE_TOKEN_CONTRACT };
+    if (cursor) body.cursor = cursor;
+    const rows = await postSignedServiceJson(
+      CANDIDATES_API_PATH,
+      body,
+      `chain-candidates:${CHAIN_ID}:${crypto.randomUUID()}`
+    );
+    if (!Array.isArray(rows?.invoices)) {
+      throw new Error("chain_candidates_response_invalid");
+    }
+    all.push(...rows.invoices);
+    if (!rows?.page?.has_more || !rows.page.next_cursor) break;
+    cursor = String(rows.page.next_cursor);
   }
-  return rows.invoices.filter((invoice) => {
+  return all.filter((invoice) => {
     const lifecycle = decideMonitoringLifecycle(invoice, {
       recipientAddress: invoice.recipient_address,
       addressUsed: ["payment_detected", "confirming", "paid", "settled", "refunded", "review_required"].includes(invoice.status),

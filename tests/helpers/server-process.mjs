@@ -72,7 +72,10 @@ export function productionServerEnv(overrides = {}) {
   return {
     APP_ENV: "production",
     APP_PORT: String(port),
-    APP_HOST: `https://terminal.example.com:${port}`,
+    APP_HOST: "https://pay.miyamibu.xyz",
+    PAY_BASE_URL: "https://pay.miyamibu.xyz",
+    PUBLIC_BASE_URL: "https://pay.miyamibu.xyz",
+    APP_BIND_HOST: "127.0.0.1",
     INTERNAL_APP_ORIGIN: `http://127.0.0.1:${port}`,
     DB_PATH: path.join(root, "app.db"),
     WORKER_STATE_DB_PATH: path.join(root, "worker-state.db"),
@@ -129,7 +132,7 @@ export function productionServerEnv(overrides = {}) {
 }
 
 export async function startServerProcess(cwd, envMap) {
-  const proc = spawn("node", ["src/server.mjs"], {
+  const proc = spawn(process.execPath, ["src/server.mjs"], {
     cwd,
     env: { ...process.env, ...envMap },
     stdio: ["ignore", "pipe", "pipe"],
@@ -138,8 +141,15 @@ export async function startServerProcess(cwd, envMap) {
   proc.stdout.on("data", (chunk) => logs.push(String(chunk)));
   proc.stderr.on("data", (chunk) => logs.push(String(chunk)));
 
-  const baseUrl = envMap.APP_HOST;
-  await waitForServer(baseUrl, proc, logs, 15_000);
+  const bindHost = String(envMap.APP_BIND_HOST || "127.0.0.1").trim();
+  const localHost = ["0.0.0.0", "::"].includes(bindHost) ? "127.0.0.1" : bindHost;
+  const baseUrl = `http://${localHost}:${envMap.APP_PORT}`;
+  try {
+    await waitForServer(baseUrl, proc, logs, 15_000);
+  } catch (error) {
+    await stopServerProcess(proc);
+    throw error;
+  }
 
   return { proc, baseUrl, logs, env: envMap };
 }

@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/contracts/release-manifest-v1.schema.json",
+  "title": "Release Manifest v1",
+  "x-clock-skew-seconds": 60,
+  "x-max-validity-seconds": 86400,
+  "x-key-separation-policy": {
+    "accountable_roles_must_use_distinct_keys": true,
+    "release_evidence_approval_domains_must_use_distinct_keys": true
+  },
+  "x-manual-cross-field-constraints": [
+    "approval_signers keys are pairwise disjoint across accountable roles",
+    "release_signer_key_ids, evidence_signer_key_ids, and all approval signer keys are pairwise disjoint",
+    "issued_at is before expires_at and validity is no more than 24 hours"
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "release_id", "mode", "commit", "source_hash",
+    "lockfile_hash", "migration_hash", "runtime", "base_image_digest",
+    "app_image_digest", "nginx_image_digest", "env_hash", "db_snapshot_hash",
+    "backup_hash", "audit_root", "environment_id", "evidence_manifest_hash",
+    "approval_manifest_hash", "artifact_hashes", "trust_policy", "issued_at",
+    "expires_at", "revocation_status", "signatures"
+  ],
+  "properties": {
+    "schema_version": { "const": "release_manifest_v1" },
+    "release_id": {
+      "type": "string",
+      "pattern": "^(?:[0-9A-HJKMNP-TV-Z]{26}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$"
+    },
+    "mode": { "enum": ["limited", "commercial"] },
+    "commit": { "$ref": "#/$defs/commit" },
+    "source_hash": { "$ref": "#/$defs/sha256" },
+    "lockfile_hash": { "$ref": "#/$defs/sha256" },
+    "migration_hash": { "$ref": "#/$defs/sha256" },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node"],
+      "properties": { "node": { "const": "24.17.0" } }
+    },
+    "base_image_digest": { "$ref": "#/$defs/imageDigest" },
+    "app_image_digest": { "$ref": "#/$defs/imageDigest" },
+    "nginx_image_digest": { "$ref": "#/$defs/imageDigest" },
+    "env_hash": { "$ref": "#/$defs/sha256" },
+    "db_snapshot_hash": { "$ref": "#/$defs/sha256" },
+    "backup_hash": { "$ref": "#/$defs/sha256" },
+    "audit_root": { "type": "string", "minLength": 1 },
+    "environment_id": { "type": "string", "minLength": 1 },
+    "evidence_manifest_hash": { "$ref": "#/$defs/sha256" },
+    "approval_manifest_hash": { "$ref": "#/$defs/sha256" },
+    "artifact_hashes": {
+      "type": "array",
+      "minItems": 8,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "trust_policy": { "$ref": "#/$defs/trustPolicy" },
+    "issued_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "revocation_status": { "const": "valid" },
+    "signatures": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/signature" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "imageDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+    "keyId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "path", "sha256", "artifact_type", "media_type"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_type": { "type": "string", "minLength": 1 },
+        "media_type": { "type": "string", "minLength": 1 }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "encoding", "key_id", "signer_role", "public_key_pem", "signature_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "encoding": { "const": "base64" },
+        "key_id": { "$ref": "#/$defs/keyId" },
+        "signer_role": { "const": "release_authority" },
+        "public_key_pem": { "type": "string", "minLength": 1 },
+        "signature_base64": {
+          "type": "string",
+          "pattern": "^(?:[A-Za-z0-9+/]{4}){21}[A-Za-z0-9+/][AQgw]==$"
+        }
+      }
+    },
+    "roleKeyMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "legal_accountable", "aml_accountable", "privacy_accountable",
+        "appi_accountable", "technology_accountable", "operations_accountable"
+      ],
+      "properties": {
+        "legal_accountable": { "$ref": "#/$defs/keyIds" },
+        "aml_accountable": { "$ref": "#/$defs/keyIds" },
+        "privacy_accountable": { "$ref": "#/$defs/keyIds" },
+        "appi_accountable": { "$ref": "#/$defs/keyIds" },
+        "technology_accountable": { "$ref": "#/$defs/keyIds" },
+        "operations_accountable": { "$ref": "#/$defs/keyIds" }
+      }
+    },
+    "keyIds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/keyId" }
+    },
+    "trustPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_signer_key_ids", "evidence_signer_key_ids", "approval_signers", "revoked_key_ids"],
+      "properties": {
+        "release_signer_key_ids": { "$ref": "#/$defs/keyIds" },
+        "evidence_signer_key_ids": { "$ref": "#/$defs/keyIds" },
+        "approval_signers": { "$ref": "#/$defs/roleKeyMap" },
+        "revoked_key_ids": {
+          "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/keyId" }
+        }
+      }
+    }
+  }
+}

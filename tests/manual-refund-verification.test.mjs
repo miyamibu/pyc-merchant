@@ -487,7 +487,7 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
   });
   await importReceiveAddresses(started.baseUrl, admin.token, 12, 200);
 
-  async function createRefundScenario(label, invoiceAmount, paidAmount, refundAmount, toAddress) {
+  async function createRefundScenario(label, invoiceAmount, paidAmount, refundAmount, toAddress, { approve = true } = {}) {
     const { detail } = await createInvoiceDetail(started.baseUrl, admin.token, invoiceAmount, `${label}-invoice`);
     const paymentTx = randomTxHash(`${label}-payment`);
     rpc.registerTransfer({
@@ -505,8 +505,10 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
     const refreshed = await getInvoice(started.baseUrl, admin.token, detail.data.invoice_id);
     const request = await requestRefund(started.baseUrl, admin.token, refreshed.data.review_case_id, refundAmount, toAddress, env.CHAIN_ID, `${label}-request`);
     assert.equal(request.status, 201);
-    const approve = await approveRefund(started.baseUrl, approver.token, request.data.refund_request_id, `${label}-approve`);
-    assert.equal(approve.status, 200);
+    if (approve) {
+      const approval = await approveRefund(started.baseUrl, approver.token, request.data.refund_request_id, `${label}-approve`);
+      assert.equal(approval.status, 200);
+    }
     return {
       refundId: request.data.refund_request_id,
       invoice: refreshed.data,
@@ -792,6 +794,46 @@ test("manual ingest rejects wrong-chain RPC and refund verification promotes onl
       audit.data.audit_logs.filter((row) => row.action === "refund.request_deduplicated").length,
       1
     );
+  });
+
+  await t.test("a requested semantic refund is reused before approval and reserves the balance once", async () => {
+    const scenario = await createRefundScenario(
+      "refund-semantic-requested",
+      2220,
+      2420,
+      200,
+      "0x4848484848484848484848484848484848484848",
+      { approve: false },
+    );
+    const duplicate = await requestRefund(
+      started.baseUrl,
+      admin.token,
+      scenario.invoice.review_case_id,
+      200,
+      scenario.refundToAddress,
+      env.CHAIN_ID,
+      "refund-semantic-requested-fresh-key",
+    );
+    assert.equal(duplicate.status, 200, JSON.stringify(duplicate.data));
+    assert.equal(duplicate.data.refund_request_id, scenario.refundId);
+    assert.equal(duplicate.data.status, "requested");
+
+    const rows = testDb.prepare(
+      `SELECT id, status, refund_amount_jpyc_base
+       FROM refund_requests
+       WHERE review_case_id = ?
+         AND lower(refund_to_address) = lower(?)
+         AND refund_chain_id = ?
+         AND refund_amount_jpyc_base = ?`
+    ).all(
+      scenario.invoice.review_case_id,
+      scenario.refundToAddress,
+      String(env.CHAIN_ID),
+      String(scenario.refundAmountBase),
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, "requested");
+    assert.equal(rows[0].refund_amount_jpyc_base, scenario.refundAmountBase);
   });
 
   await t.test("parallel refund verification claims one key and converges across another actor and key", async () => {

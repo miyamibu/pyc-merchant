@@ -72,6 +72,9 @@ function collectLicensesFromLockfile(lockfile) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const outputPath = args.get("output") ? path.resolve(ROOT, args.get("output")) : null;
+  const lockfilePath = args.get("lockfile")
+    ? path.resolve(ROOT, args.get("lockfile"))
+    : path.join(ROOT, "package-lock.json");
   const skipDocker = args.get("skip-docker") === "true";
   const checks = [];
 
@@ -80,7 +83,7 @@ function main() {
   }
 
   try {
-    ensure(fs.existsSync(path.join(ROOT, "package-lock.json")), "package-lock.json is required");
+    ensure(fs.existsSync(lockfilePath), "package-lock.json is required");
     ensure(fs.existsSync(path.join(ROOT, "package.json")), "package.json is required");
     record("lockfile_present", true);
 
@@ -130,10 +133,20 @@ function main() {
     ensure(/compose\s+--env-file \.env\.production/.test(systemd), "systemd compose commands must use the production interpolation env file");
     record("systemd_release_identity_preflight", true);
 
-    const lockfile = JSON.parse(readText("package-lock.json"));
+    const lockfile = JSON.parse(fs.readFileSync(lockfilePath, "utf8"));
     const licenses = collectLicensesFromLockfile(lockfile);
     ensure(licenses.length > 0, "license export must contain at least one dependency");
     record("license_list_exportable", true, { count: licenses.length });
+
+    // Licenses must be fail-closed: a missing license field is exported as
+    // UNKNOWN and rejects the run instead of silently passing the audit.
+    const unknownLicenseRows = licenses.filter((row) => String(row.license) === "UNKNOWN");
+    ensure(
+      unknownLicenseRows.length === 0,
+      `fail-closed: ${unknownLicenseRows.length} dependencies have an UNKNOWN license`,
+      { unknown_packages: unknownLicenseRows.slice(0, 25).map((row) => row.package) },
+    );
+    record("license_unknown_fail_closed", true, { checked: licenses.length });
 
     let dockerBuildStatus = { skipped: true, reason: "docker_unavailable" };
     if (!skipDocker && hasDocker()) {

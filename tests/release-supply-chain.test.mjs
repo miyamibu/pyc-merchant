@@ -23,16 +23,28 @@ function sha256(value) {
 }
 
 function createArtifactFixture(root) {
-  const fields = ["source_hash", "lockfile_hash", "migration_hash", "env_hash", "db_snapshot_hash", "backup_hash"];
+  const contracts = {
+    source_hash: ["release/source.tar", "source_archive", "application/x-tar"],
+    lockfile_hash: ["release/package-lock.json", "npm_lockfile", "application/json"],
+    migration_hash: ["release/migrations.json", "migration_bundle", "application/json"],
+    env_hash: ["release/production-env.json", "nonsecret_environment", "application/json"],
+    db_snapshot_hash: ["release/db-snapshot.sqlite3", "database_snapshot", "application/vnd.sqlite3"],
+    backup_hash: ["release/backup.tar", "backup_archive", "application/x-tar"],
+  };
   const manifest = { artifact_hashes: [] };
-  for (const field of fields) {
-    const relativePath = `release/${field}.txt`;
+  for (const [field, [relativePath, artifactType, mediaType]] of Object.entries(contracts)) {
     const content = `${field}-fixture`;
     fs.mkdirSync(path.dirname(path.join(root, relativePath)), { recursive: true });
     fs.writeFileSync(path.join(root, relativePath), content, "utf8");
     const digest = sha256(content);
     manifest[field] = digest;
-    manifest.artifact_hashes.push({ field, path: relativePath, sha256: digest });
+    manifest.artifact_hashes.push({
+      field,
+      path: relativePath,
+      sha256: digest,
+      artifact_type: artifactType,
+      media_type: mediaType,
+    });
   }
   return manifest;
 }
@@ -59,13 +71,32 @@ test("release artifact verification rejects symlinks even when their hash matche
   const digest = sha256("outside-source");
   manifest.source_hash = digest;
   manifest.artifact_hashes = manifest.artifact_hashes.map((entry) => (
-    entry.field === "source_hash" ? { ...entry, path: "release/source-symlink.txt", sha256: digest } : entry
+    entry.field === "source_hash" ? { ...entry, path: "release/source.tar", sha256: digest } : entry
   ));
 
-  assert.equal(resolveSafeExistingFile("release/source-symlink.txt", { root }).reason, "symlink");
+  fs.rmSync(path.join(root, "release", "source.tar"));
+  fs.symlinkSync(outsidePath, path.join(root, "release", "source.tar"));
+  assert.equal(resolveSafeExistingFile("release/source.tar", { root }).reason, "symlink");
   const result = verifyManifestArtifacts(manifest, { root });
   assert.equal(result.ok, false);
   assert.ok(result.blockers.includes("manifest_artifact_unsafe_symlink_source_hash"));
+});
+
+test("release artifact verification rejects a correctly hashed file in the wrong semantic slot", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "jpyc-release-semantic-artifacts-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const manifest = createArtifactFixture(root);
+  const sourceEntry = manifest.artifact_hashes.find((entry) => entry.field === "source_hash");
+  sourceEntry.artifact_type = "database_snapshot";
+  sourceEntry.media_type = "application/vnd.sqlite3";
+  sourceEntry.path = "release/db-snapshot.sqlite3";
+  sourceEntry.sha256 = manifest.db_snapshot_hash;
+  manifest.source_hash = manifest.db_snapshot_hash;
+
+  const result = verifyManifestArtifacts(manifest, { root });
+  assert.equal(result.ok, false);
+  assert.ok(result.blockers.includes("manifest_artifact_type_mismatch_source_hash"));
+  assert.ok(result.blockers.includes("manifest_artifact_path_mismatch_source_hash"));
 });
 
 test("release image references require registry digests and must match the manifest", () => {

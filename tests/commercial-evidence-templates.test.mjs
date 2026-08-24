@@ -31,11 +31,18 @@ test("commercial external evidence template preparation creates EXT and POC file
     "POC-001.md",
     "POC-002.md",
     "POC-003.md",
+    "PERF-001-scale-soak.md",
   ]) {
     const fullPath = path.join(dir, fileName);
     assert.equal(fs.existsSync(fullPath), true, fileName);
     const content = fs.readFileSync(fullPath, "utf8");
     assert.match(content, /status:\s*pending/i);
+  }
+
+  for (const fileName of ["EVIDENCE_MANIFEST.DRAFT.json", "APPROVAL_MANIFEST.DRAFT.json"]) {
+    const draft = JSON.parse(fs.readFileSync(path.join(dir, fileName), "utf8"));
+    assert.equal(draft.revocation_status, "draft");
+    assert.deepEqual(draft.signatures, []);
   }
 
   const ext002 = fs.readFileSync(path.join(dir, "EXT-002-wallet-device-launch.md"), "utf8");
@@ -91,4 +98,46 @@ test("EXT-003 requires live TLS and endpoint pass evidence", () => {
   assert.ok(invalid.ext.EXT_003.errors.includes("expired_tls_certificate"));
   assert.ok(invalid.ext.EXT_003.errors.includes("tls_san_mismatch"));
   assert.ok(invalid.ext.EXT_003.errors.includes("healthz_fail_dns_unresolved"));
+});
+
+test("semantic child failures cannot be promoted by a top-level pass", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "jpyc-semantic-evidence-"));
+  const evidenceDir = path.join(root, "20260715T000000Z");
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, "EXT-004-store-ops-drill.md"), [
+    "- status: pass",
+    "- participant: operator-1",
+    "- scenario: store-drill",
+    "- invoice_issue_time: fail",
+    "- qr_display_time: fail",
+    "- review_handling: fail",
+    "- refund_evidence_handling: fail",
+    "- daily_close: fail",
+    "- incident_escalation: fail",
+    "- self_resolution_result: fail",
+    "- operator_signature: signed-ref",
+    "- screenshot_ref: evidence://ext004",
+    "- tester: qa",
+    "- checked_at: 2026-07-15T00:00:00Z",
+  ].join("\n"), "utf8");
+  for (const id of ["POC-001", "POC-002", "POC-003"]) {
+    fs.writeFileSync(path.join(evidenceDir, `${id}.md`), [
+      "- status: pass",
+      "- kpi_result: fail",
+      "- daily_close_reproduced: fail",
+      "- csv_reconciliation: fail",
+      "- signed_minutes_ref: minutes-ref",
+      "- evidence_ref: evidence-ref",
+      "- scorecard_ref: scorecard-ref",
+      "- owner: owner-1",
+      "- checked_at: 2026-07-15T00:00:00Z",
+    ].join("\n"), "utf8");
+  }
+
+  const result = validateCommercialEvidence({ evidenceRoot: root, evidenceDir });
+  assert.equal(result.ext.EXT_004.ok, false);
+  assert.ok(result.ext.EXT_004.errors.includes("review_handling_fail"));
+  assert.ok(result.ext.EXT_004.errors.includes("daily_close_fail"));
+  assert.equal(result.poc_all_pass, false);
+  assert.ok(result.poc.every((entry) => entry.errors.includes("kpi_result_fail")));
 });

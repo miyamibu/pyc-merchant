@@ -98,7 +98,7 @@ export function suggestedReviewAction(reasonCodeRaw) {
   const code = normalizeReviewReasonCode(reasonCodeRaw);
   const actions = {
     [REVIEW_REASON_CODES.OVERPAYMENT]: "差額を確認し、返金候補額を検討してください",
-    [REVIEW_REASON_CODES.UNDERPAYMENT]: "不足額の追加入金案内または会計修正を判断してください",
+    [REVIEW_REASON_CODES.UNDERPAYMENT]: "不足額は同じ請求への追加送金では受け付けず、店長承認後の別請求または会計調整を判断してください",
     [REVIEW_REASON_CODES.DUPLICATE_PAYMENT]: "重複分の返金可否を確認してください",
     [REVIEW_REASON_CODES.SPLIT_PAYMENT]: "分割送金として整合確認を実施してください",
     [REVIEW_REASON_CODES.LATE_PAYMENT]: "期限後着金として提供状況と返金要否を確認してください",

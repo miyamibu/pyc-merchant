@@ -77,6 +77,33 @@ function parseEvidenceDate(value) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+function requirePassResult(errors, fields, key, label = key) {
+  const value = ensureField(errors, fields, key, label);
+  if (value && parseStatus(value) !== "pass") errors.push(`${label}_${parseStatus(value)}`);
+  return value;
+}
+
+function requirePositiveInteger(errors, fields, key, label = key) {
+  const value = ensureField(errors, fields, key, label);
+  if (value && (!/^\d+$/.test(String(value).trim()) || BigInt(String(value).trim()) <= 0n)) {
+    errors.push(`invalid_${label}`);
+  }
+  return value;
+}
+
+function requireFiniteNumber(errors, fields, key, label = key, { min = 0 } = {}) {
+  const value = ensureField(errors, fields, key, label);
+  const parsed = Number(value);
+  if (value && (!Number.isFinite(parsed) || parsed < min)) errors.push(`invalid_${label}`);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function requireEvidenceTimestamp(errors, fields, key, label = key) {
+  const value = ensureField(errors, fields, key, label);
+  if (value && parseEvidenceDate(value) == null) errors.push(`invalid_${label}`);
+  return value;
+}
+
 function findLatestEvidenceDir(rootDir) {
   if (!fs.existsSync(rootDir)) return null;
   const dirs = fs
@@ -126,13 +153,19 @@ function evaluateExt001(evidence) {
     || ensureField(errors, evidence.fields, "tx_hash", "tx_hash");
   if (txHash && !isTxHash(txHash)) errors.push("invalid_tx_hash");
   ensureField(errors, evidence.fields, "invoice_id", "invoice_id");
-  ensureField(errors, evidence.fields, "amount", "amount");
-  ensureField(errors, evidence.fields, "expected_amount_atomic", "expected_amount_atomic");
-  ensureField(errors, evidence.fields, "block_number", "block_number");
-  ensureField(errors, evidence.fields, "block_timestamp", "block_timestamp");
-  ensureField(errors, evidence.fields, "detected_at", "detected_at");
-  ensureField(errors, evidence.fields, "status_transition", "status_transition");
+  requireFiniteNumber(errors, evidence.fields, "amount", "amount", { min: Number.EPSILON });
+  requirePositiveInteger(errors, evidence.fields, "expected_amount_atomic", "expected_amount_atomic");
+  requirePositiveInteger(errors, evidence.fields, "block_number", "block_number");
+  requireEvidenceTimestamp(errors, evidence.fields, "block_timestamp", "block_timestamp");
+  requireEvidenceTimestamp(errors, evidence.fields, "detected_at", "detected_at");
+  const statusTransition = ensureField(errors, evidence.fields, "status_transition", "status_transition");
+  if (statusTransition && (!/(?:paid|confirmed|settled)/i.test(statusTransition) || /(?:fail|error|pending|rejected)/i.test(statusTransition))) {
+    errors.push("status_transition_not_successful");
+  }
+  ensureField(errors, evidence.fields, "screenshot_ref", "screenshot_ref");
+  ensureField(errors, evidence.fields, "log_ref", "log_ref");
   ensureField(errors, evidence.fields, "tester", "tester");
+  requireEvidenceTimestamp(errors, evidence.fields, "checked_at", "checked_at");
   return { ok: errors.length === 0, errors };
 }
 
@@ -146,9 +179,25 @@ function evaluateExt002(evidence) {
   if (ios && ios !== "pass") errors.push(`ios_${ios}`);
   if (android && android !== "pass") errors.push(`android_${android}`);
   if (copy && copy !== "pass") errors.push(`copy_fallback_${copy}`);
+  ensureField(errors, evidence.fields, "wallet_name", "wallet_name");
+  ensureField(errors, evidence.fields, "app_version", "app_version");
+  ensureField(errors, evidence.fields, "device_model", "device_model");
+  ensureField(errors, evidence.fields, "os_version", "os_version");
+  ensureField(errors, evidence.fields, "pay_url", "pay_url");
+  for (const [key, label] of [
+    ["wallet_launch_result", "wallet_launch"],
+    ["normal_payment_result", "normal_payment"],
+    ["expired_payment_result", "expired_payment"],
+    ["overpayment_result", "overpayment"],
+    ["underpayment_result", "underpayment"],
+    ["duplicate_payment_result", "duplicate_payment"],
+  ]) {
+    requirePassResult(errors, evidence.fields, key, label);
+  }
   ensureField(errors, evidence.fields, "screenshot_ref", "screenshot_ref");
+  ensureField(errors, evidence.fields, "diagnostic_screenshot_ref", "diagnostic_screenshot_ref");
   ensureField(errors, evidence.fields, "tester", "tester");
-  ensureField(errors, evidence.fields, "checked_at", "checked_at");
+  requireEvidenceTimestamp(errors, evidence.fields, "checked_at", "checked_at");
   return { ok: errors.length === 0, errors };
 }
 
@@ -187,7 +236,7 @@ function evaluateExt003(evidence) {
   }
   ensureField(errors, evidence.fields, "screenshot_ref", "screenshot_ref");
   ensureField(errors, evidence.fields, "tester", "tester");
-  ensureField(errors, evidence.fields, "checked_at", "checked_at");
+  requireEvidenceTimestamp(errors, evidence.fields, "checked_at", "checked_at");
   return { ok: errors.length === 0, errors };
 }
 
@@ -199,12 +248,15 @@ function evaluateExt004(evidence) {
   ensureField(errors, evidence.fields, "scenario", "scenario");
   ensureField(errors, evidence.fields, "invoice_issue_time", "invoice_issue_time");
   ensureField(errors, evidence.fields, "qr_display_time", "qr_display_time");
-  ensureField(errors, evidence.fields, "review_handling", "review_handling");
-  ensureField(errors, evidence.fields, "refund_evidence_handling", "refund_evidence_handling");
-  ensureField(errors, evidence.fields, "daily_close", "daily_close");
-  ensureField(errors, evidence.fields, "incident_escalation", "incident_escalation");
-  ensureField(errors, evidence.fields, "self_resolution_result", "self_resolution_result");
+  requirePassResult(errors, evidence.fields, "review_handling", "review_handling");
+  requirePassResult(errors, evidence.fields, "refund_evidence_handling", "refund_evidence_handling");
+  requirePassResult(errors, evidence.fields, "daily_close", "daily_close");
+  requirePassResult(errors, evidence.fields, "incident_escalation", "incident_escalation");
+  requirePassResult(errors, evidence.fields, "self_resolution_result", "self_resolution_result");
   ensureField(errors, evidence.fields, "operator_signature", "operator_signature");
+  ensureField(errors, evidence.fields, "screenshot_ref", "screenshot_ref");
+  ensureField(errors, evidence.fields, "tester", "tester");
+  requireEvidenceTimestamp(errors, evidence.fields, "checked_at", "checked_at");
   return { ok: errors.length === 0, errors };
 }
 
@@ -220,13 +272,61 @@ function evaluatePocEvidence(dirPath) {
     const parsed = parseMarkdown(fs.readFileSync(filePath, "utf8"));
     const errors = [];
     if (parsed.status !== "pass") errors.push(`status_${parsed.status}`);
-    ensureField(errors, parsed.fields, "kpi_result", "kpi_result");
-    ensureField(errors, parsed.fields, "daily_close_reproduced", "daily_close_reproduced");
-    ensureField(errors, parsed.fields, "csv_reconciliation", "csv_reconciliation");
+    requirePassResult(errors, parsed.fields, "kpi_result", "kpi_result");
+    requirePassResult(errors, parsed.fields, "daily_close_reproduced", "daily_close_reproduced");
+    requirePassResult(errors, parsed.fields, "csv_reconciliation", "csv_reconciliation");
     ensureField(errors, parsed.fields, "signed_minutes_ref", "signed_minutes_ref");
+    ensureField(errors, parsed.fields, "evidence_ref", "evidence_ref");
+    ensureField(errors, parsed.fields, "scorecard_ref", "scorecard_ref");
+    ensureField(errors, parsed.fields, "owner", "owner");
+    requireEvidenceTimestamp(errors, parsed.fields, "checked_at", "checked_at");
     results.push({ id: pocId, file: filePath, status: parsed.status, ok: errors.length === 0, errors });
   }
   return results;
+}
+
+function evaluatePerformanceEvidence(dirPath) {
+  const filePath = path.join(dirPath, "PERF-001-scale-soak.md");
+  if (!fs.existsSync(filePath)) {
+    return { id: "PERF-001", file: filePath, status: "missing", ok: false, errors: ["missing_file"] };
+  }
+  const parsed = parseMarkdown(fs.readFileSync(filePath, "utf8"));
+  const errors = [];
+  if (parsed.status !== "pass") errors.push(`status_${parsed.status}`);
+  ensureField(errors, parsed.fields, "load_profile", "load_profile");
+  ensureField(errors, parsed.fields, "tool_version", "tool_version");
+  requirePositiveInteger(errors, parsed.fields, "dataset_rows", "dataset_rows");
+  const targetConcurrency = requireFiniteNumber(errors, parsed.fields, "target_concurrency", "target_concurrency", { min: 1 });
+  const achievedConcurrency = requireFiniteNumber(errors, parsed.fields, "achieved_concurrency", "achieved_concurrency", { min: 1 });
+  const targetRps = requireFiniteNumber(errors, parsed.fields, "target_rps", "target_rps", { min: Number.EPSILON });
+  const achievedRps = requireFiniteNumber(errors, parsed.fields, "achieved_rps", "achieved_rps", { min: 0 });
+  const maxP95 = requireFiniteNumber(errors, parsed.fields, "max_p95_ms", "max_p95_ms", { min: Number.EPSILON });
+  const observedP95 = requireFiniteNumber(errors, parsed.fields, "observed_p95_ms", "observed_p95_ms", { min: 0 });
+  const maxErrorRate = requireFiniteNumber(errors, parsed.fields, "max_error_rate_pct", "max_error_rate_pct", { min: 0 });
+  const observedErrorRate = requireFiniteNumber(errors, parsed.fields, "observed_error_rate_pct", "observed_error_rate_pct", { min: 0 });
+  const soakMinimum = requireFiniteNumber(errors, parsed.fields, "soak_min_duration_seconds", "soak_min_duration_seconds", { min: 1 });
+  const soakObserved = requireFiniteNumber(errors, parsed.fields, "soak_observed_duration_seconds", "soak_observed_duration_seconds", { min: 0 });
+  const memoryGrowthMax = requireFiniteNumber(errors, parsed.fields, "memory_growth_max_bytes", "memory_growth_max_bytes", { min: 0 });
+  const memoryGrowthObserved = requireFiniteNumber(errors, parsed.fields, "memory_growth_observed_bytes", "memory_growth_observed_bytes", { min: 0 });
+  requirePassResult(errors, parsed.fields, "result", "result");
+  ensureField(errors, parsed.fields, "raw_result_ref", "raw_result_ref");
+  ensureField(errors, parsed.fields, "tester", "tester");
+  requireEvidenceTimestamp(errors, parsed.fields, "checked_at", "checked_at");
+  if (targetConcurrency != null && achievedConcurrency != null && achievedConcurrency < targetConcurrency) {
+    errors.push("achieved_concurrency_below_target");
+  }
+  if (targetRps != null && achievedRps != null && achievedRps < targetRps) errors.push("achieved_rps_below_target");
+  if (maxP95 != null && observedP95 != null && observedP95 > maxP95) errors.push("observed_p95_exceeds_maximum");
+  if (maxErrorRate != null && observedErrorRate != null && observedErrorRate > maxErrorRate) {
+    errors.push("observed_error_rate_exceeds_maximum");
+  }
+  if (soakMinimum != null && soakObserved != null && soakObserved < soakMinimum) {
+    errors.push("soak_duration_below_minimum");
+  }
+  if (memoryGrowthMax != null && memoryGrowthObserved != null && memoryGrowthObserved > memoryGrowthMax) {
+    errors.push("memory_growth_exceeds_maximum");
+  }
+  return { id: "PERF-001", file: filePath, status: parsed.status, ok: errors.length === 0, errors };
 }
 export function validateCommercialEvidence({
   evidenceRoot = path.resolve(process.cwd(), "docs/production/evidence"),
@@ -243,6 +343,7 @@ export function validateCommercialEvidence({
     latest_evidence_dir: explicitDir ? null : selectedDir,
     ext: {},
     poc: [],
+    performance: null,
     blockers: [],
   };
 
@@ -282,10 +383,13 @@ export function validateCommercialEvidence({
     }
 
     result.poc = evaluatePocEvidence(selectedDir);
+    result.performance = evaluatePerformanceEvidence(selectedDir);
+    if (!result.performance.ok) result.blockers.push(`PERF_001:${result.performance.errors.join(",")}`);
   }
 
   result.ext_all_pass = Object.values(result.ext).length > 0 && Object.values(result.ext).every((entry) => entry.ok);
   result.poc_all_pass = result.poc.length === 3 && result.poc.every((entry) => entry.ok);
+  result.performance_pass = Boolean(result.performance?.ok);
   result.ok = result.blockers.length === 0;
   return result;
 }

@@ -96,8 +96,8 @@ export function getOperatorStatusPolicy(status) {
 export const REVIEW_REASON_ACTION_POLICY = Object.freeze({
   UNDERPAYMENT: {
     title: "不足入金が発生しました",
-    suggestedAction: "不足額の追加請求を作成するか、会計を完了しない判断を店長が行います。",
-    safeExit: "元の請求額は変更しません。追加請求は同じ checkout session に紐づけます。",
+    suggestedAction: "不足額はこの請求への追加送金では受け付けません。店長承認後に別の新規請求を作るか、会計調整として処理します。",
+    safeExit: "元の請求額は変更せず、同じ請求への追加入金を促しません。別の新規請求は店長承認後に発行します。",
   },
   OVERPAYMENT: {
     title: "過入金が発生しました",
