@@ -41,15 +41,21 @@ async function canReachHealth(targetBaseUrl = ACTIVE_BASE_URL) {
   }
 }
 
-function buildServerEnv(targetBaseUrl) {
+function buildServerEnv(targetBaseUrl, { isolateRuntime = false } = {}) {
   const url = new URL(targetBaseUrl);
   const env = { ...process.env };
   const smokeRoot = env.SMOKE_RUNTIME_DIR || mkdtempSync(path.join(tmpdir(), "jpyc-smoke-"));
-  env.APP_PORT = env.APP_PORT || (url.port || "4173");
-  env.APP_HOST = env.APP_HOST || targetBaseUrl;
-  env.APP_BIND_HOST = env.APP_BIND_HOST || (["localhost", "127.0.0.1", "::1"].includes(url.hostname) ? url.hostname : "127.0.0.1");
-  env.DB_PATH = env.DB_PATH || path.join(smokeRoot, "app.db");
-  env.BACKUP_DIR = env.BACKUP_DIR || path.join(smokeRoot, "backups");
+  // The smoke runner may intentionally move away from BASE_URL when another
+  // validation server already owns that port.  The selected target must win
+  // over inherited CI APP_* values or the child will bind the occupied port.
+  env.APP_PORT = url.port || "4173";
+  env.APP_HOST = targetBaseUrl;
+  env.APP_BIND_HOST = ["localhost", "127.0.0.1", "::1"].includes(url.hostname) ? url.hostname : "127.0.0.1";
+  env.DB_PATH = isolateRuntime ? path.join(smokeRoot, "app.db") : (env.DB_PATH || path.join(smokeRoot, "app.db"));
+  env.WORKER_STATE_DB_PATH = isolateRuntime
+    ? path.join(smokeRoot, "worker-state.db")
+    : (env.WORKER_STATE_DB_PATH || path.join(smokeRoot, "worker-state.db"));
+  env.BACKUP_DIR = isolateRuntime ? path.join(smokeRoot, "backups") : (env.BACKUP_DIR || path.join(smokeRoot, "backups"));
   mkdirSync(path.dirname(path.resolve(process.cwd(), env.DB_PATH)), { recursive: true });
   mkdirSync(path.resolve(process.cwd(), env.BACKUP_DIR), { recursive: true });
   env.APP_SECRET = env.APP_SECRET || crypto.randomBytes(32).toString("hex");
@@ -87,10 +93,12 @@ async function waitForServerReady(proc, logs, timeoutMs = 15000) {
 }
 
 async function ensureServer() {
+  let isolateRuntime = false;
   if (await canReachHealth(ACTIVE_BASE_URL)) {
     if (SMOKE_REUSE_EXISTING || !SMOKE_AUTO_START) return null;
     const isolatedPort = 46000 + Math.floor(Math.random() * 10000);
     ACTIVE_BASE_URL = `http://127.0.0.1:${isolatedPort}`;
+    isolateRuntime = true;
   }
   if (await canReachHealth(ACTIVE_BASE_URL)) return null;
   if (!SMOKE_AUTO_START) {
@@ -99,7 +107,7 @@ async function ensureServer() {
   const logs = [];
   const proc = spawn(process.execPath, ["src/server.mjs"], {
     cwd: process.cwd(),
-    env: buildServerEnv(ACTIVE_BASE_URL),
+    env: buildServerEnv(ACTIVE_BASE_URL, { isolateRuntime }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   proc.stdout.on("data", (chunk) => logs.push(String(chunk)));

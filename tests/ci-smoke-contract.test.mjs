@@ -51,6 +51,24 @@ test("smoke daily close derives the date from the store timezone", () => {
   assert.doesNotMatch(SMOKE_SCRIPT, /new Date\(\)\.toISOString\(\)\.slice\(0, 10\)/);
 });
 
+test("smoke isolated server target overrides inherited CI listener settings", () => {
+  const source = sliceBetween(SMOKE_SCRIPT, "function buildServerEnv", "async function waitForServerReady");
+  assert.match(source, /\{ isolateRuntime = false \} = \{\}/);
+  assert.match(source, /env\.APP_PORT = url\.port \|\| "4173";/);
+  assert.match(source, /env\.APP_HOST = targetBaseUrl;/);
+  assert.match(source, /env\.APP_BIND_HOST = \["localhost", "127\.0\.0\.1", "::1"\]/);
+  assert.match(source, /env\.DB_PATH = isolateRuntime \? path\.join\(smokeRoot, "app\.db"\)/);
+  assert.match(source, /env\.WORKER_STATE_DB_PATH = isolateRuntime/);
+  assert.match(source, /env\.BACKUP_DIR = isolateRuntime \? path\.join\(smokeRoot, "backups"\)/);
+  assert.doesNotMatch(source, /env\.APP_PORT = env\.APP_PORT \|\|/);
+  assert.doesNotMatch(source, /env\.APP_HOST = env\.APP_HOST \|\|/);
+  assert.doesNotMatch(source, /env\.APP_BIND_HOST = env\.APP_BIND_HOST \|\|/);
+
+  const ensureServerSource = sliceBetween(SMOKE_SCRIPT, "async function ensureServer", "async function stopServer");
+  assert.match(ensureServerSource, /isolateRuntime = true;/);
+  assert.match(ensureServerSource, /buildServerEnv\(ACTIVE_BASE_URL, \{ isolateRuntime \}\)/);
+});
+
 test("CI isolates smoke runtime data and delays build metadata until required checks pass", () => {
   const smokeBlock = sliceBetween(CI_WORKFLOW, "      - name: Smoke", "      - name: Audit chain");
   assert.match(smokeBlock, /mktemp -d/);
