@@ -1122,7 +1122,14 @@ test("terminal settings are versioned and scoped to authenticated store, termina
   assert.match(settingsSource, /encodeURIComponent\(terminalId\)/);
   assert.match(settingsSource, /settingsScopeHash\(operatorIdentity\)/);
   assert.match(settingsSource, /schema_version: SETTINGS_SCHEMA_VERSION/);
-  assert.match(settingsSource, /readSettingsStorage\(LEGACY_SETTINGS_KEY\)/);
+  // Legacy global settings cannot be attributed to a specific operator
+  // identity, so they must never be migrated or reused: operators without
+  // v2 scoped settings intentionally start from defaults instead of
+  // inheriting another operator's values.
+  assert.doesNotMatch(settingsSource, /readSettingsStorage\(LEGACY_SETTINGS_KEY\)/);
+  assert.doesNotMatch(js, /migrateLegacyTerminalSettings|legacy-migration/);
+  assert.match(js, /const SETTINGS_NAMESPACE = `\$\{LEGACY_SETTINGS_KEY\}:v2`/);
+  assert.match(js, /const LEGACY_SETTINGS_KEY = "jpyc_terminal_settings";/);
   assert.match(settingsSource, /Boolean\(storageKey\) && writeSettingsStorage/);
   assert.doesNotMatch(js, /readSettingsStorage\(SETTINGS_KEY\)|writeSettingsStorage\(SETTINGS_KEY/);
   assert.match(js, /setLoggedInUi\(true\);\s*loadTerminalSettings\(\)/);

@@ -280,13 +280,38 @@ const DANGEROUS_MULTILINE_RULES = [
   { id: "sql.truncate", regex: /\btruncate\b/gi },
 ];
 
+function deleteStatementWindow(content, match) {
+  const start = match.index;
+  const searchStart = start + match[0].length;
+  const terminators = [";", "`", "\"", "'"];
+  let end = content.length;
+
+  for (const terminator of terminators) {
+    const candidate = content.indexOf(terminator, searchStart);
+    if (candidate !== -1 && candidate < end) end = candidate + 1;
+  }
+
+  if (end === content.length) {
+    const lineEnd = content.indexOf("\n", searchStart);
+    if (lineEnd !== -1) end = lineEnd;
+  }
+
+  return content
+    .slice(start, end)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\r\n]*/g, " ");
+}
+
 export function scanMultilineStatements(rootDir, filePath, content) {
-  const collapsed = content.replace(/\s+/g, " ");
-  const lineOffsets = [];
-  let offset = 0;
-  for (const line of content.split(/\r?\n/)) {
-    lineOffsets.push(offset);
-    offset += line.length + 1;
+  // Match directly against the original content: every multiline rule uses
+  // \s+/\s* (or explicit characters), so statements spanning lines are still
+  // detected, while match.index stays aligned with the original line offsets
+  // below. Collapsing whitespace first would shift indices and misattribute
+  // reported line numbers whenever preceding lines contain blank or indented
+  // content.
+  const lineOffsets = [0];
+  for (const newline of content.matchAll(/\n/g)) {
+    lineOffsets.push(newline.index + 1);
   }
   const lineOf = (index) => {
     let low = 0;
@@ -301,21 +326,22 @@ export function scanMultilineStatements(rootDir, filePath, content) {
   const findings = [];
 
   const deleteRe = /\bdelete\s+from\s+[`"[]?([a-zA-Z_][\w]*)[`"\]]?/gi;
-  for (const match of collapsed.matchAll(deleteRe)) {
+  for (const match of content.matchAll(deleteRe)) {
+    const statementText = deleteStatementWindow(content, match);
     findings.push(
       ...classifyDeleteStatement({
         rootDir,
         filePath,
         tableName: String(match[1] || "").toLowerCase(),
-        guardText: collapsed,
-        excerpt: match[0],
+        guardText: statementText,
+        excerpt: statementText,
         lineNumber: lineOf(match.index),
       })
     );
   }
 
   for (const rule of DANGEROUS_MULTILINE_RULES) {
-    for (const match of collapsed.matchAll(rule.regex)) {
+    for (const match of content.matchAll(rule.regex)) {
       findings.push(
         buildFinding({
           rootDir,
@@ -330,7 +356,7 @@ export function scanMultilineStatements(rootDir, filePath, content) {
   }
 
   const dynamicConcatRe = /\bdelete\s+from\b["'`]\s*\+\s*[a-zA-Z_$]|\bdelete\s+from\s*\$\{/gi;
-  for (const match of collapsed.matchAll(dynamicConcatRe)) {
+  for (const match of content.matchAll(dynamicConcatRe)) {
     findings.push(
       buildFinding({
         rootDir,

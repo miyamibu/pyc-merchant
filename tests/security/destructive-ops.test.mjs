@@ -178,3 +178,96 @@ test("M-040 multiline DROP TABLE is detected exactly once per statement", () => 
   const dropFindings = result.findings.filter((finding) => finding.ruleId === "sql.drop-table");
   assert.equal(dropFindings.length, 1);
 });
+
+test("M-040 multiline findings report accurate 1-based line numbers after leading blank lines and indentation", () => {
+  const rootDir = tempWorkspace();
+  writeFile(
+    rootDir,
+    "src/multiline-delete-line-number.mjs",
+    [
+      "// padding header comment",
+      "",
+      "  const padding = {",
+      "    nested: deep.value,",
+      "  };",
+      "",
+      "  const sql = `",
+      "    DELETE FROM",
+      "      audit_logs",
+      "    WHERE id = ?`;",
+      "",
+    ].join("\n")
+  );
+
+  const result = scanWorkspace(rootDir);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].ruleId, "sql.delete.protected-table");
+  assert.equal(result.findings[0].line, 8);
+});
+
+test("M-040 multiline DROP TABLE reports accurate line numbers across indented statements", () => {
+  const rootDir = tempWorkspace();
+  writeFile(
+    rootDir,
+    "migrations/003-danger-line-number.sql",
+    [
+      "-- migration header",
+      "BEGIN;",
+      "",
+      "        DROP",
+      "        TABLE",
+      "        audit_logs;",
+      "",
+    ].join("\n")
+  );
+
+  const result = scanWorkspace(rootDir);
+  const dropFindings = result.findings.filter((finding) => finding.ruleId === "sql.drop-table");
+  assert.equal(dropFindings.length, 1);
+  assert.equal(dropFindings[0].line, 4);
+});
+
+test("allowlisted DELETE guards must belong to the same statement", () => {
+  const rootDir = tempWorkspace();
+  writeFile(
+    rootDir,
+    "src/misleading-neighbor.mjs",
+    [
+      "db.prepare(`DELETE FROM rate_limit_events`).run();",
+      "db.prepare(`SELECT * FROM diagnostics WHERE created_at_unix_ms <= ?`).all(limit);",
+      "",
+    ].join("\n")
+  );
+
+  const result = scanWorkspace(rootDir);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].ruleId, "sql.delete.allowlist-guard-missing");
+  assert.equal(result.findings[0].line, 1);
+});
+
+test("allowlisted DELETE guards inside SQL comments do not satisfy the policy", () => {
+  const rootDir = tempWorkspace();
+  writeFile(
+    rootDir,
+    "src/comment-disguise.mjs",
+    "db.prepare(`DELETE FROM idempotency_records /* WHERE expires_at <= ? */`).run();\n"
+  );
+
+  const result = scanWorkspace(rootDir);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].ruleId, "sql.delete.allowlist-guard-missing");
+});
+
+test("multiline findings report accurate line numbers with CRLF newlines", () => {
+  const rootDir = tempWorkspace();
+  writeFile(
+    rootDir,
+    "src/crlf-delete.mjs",
+    ["// header", "", "const sql = `", "  DELETE FROM audit_logs", "  WHERE id = ?`;", ""].join("\r\n")
+  );
+
+  const result = scanWorkspace(rootDir);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].ruleId, "sql.delete.protected-table");
+  assert.equal(result.findings[0].line, 4);
+});

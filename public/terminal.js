@@ -1273,27 +1273,17 @@ function serializeTerminalSettings(settings) {
   });
 }
 
-function migrateLegacyTerminalSettings(storageKey, fallback) {
-  const migrationMarker = `${SETTINGS_NAMESPACE}:legacy-migration`;
-  if (readSettingsStorage(migrationMarker)) return null;
-  const legacyRaw = readSettingsStorage(LEGACY_SETTINGS_KEY);
-  writeSettingsStorage(migrationMarker, storageKey);
-  if (!legacyRaw) return null;
-  try {
-    const migrated = normalizeTerminalSettings(JSON.parse(legacyRaw), fallback);
-    writeSettingsStorage(storageKey, serializeTerminalSettings(migrated));
-    return migrated;
-  } catch (_error) {
-    return null;
-  }
-}
-
 function readTerminalSettings() {
+  // Pre-v2 settings lived under one global storage key shared by every
+  // operator on this browser. They cannot be attributed to a specific
+  // operator identity, so they are intentionally never migrated or reused:
+  // operators without v2 scoped settings start from defaults instead of
+  // inheriting another operator's values.
   const fallback = defaultTerminalSettings();
   const storageKey = currentSettingsStorageKey();
   if (!storageKey) return fallback;
   const raw = readSettingsStorage(storageKey);
-  if (!raw) return migrateLegacyTerminalSettings(storageKey, fallback) || fallback;
+  if (!raw) return fallback;
   try {
     return normalizeTerminalSettings(JSON.parse(raw), fallback);
   } catch (_error) {
