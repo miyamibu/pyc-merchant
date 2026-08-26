@@ -398,6 +398,20 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
     const payload = await res.json().catch(() => ({}));
     assert.equal(payload.error?.code, "PUBLIC_CUSTOMER_PAYMENT_DISABLED_BY_TOPOLOGY");
   }
+  const blockedPublicConsent = await fetch(
+    `${started.baseUrl}/api/v1/public/invoices/${encodeURIComponent(invoiceId)}/consent`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(policyVersions),
+    }
+  );
+  assert.equal(blockedPublicConsent.status, 404);
+  assert.equal(
+    (await blockedPublicConsent.json()).error?.code,
+    "PUBLIC_CUSTOMER_PAYMENT_DISABLED_BY_TOPOLOGY",
+    "the anonymous public consent route must be unreachable in local topology"
+  );
 
   // The local topology does not create or persist a signed public payment
   // reference. Traceability remains anchored by the invoice and audit rows.

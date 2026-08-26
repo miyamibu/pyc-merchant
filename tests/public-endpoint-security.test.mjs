@@ -29,6 +29,10 @@ test("public endpoint security rejects private, reserved, and mapped-private add
     "64:ff9b::a00:1",
     "2002:0a00:0001::1",
     "2001:0000:4136:e378::1",
+    // IPv4-mapped IPv6 written as hextets must be rejected by the ::ffff:0:0/96
+    // range check even when it does not match the dotted-decimal fast path.
+    "::ffff:0a00:0001",
+    "::ffff:6440:0000",
     // RFC 2928 2001::/23 special-purpose sub-blocks that must never classify
     // as public: benchmarking, AMT, AS112-v6, IETF protocol assignments,
     // ORCHIDv2.

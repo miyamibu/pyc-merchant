@@ -68,6 +68,12 @@
 - **health-watch**: `deploy/launchd/targets/health-watch.mjs` が loopback `http://127.0.0.1:<APP_PORT>/healthz` の HTTP 200 + `ok:true` を要求し、さらに `WORKER_STATE_DB_PATH` を read-only で開いてチェーンワーカーの鮮度（`worker:<CHAIN_ID>:last_cycle_at` が `WORKER_STALE_SEC` 秒以内・未来時刻でない、`rpc_count >= 1`、`last_checkpoint` 存在）を検証する。非 loopback bind 指定・設定欠落・DB 未読取・タイムアウトはすべて非ゼロ終了（fail-closed）。出力は 1 行 JSON のログのみで、**外部アラート送信は一切主張しない**（通知はログと exit code のみ。監視は運用者が行う）。
 - **audit-watch**: 既存 `scripts/verify-audit-chain.mjs` を無変更で再利用。`DB_PATH` を read-only で開き、`audit_logs` ハッシュチェーンと `audit_epochs` attestation を毎回全件再計算し、1 行でも破損があれば非ゼロ終了＋構造化エラー JSON（fail-closed）。こちらも外部アラート送信は行わない。
 
+### 停止シグナルと health contract
+- launchd の安全ランナーは `SIGTERM` / `SIGINT` / `SIGHUP` を子プロセスへ転送する。アプリ本体が graceful shutdown として扱うのは `SIGTERM` / `SIGINT` であり、二重停止を無視し、定期タイマーを停止し、HTTP server の `close` 完了後に worker-state DB と台帳 DB を閉じて exit 0 とする。`SIGHUP` による設定再読込は実装しないため、設定変更は停止・再起動で反映する。
+- terminal / chain-monitor plist は `KeepAlive=true`、`ThrottleInterval=10`、`ExitTimeOut=30`。30 秒以内に graceful shutdown が完了しない場合、launchd が強制終了へ進む可能性がある。`SIGKILL` は捕捉・転送できないため、監査ログや台帳 DB を直接削除して復旧してはならない。
+- `GET /healthz` の成功 contract は HTTP 200 JSON `{ "ok": true, "service": "jpyc-terminal-production", "now": "<ISO-8601>" }`。認証不要だが最小情報だけを返す。`/metrics` は `Authorization: Bearer <METRICS_SECRET>` 必須であり、health 代替として無認証公開しない。
+- health-watch plist は起動時および 60 秒間隔で実行する。各実行は HTTP 5 秒、全体 15 秒を上限とし、loopback `/healthz` に加えて worker の最終 cycle、RPC count、checkpoint、`WORKER_STALE_SEC` を検証する。非 200、JSON 不正、DB unreadable、未来時刻、stale、RPC/checkpoint 欠落は非ゼロ終了する。成功は structured JSON 1 行と exit 0 であり、外部通知の成功を意味しない。
+
 ### install / 確認 / unload（rollback）
 共通手順（`<PLIST>` は各テンプレートを `~/Library/LaunchAgents/` へコピーした実ファイル名、`$UID` はオペレータ UID）:
 
