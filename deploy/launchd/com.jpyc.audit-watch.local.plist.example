@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  JPYC audit-chain watcher template for the local_store_terminal topology on
+  an in-store Mac. Runs every 10 minutes through the safe runner.
+
+  Node is pinned to the EXACT absolute path below (note the space in
+  "Application Support" - keep it verbatim). run-env-safe.mjs refuses to run
+  under any other interpreter version:
+    /Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node
+
+  What it runs: scripts/verify-audit-chain.mjs, unchanged. It opens DB_PATH
+  from __REPO_DIR__/.env.production READ-ONLY and recomputes the full
+  audit_logs hash chain plus audit_epochs attestations:
+  - exit 0 + {"ok":true,...} while the chain verifies;
+  - exit 1 + structured JSON error (AUDIT_HASH_CHAIN_INVALID,
+    AUDIT_EPOCH_*, ...) the moment any row fails to verify.
+  It is strictly fail-closed and never modifies data. Like the health watcher
+  it does NOT deliver external alerts; only launchd log files and the exit
+  code are produced.
+
+  The .env.production must be chmod 0600; run-env-safe.mjs enforces this and
+  rejects invalid env lines without printing values.
+
+  Replace __REPO_DIR__ and __LOG_DIR__ with real values.
+
+  Install:   launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.jpyc.audit-watch.local.plist
+  Run now:   launchctl kickstart -k gui/$UID/com.jpyc.audit-watch.local
+  Status:    launchctl print gui/$UID/com.jpyc.audit-watch.local
+  Rollback:  launchctl bootout gui/$UID ~/Library/LaunchAgents/com.jpyc.audit-watch.local.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jpyc.audit-watch.local</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node</string>
+    <string>__REPO_DIR__/deploy/launchd/run-env-safe.mjs</string>
+    <string>--cwd</string>
+    <string>__REPO_DIR__</string>
+    <string>--env-file</string>
+    <string>__REPO_DIR__/.env.production</string>
+    <string>--allow-exec</string>
+    <string>/Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node</string>
+    <string>--</string>
+    <string>scripts/verify-audit-chain.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/audit-watch.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/audit-watch.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+</dict>
+</plist>

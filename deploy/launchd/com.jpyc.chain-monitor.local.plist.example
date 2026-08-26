@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  JPYC chain-monitor worker autostart template for the local_store_terminal
+  topology on an in-store Mac. The worker writes only to WORKER_STATE_DB_PATH,
+  which must stay separate from DB_PATH (audit/backup/worker separation).
+
+  __NODE24_BIN__ must be the ABSOLUTE path of the pinned Node v24.17.0
+  binary on this Mac (verify `node --version` prints v24.17.0).
+  run-env-safe.mjs refuses to launch under any other runtime version, reads
+  only __REPO_DIR__/.env.production (chmod 600 required), and never prints
+  secret values.
+
+  Replace __REPO_DIR__, __NODE24_BIN__, and __LOG_DIR__ with real values.
+  Install:   launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.jpyc.chain-monitor.local.plist
+  Restart:   launchctl kickstart -k gui/$UID/com.jpyc.chain-monitor.local
+  Rollback:  launchctl bootout gui/$UID ~/Library/LaunchAgents/com.jpyc.chain-monitor.local.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jpyc.chain-monitor.local</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE24_BIN__</string>
+    <string>__REPO_DIR__/deploy/launchd/run-env-safe.mjs</string>
+    <string>--cwd</string>
+    <string>__REPO_DIR__</string>
+    <string>--env-file</string>
+    <string>__REPO_DIR__/.env.production</string>
+    <string>--allow-exec</string>
+    <string>__NODE24_BIN__</string>
+    <string>--</string>
+    <string>src/chain-monitor.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/chain-monitor.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/chain-monitor.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

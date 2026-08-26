@@ -89,6 +89,12 @@ import {
   validateSignedReleaseEvidence,
 } from "../scripts/production-validation/signed-release-evidence.mjs";
 import { APPROVED_LEDGER_BASE_UNIT_SCALE, APPROVED_TOKEN_DECIMALS } from "./token-metadata.mjs";
+import {
+  DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
+  evaluateLocalStoreTerminalTopology,
+  parseDeploymentTopology,
+  resolvePublicPolicyOrigin,
+} from "./deployment-topology.mjs";
 import { assessChainRuntimeRegistry } from "./chain-runtime-registry.mjs";
 import { validatePublicHttpsUrl } from "./public-endpoint-security.mjs";
 import {
@@ -115,12 +121,16 @@ const DEFAULTS = {
   INTERNAL_APP_ORIGIN: "",
   PAY_BASE_URL: "",
   PUBLIC_BASE_URL: "",
+  PUBLIC_POLICY_ORIGIN: "",
+  PUBLIC_PAYMENT_PAGE_ENABLED: "true",
   APP_SECRET: "__REPLACE_WITH_LONG_RANDOM_SECRET__",
   PAYMENT_RECEIPT_ACTIVE_KID: "app-secret-v1",
   PAYMENT_RECEIPT_KEY_RING: "",
   PAYMENT_RECEIPT_VERIFY_ONLY_KIDS: "",
   DB_PATH: "./data/app.db",
   WORKER_STATE_DB_PATH: "",
+  BACKUP_DIR: "",
+  LOCAL_TERMINAL_OPERATOR_READINESS_REF: "",
   CHAIN_ID: "137",
   ENABLED_PAYMENT_CHAIN_IDS: "137",
   TOKEN_DECIMALS: "18",
@@ -174,6 +184,7 @@ const DEFAULTS = {
   ENABLE_PROVIDER_RAIL_MOCK: "false",
   MANUAL_INGEST_APPROVAL_REF: "",
   COMMERCIAL_GO_MODE: "false",
+  DEPLOYMENT_TOPOLOGY: "public_cloud",
   DEPLOYMENT_STAGE: "",
   TEST_CRASH_FAULT_INJECTION: "",
   COMMERCIAL_EVIDENCE_ROOT: "./docs/production/evidence",
@@ -452,6 +463,25 @@ const DEPLOYMENT_STAGE = String(
   ENV.DEPLOYMENT_STAGE || DEFAULTS.DEPLOYMENT_STAGE || (IS_PRODUCTION ? "commercial" : "development")
 ).trim().toLowerCase();
 const PRODUCTION_LIKE_RUNTIME = IS_PRODUCTION || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE) || COMMERCIAL_GO_MODE;
+const DEPLOYMENT_TOPOLOGY = parseDeploymentTopology(ENV.DEPLOYMENT_TOPOLOGY ?? DEFAULTS.DEPLOYMENT_TOPOLOGY);
+if (!DEPLOYMENT_TOPOLOGY) {
+  console.error("FATAL: DEPLOYMENT_TOPOLOGY must be public_cloud or local_store_terminal.");
+  process.exit(1);
+}
+const LOCAL_STORE_TERMINAL_TOPOLOGY = DEPLOYMENT_TOPOLOGY === DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL;
+// PUBLIC_POLICY_ORIGIN is the official policy/Site origin key; PUBLIC_BASE_URL
+// remains a compatible fallback. The Sites links and the separate guide QR in
+// the terminal UI are derived from this resolved origin only.
+const PUBLIC_POLICY_ORIGIN_EFFECTIVE = LOCAL_STORE_TERMINAL_TOPOLOGY ? resolvePublicPolicyOrigin(ENV) : null;
+const PUBLIC_POLICY_ORIGIN = PUBLIC_POLICY_ORIGIN_EFFECTIVE?.origin || "";
+const PUBLIC_POLICY_LINKS = PUBLIC_POLICY_ORIGIN
+  ? Object.freeze({
+      terms: `${PUBLIC_POLICY_ORIGIN}/terms`,
+      privacy: `${PUBLIC_POLICY_ORIGIN}/privacy`,
+      refund_policy: `${PUBLIC_POLICY_ORIGIN}/refund-policy`,
+      security: `${PUBLIC_POLICY_ORIGIN}/security`,
+    })
+  : null;
 
 function validateProductionLikePublicOrigins() {
   if (!PRODUCTION_LIKE_RUNTIME) return;
@@ -459,9 +489,68 @@ function validateProductionLikePublicOrigins() {
     APP_HOST: String(process.env.APP_HOST || "").trim(),
     PAY_BASE_URL: String(process.env.PAY_BASE_URL || "").trim(),
     PUBLIC_BASE_URL: String(process.env.PUBLIC_BASE_URL || "").trim(),
+    PUBLIC_POLICY_ORIGIN: String(process.env.PUBLIC_POLICY_ORIGIN || "").trim(),
   };
+  if (LOCAL_STORE_TERMINAL_TOPOLOGY) {
+    // Local store terminal keeps a separate public policy/Site origin while the
+    // app itself stays on explicit loopback origins. A public APP_HOST would
+    // silently re-create signed public payment URLs, so it is rejected.
+    for (const key of ["APP_HOST", "PAY_BASE_URL"]) {
+      if (!values[key]) {
+        console.error(`FATAL: ${key} must be explicitly configured for production-like runtime.`);
+        process.exit(1);
+      }
+    }
+    // PUBLIC_POLICY_ORIGIN is the official key; PUBLIC_BASE_URL remains a
+    // compatible fallback for deployments configured before the rename.
+    const resolvedPolicy = resolvePublicPolicyOrigin(values);
+    if (!resolvedPolicy) {
+      console.error("FATAL: PUBLIC_POLICY_ORIGIN must be an origin-only public HTTPS URL for the local store terminal policy origin (PUBLIC_BASE_URL stays accepted as a fallback).");
+      process.exit(1);
+    }
+    const policyValidation = validatePublicHttpsUrl(resolvedPolicy.origin);
+    if (!policyValidation.ok
+      || policyValidation.url.pathname !== "/"
+      || policyValidation.url.search
+      || policyValidation.url.hash) {
+      console.error("FATAL: the local store terminal policy origin must be an origin-only public HTTPS URL.");
+      process.exit(1);
+    }
+    const loopbackOrigins = [];
+    for (const key of ["APP_HOST", "PAY_BASE_URL"]) {
+      let parsed;
+      try {
+        parsed = new URL(values[key]);
+      } catch (_error) {
+        console.error(`FATAL: ${key} must be an explicit loopback http://127.0.0.1 origin for local_store_terminal.`);
+        process.exit(1);
+      }
+      const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      if (parsed.protocol !== "http:"
+        || !["127.0.0.1", "::1", "localhost"].includes(hostname)
+        || parsed.pathname !== "/"
+        || parsed.search
+        || parsed.hash) {
+        console.error(`FATAL: ${key} must be an explicit loopback http://127.0.0.1 origin for local_store_terminal.`);
+        process.exit(1);
+      }
+      loopbackOrigins.push(parsed.origin);
+    }
+    if (new Set(loopbackOrigins).size !== 1) {
+      console.error("FATAL: APP_HOST and PAY_BASE_URL must use the same loopback origin in local_store_terminal.");
+      process.exit(1);
+    }
+    if (loopbackOrigins[0] === policyValidation.url.origin) {
+      console.error("FATAL: the loopback app origin must differ from PUBLIC_BASE_URL in local_store_terminal.");
+      process.exit(1);
+    }
+    return;
+  }
   const origins = [];
-  for (const [key, raw] of Object.entries(values)) {
+  // public_cloud keeps its historical requirement set: PUBLIC_POLICY_ORIGIN is
+  // optional there and never replaces the shared public origin checks.
+  for (const key of ["APP_HOST", "PAY_BASE_URL", "PUBLIC_BASE_URL"]) {
+    const raw = values[key];
     if (!raw) {
       console.error(`FATAL: ${key} must be explicitly configured for production-like runtime.`);
       process.exit(1);
@@ -483,6 +572,17 @@ function validateProductionLikePublicOrigins() {
 }
 
 validateProductionLikePublicOrigins();
+if (LOCAL_STORE_TERMINAL_TOPOLOGY) {
+  // Structural local-store-terminal requirements fail closed before any
+  // listener, DB, or worker state is created.
+  const topologyEvaluation = evaluateLocalStoreTerminalTopology(ENV);
+  if (!topologyEvaluation.ok) {
+    for (const blocker of topologyEvaluation.blockers) {
+      console.error(`FATAL: ${blocker}`);
+    }
+    process.exit(1);
+  }
+}
 const TEST_CRASH_FAULT_INJECTION = String(
   ENV.TEST_CRASH_FAULT_INJECTION || DEFAULTS.TEST_CRASH_FAULT_INJECTION || ""
 ).trim().toLowerCase();
@@ -898,7 +998,7 @@ if (PRODUCTION_LIKE_RUNTIME) {
     console.error("FATAL: production wallet deeplink adapter is not fully configured.");
     process.exit(1);
   }
-  if (/localhost|127\.0\.0\.1/i.test(APP_HOST)) {
+  if (/localhost|127\.0\.0\.1/i.test(APP_HOST) && !LOCAL_STORE_TERMINAL_TOPOLOGY) {
     console.error("FATAL: APP_HOST must not be localhost in production.");
     process.exit(1);
   }
@@ -919,7 +1019,7 @@ if (PRODUCTION_LIKE_RUNTIME) {
     console.error("FATAL: CORS_ALLOW_ORIGINS wildcard is not allowed in production.");
     process.exit(1);
   }
-  if (!TRUST_PROXY_CONFIGURED) {
+  if (!TRUST_PROXY_CONFIGURED && !LOCAL_STORE_TERMINAL_TOPOLOGY) {
     console.error("FATAL: production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS.");
     process.exit(1);
   }
@@ -1141,6 +1241,22 @@ CREATE TABLE IF NOT EXISTS invoices (
   integrity_hold_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS invoice_consents (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL UNIQUE REFERENCES invoices(id),
+  store_id TEXT NOT NULL REFERENCES stores(id),
+  session_id TEXT NOT NULL REFERENCES terminal_sessions(id),
+  staff_user_id TEXT NOT NULL REFERENCES staff_users(id),
+  terms_version TEXT NOT NULL,
+  privacy_version TEXT NOT NULL,
+  refund_policy_version TEXT NOT NULL,
+  terms_hash TEXT NOT NULL,
+  privacy_hash TEXT NOT NULL,
+  refund_policy_hash TEXT NOT NULL,
+  policy_urls_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS payment_events (
@@ -3073,6 +3189,12 @@ function buildTerminalPublicEntryUrl(publicEntryToken) {
 }
 
 function buildTerminalPublicEntryMeta(terminal) {
+  if (LOCAL_STORE_TERMINAL_TOPOLOGY) {
+    return {
+      public_entry_token: null,
+      fixed_qr_url: null,
+    };
+  }
   const publicEntryToken = String(terminal?.public_entry_token || "").trim();
   return {
     public_entry_token: publicEntryToken || null,
@@ -3117,7 +3239,12 @@ function summarizeInvoiceForTerminalState(invoice) {
     fulfillment_hold: fulfillmentDecision.decision !== FULFILLMENT_DECISIONS.ALLOW_FULFILLMENT,
     fulfillment_decision: fulfillmentDecision,
     expires_at: invoice.expires_at,
-    payment_url: invoice.payment_url,
+    ...(LOCAL_STORE_TERMINAL_TOPOLOGY
+      ? {
+          payment_url: null,
+          customer_policy_consent: buildLocalConsentSummary(invoice),
+        }
+      : { payment_url: invoice.payment_url }),
     recipient_address: invoice.recipient_address,
     review_case_id: review?.id || null,
     state_axes: deriveInvoiceStateAxes(invoice),
@@ -3463,6 +3590,7 @@ function getTerminalByPublicEntryToken(publicEntryToken) {
 function ensureTerminalPublicEntryToken(terminalId) {
   const current = getTerminalById(terminalId);
   if (!current) return null;
+  if (LOCAL_STORE_TERMINAL_TOPOLOGY) return current;
   if (String(current.public_entry_token || "").trim()) return current;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const token = generateTerminalPublicEntryToken();
@@ -3484,6 +3612,7 @@ function ensureTerminalPublicEntryToken(terminalId) {
 }
 
 function backfillTerminalPublicEntryTokens() {
+  if (LOCAL_STORE_TERMINAL_TOPOLOGY) return;
   const terminals = db
     .prepare(`SELECT id FROM terminals WHERE public_entry_token IS NULL OR public_entry_token = '' ORDER BY created_at ASC, id ASC`)
     .all();
@@ -3710,7 +3839,7 @@ function buildPublicTerminalEntryState(publicEntryToken) {
       store_name: terminal.store_name || "JPYC Store",
       fixed_qr_url: publicMeta.fixed_qr_url,
       public_entry_token: publicMeta.public_entry_token,
-      pay_url: context.currentInvoice.payment_url,
+      pay_url: LOCAL_STORE_TERMINAL_TOPOLOGY ? null : context.currentInvoice.payment_url,
       active_invoice: summarizeInvoiceForTerminalState(context.currentInvoice),
       resolved_at: nowIso(),
     };
@@ -3884,7 +4013,7 @@ function listInvoiceReissueHistory(invoice) {
       status: row.status,
       status_reason: row.status_reason,
       receive_address: row.recipient_address,
-      pay_url: row.payment_url,
+      pay_url: LOCAL_STORE_TERMINAL_TOPOLOGY ? null : row.payment_url,
       expires_at: row.expires_at,
       created_at: row.created_at,
       updated_at: row.updated_at,
@@ -6576,6 +6705,97 @@ function buildPolicySnapshot(store) {
     content_verification: storeGate.content_verification,
     published_at: nowIso(),
     source: "store",
+  };
+}
+
+function getInvoicePolicyConsent(invoiceId) {
+  return db.prepare(`SELECT * FROM invoice_consents WHERE invoice_id = ?`).get(invoiceId) || null;
+}
+
+function parseInvoicePolicySnapshot(invoice) {
+  try {
+    return invoice.policy_snapshot_json ? JSON.parse(invoice.policy_snapshot_json) : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function evaluateInvoicePolicyGate(invoice) {
+  const snapshot = parseInvoicePolicySnapshot(invoice);
+  return snapshot
+    ? evaluatePolicySnapshot(snapshot)
+    : {
+        ok: false,
+        values: {},
+        versions: {},
+        hashes: {},
+        missing_keys: ["terms", "privacy", "refund"],
+        missing_version_keys: ["terms_version", "privacy_version", "refund_policy_version"],
+        missing_hash_keys: ["terms_hash", "privacy_hash", "refund_policy_hash"],
+        content_verification_ok: false,
+        snapshot_missing: true,
+      };
+}
+
+function evaluateLocalPolicySiteBinding(policyGate) {
+  if (!LOCAL_STORE_TERMINAL_TOPOLOGY || !PUBLIC_POLICY_LINKS) {
+    return { ok: !LOCAL_STORE_TERMINAL_TOPOLOGY, mismatch_keys: [] };
+  }
+  const expected = {
+    terms: PUBLIC_POLICY_LINKS.terms,
+    privacy: PUBLIC_POLICY_LINKS.privacy,
+    refund: PUBLIC_POLICY_LINKS.refund_policy,
+  };
+  const mismatchKeys = Object.entries(expected)
+    .filter(([key, value]) => String(policyGate?.values?.[key] || "") !== value)
+    .map(([key]) => key);
+  return { ok: mismatchKeys.length === 0, mismatch_keys: mismatchKeys };
+}
+
+// local_store_terminal only: customers never open a web payment page, so the
+// store staff record the customer's terms/privacy/refund consent from an
+// authenticated terminal session before the transfer QR may be displayed.
+// Consent is per invoice: a reissued invoice always starts unconsented.
+function buildLocalConsentSummary(invoice) {
+  if (!LOCAL_STORE_TERMINAL_TOPOLOGY) return null;
+  const consent = getInvoicePolicyConsent(invoice.id);
+  const gate = evaluateInvoicePolicyGate(invoice);
+  const siteBinding = evaluateLocalPolicySiteBinding(gate);
+  return {
+    required: true,
+    ready: gate.ok === true && siteBinding.ok,
+    recorded: Boolean(consent),
+    recorded_at: consent?.recorded_at || null,
+    ...(gate.ok && siteBinding.ok
+      ? {
+          versions: gate.versions,
+          hashes: gate.hashes,
+          urls: gate.values,
+          missing_keys: [],
+        }
+      : {
+          missing_keys: [...new Set([...gate.missing_keys, ...gate.missing_version_keys, ...gate.missing_hash_keys])],
+          snapshot_missing: gate.snapshot_missing === true,
+          site_binding_mismatch_keys: siteBinding.mismatch_keys,
+        }),
+  };
+}
+
+function isLocalInvoiceConsented(invoice) {
+  if (!LOCAL_STORE_TERMINAL_TOPOLOGY) return true;
+  return Boolean(getInvoicePolicyConsent(invoice.id));
+}
+
+// Fail-closed wallet payload: until the per-invoice consent row exists, no
+// transfer URI / deeplink leaves the server, so nothing scannable can be
+// rendered even by a modified client.
+function gateWalletPayloadForConsent(walletPayload, invoice) {
+  if (isLocalInvoiceConsented(invoice)) return walletPayload;
+  return {
+    ...walletPayload,
+    payment_uri: null,
+    wallet_url: null,
+    wallet_deeplink: null,
   };
 }
 
@@ -14894,6 +15114,19 @@ app.use((req, res, next) => {
   next();
 });
 
+if (LOCAL_STORE_TERMINAL_TOPOLOGY) {
+  // The local store terminal has no public customer payment page: customers
+  // scan the per-invoice wallet transfer QR shown on the staff terminal.
+  // Customer web entry points stay disabled regardless of bind reachability.
+  const customerPaymentPagePrefixes = ["/pay", "/t/", "/mobile.html", "/api/v1/public/"];
+  app.use((req, res, next) => {
+    if (customerPaymentPagePrefixes.some((prefix) => String(req.path || "").startsWith(prefix))) {
+      return jsonError(res, 404, "PUBLIC_CUSTOMER_PAYMENT_DISABLED_BY_TOPOLOGY", "public customer payment endpoints are disabled by deployment topology");
+    }
+    return next();
+  });
+}
+
 app.use((req, res, next) => {
   const noStorePaths = [
     "/terminal.html",
@@ -15114,6 +15347,7 @@ app.get("/readyz", requireMetricsAuth, (_req, res) => {
     ok: ready,
     now: nowIso(),
     app_env: APP_ENV,
+    deployment_topology: DEPLOYMENT_TOPOLOGY,
     payments_disabled: commercial.payments_disabled,
     commercial_go_mode: commercial.commercial_go_mode,
     release_id: commercial.release_gate?.release_id || null,
@@ -15270,6 +15504,13 @@ app.post("/api/v1/terminal-sessions", async (req, res) => {
     role: staff.role,
     effective_permissions: [...getPermissionsForSession(staff)].sort(),
     ...publicEntry,
+    deployment_topology: DEPLOYMENT_TOPOLOGY,
+    ...(LOCAL_STORE_TERMINAL_TOPOLOGY
+      ? {
+          public_policy_origin: PUBLIC_POLICY_ORIGIN || null,
+          public_policy_links: PUBLIC_POLICY_LINKS,
+        }
+      : {}),
     current_invoice: summarizeInvoiceForTerminalState(currentInvoiceContext.currentInvoice),
     terminal_invariant_broken: currentInvoiceContext.invariantBroken === true,
     payments: getPaymentsDisableState({ storeId: terminal.store_id, terminalId: terminal.id }),
@@ -16907,7 +17148,8 @@ app.post("/api/v1/invoices", (req, res) => {
         receive_address: created.recipient_address,
       },
     });
-    const walletPayload = buildInvoiceWalletPayload(created, store);
+    const walletPayload = gateWalletPayloadForConsent(buildInvoiceWalletPayload(created, store), created);
+    const consentSummary = buildLocalConsentSummary(created);
 
     return {
       status: 201,
@@ -16916,9 +17158,15 @@ app.post("/api/v1/invoices", (req, res) => {
         invoice_no: created.invoice_no,
         status: created.status,
         expires_at: created.expires_at,
-        payment_url: created.payment_url,
-        pay_url: created.payment_url,
-        qr_payload: created.payment_url,
+        ...(LOCAL_STORE_TERMINAL_TOPOLOGY
+          ? {}
+          : { payment_url: created.payment_url, pay_url: created.payment_url }),
+        // In local_store_terminal the QR payload is the wallet transfer URI
+        // itself (chain 137, official token, configured recipient, exact
+        // amount); no public signed payment page exists in that topology.
+        // The URI stays withheld until the per-invoice policy consent row is
+        // recorded from the authenticated staff session.
+        qr_payload: LOCAL_STORE_TERMINAL_TOPOLOGY ? (walletPayload.payment_uri || null) : created.payment_url,
         fixed_qr_url: publicEntry.fixed_qr_url,
         fixed_qr_payload: publicEntry.fixed_qr_url,
         terminal_public_entry_token: publicEntry.public_entry_token,
@@ -16932,6 +17180,10 @@ app.post("/api/v1/invoices", (req, res) => {
         display_amount: created.display_amount || formatJpyc(created.amount_jpyc_base),
         state_axes: deriveInvoiceStateAxes(created),
         ...walletPayload,
+        ...(LOCAL_STORE_TERMINAL_TOPOLOGY ? { customer_policy_consent: consentSummary } : {}),
+        // buildWalletLaunchPayload echoes pay_url for wrapper templates; the
+        // local topology must not expose any signed payment page link.
+        ...(LOCAL_STORE_TERMINAL_TOPOLOGY ? { pay_url: null } : {}),
         sse: {
           token: sseToken,
           invoice_id: created.id,
@@ -16970,9 +17222,10 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
        ORDER BY created_at DESC`
     )
     .all(invoice.id, invoice.id);
-  const walletPayload = buildInvoiceWalletPayload(invoice, store);
+  const walletPayload = gateWalletPayloadForConsent(buildInvoiceWalletPayload(invoice, store), invoice);
   const providerSummary = buildProviderSummary(invoice);
   const fulfillmentDecision = buildAuthoritativeFulfillmentDecision(invoice);
+  const consentSummary = buildLocalConsentSummary(invoice);
   return res.json({
     invoice_id: invoice.id,
     invoice_no: invoice.invoice_no,
@@ -17020,9 +17273,12 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
       recipient_address: invoice.recipient_address
     },
     expires_at: invoice.expires_at,
-    payment_url: invoice.payment_url,
-    pay_url: invoice.payment_url,
+    ...(LOCAL_STORE_TERMINAL_TOPOLOGY
+      ? {}
+      : { payment_url: invoice.payment_url, pay_url: invoice.payment_url }),
     ...walletPayload,
+    ...(LOCAL_STORE_TERMINAL_TOPOLOGY ? { customer_policy_consent: consentSummary } : {}),
+    ...(LOCAL_STORE_TERMINAL_TOPOLOGY ? { pay_url: null } : {}),
     provider_summary: providerSummary,
     payment_recovery: paymentRecovery ? {
       status: paymentRecovery.status,
@@ -17040,6 +17296,146 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
     events,
     lineage,
     ...(DIAGNOSTIC_MODE_ENABLED ? { diagnostics: buildInvoiceDiagnostics(invoice, store, review) } : {}),
+  });
+});
+
+// local_store_terminal only: the authenticated staff session records that the
+// customer confirmed the published Sites terms/privacy/refund content bound to
+// this invoice's policy snapshot (versions + SHA-256 hashes + URLs). The
+// request body carries versions only; no customer PII is accepted or stored.
+// Consent is per invoice, so a reissued invoice always starts unconsented and
+// the transfer QR stays withheld until this endpoint succeeds.
+app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoice.create"), (req, res) => {
+  if (!LOCAL_STORE_TERMINAL_TOPOLOGY) {
+    return jsonError(res, 404, "CONSENT_ENDPOINT_DISABLED_BY_TOPOLOGY", "staff-recorded policy consent is only available in local_store_terminal");
+  }
+  const invoice = db
+    .prepare(`SELECT * FROM invoices WHERE id = ? AND store_id = ? AND terminal_id = ?`)
+    .get(req.params.invoiceId, req.session.store_id, req.session.terminal_id);
+  if (!invoice) return jsonError(res, 404, "NOT_FOUND", "Invoice not found");
+  if (String(invoice.status) !== "issued") {
+    return jsonError(res, 409, "POLICY_CONSENT_NOT_ALLOWED", "Policy consent can only be recorded for an issued invoice");
+  }
+  const policyGate = evaluateInvoicePolicyGate(invoice);
+  if (!policyGate.ok) {
+    return jsonError(res, 503, "POLICY_CONFIGURATION_NOT_READY", "Published customer policy configuration is not ready", {
+      missing_keys: policyGate.missing_keys,
+      missing_version_keys: policyGate.missing_version_keys,
+      missing_hash_keys: policyGate.missing_hash_keys,
+      content_verification_ok: policyGate.content_verification_ok ?? false,
+      snapshot_missing: policyGate.snapshot_missing === true,
+    });
+  }
+  const siteBinding = evaluateLocalPolicySiteBinding(policyGate);
+  if (!siteBinding.ok) {
+    return jsonError(res, 503, "POLICY_SITE_BINDING_MISMATCH", "Invoice policy URLs do not match the configured public Site", {
+      mismatch_keys: siteBinding.mismatch_keys,
+    });
+  }
+  const versionSubmission = validatePolicyVersionSubmission(policyGate.versions, req.body || {});
+  if (!versionSubmission.ok) {
+    return jsonError(res, 409, "POLICY_VERSION_MISMATCH", "Submitted policy versions do not match the published versions", {
+      missing_keys: versionSubmission.missing_keys,
+      mismatch_keys: versionSubmission.mismatch_keys,
+      unexpected_keys: versionSubmission.unexpected_keys,
+    });
+  }
+  const existing = getInvoicePolicyConsent(invoice.id);
+  if (existing) {
+    const replayMatches =
+      existing.terms_version === policyGate.versions.terms_version
+      && existing.privacy_version === policyGate.versions.privacy_version
+      && existing.refund_policy_version === policyGate.versions.refund_policy_version;
+    if (!replayMatches) {
+      return jsonError(res, 409, "CONSENT_SNAPSHOT_CHANGED", "A consent record with different policy versions already exists for this invoice");
+    }
+    return res.json({
+      ok: true,
+      invoice_id: invoice.id,
+      consent_id: existing.id,
+      recorded_at: existing.recorded_at,
+      idempotent_replay: true,
+    });
+  }
+
+  const consentId = uuid();
+  const recordedAt = nowIso();
+  let inserted = false;
+  try {
+    db.transaction(() => {
+      // Re-check inside the transaction so a concurrent duplicate insert
+      // cannot produce two rows or a missing audit entry.
+      const raced = db.prepare(`SELECT id FROM invoice_consents WHERE invoice_id = ?`).get(invoice.id);
+      if (raced) return;
+      db.prepare(
+        `INSERT INTO invoice_consents
+         (id, invoice_id, store_id, session_id, staff_user_id,
+          terms_version, privacy_version, refund_policy_version,
+          terms_hash, privacy_hash, refund_policy_hash,
+          policy_urls_json, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        consentId,
+        invoice.id,
+        req.session.store_id,
+        req.session.session_id,
+        req.session.staff_user_id,
+        policyGate.versions.terms_version,
+        policyGate.versions.privacy_version,
+        policyGate.versions.refund_policy_version,
+        String(policyGate.hashes.terms_hash).toLowerCase(),
+        String(policyGate.hashes.privacy_hash).toLowerCase(),
+        String(policyGate.hashes.refund_policy_hash).toLowerCase(),
+        JSON.stringify(policyGate.values),
+        recordedAt
+      );
+      inserted = true;
+      requiredAudit({
+        storeId: req.session.store_id,
+        actorType: "staff",
+        actorId: req.session.staff_user_id,
+        action: "customer_policy_consent_staff",
+        targetType: "invoice",
+        targetId: invoice.id,
+        requestId: requestIdFromReq(req),
+        idempotencyKey: null,
+        beforeState: null,
+        afterState: {
+          consent_id: consentId,
+          invoice_no: invoice.invoice_no,
+          terms_version: policyGate.versions.terms_version,
+          privacy_version: policyGate.versions.privacy_version,
+          refund_policy_version: policyGate.versions.refund_policy_version,
+          policy_hashes: policyGate.hashes,
+          policy_urls: policyGate.values,
+          recorded_via_session: req.session.session_id,
+          channel: "local_store_terminal_staff_session",
+          consented_at: recordedAt,
+        },
+        ip: req.ip,
+      });
+    })();
+  } catch (error) {
+    console.error(JSON.stringify({
+      ts: nowIso(),
+      level: "error",
+      type: "policy_consent.record_failed",
+      request_id: requestIdFromReq(req),
+      message: String(error?.message || error),
+    }));
+    return jsonError(res, 500, "CONSENT_RECORD_FAILED", "Policy consent could not be recorded");
+  }
+  const persisted = getInvoicePolicyConsent(invoice.id);
+  if (!persisted) {
+    return jsonError(res, 500, "CONSENT_RECORD_FAILED", "Policy consent could not be confirmed after recording");
+  }
+  sendEvent(req.session.terminal_id, "invoice.updated", { invoiceId: invoice.id, status: invoice.status });
+  return res.status(inserted ? 201 : 200).json({
+    ok: true,
+    invoice_id: invoice.id,
+    consent_id: persisted.id,
+    recorded_at: persisted.recorded_at,
+    idempotent_replay: !inserted,
   });
 });
 
@@ -17373,6 +17769,11 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
     const issued = result.body.issued;
     const terminal = ensureTerminalPublicEntryToken(req.session.terminal_id);
     const publicEntry = buildTerminalPublicEntryMeta(terminal);
+    const reissuedWalletPayload = gateWalletPayloadForConsent(
+      buildInvoiceWalletPayload(issued.invoice),
+      issued.invoice
+    );
+    const reissuedConsentSummary = buildLocalConsentSummary(issued.invoice);
     const sseToken = createSseToken({
       invoiceId: issued.invoice.id,
       terminalId: req.session.terminal_id,
@@ -17402,7 +17803,12 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
         checkout_session_id: issued.invoice.checkout_session_id,
         status: issued.invoice.status,
         expires_at: issued.invoice.expires_at,
-        payment_url: issued.invoice.payment_url,
+        ...(LOCAL_STORE_TERMINAL_TOPOLOGY
+          ? {
+              qr_payload: reissuedWalletPayload.payment_uri || null,
+              customer_policy_consent: reissuedConsentSummary,
+            }
+          : { payment_url: issued.invoice.payment_url }),
         fixed_qr_url: publicEntry.fixed_qr_url,
         terminal_public_entry_token: publicEntry.public_entry_token,
         receive_address: issued.invoice.recipient_address,
@@ -22004,6 +22410,7 @@ export function startServer() {
   const onListening = () => {
     console.log(`JPYC production server started on ${APP_HOST} (port ${PORT})`);
     console.log(`Bind host: ${APP_BIND_HOST || "runtime default"}`);
+    console.log(`Deployment topology: ${DEPLOYMENT_TOPOLOGY}`);
     console.log(`DB path: ${DB_PATH}`);
   };
   serverInstance = APP_BIND_HOST

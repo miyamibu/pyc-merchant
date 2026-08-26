@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  JPYC periodic SQLite backup template for the local_store_terminal topology
+  on an in-store Mac. Runs daily at 03:30 local time through the safe runner.
+
+  Node is pinned to the EXACT absolute path below (note the space in
+  "Application Support" - keep it verbatim). run-env-safe.mjs refuses to run
+  under any other interpreter version:
+    /Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node
+
+  Secrets never go into this file. The backup target reads DB_PATH and
+  BACKUP_DIR from __REPO_DIR__/.env.production through deploy/launchd/
+  run-env-safe.mjs, which requires that file to be chmod 0600 and rejects
+  invalid env lines without printing values. The wrapper fails closed when
+  DB_PATH / BACKUP_DIR are not set, so launchd never backs up guessed paths.
+  It reuses scripts/deploy/backup-sqlite.sh unchanged via a fixed argv array
+  (/bin/bash + absolute script path): no eval, no shell string interpolation,
+  no secret output. Backups are written as app-<UTC timestamp>.sqlite3 with
+  mode 0600 into BACKUP_DIR.
+
+  Replace __REPO_DIR__ and __LOG_DIR__ with real values.
+
+  Install:   chmod 600 .env.production (verify!) then
+             launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.jpyc.backup.local.plist
+  Run now:   launchctl kickstart -k gui/$UID/com.jpyc.backup.local
+  Status:    launchctl print gui/$UID/com.jpyc.backup.local
+  Rollback:  launchctl bootout gui/$UID ~/Library/LaunchAgents/com.jpyc.backup.local.plist
+
+  This job only writes backup files into BACKUP_DIR and logs; it never deletes
+  business records. Restore practice must use the isolated drill
+  (tests/launchd-backup-restore-drill.test.mjs) or scripts/deploy/
+  restore-drill.sh - never in place against live data.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jpyc.backup.local</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node</string>
+    <string>__REPO_DIR__/deploy/launchd/run-env-safe.mjs</string>
+    <string>--cwd</string>
+    <string>__REPO_DIR__</string>
+    <string>--env-file</string>
+    <string>__REPO_DIR__/.env.production</string>
+    <string>--allow-exec</string>
+    <string>/Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node</string>
+    <string>--</string>
+    <string>deploy/launchd/targets/backup-sqlite.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/backup.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/backup.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>ExitTimeOut</key>
+  <integer>300</integer>
+</dict>
+</plist>

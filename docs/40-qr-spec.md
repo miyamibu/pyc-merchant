@@ -3,6 +3,11 @@
 ## Goal
 店頭端末で提示する QR の役割を `端末ごとの固定入口` に限定し、取引の正本を常に `invoice` に維持する。
 
+## Additive Topology: local_store_terminal
+- `DEPLOYMENT_TOPOLOGY=local_store_terminal` では fixed 入口 QR の代わりに、current invoice 専用の EIP-681 送金用 QR（`ethereum:<official token>@137/transfer?address=<recipient>&uint256=<exact atomic>`）をスタッフ画面に表示する。
+- このトポロジでは signed `/pay?ref=...` の公開支払いページは存在しない（`/pay`, `/t/`, `/mobile.html`, `/api/v1/public/*` は 404）。詳細と要件は `docs/100-local-store-terminal-topology.md`。
+- `public_cloud` 既定の以下の仕様は変更されない。
+
 ## Fixed QR Entry
 - 店頭で見せる主QRは `terminal` 固有の公開入口 URL (`/t/:publicEntryToken`) とする。
 - fixed QR に埋め込む origin は final public URL `https://pay.miyamibu.xyz` に固定し、temporary host や内部検証用 URL をそのまま印刷しない。

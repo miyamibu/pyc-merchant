@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "status": "CANDIDATE_NOT_APPROVED",
+  "captured_at": "2026-08-26T02:48:31Z",
+  "chain_id": 137,
+  "token_contract": "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
+  "token_name": "JPY Coin",
+  "token_symbol": "JPYC",
+  "token_decimals": 18,
+  "proxy": {
+    "kind": "ERC1967",
+    "implementation_slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+    "implementation_address": "0xafac17fc3936a29ca2d2787ced3c5d1c52007d2e"
+  },
+  "candidate_pins": {
+    "runtime_bytecode_bytes": 811,
+    "runtime_code_hash": "0xed040fe509076fecc53768e957b9b52a3b3fba907d9d0ed4dc029c86ec3e904e",
+    "implementation_bytecode_bytes": 20019,
+    "implementation_code_hash": "0xe79ee627372f287ed4c10739504509aa22e6445c3ca0eb83fdacc98ba57394b2"
+  },
+  "rpc_observations": [
+    {
+      "endpoint_id": "polygon-dcloud",
+      "block_number": 92671655,
+      "block_hash": "0x016c9d84ee075c611a7cab3bd7fff95255b77daa41f70a1303a809d6c83485a0",
+      "required_fields_agree": true
+    },
+    {
+      "endpoint_id": "polygon-publicnode",
+      "block_number": 92671656,
+      "block_hash": "0x30524f2e184287585058dc24419c74d417df7d8eb9584de78cf4d86ba2f9fbc6",
+      "required_fields_agree": true
+    }
+  ],
+  "raw_evidence": {
+    "git_tracked": false,
+    "contains_exact_runtime_bytecodes": true,
+    "path": "/Users/mimac/Documents/Codex/2026-08-26/jpyc-production-go-sites/20260826T021255Z/TOKEN_METADATA_PIN.rpc.json"
+  },
+  "approval": {
+    "approved": false,
+    "approval_ref": null,
+    "release_binding": null,
+    "expires_at": null,
+    "signatures": []
+  }
+}

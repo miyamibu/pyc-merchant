@@ -1,0 +1,37 @@
+# newsyslog(8) rotation example for JPYC local_store_terminal launchd jobs.
+#
+# Install (root-owned, system-scheduled):
+#   1. Replace __LOG_DIR__, __LOG_USER__ and __LOG_GROUP__ with real values
+#      (__LOG_DIR__ must match the StandardOutPath/StandardErrorPath directory
+#      used by the com.jpyc.*.local plists; __LOG_USER__/__LOG_GROUP__ should
+#      be the store operator account that owns the log files, so rotated
+#      archives stay readable by launchd agents running as that user).
+#   2. sudo cp com.jpyc.local.newsyslog.conf.example /etc/newsyslog.d/jpyc-local.conf
+#      sudo chown root:wheel /etc/newsyslog.d/jpyc-local.conf
+#      sudo chmod 644 /etc/newsyslog.d/jpyc-local.conf
+#   3. Dry run first:  sudo newsyslog -n -v -f /etc/newsyslog.d/jpyc-local.conf
+#   Rollback:          sudo rm /etc/newsyslog.d/jpyc-local.conf
+#
+# Rotation semantics for launchd-managed stdout/stderr logs:
+# - launchd holds the file descriptors open and does not reopen them on
+#   signal. The "N" flag below stops newsyslog from signalling syslogd or any
+#   daemon; rotation therefore renames the active file and creates a fresh
+#   one. The running job keeps appending to the renamed inode until its next
+#   restart.
+# - Recommended pairing: rotate nightly shortly BEFORE a maintenance window,
+#   then `launchctl kickstart -k gui/$UID/com.jpyc.terminal.local` (and the
+#   chain-monitor label) to make launchd recreate fresh log files. Size caps
+#   plus a bounded archive count keep disk usage safe even without restarts.
+# - "J" compresses archives with bzip2; count 7 keeps one week of history.
+#
+# logfilename                        owner:group       mode count size when flags
+__LOG_DIR__/terminal.out.log          __LOG_USER__:__LOG_GROUP__ 640  7  2048 *    JN
+__LOG_DIR__/terminal.err.log          __LOG_USER__:__LOG_GROUP__ 640  7  2048 *    JN
+__LOG_DIR__/chain-monitor.out.log     __LOG_USER__:__LOG_GROUP__ 640  7  2048 *    JN
+__LOG_DIR__/chain-monitor.err.log     __LOG_USER__:__LOG_GROUP__ 640  7  2048 *    JN
+__LOG_DIR__/backup.out.log            __LOG_USER__:__LOG_GROUP__ 640  7  1024 *    JN
+__LOG_DIR__/backup.err.log            __LOG_USER__:__LOG_GROUP__ 640  7  1024 *    JN
+__LOG_DIR__/health-watch.out.log      __LOG_USER__:__LOG_GROUP__ 640  7  1024 *    JN
+__LOG_DIR__/health-watch.err.log      __LOG_USER__:__LOG_GROUP__ 640  7  1024 *    JN
+__LOG_DIR__/audit-watch.out.log       __LOG_USER__:__LOG_GROUP__ 640  7  1024 *    JN
+__LOG_DIR__/audit-watch.err.log       __LOG_USER__:__LOG_GROUP__ 640  7  1024 *    JN

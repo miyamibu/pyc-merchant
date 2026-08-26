@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "payload_type": "jpyc_token_metadata_pin_approval",
+  "approval_status": "UNSIGNED_CANDIDATE",
+  "chain_id": 137,
+  "token_contract": "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
+  "token_name": "JPY Coin",
+  "token_symbol": "JPYC",
+  "token_decimals": 18,
+  "proxy_kind": "ERC1967",
+  "implementation_address": "0xafac17fc3936a29ca2d2787ced3c5d1c52007d2e",
+  "runtime_code_hash": "0xed040fe509076fecc53768e957b9b52a3b3fba907d9d0ed4dc029c86ec3e904e",
+  "implementation_code_hash": "0xe79ee627372f287ed4c10739504509aa22e6445c3ca0eb83fdacc98ba57394b2",
+  "release_binding": {
+    "source_commit": null,
+    "source_tree": null,
+    "release_id": null,
+    "environment_id": "local_mac_plus_chatgpt_sites",
+    "sites_project_id": "appgprj_6a8e510e246c8191b9238f5b67364cd9",
+    "sites_version_id": "appgprj_6a8e510e246c8191b9238f5b67364cd9~appgver_9d62a00e61e08191a67986ff82da76c8"
+  },
+  "scope": {
+    "network": "Polygon PoS mainnet",
+    "payment_token": "JPYC",
+    "deployment_topology": "local_store_terminal"
+  },
+  "valid_from": null,
+  "expires_at": null,
+  "approver": null,
+  "signature": null
+}

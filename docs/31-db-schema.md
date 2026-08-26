@@ -118,6 +118,17 @@ PostgreSQL移行時は `expires_at` index と定期ジョブ（例: cron/pg_cron
 - `raw_payload` (jsonb)
 - `created_at`
 
+### `invoice_consents`
+- local_store_terminal トポロジ専用。スタッフが記録した請求単位の規約同意（terms / privacy / refund の公開済みスナップショット）を保持する。PII は保持しない。
+- `id` (uuid, pk)
+- `invoice_id` (fk, UNIQUE; 請求ごと 1 行・再発行後の新 invoice は未同意から開始)
+- `store_id`, `session_id`, `staff_user_id` (fk; 同意を記録した認証済み端末セッション)
+- `terms_version`, `privacy_version`, `refund_policy_version` (text)
+- `terms_hash`, `privacy_hash`, `refund_policy_hash` (sha256 hex)
+- `policy_urls_json` (json; 同意対象ページ URL)
+- `recorded_at` (timestamptz)
+- 挿入と監査ログ (`customer_policy_consent_staff`) は同一トランザクションで記録される。
+
 ### `review_cases`
 - `id` (uuid, pk)
 - `invoice_id` (fk)

@@ -211,6 +211,19 @@
 
           <section class="panel stack">
             <h3 class="title title-md">お客様提示（端末入口QR）</h3>
+            <div id="invoiceConsentPanel" class="panel stack hidden" aria-live="polite" aria-atomic="true">
+              <span id="invoiceConsentBadge" class="status-pill s-yellow">規約同意待ち</span>
+              <p class="title title-md">お客様の規約確認を記録してから送金QRを表示します</p>
+              <p id="invoiceConsentBody" class="helper-text">お客様に公開情報Siteの利用規約・プライバシーポリシー・返金ポリシーを確認してもらい、チェックを付けて記録してください。同意の記録が完了するまで送金QRは表示されません。</p>
+              <label class="small" for="invoiceConsentCheckbox">
+                <input id="invoiceConsentCheckbox" type="checkbox" />
+                利用規約・プライバシーポリシー・返金ポリシーを確認しました
+              </label>
+              <div class="inline-action-group">
+                <button id="recordConsentBtn" class="btn btn-primary" type="button" data-permission="invoice.create" disabled>同意を記録してQRを表示</button>
+              </div>
+              <p id="invoiceConsentStatus" class="helper-text"></p>
+            </div>
             <canvas id="qrCanvas" width="420" height="420" aria-label="決済QR"></canvas>
             <p id="qrAccessibleText" class="visually-hidden">請求IDと金額は現在の請求欄に表示されます。</p>
             <div id="tapModePanel" class="panel stack hidden" data-provider-rail aria-live="polite" aria-atomic="true">
@@ -222,6 +235,27 @@
             <p id="customerDisplayHint" class="helper-text">このQRは端末ごとの入口です。お客様画面は、その時点の会計に一度だけ紐づきます。</p>
           </section>
         </div>
+
+        <section id="sitesGuideCard" class="panel stack hidden" aria-labelledby="sitesGuideTitle">
+          <div class="section-header">
+            <h3 id="sitesGuideTitle" class="title title-md">ご案内（公開情報Site）</h3>
+            <span class="badge">決済用ではありません</span>
+          </div>
+          <p class="helper-text">規約・安全情報は、この端末とは別の公開情報Siteで案内します。下のQRとリンクは決済用ではなく、Siteの閲覧専用です。</p>
+          <div class="split-layout">
+            <nav class="stack gap-tight" aria-label="公開情報サイトへのリンク">
+              <a id="policyTermsLink" class="helper-link hidden" target="_blank" rel="noopener noreferrer">利用規約</a>
+              <a id="policyPrivacyLink" class="helper-link hidden" target="_blank" rel="noopener noreferrer">プライバシーポリシー</a>
+              <a id="policyRefundLink" class="helper-link hidden" target="_blank" rel="noopener noreferrer">返金ポリシー</a>
+              <a id="policySecurityLink" class="helper-link hidden" target="_blank" rel="noopener noreferrer">安全対策・誤送金防止</a>
+            </nav>
+            <div class="stack">
+              <canvas id="policyGuideQrCanvas" width="180" height="180" aria-label="公開情報SiteのQR（決済用ではありません）"></canvas>
+              <p class="small">公開情報Site QR（決済用ではありません）</p>
+              <p id="policyGuideOriginText" class="mono small">-</p>
+            </div>
+          </div>
+        </section>
 
         <section id="operatorGuideCard" class="panel stack" aria-labelledby="operatorGuideSectionTitle">
           <div class="section-header">
