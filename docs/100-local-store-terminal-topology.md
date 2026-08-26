@@ -22,7 +22,7 @@
 - 店頭スタッフ画面は fixed 入口 QR の代わりに、**当該 invoice 専用**の EIP-681 ERC-20 transfer URI を QR 表示する:
   `ethereum:<official JPYC token>@137/transfer?address=<invoice recipient>&uint256=<exact atomic amount>`
 - chain（137）/ トークン（公式コントラクト）/ 受取アドレス（サーバ管理プールまたは承認 recipient）/ 金額（atomic units, exact）はすべて請求レコード由来で、クライアント側で組み替えられない。
-- API では invoice 作成レスポンスの `qr_payload` / `payment_uri` がこの URI になり、`payment_url` / `pay_url` は local トポロジでは返さない（DB 内部には traceability 用に保存継続）。
+- API では invoice 作成レスポンスの `qr_payload` / `payment_uri` がこの URI になり、`payment_url` / `pay_url` は local トポロジでは返さない。後方互換のため `NOT NULL` の `invoices.payment_url` には空文字を保存し、署名付き支払い参照を生成しない。traceability は invoice ID、checkout session、payment evidence、review/refund、settlement、audit の参照で維持する。
 - **同意保存までの送金 QR 非表示**: サーバは当該 invoice の `invoice_consents` 行が存在するまで `payment_uri` / `qr_payload` / `wallet_url` / `wallet_deeplink` を返さない（fail-closed）。UI も二重にゲートする。
 - 検証: `tests/deployment-topology.test.mjs`、validator `local_topology_wallet_transfer_qr_exactness`。
 
@@ -93,6 +93,7 @@ rm ~/Library/LaunchAgents/<PLIST>   # テンプレート実ファイルのみ。
 
 ### 分離復元ドリル（isolated drill）
 - `tests/launchd-backup-restore-drill.test.mjs` は `mkdtemp` 専用ディレクトリ内だけで完結する: フィクスチャ SQLite（有効な監査ハッシュチェーン付き）→ 実 `scripts/deploy/backup-sqlite.sh` でバックアップ（mode 0600 検証）→ `quick_check` + 件数/センチネルデータ照合 + `scripts/verify-audit-chain.mjs` 再検証 → 実 `scripts/deploy/restore-drill.sh` で復元ドリル → 改ざん検知の fail-closed 確認 → 自ディレクトリの self-cleanup。
+- `scripts/deploy/restore-drill.sh` 自体も監査チェーンに加えて**業務レコード整合を検証する**: コア業務テーブル（stores / terminals / invoices / payment_events / review_cases / refund_requests / audit_logs）の存在と `PRAGMA foreign_key_check` 違反ゼロを要求し、欠落・破損のあるバックアップは非ゼロ終了する。テストでは業務テーブルを欠くフィクスチャ改変コピーで fail-closed を確認する。
 - リポジトリの `runtime/` / `data/` / 保護パス・業務 DB には一切触れない。実機での定期確認はこのテストを pinned Node で実行する:
   `"/Users/mimac/Library/Application Support/JPYC Terminal/runtime/node-v24.17.0-darwin-arm64/bin/node" --test tests/launchd-backup-restore-drill.test.mjs`
 
@@ -100,7 +101,7 @@ rm ~/Library/LaunchAgents/<PLIST>   # テンプレート実ファイルのみ。
 
 ## ロールバック指針
 - アプリ単体: `launchctl bootout gui/$UID/<label>` で停止し、直前リリースへは Git タグ／`RELEASE_ID` を用いて `git checkout` 後 `npm ci` → 再 bootstrap。DB は `scripts/deploy/backup-sqlite.sh` + `restore-drill.sh` の手順に従う（保護対象ランタイム削除は行わない）。
-- トポロジ単体: `.env` の `DEPLOYMENT_TOPOLOGY` を `public_cloud` へ戻し、nginx/Caddy 構成（`deploy/nginx` or `deploy/caddy`）で再公開。local 固有キーは残置しても無害（public_cloud では未使用）。
+- トポロジ単体: `.env` の `DEPLOYMENT_TOPOLOGY` を `public_cloud` へ戻し、nginx/Caddy 構成（`deploy/nginx` or `deploy/caddy`）で再公開。local 固有キーは残置しても無害（public_cloud では未使用）。ただし production-like 実行では、**値が設定済みの `PUBLIC_POLICY_ORIGIN` が origin-only 公開 HTTPS URL でない場合は起動時に FATAL となる**（無効値の黙視を防ぐ fail-fast。未設定なら従来どおり任意・不問）。
 - ロールバック後も監査ログ・決済証跡は削除せず状態遷移で扱う。
 
 ## pay.miyamibu.xyz の扱い（歴史的事実と現行条件の分離）

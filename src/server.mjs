@@ -549,6 +549,20 @@ function validateProductionLikePublicOrigins() {
   const origins = [];
   // public_cloud keeps its historical requirement set: PUBLIC_POLICY_ORIGIN is
   // optional there and never replaces the shared public origin checks.
+  // Optional must not mean unverified: a value that is set but invalid (wrong
+  // scheme, port, path, or loopback host) would previously be silently ignored
+  // by resolvePublicPolicyOrigin, hiding an operator configuration error, so
+  // production-like runtimes fail fast instead.
+  if (values.PUBLIC_POLICY_ORIGIN) {
+    const policyValidation = validatePublicHttpsUrl(values.PUBLIC_POLICY_ORIGIN);
+    if (!policyValidation.ok
+      || policyValidation.url.pathname !== "/"
+      || policyValidation.url.search
+      || policyValidation.url.hash) {
+      console.error("FATAL: PUBLIC_POLICY_ORIGIN, when configured for public_cloud, must be an origin-only public HTTPS URL on port 443 (or be removed).");
+      process.exit(1);
+    }
+  }
   for (const key of ["APP_HOST", "PAY_BASE_URL", "PUBLIC_BASE_URL"]) {
     const raw = values[key];
     if (!raw) {
@@ -5502,8 +5516,10 @@ function issueInvoiceRecord({
         ts
       );
     }
-    const signedRef = createSignedPayRef(id, expiresAt);
-    const paymentUrl = `${APP_HOST}/pay?ref=${encodeURIComponent(signedRef)}`;
+    const signedRef = LOCAL_STORE_TERMINAL_TOPOLOGY ? null : createSignedPayRef(id, expiresAt);
+    const paymentUrl = signedRef
+      ? `${APP_HOST}/pay?ref=${encodeURIComponent(signedRef)}`
+      : "";
     db.prepare(
       `INSERT INTO invoices
       (id, invoice_no, checkout_session_id, merchant_id, store_id, terminal_id, staff_user_id, operator_id, event_id, booth_id, amount_jpy, amount_jpyc, amount_jpyc_base,
@@ -6738,8 +6754,12 @@ function evaluateInvoicePolicyGate(invoice) {
 }
 
 function evaluateLocalPolicySiteBinding(policyGate) {
+  // applicable:false marks the "binding not evaluated" case explicitly. The
+  // ok:true here means "no local site-binding requirement applies to this
+  // topology", NOT "the invoice policy URLs were verified against a Site
+  // origin"; callers must never read it as a positive binding verification.
   if (!LOCAL_STORE_TERMINAL_TOPOLOGY || !PUBLIC_POLICY_LINKS) {
-    return { ok: !LOCAL_STORE_TERMINAL_TOPOLOGY, mismatch_keys: [] };
+    return { ok: true, applicable: false, mismatch_keys: [] };
   }
   const expected = {
     terms: PUBLIC_POLICY_LINKS.terms,
@@ -6749,7 +6769,7 @@ function evaluateLocalPolicySiteBinding(policyGate) {
   const mismatchKeys = Object.entries(expected)
     .filter(([key, value]) => String(policyGate?.values?.[key] || "") !== value)
     .map(([key]) => key);
-  return { ok: mismatchKeys.length === 0, mismatch_keys: mismatchKeys };
+  return { ok: mismatchKeys.length === 0, applicable: true, mismatch_keys: mismatchKeys };
 }
 
 // local_store_terminal only: customers never open a web payment page, so the

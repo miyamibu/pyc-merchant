@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
+import Database from "better-sqlite3";
 import {
   apiRequest,
   authHeaders,
@@ -264,7 +265,7 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
 
   const amountJpy = 1880;
   const created = await createInvoice(started.baseUrl, admin.token, amountJpy, `local-topology-${Date.now()}`);
-  assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.equal(created.status, 201, `${JSON.stringify(created.data)}\n${started.logs.join("")}`);
 
   // No public signed payment URL may leave the terminal boundary.
   assert.ok(!created.data.payment_url, "payment_url must be absent in local_store_terminal");
@@ -397,6 +398,147 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
     const payload = await res.json().catch(() => ({}));
     assert.equal(payload.error?.code, "PUBLIC_CUSTOMER_PAYMENT_DISABLED_BY_TOPOLOGY");
   }
+
+  // The local topology does not create or persist a signed public payment
+  // reference. Traceability remains anchored by the invoice and audit rows.
+  const db = new Database(env.DB_PATH, { readonly: true, fileMustExist: true });
+  try {
+    const storedRow = db
+      .prepare(`SELECT payment_url FROM invoices WHERE id = ?`)
+      .get(invoiceId);
+    assert.equal(
+      storedRow?.payment_url,
+      "",
+      "local topology must not create or persist a signed public payment URL"
+    );
+  } finally {
+    db.close();
+  }
+
+  // Concurrency closure: duplicate consent POSTs can never produce two consent
+  // rows or two audit entries. better-sqlite3 handlers serialize within the
+  // server process and the insert re-checks inside one transaction, so the
+  // loser observes the committed winner as an idempotent replay. A freshly
+  // reissued (unconsented) invoice guarantees neither writer has an existing
+  // row to replay, and a terminal holds exactly one active invoice.
+  const raceReissue = await apiRequest(started.baseUrl, `/api/v1/invoices/${encodeURIComponent(invoiceId)}/reissue`, {
+    method: "POST",
+    headers: authHeaders(admin.token, { "content-type": "application/json", "idempotency-key": `race-reissue-${Date.now()}` }),
+    body: "{}",
+  });
+  assert.equal(raceReissue.status, 201, JSON.stringify(raceReissue.data));
+  const raceInvoiceId = raceReissue.data.invoice_id;
+  const raceConsentBody = JSON.stringify({
+    terms_version: raceReissue.data.customer_policy_consent.versions.terms_version,
+    privacy_version: raceReissue.data.customer_policy_consent.versions.privacy_version,
+    refund_policy_version: raceReissue.data.customer_policy_consent.versions.refund_policy_version,
+  });
+  const raceConsentPath = `/api/v1/invoices/${encodeURIComponent(raceInvoiceId)}/policy-consent`;
+  const [firstWrite, secondWrite] = await Promise.all([
+    apiRequest(started.baseUrl, raceConsentPath, {
+      method: "POST",
+      headers: authHeaders(admin.token, { "content-type": "application/json" }),
+      body: raceConsentBody,
+    }),
+    apiRequest(started.baseUrl, raceConsentPath, {
+      method: "POST",
+      headers: authHeaders(relogin.data.token, { "content-type": "application/json" }),
+      body: raceConsentBody,
+    }),
+  ]);
+  const writeStatuses = [firstWrite.status, secondWrite.status].sort();
+  assert.deepEqual(writeStatuses, [200, 201], JSON.stringify([firstWrite.data, secondWrite.data]));
+  const winnerWrite = firstWrite.status === 201 ? firstWrite : secondWrite;
+  const loserWrite = firstWrite.status === 201 ? secondWrite : firstWrite;
+  assert.equal(loserWrite.data.idempotent_replay, true);
+  assert.equal(loserWrite.data.consent_id, winnerWrite.data.consent_id);
+  const consentDb = new Database(env.DB_PATH, { readonly: true, fileMustExist: true });
+  try {
+    assert.equal(
+      consentDb.prepare(`SELECT COUNT(*) AS count FROM invoice_consents WHERE invoice_id = ?`).get(raceInvoiceId).count,
+      1,
+    );
+    assert.equal(
+      consentDb
+        .prepare(`SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'customer_policy_consent_staff' AND target_id = ?`)
+        .get(raceInvoiceId).count,
+      1,
+    );
+  } finally {
+    consentDb.close();
+  }
+
+  // Policy revision closure: republishing the store policies must never
+  // retroactively alter an already-consented invoice. The consented invoice
+  // keeps its frozen policy snapshot, its recorded consent, and its exact
+  // transfer URI; only newly issued invoices bind to the revised versions.
+  const revisedContents = {
+    terms: "Local terminal terms\nVersion: 2026-09-01\n",
+    privacy: "Local terminal privacy\nVersion: 2026-09-01\n",
+    refund: "Local terminal refund policy\nVersion: 2026-09-01\n",
+  };
+  const revisedVersions = {
+    terms_version: "2026-09-01",
+    privacy_version: "2026-09-01",
+    refund_policy_version: "2026-09-01",
+  };
+  const republish = await apiRequest(
+    started.baseUrl,
+    `/api/v1/admin/stores/${encodeURIComponent(admin.storeId)}/customer-policies`,
+    {
+      method: "PATCH",
+      headers: authHeaders(admin.token, {
+        "content-type": "application/json",
+        "idempotency-key": `local-policy-revision-${Date.now()}`,
+      }),
+      body: JSON.stringify({
+        terms_url: `${PUBLIC_POLICY_ORIGIN}/terms`,
+        privacy_url: `${PUBLIC_POLICY_ORIGIN}/privacy`,
+        refund_policy_url: `${PUBLIC_POLICY_ORIGIN}/refund-policy`,
+        ...revisedVersions,
+        terms_hash: hashPolicyContent(revisedContents.terms),
+        privacy_hash: hashPolicyContent(revisedContents.privacy),
+        refund_policy_hash: hashPolicyContent(revisedContents.refund),
+        contents: revisedContents,
+      }),
+    }
+  );
+  assert.equal(republish.status, 200, JSON.stringify(republish.data));
+
+  const afterRepublish = await getInvoice(started.baseUrl, admin.token, raceInvoiceId);
+  assert.equal(afterRepublish.status, 200, JSON.stringify(afterRepublish.data));
+  assert.equal(afterRepublish.data.customer_policy_consent?.recorded, true);
+  assert.equal(afterRepublish.data.customer_policy_consent?.versions?.terms_version, "2026-08-26");
+  const raceExpectedUri = `ethereum:${OFFICIAL_JPYC_TOKEN.toLowerCase()}@137/transfer?address=${String(raceReissue.data.receive_address).toLowerCase()}&uint256=${expectedAtomic}`;
+  assert.equal(afterRepublish.data.payment_uri, raceExpectedUri);
+
+  const oldVersionReplay = await apiRequest(started.baseUrl, raceConsentPath, {
+    method: "POST",
+    headers: authHeaders(admin.token, { "content-type": "application/json" }),
+    body: raceConsentBody,
+  });
+  assert.equal(oldVersionReplay.status, 200);
+  assert.equal(oldVersionReplay.data.idempotent_replay, true);
+
+  const revisedInvoice = await apiRequest(started.baseUrl, `/api/v1/invoices/${encodeURIComponent(raceInvoiceId)}/reissue`, {
+    method: "POST",
+    headers: authHeaders(admin.token, { "content-type": "application/json", "idempotency-key": `revised-reissue-${Date.now()}` }),
+    body: "{}",
+  });
+  assert.equal(revisedInvoice.status, 201, JSON.stringify(revisedInvoice.data));
+  assert.equal(revisedInvoice.data.customer_policy_consent?.versions?.terms_version, "2026-09-01");
+  assert.ok(!revisedInvoice.data.qr_payload, "the revised invoice still withholds its URI before its own consent");
+  const staleConsentAttempt = await apiRequest(
+    started.baseUrl,
+    `/api/v1/invoices/${encodeURIComponent(revisedInvoice.data.invoice_id)}/policy-consent`,
+    {
+      method: "POST",
+      headers: authHeaders(admin.token, { "content-type": "application/json" }),
+      body: raceConsentBody,
+    }
+  );
+  assert.equal(staleConsentAttempt.status, 409);
+  assert.equal(staleConsentAttempt.data.error?.code, "POLICY_VERSION_MISMATCH");
 });
 
 test("local_store_terminal requires a fresh policy consent after a reissued invoice", async (t) => {

@@ -45,6 +45,42 @@ if (!tables || Number(tables.count || 0) < 5) {
   console.error("sqlite restore drill failed: expected tables missing");
   process.exit(1);
 }
+
+// Business-record integrity (in addition to the audit chain verified below):
+// a restorable backup must still contain the core business tables and must
+// not violate any foreign key constraint, so accounting traceability from
+// invoices to payment/review/refund/audit evidence survives a restore.
+const CORE_BUSINESS_TABLES = [
+  "stores",
+  "terminals",
+  "invoices",
+  "payment_events",
+  "review_cases",
+  "refund_requests",
+  "audit_logs",
+];
+const drillDb = new Database(restorePath, { readonly: true });
+try {
+  const existingTables = new Set(
+    drillDb
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+      .all()
+      .map((row) => String(row.name))
+  );
+  for (const table of CORE_BUSINESS_TABLES) {
+    if (!existingTables.has(table)) {
+      console.error(`sqlite restore drill failed: core business table missing: ${table}`);
+      process.exit(1);
+    }
+  }
+  const fkViolations = drillDb.pragma("foreign_key_check");
+  if (!Array.isArray(fkViolations) || fkViolations.length > 0) {
+    console.error(`sqlite restore drill failed: foreign_key_check reported ${fkViolations ? fkViolations.length : "unknown"} violations`);
+    process.exit(1);
+  }
+} finally {
+  drillDb.close();
+}
 NODE
 
 DB_PATH="$RESTORE_PATH" node scripts/verify-audit-chain.mjs

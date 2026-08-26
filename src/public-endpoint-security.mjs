@@ -69,15 +69,20 @@ export function isPublicIp(value) {
     [0x00000000000000000000ffff00000000n, 96], // IPv4-mapped
     [0x0064ff9b000000000000000000000000n, 96], // NAT64 well-known prefix
     [0x0064ff9b000100000000000000000000n, 48], // NAT64 local-use prefix
-    [0x20020000000000000000000000000000n, 16], // 6to4
-    [0x20010000000000000000000000000000n, 32], // Teredo
-    [0x00000000000000000000000000000000n, 96], // IPv4-compatible / ::/96
     [0x01000000000000000000000000000000n, 8], // discard-only / special use
-    [0x20010001000000000000000000000000n, 32], // IETF protocol assignments
-    [0x20010002000000000000000000000000n, 48], // benchmarking
+    [0x00000000000000000000000000000000n, 96], // IPv4-compatible / ::/96
+    // RFC 2928 "IETF protocol assignments": the whole 2001::/23 block is
+    // special-purpose (Teredo 2001::/32, benchmarking 2001:2::/48, AMT
+    // 2001:3::/32, AS112-v6 2001:4::/32, IETF assignments 2001:10::/28,
+    // ORCHIDv2 2001:20::/28, ...). Pinning individual sub-blocks here left
+    // 2001:10::/28 (and AMT/AS112-v6) misclassified as public, so the whole
+    // /23 is rejected instead. 2001:db8::/32 (documentation) sits outside the
+    // /23 and stays listed separately.
+    [0x20010000000000000000000000000000n, 23],
+    [0x20020000000000000000000000000000n, 16], // 6to4
+    [0x5f000000000000000000000000000000n, 16], // SRv6 (RFC 9602)
     [0xfc000000000000000000000000000000n, 7], // unique local
     [0xfe800000000000000000000000000000n, 10], // link-local
-    [0x20010020000000000000000000000000n, 28], // ORCHIDv2 / special-use block
     [0x20010db8000000000000000000000000n, 32], // documentation
     [0xff000000000000000000000000000000n, 8], // multicast
   ].some(([bits, prefix]) => ipv6InRange(parsed, prefix, BigInt(bits)));

@@ -63,6 +63,10 @@ test("server exposes the local-only staff consent endpoint and withholds wallet 
   assert.match(server, /PUBLIC_POLICY_ORIGIN_EFFECTIVE/);
   assert.match(server, /public_policy_origin: PUBLIC_POLICY_ORIGIN \|\| null,/);
   assert.match(server, /refund_policy: `\$\{PUBLIC_POLICY_ORIGIN\}\/refund-policy`/);
+  // The site-binding check must mark the non-local topology as "not
+  // applicable" instead of returning a bare ok:true that could be misread as
+  // a positive binding verification.
+  assert.match(server, /applicable: false/);
 });
 
 test("launchd plists launch through the safe runner with a pinned Node 24.17.0 path and explicit .env.production", () => {

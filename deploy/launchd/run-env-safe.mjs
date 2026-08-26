@@ -29,6 +29,9 @@
 //                                               freshness check)
 // - The pinned Node version is enforced; the runner refuses any other
 //   runtime so launchd cannot silently upgrade the interpreter.
+// - Catchable termination signals are forwarded to the child. SIGKILL cannot
+//   be caught or forwarded by any process; launchd may use it only after the
+//   configured graceful shutdown window expires.
 //
 // This file intentionally prints neither env keys' values nor file contents.
 

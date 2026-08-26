@@ -74,6 +74,31 @@ test("all production-like selectors reject missing, non-HTTPS, or mismatched pub
   }
 });
 
+test("production-like public_cloud fails fast on a configured-but-invalid PUBLIC_POLICY_ORIGIN", async (t) => {
+  // PUBLIC_POLICY_ORIGIN is optional in public_cloud, but a value that is set
+  // must still be an origin-only public HTTPS URL. Silent ignore would hide an
+  // operator configuration error.
+  const invalidValues = [
+    "http://policy.miyamibu.xyz",
+    // A bare trailing slash is a VALID origin-only value (it is normalized by
+    // resolvePublicPolicyOrigin, see tests/deployment-topology.test.mjs), so
+    // only real format violations are expected to fail startup here.
+    "https://policy.miyamibu.xyz/terms",
+    "https://127.0.0.1",
+    "https://user:pass@policy.miyamibu.xyz",
+    "not-a-url",
+  ];
+  for (const value of invalidValues) {
+    await t.test(String(value), async () => {
+      const env = productionLikeEnv({ PUBLIC_POLICY_ORIGIN: value });
+      const started = spawnForExit(env);
+      const exit = await waitForExit(started.proc);
+      assert.notEqual(exit.code, 0);
+      assert.match(started.logs.join(""), /PUBLIC_POLICY_ORIGIN, when configured for public_cloud/);
+    });
+  }
+});
+
 test("pilot and commercial stages require explicit bootstrap and never create demo identities", async (t) => {
   for (const stage of ["pilot", "commercial"]) {
     await t.test(stage, async () => {

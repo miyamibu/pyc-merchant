@@ -115,6 +115,19 @@ function createFixtureDb(dbPath) {
       invoice_id TEXT NOT NULL,
       status TEXT NOT NULL
     );
+    CREATE TABLE stores (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL
+    );
+    CREATE TABLE terminals (
+      id TEXT PRIMARY KEY,
+      store_id TEXT NOT NULL
+    );
+    CREATE TABLE refund_requests (
+      id TEXT PRIMARY KEY,
+      invoice_id TEXT NOT NULL,
+      status TEXT NOT NULL
+    );
   `);
 
   const createdAt = new Date("2026-08-26T00:00:00.000Z").toISOString();
@@ -197,6 +210,12 @@ function createFixtureDb(dbPath) {
     .run("pe-drill-fixture-0001", "inv-drill-fixture-0001", 2);
   db.prepare(`INSERT INTO review_cases (id, invoice_id, status) VALUES (?, ?, ?)`)
     .run("rc-drill-fixture-0001", "inv-drill-fixture-0001", "closed");
+  db.prepare(`INSERT INTO stores (id, name) VALUES (?, ?)`)
+    .run("store-drill-fixture-0001", "Drill Fixture Store");
+  db.prepare(`INSERT INTO terminals (id, store_id) VALUES (?, ?)`)
+    .run("terminal-drill-fixture-0001", "store-drill-fixture-0001");
+  db.prepare(`INSERT INTO refund_requests (id, invoice_id, status) VALUES (?, ?, ?)`)
+    .run("rr-drill-fixture-0001", "inv-drill-fixture-0001", "requested");
   db.close();
 }
 
@@ -246,6 +265,9 @@ test("backup then restore drill passes on an isolated mkdtemp SQLite fixture and
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM invoices`).get().count, 1);
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM payment_events`).get().count, 1);
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM review_cases`).get().count, 1);
+    assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM stores`).get().count, 1);
+    assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM terminals`).get().count, 1);
+    assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM refund_requests`).get().count, 1);
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM audit_logs`).get().count, 2);
     const sentinelInvoice = restored.prepare(`SELECT id, status, amount_base_units FROM invoices WHERE id = ?`)
       .get("inv-drill-fixture-0001");
@@ -279,6 +301,34 @@ test("backup then restore drill passes on an isolated mkdtemp SQLite fixture and
     const tamperVerify = runVerifyAuditChain({ DB_PATH: tamperedPath });
     assert.notEqual(tamperVerify.code, 0);
     assert.match(tamperVerify.stderr, /AUDIT_HASH_CHAIN_INVALID/);
+
+    // 6) Fail-closed evidence: a backup missing a core business table must
+    // fail the restore drill even when the audit chain itself is intact.
+    // (The fixture DB is an isolated mkdtemp test artifact created by this
+    // test; the table is renamed rather than dropped so fixture data is
+    // preserved while the drill still sees the expected table as missing.)
+    const missingTableDir = path.join(tempRoot, "missing-business-table");
+    fs.mkdirSync(missingTableDir, { recursive: true });
+    const missingTablePath = path.join(missingTableDir, "missing-review-cases.sqlite3");
+    fs.copyFileSync(backupFile, missingTablePath);
+    fs.chmodSync(missingTablePath, 0o600);
+    const renameDb = new Database(missingTablePath);
+    renameDb.exec(`ALTER TABLE review_cases RENAME TO review_cases_drill_hidden`);
+    renameDb.close();
+    let drillFailed = false;
+    let drillStderrText = "";
+    try {
+      execFileSync(
+        "/bin/bash",
+        [path.join(REPO_ROOT, "scripts", "deploy", "restore-drill.sh"), missingTablePath],
+        { cwd: REPO_ROOT, env: childEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+      );
+    } catch (error) {
+      drillFailed = true;
+      drillStderrText = String(error.stderr || "");
+    }
+    assert.equal(drillFailed, true, "restore drill must fail when a core business table is missing");
+    assert.match(drillStderrText, /core business table missing: review_cases/);
   } finally {
     // Remove only the mkdtemp directory this test created.
     fs.rmSync(tempRoot, { recursive: true, force: true });
