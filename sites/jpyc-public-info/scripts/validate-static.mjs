@@ -19,8 +19,17 @@ const sourceFiles = [
   'app/site-shell.tsx',
   'app/content.ts',
   'app/[slug]/page.tsx',
+  'app/policy-document.mjs',
+  'app/policy-response.mjs',
+  'app/terms/route.ts',
+  'app/privacy/route.ts',
+  'app/refund-policy/route.ts',
 ];
 const source = sourceFiles.map((path) => read(path)).join('\n');
+assert.match(read('app/policy-response.mjs'), /renderPolicyDocument\(content\)/);
+for (const slug of ['terms', 'privacy', 'refund-policy']) {
+  assert.match(read(`app/${slug}/route.ts`), new RegExp(`policyResponse\\('${slug}'\\)`));
+}
 
 for (const forbidden of [
   /APP_SECRET/i,

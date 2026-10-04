@@ -2972,7 +2972,8 @@ function renderCustomerFacingDisplay(invoice) {
       const consent = invoice?.customer_policy_consent;
       const consentRecorded = consent?.recorded === true;
       const walletUri = String(invoice?.payment_uri || "").trim();
-      const invoiceActive = Boolean(invoice && walletUri) && consentRecorded;
+      const invoiceActive = Boolean(invoice && walletUri) && consentRecorded
+        && invoice.status === "issued" && Date.parse(invoice.expires_at || "") > Date.now();
       if (invoiceActive) {
         drawQr(walletUri);
         if (typeof requestScreenWakeLock === "function") void requestScreenWakeLock();
@@ -3107,14 +3108,19 @@ function renderInvoiceConsent() {
   if (state.deploymentTopology !== "local_store_terminal"
     || !invoiceConsentRequired(invoice)
     || invoice?.customer_policy_consent?.recorded === true
-    || canonicalInvoiceStatus(invoice?.status) === "cancelled") {
+    || invoice?.status !== "issued") {
     el.invoiceConsentPanel.classList.add("hidden");
     if (el.invoiceConsentCheckbox) el.invoiceConsentCheckbox.checked = false;
     syncConsentControls();
     return;
   }
   const consent = invoice.customer_policy_consent;
-  if (!consent.ready) {
+  if (consent.requires_reissue) {
+    el.invoiceConsentBadge.textContent = "請求の再発行が必要";
+    el.invoiceConsentBadge.className = "status-pill s-red";
+    el.invoiceConsentBody.textContent = "この請求の以前の同意記録では、公開本文を確認できません。請求を再発行し、公開内容を確認してから同意を記録してください。送金QRは表示されません。";
+    if (el.invoiceConsentStatus) el.invoiceConsentStatus.textContent = "";
+  } else if (!consent.ready) {
     el.invoiceConsentBadge.textContent = "規約設定未公開";
     el.invoiceConsentBadge.className = "status-pill s-red";
     el.invoiceConsentBody.textContent = "公開済みの規約スナップショットがこの請求に紐づいていません。管理者へ連絡し、新しい請求を作り直してください。送金QRは表示されません。";
@@ -3137,9 +3143,11 @@ function syncConsentControls() {
   if (!el.recordConsentBtn) return;
   const checked = Boolean(el.invoiceConsentCheckbox?.checked);
   const ready = state.currentInvoice?.customer_policy_consent?.ready === true;
+  const requiresReissue = state.currentInvoice?.customer_policy_consent?.requires_reissue === true;
   el.recordConsentBtn.disabled =
     !checked
     || !ready
+    || requiresReissue
     || state.consentRecordingInFlight
     || !state.invoiceId;
 }
@@ -5797,6 +5805,8 @@ function bindEvents() {
       refreshFulfillmentObservationAfterResume();
       const localPaymentQrDisplayed = state.deploymentTopology === "local_store_terminal"
         && state.currentInvoice?.customer_policy_consent?.recorded === true
+        && state.currentInvoice?.status === "issued"
+        && Date.parse(state.currentInvoice?.expires_at || "") > Date.now()
         && Boolean(String(state.currentInvoice?.payment_uri || "").trim());
       const qrDisplayed = state.fixedQrUrl || localPaymentQrDisplayed;
       if (qrDisplayed && !el.qrCanvas.classList.contains("hidden") && typeof requestScreenWakeLock === "function") {

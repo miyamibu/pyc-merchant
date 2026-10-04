@@ -24,7 +24,7 @@ export default function Home() {
           <Link href="/payment-guide">支払い方法</Link>
           <Link href="/security">安全対策</Link>
           <Link href="/faq">FAQ</Link>
-          <Link href="/terms">規約</Link>
+          <a href="/terms">規約</a>
         </nav>
       </header>
 
@@ -76,9 +76,9 @@ export default function Home() {
             <h2 id="policy-title">支払い前に確認する文書</h2>
           </div>
           <div className="link-grid">
-            <Link href="/terms"><strong>利用規約</strong><span>サービスの利用条件と責任範囲</span></Link>
-            <Link href="/privacy"><strong>プライバシー</strong><span>記録される情報と取扱方針</span></Link>
-            <Link href="/refund-policy"><strong>返金ポリシー</strong><span>返金の確認・審査・承認手順</span></Link>
+            <a href="/terms"><strong>利用規約</strong><span>サービスの利用条件と責任範囲</span></a>
+            <a href="/privacy"><strong>プライバシー</strong><span>記録される情報と取扱方針</span></a>
+            <a href="/refund-policy"><strong>返金ポリシー</strong><span>返金の確認・審査・承認手順</span></a>
             <Link href="/contact"><strong>問い合わせ</strong><span>安全な問い合わせ方法</span></Link>
           </div>
         </section>
@@ -87,8 +87,8 @@ export default function Home() {
       <footer>
         <div><strong>JPYC 店頭決済案内</strong><p>店舗端末のQRからのみ支払うための公開情報Site</p></div>
         <nav aria-label="フッターナビゲーション">
-          <Link href="/privacy">プライバシー</Link>
-          <Link href="/refund-policy">返金</Link>
+          <a href="/privacy">プライバシー</a>
+          <a href="/refund-policy">返金</a>
           <Link href="/version">バージョン</Link>
           <Link href="/contact">問い合わせ</Link>
         </nav>

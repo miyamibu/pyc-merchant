@@ -64,9 +64,11 @@ import {
   isPublishedPolicyUrl,
   isPublishedPolicyVersion,
   POLICY_CONTENT_HASH_CANONICALIZATION,
+  POLICY_DOCUMENT_CONTRACT,
   unavailablePolicyPublication,
   validatePolicyVersionSubmission,
   verifyPolicyContentHashes,
+  verifyPublishedPolicyPages,
 } from "./policy-publication.mjs";
 import {
   JPYC_CONTRACT_REFERENCE,
@@ -1270,6 +1272,8 @@ CREATE TABLE IF NOT EXISTS invoice_consents (
   privacy_hash TEXT NOT NULL,
   refund_policy_hash TEXT NOT NULL,
   policy_urls_json TEXT NOT NULL,
+  site_content_verified_at TEXT,
+  site_content_contract TEXT,
   recorded_at TEXT NOT NULL
 );
 
@@ -2292,6 +2296,8 @@ addColumnIfMissing("stores", "refund_treasury_address", "refund_treasury_address
 addColumnIfMissing("stores", "refund_treasury_chain_id", "refund_treasury_chain_id TEXT");
 addColumnIfMissing("stores", "refund_treasury_approval_ref", "refund_treasury_approval_ref TEXT");
 addColumnIfMissing("invoices", "policy_snapshot_json", "policy_snapshot_json TEXT");
+addColumnIfMissing("invoice_consents", "site_content_verified_at", "site_content_verified_at TEXT");
+addColumnIfMissing("invoice_consents", "site_content_contract", "site_content_contract TEXT");
 addColumnIfMissing("invoices", "monitor_until", "monitor_until TEXT");
 addColumnIfMissing("invoices", "last_reconciled_block", "last_reconciled_block INTEGER");
 addColumnIfMissing("invoices", "integrity_hold", "integrity_hold INTEGER NOT NULL DEFAULT 0");
@@ -4026,7 +4032,7 @@ function listInvoiceReissueHistory(invoice) {
       invoice_no: row.invoice_no,
       status: row.status,
       status_reason: row.status_reason,
-      receive_address: row.recipient_address,
+      receive_address: LOCAL_STORE_TERMINAL_TOPOLOGY ? null : row.recipient_address,
       pay_url: LOCAL_STORE_TERMINAL_TOPOLOGY ? null : row.payment_url,
       expires_at: row.expires_at,
       created_at: row.created_at,
@@ -4061,7 +4067,7 @@ function buildInvoiceWalletPayload(invoice, store = null) {
 }
 
 function buildInvoiceDiagnostics(invoice, store = null, reviewCase = null) {
-  const walletPayload = buildInvoiceWalletPayload(invoice, store);
+  const walletPayload = gateWalletPayloadForConsent(buildInvoiceWalletPayload(invoice, store), invoice);
   return {
     enabled: true,
     generated_at: nowIso(),
@@ -4088,7 +4094,7 @@ function buildInvoiceDiagnostics(invoice, store = null, reviewCase = null) {
     token_decimals: walletPayload.token_decimals,
     receive_address: walletPayload.receive_address,
     expected_amount_atomic: walletPayload.expected_amount_atomic,
-    payment_url: invoice.payment_url,
+    payment_url: LOCAL_STORE_TERMINAL_TOPOLOGY ? null : invoice.payment_url,
     pay_url: walletPayload.pay_url,
     expires_at: invoice.expires_at,
     ttl_remaining_sec: computeTtlRemainingSec(invoice.expires_at),
@@ -6779,13 +6785,15 @@ function evaluateLocalPolicySiteBinding(policyGate) {
 function buildLocalConsentSummary(invoice) {
   if (!LOCAL_STORE_TERMINAL_TOPOLOGY) return null;
   const consent = getInvoicePolicyConsent(invoice.id);
+  const verifiedConsent = Boolean(consent?.site_content_verified_at && consent.site_content_contract === POLICY_DOCUMENT_CONTRACT);
   const gate = evaluateInvoicePolicyGate(invoice);
   const siteBinding = evaluateLocalPolicySiteBinding(gate);
   return {
     required: true,
     ready: gate.ok === true && siteBinding.ok,
-    recorded: Boolean(consent),
-    recorded_at: consent?.recorded_at || null,
+    recorded: verifiedConsent,
+    recorded_at: verifiedConsent ? consent.recorded_at : null,
+    requires_reissue: Boolean(consent && !verifiedConsent),
     ...(gate.ok && siteBinding.ok
       ? {
           versions: gate.versions,
@@ -6803,19 +6811,36 @@ function buildLocalConsentSummary(invoice) {
 
 function isLocalInvoiceConsented(invoice) {
   if (!LOCAL_STORE_TERMINAL_TOPOLOGY) return true;
-  return Boolean(getInvoicePolicyConsent(invoice.id));
+  const consent = getInvoicePolicyConsent(invoice.id);
+  return Boolean(consent?.site_content_verified_at && consent.site_content_contract === POLICY_DOCUMENT_CONTRACT);
 }
 
-// Fail-closed wallet payload: until the per-invoice consent row exists, no
-// transfer URI / deeplink leaves the server, so nothing scannable can be
-// rendered even by a modified client.
+// Only active, consented invoices may expose payment instructions. The blocked
+// shape is an allowlist, so new wallet payload fields cannot bypass this gate.
 function gateWalletPayloadForConsent(walletPayload, invoice) {
-  if (isLocalInvoiceConsented(invoice)) return walletPayload;
+  if (!LOCAL_STORE_TERMINAL_TOPOLOGY) return walletPayload;
+  const expiresAt = Date.parse(String(invoice?.expires_at || ""));
+  if (String(invoice?.status || "") === "issued"
+    && Number.isFinite(expiresAt) && expiresAt > Date.now()
+    && isLocalInvoiceConsented(invoice)) return walletPayload;
   return {
-    ...walletPayload,
     payment_uri: null,
     wallet_url: null,
     wallet_deeplink: null,
+    copy_fallback: null,
+    chain_id: null,
+    token_contract: null,
+    receive_address: null,
+    expected_amount_atomic: null,
+    token_amount_atomic: null,
+    network: null,
+    token_symbol: null,
+    token_decimals: null,
+    pay_url: null,
+    wallet_adapter: { available: false, status: "payment_information_withheld" },
+    supported_wallets: [],
+    amount_jpy: walletPayload.amount_jpy,
+    expires_at: walletPayload.expires_at,
   };
 }
 
@@ -17190,7 +17215,7 @@ app.post("/api/v1/invoices", (req, res) => {
         fixed_qr_url: publicEntry.fixed_qr_url,
         fixed_qr_payload: publicEntry.fixed_qr_url,
         terminal_public_entry_token: publicEntry.public_entry_token,
-        receive_address: created.recipient_address,
+        receive_address: walletPayload.receive_address,
         checkout_session_id: created.checkout_session_id,
         amount_scale_version: created.amount_scale_version || AMOUNT_SCALE_VERSION,
         token_decimals: created.token_decimals ?? TOKEN_DECIMALS,
@@ -17278,7 +17303,7 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
       amount_scale_version: invoice.amount_scale_version || AMOUNT_SCALE_VERSION,
       token_decimals: invoice.token_decimals ?? TOKEN_DECIMALS,
       ledger_decimals: invoice.ledger_decimals ?? LEDGER_DECIMALS,
-      token_amount_atomic: invoice.token_amount_atomic || null,
+      token_amount_atomic: LOCAL_STORE_TERMINAL_TOPOLOGY && !walletPayload.payment_uri ? null : invoice.token_amount_atomic || null,
       ledger_amount_base: invoice.ledger_amount_base || invoice.amount_jpyc_base,
       display_amount: invoice.display_amount || formatJpyc(invoice.amount_jpyc_base),
       paid_token_amount_atomic: invoice.paid_amount_jpyc_base == null
@@ -17288,9 +17313,9 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
       paid_amount_jpyc_display: formatJpyc(invoice.paid_amount_jpyc_base)
     },
     chain: {
-      chain_id: invoice.chain_id,
-      token_contract: invoice.token_contract,
-      recipient_address: invoice.recipient_address
+      chain_id: LOCAL_STORE_TERMINAL_TOPOLOGY ? walletPayload.chain_id : invoice.chain_id,
+      token_contract: LOCAL_STORE_TERMINAL_TOPOLOGY ? walletPayload.token_contract : invoice.token_contract,
+      recipient_address: LOCAL_STORE_TERMINAL_TOPOLOGY ? walletPayload.receive_address : invoice.recipient_address
     },
     expires_at: invoice.expires_at,
     ...(LOCAL_STORE_TERMINAL_TOPOLOGY
@@ -17325,7 +17350,7 @@ app.get("/api/v1/invoices/:invoiceId", (req, res) => {
 // request body carries versions only; no customer PII is accepted or stored.
 // Consent is per invoice, so a reissued invoice always starts unconsented and
 // the transfer QR stays withheld until this endpoint succeeds.
-app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoice.create"), (req, res) => {
+app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoice.create"), async (req, res) => {
   if (!LOCAL_STORE_TERMINAL_TOPOLOGY) {
     return jsonError(res, 404, "CONSENT_ENDPOINT_DISABLED_BY_TOPOLOGY", "staff-recorded policy consent is only available in local_store_terminal");
   }
@@ -17362,6 +17387,9 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
   }
   const existing = getInvoicePolicyConsent(invoice.id);
   if (existing) {
+    if (!existing.site_content_verified_at || existing.site_content_contract !== POLICY_DOCUMENT_CONTRACT) {
+      return jsonError(res, 409, "POLICY_CONSENT_REISSUE_REQUIRED", "An earlier consent cannot verify the published policy; reissue the invoice");
+    }
     const replayMatches =
       existing.terms_version === policyGate.versions.terms_version
       && existing.privacy_version === policyGate.versions.privacy_version
@@ -17378,6 +17406,14 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
     });
   }
 
+  const publishedPages = await verifyPublishedPolicyPages(policyGate.values, policyGate.hashes);
+  if (!publishedPages.ok) {
+    return jsonError(res, 503, "POLICY_SITE_CONTENT_UNVERIFIED", "Published policy pages do not match the invoice policy hashes", {
+      mismatch_keys: publishedPages.mismatch_keys,
+      unavailable_keys: publishedPages.unavailable_keys,
+    });
+  }
+
   const consentId = uuid();
   const recordedAt = nowIso();
   let inserted = false;
@@ -17385,6 +17421,11 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
     db.transaction(() => {
       // Re-check inside the transaction so a concurrent duplicate insert
       // cannot produce two rows or a missing audit entry.
+      const current = db.prepare(`SELECT status, expires_at FROM invoices WHERE id = ?`).get(invoice.id);
+      const currentExpiry = Date.parse(String(current?.expires_at || ""));
+      if (String(current?.status || "") !== "issued" || !Number.isFinite(currentExpiry) || currentExpiry <= Date.now()) {
+        throw new Error("invoice is no longer payable");
+      }
       const raced = db.prepare(`SELECT id FROM invoice_consents WHERE invoice_id = ?`).get(invoice.id);
       if (raced) return;
       db.prepare(
@@ -17392,8 +17433,8 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
          (id, invoice_id, store_id, session_id, staff_user_id,
           terms_version, privacy_version, refund_policy_version,
           terms_hash, privacy_hash, refund_policy_hash,
-          policy_urls_json, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          policy_urls_json, site_content_verified_at, site_content_contract, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         consentId,
         invoice.id,
@@ -17407,6 +17448,8 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
         String(policyGate.hashes.privacy_hash).toLowerCase(),
         String(policyGate.hashes.refund_policy_hash).toLowerCase(),
         JSON.stringify(policyGate.values),
+        recordedAt,
+        POLICY_DOCUMENT_CONTRACT,
         recordedAt
       );
       inserted = true;
@@ -17428,6 +17471,8 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
           refund_policy_version: policyGate.versions.refund_policy_version,
           policy_hashes: policyGate.hashes,
           policy_urls: policyGate.values,
+          site_content_verified_at: recordedAt,
+          site_content_contract: POLICY_DOCUMENT_CONTRACT,
           recorded_via_session: req.session.session_id,
           channel: "local_store_terminal_staff_session",
           consented_at: recordedAt,
@@ -17436,6 +17481,9 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
       });
     })();
   } catch (error) {
+    if (error?.message === "invoice is no longer payable") {
+      return jsonError(res, 409, "POLICY_CONSENT_NOT_ALLOWED", "Policy consent can only be recorded for an active issued invoice");
+    }
     console.error(JSON.stringify({
       ts: nowIso(),
       level: "error",
@@ -17448,6 +17496,9 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
   const persisted = getInvoicePolicyConsent(invoice.id);
   if (!persisted) {
     return jsonError(res, 500, "CONSENT_RECORD_FAILED", "Policy consent could not be confirmed after recording");
+  }
+  if (!persisted.site_content_verified_at || persisted.site_content_contract !== POLICY_DOCUMENT_CONTRACT) {
+    return jsonError(res, 409, "POLICY_CONSENT_REISSUE_REQUIRED", "An earlier consent cannot verify the published policy; reissue the invoice");
   }
   sendEvent(req.session.terminal_id, "invoice.updated", { invoiceId: invoice.id, status: invoice.status });
   return res.status(inserted ? 201 : 200).json({
@@ -17831,7 +17882,7 @@ app.post("/api/v1/invoices/:invoiceId/reissue", requirePermission("invoice.creat
           : { payment_url: issued.invoice.payment_url }),
         fixed_qr_url: publicEntry.fixed_qr_url,
         terminal_public_entry_token: publicEntry.public_entry_token,
-        receive_address: issued.invoice.recipient_address,
+        receive_address: reissuedWalletPayload.receive_address,
         sse: {
           token: sseToken,
           invoice_id: issued.invoice.id,

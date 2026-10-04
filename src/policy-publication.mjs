@@ -1,4 +1,10 @@
 import crypto from "node:crypto";
+import { fetchPinnedPublicHttps, validatePublicHttpsUrl } from "./public-endpoint-security.mjs";
+import {
+  extractPolicyDocumentContent,
+  POLICY_DOCUMENT_HEADERS,
+} from "../sites/jpyc-public-info/app/policy-document.mjs";
+export { POLICY_DOCUMENT_CONTRACT } from "../sites/jpyc-public-info/app/policy-document.mjs";
 
 export const POLICY_URL_KEYS = Object.freeze(["terms", "privacy", "refund"]);
 export const POLICY_VERSION_KEYS = Object.freeze(["terms_version", "privacy_version", "refund_policy_version"]);
@@ -82,6 +88,64 @@ export function verifyPolicyContentHashes(contents, hashes) {
     missing_content_keys: missingContentKeys,
     mismatch_hash_keys: mismatchHashKeys,
   };
+}
+
+// Kept for callers of the previous candidate. Only a complete contract-v2
+// document is accepted; this function no longer parses arbitrary visible HTML.
+export const extractVisiblePolicyContent = extractPolicyDocumentContent;
+
+export async function fetchPublishedPolicyPage(url) {
+  const result = await fetchPinnedPublicHttps(url, {
+    headers: { accept: "text/html", "accept-encoding": "identity", "cache-control": "no-cache" },
+    maxRedirects: 0,
+    timeoutMs: 3500,
+    maxResponseBytes: 256_000,
+  });
+  return new Response(result.bodyBytes, { status: result.status, headers: result.headers });
+}
+
+export async function verifyPublishedPolicyPages(urls, hashes, { fetchImpl = fetchPublishedPolicyPage } = {}) {
+  const mismatchKeys = [];
+  const unavailableKeys = [];
+  for (const key of POLICY_URL_KEYS) {
+    const url = urls?.[key];
+    const expected = String(hashes?.[POLICY_CONTENT_HASH_KEYS[key]] || "").toLowerCase();
+    // The consent caller also requires exact equality with its configured Site
+    // origin and paths. Static hostname syntax alone never authorizes a socket.
+    if (!isPublishedPolicyUrl(url) || !validatePublicHttpsUrl(url).ok || !isPublishedPolicyHash(expected)) {
+      unavailableKeys.push(key);
+      continue;
+    }
+    try {
+      const response = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(3500) });
+      if (response.status !== 200
+        || response.headers.get("content-type") !== POLICY_DOCUMENT_HEADERS["content-type"]
+        || response.headers.get("content-security-policy") !== POLICY_DOCUMENT_HEADERS["content-security-policy"]
+        || response.headers.get("x-content-type-options") !== "nosniff"
+        || response.headers.get("cache-control") !== "no-store"
+        || response.headers.has("refresh") || response.headers.has("location")
+        || response.headers.has("content-disposition") || response.headers.has("content-encoding")) {
+        unavailableKeys.push(key);
+        continue;
+      }
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of response.body) {
+        size += chunk.byteLength;
+        if (size > 256_000) throw new Error("policy page too large");
+        chunks.push(chunk);
+      }
+      const bytes = Buffer.concat(chunks);
+      const html = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+      const content = extractPolicyDocumentContent(html);
+      if (!content) unavailableKeys.push(key);
+      else if (hashPolicyContent(content) !== expected) mismatchKeys.push(key);
+    } catch {
+      unavailableKeys.push(key);
+    }
+  }
+  return { ok: mismatchKeys.length === 0 && unavailableKeys.length === 0,
+    mismatch_keys: mismatchKeys, unavailable_keys: unavailableKeys };
 }
 
 export function extractPolicyObjectValues(content, constantName, requiredKeys) {

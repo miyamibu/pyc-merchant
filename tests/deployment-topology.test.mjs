@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import Database from "better-sqlite3";
 import {
   apiRequest,
@@ -20,11 +23,25 @@ import {
   parseDeploymentTopology,
   resolvePublicPolicyOrigin,
 } from "../src/deployment-topology.mjs";
-import { hashPolicyContent } from "../src/policy-publication.mjs";
+import { hashPolicyContent, POLICY_DOCUMENT_CONTRACT } from "../src/policy-publication.mjs";
+import { renderPolicyDocument } from "../sites/jpyc-public-info/app/policy-document.mjs";
 
 const CWD = process.cwd();
 const PUBLIC_POLICY_ORIGIN = "https://miyamibu.xyz";
 const OFFICIAL_JPYC_TOKEN = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
+const LOCAL_POLICY_CONTENTS = {
+  terms: JSON.stringify({ title: "Local terminal terms", summary: "Version: 2026-08-26", sections: [{ title: "Terms", paragraphs: ["Pay only from the terminal QR."] }] }),
+  privacy: JSON.stringify({ title: "Local terminal privacy", summary: "Version: 2026-08-26", sections: [{ title: "Privacy", paragraphs: ["No wallet secrets are collected."] }] }),
+  refund: JSON.stringify({ title: "Local terminal refund policy", summary: "Version: 2026-08-26", sections: [{ title: "Refund", bullets: ["Refunds require review."] }] }),
+};
+
+function policySiteFixture(contents = LOCAL_POLICY_CONTENTS) {
+  const dir = mkdtempSync(path.join(tmpdir(), "jpyc-policy-site-fixture-"));
+  const file = path.join(dir, "pages.json");
+  const write = (value) => writeFileSync(file, JSON.stringify(value));
+  write(contents);
+  return { file, write, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
 function spawnForExit(env) {
   const logs = [];
@@ -192,8 +209,11 @@ test("local_store_terminal requires the Mac operational readiness reference", as
 });
 
 test("local_store_terminal serves on loopback, disables public payment pages, gates the transfer QR behind staff-recorded policy consent, and emits an exact wallet transfer QR", async (t) => {
+  const siteFixture = policySiteFixture();
   const port = 21000 + ((process.pid * 53 + 7) % 20000);
   const env = productionServerEnv({
+    NODE_OPTIONS: "--import=./tests/helpers/mock-policy-site.mjs",
+    POLICY_SITE_FIXTURE_PATH: siteFixture.file,
     APP_ENV: "development",
     COMMERCIAL_GO_MODE: "false",
     DEPLOYMENT_STAGE: "development",
@@ -216,7 +236,7 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
   });
 
   const started = await startServerProcess(CWD, env);
-  t.after(async () => stopServerProcess(started.proc));
+  t.after(async () => { await stopServerProcess(started.proc); siteFixture.cleanup(); });
   assert.match(started.logs.join(""), /Deployment topology: local_store_terminal/);
 
   const admin = await loginAs(started.baseUrl, {
@@ -230,11 +250,7 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
 
   // Publish the store's Sites policy snapshot before issuance so the invoice
   // carries a ready consent target (urls + versions + sha256 hashes).
-  const policyContents = {
-    terms: "Local terminal terms\nVersion: 2026-08-26\n",
-    privacy: "Local terminal privacy\nVersion: 2026-08-26\n",
-    refund: "Local terminal refund policy\nVersion: 2026-08-26\n",
-  };
+  const policyContents = LOCAL_POLICY_CONTENTS;
   const policyVersions = {
     terms_version: "2026-08-26",
     privacy_version: "2026-08-26",
@@ -345,6 +361,45 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
   );
   assert.equal(unauthenticatedConsent.status, 401);
 
+  // A correct stored body/hash is insufficient when one served page differs.
+  // Keep the old marker while changing the text rendered inside the page.
+  const changedTerms = JSON.parse(policyContents.terms);
+  changedTerms.sections[0].paragraphs[0] = "Different published terms";
+  siteFixture.write({ ...policyContents, terms: JSON.stringify(changedTerms), $markerOverrides: { terms: hashPolicyContent(policyContents.terms) } });
+  const wrongSite = await apiRequest(
+    started.baseUrl,
+    `/api/v1/invoices/${encodeURIComponent(invoiceId)}/policy-consent`,
+    {
+      method: "POST",
+      headers: authHeaders(admin.token, { "content-type": "application/json" }),
+      body: JSON.stringify(policyVersions),
+    }
+  );
+  assert.equal(wrongSite.status, 503, JSON.stringify(wrongSite.data));
+  assert.equal(wrongSite.data.error?.code, "POLICY_SITE_CONTENT_UNVERIFIED");
+  assert.deepEqual(wrongSite.data.error?.details?.unavailable_keys, ["terms"]);
+  const mismatchDb = new Database(env.DB_PATH, { readonly: true, fileMustExist: true });
+  assert.equal(mismatchDb.prepare(`SELECT COUNT(*) AS count FROM invoice_consents WHERE invoice_id = ?`).get(invoiceId).count, 0);
+  mismatchDb.close();
+  // Independent review's counterexamples must never insert a consent row.
+  const baselineDoc = renderPolicyDocument(policyContents.terms);
+  for (const changedDoc of [
+    baselineDoc.replace('</p></header>', '</p><p class="new-policy">A large fee applies.</p></header>'),
+    baselineDoc.replace('</article></main>', '</article><section><h2>New fees</h2><p>A large fee applies.</p></section></main>'),
+    baselineDoc.replace('<main id="main">', '<main id="main" hidden>') + '<main id="main"><p>Different terms</p></main>',
+  ]) {
+    siteFixture.write({ ...policyContents, $htmlOverrides: { terms: changedDoc } });
+    const denied = await apiRequest(started.baseUrl, `/api/v1/invoices/${encodeURIComponent(invoiceId)}/policy-consent`, {
+      method: "POST", headers: authHeaders(admin.token, { "content-type": "application/json" }),
+      body: JSON.stringify(policyVersions),
+    });
+    assert.equal(denied.status, 503, JSON.stringify(denied.data));
+    const evidenceDb = new Database(env.DB_PATH, { readonly: true, fileMustExist: true });
+    assert.equal(evidenceDb.prepare(`SELECT COUNT(*) AS count FROM invoice_consents WHERE invoice_id = ?`).get(invoiceId).count, 0);
+    evidenceDb.close();
+  }
+  siteFixture.write(policyContents);
+
   const recorded = await apiRequest(
     started.baseUrl,
     `/api/v1/invoices/${encodeURIComponent(invoiceId)}/policy-consent`,
@@ -384,6 +439,60 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
   assert.equal(afterConsent.data.amounts?.token_amount_atomic, expectedAtomic);
   assert.equal(afterConsent.data.chain?.chain_id, "137");
   assert.equal(afterConsent.data.chain?.recipient_address, configuredRecipient);
+
+  // Persisted consent must not reactivate any non-issued or elapsed invoice.
+  const lifecycleDb = new Database(env.DB_PATH);
+  const originalExpiry = lifecycleDb.prepare(`SELECT expires_at FROM invoices WHERE id = ?`).get(invoiceId).expires_at;
+  const verifiedAt = lifecycleDb.prepare(`SELECT site_content_verified_at FROM invoice_consents WHERE invoice_id = ?`).get(invoiceId).site_content_verified_at;
+  assert.ok(verifiedAt);
+  assert.equal(lifecycleDb.prepare(`SELECT site_content_contract FROM invoice_consents WHERE invoice_id = ?`).get(invoiceId).site_content_contract, POLICY_DOCUMENT_CONTRACT);
+  try {
+    for (const status of ["payment_detected", "confirming", "paid", "settled", "refunded", "review_required", "expired", "cancelled", "unknown_future_status"]) {
+      lifecycleDb.prepare(`UPDATE invoices SET status = ? WHERE id = ?`).run(status, invoiceId);
+      const closed = await getInvoice(started.baseUrl, admin.token, invoiceId);
+      assert.equal(closed.status, 200);
+      assert.equal(closed.data.payment_uri, null, status);
+      assert.equal(closed.data.wallet_url, null, status);
+      assert.equal(closed.data.wallet_deeplink, null, status);
+      for (const field of ["chain_id", "token_contract", "receive_address", "expected_amount_atomic", "copy_fallback"]) {
+        assert.equal(closed.data[field], null, `${status}:${field}`);
+      }
+      assert.deepEqual(closed.data.chain, { chain_id: null, token_contract: null, recipient_address: null });
+      assert.equal(closed.data.amounts.token_amount_atomic, null);
+      assert.equal(closed.data.diagnostics?.payment_uri || null, null, status);
+    }
+    lifecycleDb.prepare(`UPDATE invoices SET status = 'issued', expires_at = ? WHERE id = ?`).run("2020-01-01T00:00:00.000Z", invoiceId);
+    const elapsed = await getInvoice(started.baseUrl, admin.token, invoiceId);
+    assert.equal(elapsed.data.payment_uri, null);
+    lifecycleDb.prepare(`UPDATE invoices SET expires_at = ? WHERE id = ?`).run("invalid-expiry", invoiceId);
+    const malformedExpiry = await getInvoice(started.baseUrl, admin.token, invoiceId);
+    assert.equal(malformedExpiry.data.payment_uri, null);
+
+    lifecycleDb.prepare(`UPDATE invoices SET expires_at = ? WHERE id = ?`).run(originalExpiry, invoiceId);
+    // Earlier candidate rows with a timestamp but no v2 contract are legacy too.
+    lifecycleDb.prepare(`UPDATE invoice_consents SET site_content_contract = NULL WHERE invoice_id = ?`).run(invoiceId);
+    const previousCandidate = await getInvoice(started.baseUrl, admin.token, invoiceId);
+    assert.equal(previousCandidate.data.payment_uri, null);
+    assert.equal(previousCandidate.data.customer_policy_consent?.requires_reissue, true);
+    lifecycleDb.prepare(`UPDATE invoice_consents SET site_content_contract = ? WHERE invoice_id = ?`).run(POLICY_DOCUMENT_CONTRACT, invoiceId);
+    lifecycleDb.prepare(`UPDATE invoice_consents SET site_content_verified_at = NULL WHERE invoice_id = ?`).run(invoiceId);
+    const legacy = await getInvoice(started.baseUrl, admin.token, invoiceId);
+    assert.equal(legacy.data.payment_uri, null);
+    assert.equal(legacy.data.customer_policy_consent?.recorded, false);
+    assert.equal(legacy.data.customer_policy_consent?.requires_reissue, true);
+    const legacyReplay = await apiRequest(started.baseUrl, `/api/v1/invoices/${encodeURIComponent(invoiceId)}/policy-consent`, {
+      method: "POST",
+      headers: authHeaders(admin.token, { "content-type": "application/json" }),
+      body: JSON.stringify(policyVersions),
+    });
+    assert.equal(legacyReplay.status, 409);
+    assert.equal(legacyReplay.data.error?.code, "POLICY_CONSENT_REISSUE_REQUIRED");
+  } finally {
+    lifecycleDb.prepare(`UPDATE invoices SET status = 'issued', expires_at = ? WHERE id = ?`).run(originalExpiry, invoiceId);
+    lifecycleDb.prepare(`UPDATE invoice_consents SET site_content_verified_at = ? WHERE invoice_id = ?`).run(verifiedAt, invoiceId);
+    lifecycleDb.prepare(`UPDATE invoice_consents SET site_content_contract = ? WHERE invoice_id = ?`).run(POLICY_DOCUMENT_CONTRACT, invoiceId);
+    lifecycleDb.close();
+  }
 
   // Customer web payment entry points stay disabled by topology.
   const blockedPaths = [
@@ -523,7 +632,7 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
   assert.equal(afterRepublish.status, 200, JSON.stringify(afterRepublish.data));
   assert.equal(afterRepublish.data.customer_policy_consent?.recorded, true);
   assert.equal(afterRepublish.data.customer_policy_consent?.versions?.terms_version, "2026-08-26");
-  const raceExpectedUri = `ethereum:${OFFICIAL_JPYC_TOKEN.toLowerCase()}@137/transfer?address=${String(raceReissue.data.receive_address).toLowerCase()}&uint256=${expectedAtomic}`;
+  const raceExpectedUri = `ethereum:${OFFICIAL_JPYC_TOKEN.toLowerCase()}@137/transfer?address=${String(afterRepublish.data.receive_address).toLowerCase()}&uint256=${expectedAtomic}`;
   assert.equal(afterRepublish.data.payment_uri, raceExpectedUri);
 
   const oldVersionReplay = await apiRequest(started.baseUrl, raceConsentPath, {
@@ -556,8 +665,11 @@ test("local_store_terminal serves on loopback, disables public payment pages, ga
 });
 
 test("local_store_terminal requires a fresh policy consent after a reissued invoice", async (t) => {
+  const siteFixture = policySiteFixture();
   const port = 21000 + ((process.pid * 61 + 13) % 20000);
   const env = productionServerEnv({
+    NODE_OPTIONS: "--import=./tests/helpers/mock-policy-site.mjs",
+    POLICY_SITE_FIXTURE_PATH: siteFixture.file,
     APP_ENV: "development",
     COMMERCIAL_GO_MODE: "false",
     DEPLOYMENT_STAGE: "development",
@@ -577,7 +689,7 @@ test("local_store_terminal requires a fresh policy consent after a reissued invo
   });
 
   const started = await startServerProcess(CWD, env);
-  t.after(async () => stopServerProcess(started.proc));
+  t.after(async () => { await stopServerProcess(started.proc); siteFixture.cleanup(); });
 
   const admin = await loginAs(started.baseUrl, {
     terminalCode: env.TERMINAL_CODE,
@@ -600,14 +712,10 @@ test("local_store_terminal requires a fresh policy consent after a reissued invo
         terms_version: "2026-08-26",
         privacy_version: "2026-08-26",
         refund_policy_version: "2026-08-26",
-        terms_hash: hashPolicyContent("Local terminal terms\nVersion: 2026-08-26\n"),
-        privacy_hash: hashPolicyContent("Local terminal privacy\nVersion: 2026-08-26\n"),
-        refund_policy_hash: hashPolicyContent("Local terminal refund policy\nVersion: 2026-08-26\n"),
-        contents: {
-          terms: "Local terminal terms\nVersion: 2026-08-26\n",
-          privacy: "Local terminal privacy\nVersion: 2026-08-26\n",
-          refund: "Local terminal refund policy\nVersion: 2026-08-26\n",
-        },
+        terms_hash: hashPolicyContent(LOCAL_POLICY_CONTENTS.terms),
+        privacy_hash: hashPolicyContent(LOCAL_POLICY_CONTENTS.privacy),
+        refund_policy_hash: hashPolicyContent(LOCAL_POLICY_CONTENTS.refund),
+        contents: LOCAL_POLICY_CONTENTS,
       }),
     }
   );

@@ -18,7 +18,7 @@ export function SiteHeader() {
           <Link href="/payment-guide">支払い方法</Link>
           <Link href="/security">安全対策</Link>
           <Link href="/faq">FAQ</Link>
-          <Link href="/terms">規約</Link>
+          <a href="/terms">規約</a>
         </nav>
       </header>
     </>
@@ -30,8 +30,8 @@ export function SiteFooter() {
     <footer>
       <div><strong>JPYC 店頭決済案内</strong><p>店舗端末のQRからのみ支払うための公開情報Site</p></div>
       <nav aria-label="フッターナビゲーション">
-        <Link href="/privacy">プライバシー</Link>
-        <Link href="/refund-policy">返金</Link>
+        <a href="/privacy">プライバシー</a>
+        <a href="/refund-policy">返金</a>
         <Link href="/version">バージョン</Link>
         <Link href="/contact">問い合わせ</Link>
       </nav>

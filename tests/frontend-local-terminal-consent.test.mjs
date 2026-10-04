@@ -39,7 +39,9 @@ test("terminal UI records per-invoice policy consent before drawing the transfer
   // Client-side double gate: even if a URI were present, it is not drawn
   // while customer_policy_consent.recorded is false.
   assert.match(js, /const consentRecorded = consent\?\.recorded === true;/);
-  assert.match(js, /const invoiceActive = Boolean\(invoice && walletUri\) && consentRecorded;/);
+  assert.match(js, /const invoiceActive = Boolean\(invoice && walletUri\) && consentRecorded/);
+  assert.match(js, /invoice\.status === "issued" && Date\.parse\(invoice\.expires_at/);
+  assert.match(js, /const requiresReissue = state\.currentInvoice\?\.customer_policy_consent\?\.requires_reissue === true;/);
   assert.match(js, /規約同意の記録が完了していないため、送金QRは表示していません。/);
   assert.match(js, /\/api\/v1\/invoices\/\$\{encodeURIComponent\(invoiceId\)\}\/policy-consent/);
   assert.match(js, /terms_version: consent\.versions\.terms_version/);

@@ -11,7 +11,10 @@ import {
   POLICY_CONTENT_HASH_CANONICALIZATION,
   validatePolicyVersionSubmission,
   verifyPolicyContentHashes,
+  verifyPublishedPolicyPages,
 } from "../src/policy-publication.mjs";
+
+import { POLICY_DOCUMENT_HEADERS, renderPolicyDocument } from "../sites/jpyc-public-info/app/policy-document.mjs";
 
 const ROOT = process.cwd();
 
@@ -98,6 +101,53 @@ test("policy content hashes are verified from exact UTF-8 bytes on the server", 
   );
   assert.equal(missingContent.ok, false);
   assert.deepEqual(missingContent.missing_content_keys, ["refund"]);
+});
+
+test("published policy page verification fails closed for changed, missing, or unavailable pages", async () => {
+  const urls = {
+    terms: "https://policies.merchant.jp/terms",
+    privacy: "https://policies.merchant.jp/privacy",
+    refund: "https://policies.merchant.jp/refund-policy",
+  };
+  const contents = {
+    terms: JSON.stringify({ title: "Terms", summary: "Terms summary", sections: [{ title: "Terms section", paragraphs: ["Original visible terms"] }] }),
+    privacy: JSON.stringify({ title: "Privacy", summary: "Privacy summary", sections: [{ title: "Privacy section", paragraphs: ["Visible privacy"] }] }),
+    refund: JSON.stringify({ title: "Refund", summary: "Refund summary", sections: [{ title: "Refund section", bullets: ["Visible refund"] }] }),
+  };
+  const hashes = {
+    terms_hash: hashPolicyContent(contents.terms),
+    privacy_hash: hashPolicyContent(contents.privacy),
+    refund_policy_hash: hashPolicyContent(contents.refund),
+  };
+  const page = (content) => new Response(renderPolicyDocument(content), {
+    status: 200, headers: POLICY_DOCUMENT_HEADERS,
+  });
+  const requests = [];
+  const fetchImpl = async (url, options) => {
+    requests.push({ url, redirect: options.redirect });
+    if (url === urls.terms) {
+      const changed = JSON.parse(contents.terms);
+      changed.sections[0].paragraphs[0] = "Changed visible terms";
+      return page(JSON.stringify(changed));
+    }
+    if (url === urls.privacy) return page(contents.privacy);
+    return new Response("not found", { status: 404 });
+  };
+  const result = await verifyPublishedPolicyPages(urls, hashes, { fetchImpl });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.mismatch_keys, ["terms"]);
+  assert.deepEqual(result.unavailable_keys, ["refund"]);
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every((request) => request.redirect === "error"));
+
+  const missingMarker = await verifyPublishedPolicyPages(urls, hashes, {
+    fetchImpl: async () => new Response("<article>old deployment</article>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    }),
+  });
+  assert.equal(missingMarker.ok, false);
+  assert.deepEqual(missingMarker.unavailable_keys, ["terms", "privacy", "refund"]);
 });
 
 test("policy URLs reject credentials, placeholders, local names, and non-public IP ranges", () => {
