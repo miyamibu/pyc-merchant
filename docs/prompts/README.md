@@ -18,8 +18,4 @@ JPYC 商用 closeout に必要な Codex prompt を一箇所で参照できるよ
 
 ## Prompt Index
 - [EXT Closeout Prompts (EXT-001..EXT-004)](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/prompts/ext-closeout-prompts.md)
-- [Codex Full Codebase Review Prompt](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/prompts/codex-full-codebase-review-prompt.md)
-- [Codex Remediation And Readiness Prompt](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/prompts/codex-remediation-and-readiness-prompt.md)
-- [Codex Repo-Internal Closeout Polish Prompt](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/prompts/codex-repo-internal-closeout-polish-prompt.md)
 - Canonical closeout status source: [Blocked External Validation](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/production/BLOCKED_EXTERNAL_VALIDATION.md)
-- [Claude Commercial Closeout Instructions](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/prompts/claude-commercial-closeout-instructions.md)
