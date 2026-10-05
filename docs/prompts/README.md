@@ -23,5 +23,6 @@ JPYC 商用 closeout に必要な Codex prompt を一箇所で参照できるよ
 ## Historical prompt archive
 These prompts are preserved for provenance. Their old checkout paths, findings, test counts and approvals are historical; do not execute them as current release instructions. Current release decisions use AGENTS.md and the current closeout status.
 - [claude-commercial-closeout-instructions.md](./claude-commercial-closeout-instructions.md)
+- [codex-full-codebase-review-prompt.md](./codex-full-codebase-review-prompt.md)
 - [codex-remediation-and-readiness-prompt.md](./codex-remediation-and-readiness-prompt.md)
 - [codex-repo-internal-closeout-polish-prompt.md](./codex-repo-internal-closeout-polish-prompt.md)
