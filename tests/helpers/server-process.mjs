@@ -223,6 +223,7 @@ export async function loginAs(baseUrl, { terminalCode, pin, staffName }) {
     sessionId: res.data.sessionId,
     fixedQrUrl: res.data.fixed_qr_url,
     publicEntryToken: res.data.public_entry_token,
+    deploymentTopology: res.data.deployment_topology || null,
   };
 }
 

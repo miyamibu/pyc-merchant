@@ -123,6 +123,43 @@ test("endpoint assessment quarantines every material metadata mismatch", () => {
   }
 });
 
+test("requireApprovalPins policy quarantines every missing approval pin", async () => {
+  // Production-like runtimes force this policy on (chain-monitor forces
+  // REQUIRE_TOKEN_METADATA_PINS=true and fails startup without configured
+  // pins), so a missing name/code-hash/implementation-hash pin must never be
+  // downgraded to a warning.
+  const unpinnedSnapshot = {
+    endpoint_id: "sha256:test",
+    chain_id: "137",
+    latest_block: "100",
+    token_contract: tokenContract,
+    decimals: 18,
+    symbol: "JPYC",
+    name: "JPY Coin",
+    code: tokenCode,
+  };
+  for (const [policyOverrides, expectedCode] of [
+    [{ requireApprovalPins: true, name: "" }, "TOKEN_NAME_PIN_MISSING"],
+    [{ requireApprovalPins: true, codeHash: "" }, "TOKEN_CODE_HASH_PIN_MISSING"],
+    [{ requireApprovalPins: true }, "IMPLEMENTATION_CODE_HASH_PIN_MISSING"],
+  ]) {
+    const result = assessTokenMetadataSnapshot(unpinnedSnapshot, policy(policyOverrides));
+    assert.equal(result.ok, false);
+    assert.equal(result.endpoint_state, "quarantined");
+    assert.ok(result.failures.some((failure) => failure.code === expectedCode), JSON.stringify(result.failures));
+  }
+
+  // The default (opt-in) policy keeps development usable but must emit an
+  // explicit warning so the missing code-hash pin stays visible in evidence
+  // output.
+  const defaultResult = assessTokenMetadataSnapshot(
+    { ...unpinnedSnapshot },
+    policy({ codeHash: "" })
+  );
+  assert.equal(defaultResult.ok, true);
+  assert.ok(defaultResult.warnings.some((warning) => warning.code === "TOKEN_CODE_HASH_NOT_PINNED"));
+});
+
 test("implementation code hash is compared only when an approved value is configured", async () => {
   const unpinned = await verifyRpcEndpointTokenMetadata({
     rpcUrl: "https://polygon-a.example.test",

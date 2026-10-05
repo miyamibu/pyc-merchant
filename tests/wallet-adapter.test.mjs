@@ -275,6 +275,46 @@ test("actual wallet target values must remain bound to their reviewed query para
   assert.equal(payload.wallet_adapter.expanded_target_validated, false);
 });
 
+test("blocked protocols stay blocked even when a registry entry allowlists them", () => {
+  // data:, file:, http:, and javascript: are hard-blocked at the module level.
+  // A reviewed registry entry must not be able to re-enable them, so an
+  // operator mistake in allowed_scheme can never widen the launch surface.
+  for (const template of [
+    "http://pay.example/wallet?uri={{payment_uri_encoded}}",
+    "javascript://pay?uri={{payment_uri_encoded}}",
+    "data:text/html?uri={{payment_uri_encoded}}",
+    "file:///wallet?uri={{payment_uri_encoded}}",
+  ]) {
+    const adapter = createWalletAdapter({
+      WALLET_ADAPTER_TYPE: "wallet_deeplink",
+      WALLET_DEEPLINK_TEMPLATE: template,
+      WALLET_ADAPTER_REGISTRY_JSON: approvedRegistry(template),
+    });
+    assert.equal(adapter.available, false, template);
+    assert.equal(adapter.status, "template_scheme_not_allowed", template);
+  }
+});
+
+test("non-wallet action schemes stay blocked even when a registry entry allowlists them", () => {
+  // Communication, package-market, and Android intent schemes are never
+  // wallet launch targets. A reviewed registry entry cannot re-enable them.
+  for (const template of [
+    "mailto:pay@example.com?uri={{payment_uri_encoded}}",
+    "tel:000?uri={{payment_uri_encoded}}",
+    "sms:000?uri={{payment_uri_encoded}}",
+    "intent://pay?uri={{payment_uri_encoded}}",
+    "market://details?uri={{payment_uri_encoded}}",
+  ]) {
+    const adapter = createWalletAdapter({
+      WALLET_ADAPTER_TYPE: "wallet_deeplink",
+      WALLET_DEEPLINK_TEMPLATE: template,
+      WALLET_ADAPTER_REGISTRY_JSON: approvedRegistry(template),
+    });
+    assert.equal(adapter.available, false, template);
+    assert.equal(adapter.status, "template_scheme_not_allowed", template);
+  }
+});
+
 test("buildWalletLaunchPayload falls back to payment URI without deeplink template", () => {
   const payload = buildWalletLaunchPayload({
     env: {

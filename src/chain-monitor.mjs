@@ -14,6 +14,7 @@ import {
 } from "./amounts.mjs";
 import { buildChainRuntimeRegistryRecord } from "./chain-runtime-registry.mjs";
 import { decideMonitoringLifecycle, normalizeChainId } from "./payment-logic.mjs";
+import { CONNECTION_ENV_KEYS, isProductionLikeRuntime } from "./deployment-topology.mjs";
 import {
   OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
   getSupportedPaymentChain,
@@ -30,6 +31,8 @@ import {
 const CWD = process.cwd();
 const DEFAULTS = {
   APP_ENV: "development",
+  DEPLOYMENT_STAGE: "",
+  COMMERCIAL_GO_MODE: "false",
   APP_HOST: "http://localhost:4173",
   INTERNAL_APP_ORIGIN: "",
   WORKER_STATE_DB_PATH: "",
@@ -95,7 +98,7 @@ function loadEnv() {
     }
   }
   for (const [key, value] of Object.entries(process.env)) {
-    if (key in values && typeof value === "string" && value.length > 0) {
+    if (key in values && typeof value === "string" && (value.length > 0 || CONNECTION_ENV_KEYS.has(key))) {
       values[key] = value;
     }
   }
@@ -106,9 +109,7 @@ const ENV = loadEnv();
 const APP_ENV = String(ENV.APP_ENV || DEFAULTS.APP_ENV).trim().toLowerCase();
 const IS_PRODUCTION = APP_ENV === "production";
 const DEPLOYMENT_STAGE = String(ENV.DEPLOYMENT_STAGE || "").trim().toLowerCase();
-const PRODUCTION_LIKE = IS_PRODUCTION
-  || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE)
-  || String(ENV.COMMERCIAL_GO_MODE || "").trim().toLowerCase() === "true";
+const PRODUCTION_LIKE = isProductionLikeRuntime({ ...ENV, APP_ENV, DEPLOYMENT_STAGE });
 const APP_HOST = ENV.APP_HOST || DEFAULTS.APP_HOST;
 const INTERNAL_APP_ORIGIN = String(ENV.INTERNAL_APP_ORIGIN || DEFAULTS.INTERNAL_APP_ORIGIN || "").trim().replace(/\/$/, "");
 const CHAIN_ID = normalizeChainId(ENV.CHAIN_ID || DEFAULTS.CHAIN_ID)

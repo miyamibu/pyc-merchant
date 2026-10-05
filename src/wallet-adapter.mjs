@@ -18,7 +18,17 @@ const WALLET_TEMPLATE_KEYS = new Set([
   "pay_url",
   "pay_url_encoded",
 ]);
-const BLOCKED_WALLET_PROTOCOLS = new Set(["data:", "file:", "http:", "javascript:"]);
+const BLOCKED_WALLET_PROTOCOLS = new Set([
+  "data:",
+  "file:",
+  "http:",
+  "javascript:",
+  "mailto:",
+  "market:",
+  "intent:",
+  "sms:",
+  "tel:",
+]);
 const WALLET_CAPABILITY_LABELS = Object.freeze({
   environmentTested: "検証済み環境",
   launch: "起動導線あり",

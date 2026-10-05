@@ -162,6 +162,11 @@ npm run production:validate:env
 - 内部検証用の一時 URL と、お客様に見せる fixed QR の URL を混同しません。fixed QR は最終URL確定後に作ります。
 - 実運用前の確認は `npm run deploy:pc:preflight`、公開後のURL確認は `npm run deploy:public-host:check -- <env-file> <public_entry_token> '<signed_pay_url>'` を使います。
 
+## 店頭 Mac 内完結トポロジ（local_store_terminal）
+- `DEPLOYMENT_TOPOLOGY=local_store_terminal` を選ぶと、アプリは loopback のみで待ち受け、公開顧客支払いページ（signed `/pay?ref=` や fixed 入口 QR）を持ちません。代わりに invoice 専用の送金用ウォレット QR（chain 137 / 公式 JPYC / 承認 recipient / exact amount）を店頭画面に表示します。
+- 詳細・要件・launchd 自動起動・ロールバック: [`docs/100-local-store-terminal-topology.md`](docs/100-local-store-terminal-topology.md)
+- 上記「独自ドメイン」セクションは `public_cloud` トポロジの要件です。
+
 ## 実証リリース検証パック
 - 実行: `npm run production:validate`
 - 証跡保存先: [`docs/production/evidence`](/Users/mimac/Desktop/JPYC決済端末_MVP_UIUX/docs/production/evidence)

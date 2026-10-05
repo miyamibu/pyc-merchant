@@ -7,6 +7,18 @@ export const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/;
 export const RELEASE_MANIFEST_SCHEMA_VERSION = "release_manifest_v1";
 export const MANIFEST_CLOCK_SKEW_MS = 60_000;
 export const RELEASE_MANIFEST_MAX_VALIDITY_MS = 24 * 60 * 60 * 1000;
+// release_manifest_v1 keeps `environment_id` an opaque non-empty string so new
+// environments stay additive without a breaking schema revision. The values
+// below are recognized by documentation and tooling only; validation must not
+// enumerate them.
+export const KNOWN_RELEASE_ENVIRONMENT_IDS = Object.freeze([
+  "public_cloud",
+  "local_mac_plus_chatgpt_sites",
+]);
+
+export function isKnownReleaseEnvironmentId(value) {
+  return KNOWN_RELEASE_ENVIRONMENT_IDS.includes(String(value || "").trim().toLowerCase());
+}
 export const ACCOUNTABLE_SIGNER_ROLES = Object.freeze([
   "legal_accountable",
   "aml_accountable",

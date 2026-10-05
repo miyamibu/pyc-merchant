@@ -277,8 +277,13 @@ const state = {
   storePaymentsControlInFlight: false,
   storePaymentsOperation: null,
   paymentChains: [],
+  deploymentTopology: "public_cloud",
   fixedQrUrl: "",
   fixedQrToken: "",
+  policyOrigin: "",
+  policyLinks: null,
+  invoiceConsent: null,
+  consentRecordingInFlight: false,
   invoiceId: "",
   invoiceStatus: "",
   currentInvoice: null,
@@ -349,6 +354,8 @@ const state = {
   refundPayerAddressVerified: false,
   refundPayerAddressReviewId: "",
   autoResetTimer: null,
+  localPaymentQrExpiryTimer: null,
+  consentRecordingRequest: null,
   autoResetInvoiceId: "",
   logoutInFlight: false,
   logoutRetryToken: "",
@@ -404,6 +411,18 @@ const el = {
   paymentContractText: document.getElementById("paymentContractText"),
   qrCanvas: document.getElementById("qrCanvas"),
   qrAccessibleText: document.getElementById("qrAccessibleText"),
+  policyGuideQrCanvas: document.getElementById("policyGuideQrCanvas"),
+  policyGuideOriginText: document.getElementById("policyGuideOriginText"),
+  policyTermsLink: document.getElementById("policyTermsLink"),
+  policyPrivacyLink: document.getElementById("policyPrivacyLink"),
+  policyRefundLink: document.getElementById("policyRefundLink"),
+  policySecurityLink: document.getElementById("policySecurityLink"),
+  invoiceConsentPanel: document.getElementById("invoiceConsentPanel"),
+  invoiceConsentBadge: document.getElementById("invoiceConsentBadge"),
+  invoiceConsentBody: document.getElementById("invoiceConsentBody"),
+  invoiceConsentCheckbox: document.getElementById("invoiceConsentCheckbox"),
+  recordConsentBtn: document.getElementById("recordConsentBtn"),
+  invoiceConsentStatus: document.getElementById("invoiceConsentStatus"),
   expiresAtText: document.getElementById("expiresAtText"),
   amountText: document.getElementById("amountText"),
   paidText: document.getElementById("paidText"),
@@ -1155,6 +1174,7 @@ function failClosedFulfillmentObservation() {
 }
 
 function refreshFulfillmentObservationAfterResume() {
+  if (state.deploymentTopology === "local_store_terminal") renderCustomerFacingQr();
   if (!state.token || !state.invoiceId || document.visibilityState === "hidden") return;
   // iPad/Safari may suspend timers and EventSource while backgrounded. Keep
   // the last green decision hidden until a fresh server response is accepted.
@@ -1170,6 +1190,7 @@ function renderFulfillmentSafetySurfaces() {
   setInvoiceStatusPill(state.invoiceStatus);
   renderProviderControls(state.currentInvoice);
   renderCustomerFacingQr();
+  renderInvoiceConsent();
   renderOperatorGuide();
 }
 
@@ -2378,8 +2399,13 @@ function resetSessionUi(reason = "未ログイン", options = {}) {
   state.storePaymentsControlInFlight = false;
   state.storePaymentsOperation = null;
   state.paymentChains = [];
+  state.deploymentTopology = "public_cloud";
   state.fixedQrUrl = "";
   state.fixedQrToken = "";
+  state.policyOrigin = "";
+  state.policyLinks = null;
+  state.invoiceConsent = null;
+  state.consentRecordingInFlight = false;
   state.reviewRows = [];
   state.selectedReviewId = "";
   state.selectedReviewDetail = null;
@@ -2864,26 +2890,34 @@ function setInvoiceStatusPill(statusRaw) {
   el.invoiceStatusPill.className = `status-pill ${klass}`;
 }
 
-function clearQr() {
-  const rect = el.qrCanvas.getBoundingClientRect?.();
-  const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || 420, rect?.height || 420)));
+function clearQrCanvas(canvas, { showEmptyLabel = false } = {}) {
+  const rect = canvas.getBoundingClientRect?.();
+  const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || canvas.width || 420, rect?.height || canvas.height || 420)));
   const dpr = Math.min(Math.max(Number(window.devicePixelRatio) || 1, 1), 3);
-  el.qrCanvas.width = Math.round(cssSize * dpr);
-  el.qrCanvas.height = Math.round(cssSize * dpr);
-  const ctx = el.qrCanvas.getContext("2d");
+  canvas.width = Math.round(cssSize * dpr);
+  canvas.height = Math.round(cssSize * dpr);
+  const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssSize, cssSize);
   ctx.fillStyle = "#f4f6fb";
   ctx.fillRect(0, 0, cssSize, cssSize);
-  ctx.fillStyle = "#5a6a82";
-  ctx.font = "16px sans-serif";
-  ctx.fillText("QRなし", 16, 30);
+  if (showEmptyLabel) {
+    ctx.fillStyle = "#5a6a82";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("QRなし", 16, 30);
+  }
+}
+
+function clearQr() {
+  stopLocalPaymentQrExpiryTimer();
+  clearQrCanvas(el.qrCanvas, { showEmptyLabel: true });
   if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
 }
 
-function drawQr(value) {
+function drawQr(value, canvas = el.qrCanvas) {
   if (!value || typeof qrcode !== "function") {
-    clearQr();
+    if (canvas === el.qrCanvas) clearQr();
+    else clearQrCanvas(canvas);
     return;
   }
   const qr = qrcode(0, "M");
@@ -2893,12 +2927,12 @@ function drawQr(value) {
   const moduleCount = qr.getModuleCount();
   const quietZoneModules = 4;
   const totalModules = moduleCount + quietZoneModules * 2;
-  const rect = el.qrCanvas.getBoundingClientRect?.();
-  const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || 420, rect?.height || 420)));
+  const rect = canvas.getBoundingClientRect?.();
+  const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || canvas.width || 420, rect?.height || canvas.height || 420)));
   const dpr = Math.min(Math.max(Number(window.devicePixelRatio) || 1, 1), 3);
-  el.qrCanvas.width = Math.round(cssSize * dpr);
-  el.qrCanvas.height = Math.round(cssSize * dpr);
-  const ctx = el.qrCanvas.getContext("2d");
+  canvas.width = Math.round(cssSize * dpr);
+  canvas.height = Math.round(cssSize * dpr);
+  const ctx = canvas.getContext("2d");
   const tile = Math.max(1, Math.floor(cssSize / totalModules));
   const renderedSize = tile * totalModules;
   const offset = Math.floor((cssSize - renderedSize) / 2);
@@ -2927,12 +2961,62 @@ function providerBadgeClass(operatorStateCode) {
   return "s-blue";
 }
 
+function stopLocalPaymentQrExpiryTimer() {
+  if (state.localPaymentQrExpiryTimer != null) clearTimeout(state.localPaymentQrExpiryTimer);
+  state.localPaymentQrExpiryTimer = null;
+}
+
+function hideLocalPaymentQr() {
+  if (state.deploymentTopology === "local_store_terminal") clearQr();
+}
+
+function scheduleLocalPaymentQrExpiry(invoice) {
+  const delayMs = Math.min(Math.max(Date.parse(invoice.expires_at) - Date.now(), 1), 2_147_483_647);
+  const timer = window.setTimeout(() => {
+    if (state.localPaymentQrExpiryTimer !== timer) return;
+    state.localPaymentQrExpiryTimer = null;
+    renderCustomerFacingQr();
+  }, delayMs);
+  state.localPaymentQrExpiryTimer = timer;
+}
+
 function renderCustomerFacingDisplay(invoice) {
+  stopLocalPaymentQrExpiryTimer();
   const providerSummary = invoice?.provider_summary || null;
   const tapOnly = PROVIDER_RAIL_ENABLED && providerSummary?.qr_available === false;
   el.qrCanvas.classList.toggle("hidden", tapOnly);
   if (el.tapModePanel) el.tapModePanel.classList.toggle("hidden", !tapOnly);
   if (!tapOnly) {
+    if (state.deploymentTopology === "local_store_terminal") {
+      // No fixed customer entry QR exists in this topology: the displayed QR is
+      // the per-invoice wallet transfer URI (chain, token, recipient, exact
+      // amount come from the invoice record itself). The transfer URI is only
+      // rendered after the server confirmed the per-invoice policy consent
+      // row; the server also withholds payment_uri until then.
+      const consent = invoice?.customer_policy_consent;
+      const consentRecorded = consent?.recorded === true;
+      const walletUri = String(invoice?.payment_uri || "").trim();
+      const invoiceActive = Boolean(invoice && walletUri) && consentRecorded
+        && invoice.status === "issued" && Date.parse(invoice.expires_at || "") > Date.now()
+        && document.visibilityState !== "hidden";
+      if (invoiceActive) {
+        drawQr(walletUri);
+        scheduleLocalPaymentQrExpiry(invoice);
+        if (typeof requestScreenWakeLock === "function") void requestScreenWakeLock();
+        el.fixedQrUrlLink.textContent = "送金用QR（この会計専用）";
+        el.fixedQrUrlLink.removeAttribute("href");
+      } else {
+        el.fixedQrUrlLink.textContent = "-";
+        el.fixedQrUrlLink.removeAttribute("href");
+        clearQr();
+      }
+      el.customerDisplayHint.textContent = !invoiceActive && Boolean(walletUri)
+        ? "規約同意の記録が完了していないため、送金QRは表示していません。"
+        : invoiceActive
+          ? "このQRは現在の会計専用の送金用QRです。お客様のウォレットで読み取って送金してください。"
+          : "会計準備中です。規約同意を記録すると、この会計専用の送金用QRが表示されます。";
+      return;
+    }
     if (state.fixedQrUrl) {
       drawQr(state.fixedQrUrl);
       if (typeof requestScreenWakeLock === "function") void requestScreenWakeLock();
@@ -2982,6 +3066,159 @@ function renderCustomerFacingDisplay(invoice) {
 
 function renderCustomerFacingQr() {
   renderCustomerFacingDisplay(state.currentInvoice);
+}
+
+// The public policy/Site origin (PUBLIC_POLICY_ORIGIN, official key) is
+// validated origin-only HTTPS before anything is rendered. Links and the
+// guide QR are built only from that validated origin.
+function isOriginOnlyHttpsUrl(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    return parsed.protocol === "https:"
+      && !parsed.username
+      && !parsed.password
+      && parsed.port === ""
+      && parsed.pathname === "/"
+      && !parsed.search
+      && !parsed.hash;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function setPolicyLink(linkEl, href, label) {
+  if (!linkEl) return;
+  try {
+    const parsed = new URL(String(href || ""));
+    if (parsed.protocol === "https:" && parsed.origin === state.policyOrigin) {
+      linkEl.href = parsed.href;
+      linkEl.textContent = label;
+      linkEl.classList.remove("hidden");
+      return;
+    }
+  } catch (_error) {
+    // Invalid links remain hidden.
+  }
+  linkEl.classList.add("hidden");
+  linkEl.removeAttribute("href");
+}
+
+function renderSitesGuide() {
+  const host = document.getElementById("sitesGuideCard");
+  if (!host) return;
+  const origin = String(state.policyOrigin || "").trim();
+  if (!origin || !isOriginOnlyHttpsUrl(origin)) {
+    state.policyOrigin = "";
+    state.policyLinks = null;
+    host.classList.add("hidden");
+    return;
+  }
+  const links = state.policyLinks && typeof state.policyLinks === "object" ? state.policyLinks : {};
+  setPolicyLink(el.policyTermsLink, links.terms, "利用規約");
+  setPolicyLink(el.policyPrivacyLink, links.privacy, "プライバシーポリシー");
+  setPolicyLink(el.policyRefundLink, links.refund_policy, "返金ポリシー");
+  setPolicyLink(el.policySecurityLink, links.security, "安全対策・誤送金防止");
+  if (el.policyGuideQrCanvas) drawQr(origin, el.policyGuideQrCanvas);
+  if (el.policyGuideOriginText) el.policyGuideOriginText.textContent = origin;
+  host.classList.remove("hidden");
+}
+
+function invoiceConsentRequired(invoice = state.currentInvoice) {
+  const consent = invoice?.customer_policy_consent;
+  return Boolean(consent && consent.required === true);
+}
+
+function renderInvoiceConsent() {
+  if (!el.invoiceConsentPanel) return;
+  const invoice = state.currentInvoice;
+  if (state.deploymentTopology !== "local_store_terminal"
+    || !invoiceConsentRequired(invoice)
+    || invoice?.customer_policy_consent?.recorded === true
+    || invoice?.status !== "issued") {
+    el.invoiceConsentPanel.classList.add("hidden");
+    if (el.invoiceConsentCheckbox) el.invoiceConsentCheckbox.checked = false;
+    syncConsentControls();
+    return;
+  }
+  const consent = invoice.customer_policy_consent;
+  if (consent.requires_reissue) {
+    el.invoiceConsentBadge.textContent = "請求の再発行が必要";
+    el.invoiceConsentBadge.className = "status-pill s-red";
+    el.invoiceConsentBody.textContent = "この請求の以前の同意記録では、公開本文を確認できません。請求を再発行し、公開内容を確認してから同意を記録してください。送金QRは表示されません。";
+    if (el.invoiceConsentStatus) el.invoiceConsentStatus.textContent = "";
+  } else if (!consent.ready) {
+    el.invoiceConsentBadge.textContent = "規約設定未公開";
+    el.invoiceConsentBadge.className = "status-pill s-red";
+    el.invoiceConsentBody.textContent = "公開済みの規約スナップショットがこの請求に紐づいていません。管理者へ連絡し、新しい請求を作り直してください。送金QRは表示されません。";
+    if (el.recordConsentBtn) el.recordConsentBtn.disabled = true;
+    if (el.invoiceConsentStatus) el.invoiceConsentStatus.textContent = "";
+  } else {
+    const versions = consent.versions || {};
+    el.invoiceConsentBadge.textContent = "規約同意待ち";
+    el.invoiceConsentBadge.className = "status-pill s-yellow";
+    el.invoiceConsentBody.textContent =
+      `お客様に Site の利用規約・プライバシーポリシー・返金ポリシーを確認してもらい、チェックを付けて記録します。`
+      + ` 対象バージョン: terms ${versions.terms_version || "-"} / privacy ${versions.privacy_version || "-"} / refund ${versions.refund_policy_version || "-"}。`
+      + ` 同意の記録が完了するまで、この会計の送金QRは表示されません。`;
+  }
+  el.invoiceConsentPanel.classList.remove("hidden");
+  syncConsentControls();
+}
+
+function syncConsentControls() {
+  if (!el.recordConsentBtn) return;
+  const checked = Boolean(el.invoiceConsentCheckbox?.checked);
+  const ready = state.currentInvoice?.customer_policy_consent?.ready === true;
+  const requiresReissue = state.currentInvoice?.customer_policy_consent?.requires_reissue === true;
+  el.recordConsentBtn.disabled =
+    !checked
+    || !ready
+    || requiresReissue
+    || state.currentInvoice?.customer_policy_consent?.recorded === true
+    || state.currentInvoice?.status !== "issued"
+    || !(Date.parse(state.currentInvoice?.expires_at || "") > Date.now())
+    || state.consentRecordingInFlight
+    || !state.invoiceId;
+}
+
+async function handleRecordInvoiceConsent() {
+  if (!requireUiPermission("invoice.create", "規約同意の記録")) return;
+  const invoiceId = String(state.invoiceId || "").trim();
+  const consent = state.currentInvoice?.customer_policy_consent;
+  syncConsentControls();
+  if (state.deploymentTopology !== "local_store_terminal"
+    || el.recordConsentBtn?.disabled !== false
+    || String(state.currentInvoice?.invoice_id || "") !== invoiceId
+    || !invoiceId || !consent?.versions || state.consentRecordingInFlight) return;
+  const recordingRequest = {};
+  state.consentRecordingRequest = recordingRequest;
+  state.consentRecordingInFlight = true;
+  syncConsentControls();
+  try {
+    await requestJson(`/api/v1/invoices/${encodeURIComponent(invoiceId)}/policy-consent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        terms_version: consent.versions.terms_version,
+        privacy_version: consent.versions.privacy_version,
+        refund_policy_version: consent.versions.refund_policy_version,
+      }),
+    });
+    if (state.consentRecordingRequest !== recordingRequest || state.invoiceId !== invoiceId) return;
+    showToast("規約同意を記録しました。監査ログにも残っています");
+    await loadInvoice(invoiceId);
+  } catch (error) {
+    if (isIgnoredRequestError(error)
+      || state.consentRecordingRequest !== recordingRequest || state.invoiceId !== invoiceId) return;
+    showToast(`規約同意を記録できませんでした: ${String(error.message || error)}`, true);
+    await loadInvoice(invoiceId, { silent: true });
+  } finally {
+    if (state.consentRecordingRequest === recordingRequest) {
+      state.consentRecordingRequest = null;
+      state.consentRecordingInFlight = false;
+      renderInvoiceConsent();
+    }
+  }
 }
 
 function stopFallbackPolling() {
@@ -3161,9 +3398,13 @@ function scheduleCompletedInvoiceAutoReset(invoice = state.currentInvoice) {
 function renderInvoice(invoice) {
   const previousInvoiceId = state.invoiceId;
   const nextInvoiceId = String(invoice?.invoice_id || "");
+  if (String(previousInvoiceId || "") !== nextInvoiceId && el.invoiceConsentCheckbox) {
+    el.invoiceConsentCheckbox.checked = false;
+  }
   if (previousInvoiceId && previousInvoiceId !== nextInvoiceId) state.pendingDangerAction = "";
   state.currentInvoice = invoice;
   state.invoiceDiagnostics = invoice.diagnostics || null;
+  state.invoiceConsent = invoice.customer_policy_consent || null;
   state.invoiceId = invoice.invoice_id || "";
   const invoiceStatus = canonicalInvoiceStatus(invoice.status);
   state.invoiceStatus = invoiceStatus;
@@ -3191,6 +3432,7 @@ function renderInvoice(invoice) {
   el.reasonText.textContent = invoice.status_reason ? invoiceStatusReasonLabel(invoice.status_reason) : "-";
   renderProviderControls(invoice);
   renderCustomerFacingQr();
+  renderInvoiceConsent();
 
   if (state.terminalId && ACTIVE_INVOICE_STATUSES.has(invoiceStatus) && (!state.sse || previousInvoiceId !== state.invoiceId)) {
     void connectTerminalStream();
@@ -3216,6 +3458,9 @@ function clearInvoiceView() {
   state.fulfillmentObservationValid = false;
   stopFulfillmentFreshnessTimer();
   state.invoiceDiagnostics = null;
+  state.invoiceConsent = null;
+  state.consentRecordingInFlight = false;
+  state.consentRecordingRequest = null;
   state.selectedReviewId = "";
   state.selectedReviewDetail = null;
   state.sseToken = "";
@@ -3239,6 +3484,7 @@ function clearInvoiceView() {
   if (el.presentTapBtn) el.presentTapBtn.disabled = true;
   if (el.resumeQrBtn) el.resumeQrBtn.disabled = true;
   renderCustomerFacingQr();
+  renderInvoiceConsent();
   closeSse("未接続");
   stopFallbackPolling();
   setFallbackPollingStatus("idle", "未開始");
@@ -3923,7 +4169,12 @@ async function handleLogin() {
       ? new Date(startedAtMs + ttlMs).toISOString()
       : "");
     state.diagnosticsEnabled = data.diagnostic_mode_enabled === true;
+    state.deploymentTopology = String(data.deployment_topology || "public_cloud");
     state.supportedWallets = Array.isArray(data.supported_wallets) ? data.supported_wallets : [];
+    state.policyOrigin = typeof data.public_policy_origin === "string" ? data.public_policy_origin.trim() : "";
+    state.policyLinks = data.public_policy_links && typeof data.public_policy_links === "object"
+      ? data.public_policy_links
+      : null;
     setPaymentsDisableState(
       data.payments,
       normalizePaymentsDisableState(data.payments) ? "ready" : "error"
@@ -3950,6 +4201,7 @@ async function handleLogin() {
     startSessionExpiryTimer();
     setNetworkStatus("認証済み");
     renderCustomerFacingQr();
+    renderSitesGuide();
     applyPermissionVisibility();
     renderDiagnostics();
     renderOperatorGuide();
@@ -5570,6 +5822,12 @@ function bindEvents() {
     });
   }
   el.reissueInvoiceBtn.addEventListener("click", () => void handleReissueInvoice());
+  if (el.invoiceConsentCheckbox) {
+    el.invoiceConsentCheckbox.addEventListener("change", syncConsentControls);
+  }
+  if (el.recordConsentBtn) {
+    el.recordConsentBtn.addEventListener("click", () => void handleRecordInvoiceConsent());
+  }
   if (PROVIDER_RAIL_ENABLED && el.presentTapBtn && el.resumeQrBtn) {
     el.presentTapBtn.addEventListener("click", () => void handlePresentTap());
     el.resumeQrBtn.addEventListener("click", () => void handleResumeQr());
@@ -5578,25 +5836,39 @@ function bindEvents() {
   el.saveSettingsBtn.addEventListener("click", saveTerminalSettings);
 
   window.addEventListener("beforeunload", () => {
+    hideLocalPaymentQr();
     closeSse();
     stopFallbackPolling();
     stopOpsAutoRefresh();
     stopSessionExpiryTimer();
     if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
   });
+  window.addEventListener("pagehide", hideLocalPaymentQr);
   window.addEventListener("pageshow", refreshFulfillmentObservationAfterResume);
   window.addEventListener("online", refreshFulfillmentObservationAfterResume);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       refreshFulfillmentObservationAfterResume();
-      if (state.fixedQrUrl && !el.qrCanvas.classList.contains("hidden") && typeof requestScreenWakeLock === "function") {
+      const localPaymentQrDisplayed = state.deploymentTopology === "local_store_terminal"
+        && state.currentInvoice?.customer_policy_consent?.recorded === true
+        && state.currentInvoice?.status === "issued"
+        && Date.parse(state.currentInvoice?.expires_at || "") > Date.now()
+        && Boolean(String(state.currentInvoice?.payment_uri || "").trim());
+      const qrDisplayed = state.fixedQrUrl || localPaymentQrDisplayed;
+      if (qrDisplayed && !el.qrCanvas.classList.contains("hidden") && typeof requestScreenWakeLock === "function") {
         void requestScreenWakeLock();
       }
     } else {
+      hideLocalPaymentQr();
       if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
     }
   });
   window.addEventListener("resize", () => {
+    if (state.deploymentTopology === "local_store_terminal") {
+      renderCustomerFacingDisplay(state.currentInvoice);
+      renderSitesGuide();
+      return;
+    }
     if (state.fixedQrUrl && !el.qrCanvas.classList.contains("hidden")) drawQr(state.fixedQrUrl);
   });
 }

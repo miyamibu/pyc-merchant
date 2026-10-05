@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  JPYC terminal app autostart template for the local_store_terminal topology
+  on an in-store Mac. Copy to ~/Library/LaunchAgents/ after replacing
+  __REPO_DIR__, __NODE24_BIN__, and __LOG_DIR__ with real values.
+
+  __NODE24_BIN__ must be the ABSOLUTE path of the pinned Node v24.17.0
+  binary on this Mac (for example /opt/homebrew/opt/node@24/bin/node after
+  verifying `node --version` prints v24.17.0, or
+  /Users/<you>/.nvm/versions/node/v24.17.0/bin/node). run-env-safe.mjs
+  refuses to launch under any other runtime version.
+
+  Secrets never go into this file. The app reads its configuration from the
+  explicit .env.production inside __REPO_DIR__ through deploy/launchd/
+  run-env-safe.mjs, which requires that file to be chmod 600 and rejects
+  invalid env lines without printing values.
+
+  Install:   launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.jpyc.terminal.local.plist
+  Restart:   launchctl kickstart -k gui/$UID/com.jpyc.terminal.local
+  Status:    launchctl print gui/$UID/com.jpyc.terminal.local
+  Rollback:  launchctl bootout gui/$UID ~/Library/LaunchAgents/com.jpyc.terminal.local.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jpyc.terminal.local</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE24_BIN__</string>
+    <string>__REPO_DIR__/deploy/launchd/run-env-safe.mjs</string>
+    <string>--cwd</string>
+    <string>__REPO_DIR__</string>
+    <string>--env-file</string>
+    <string>__REPO_DIR__/.env.production</string>
+    <string>--allow-exec</string>
+    <string>__NODE24_BIN__</string>
+    <string>--</string>
+    <string>src/server.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/terminal.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/terminal.err.log</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

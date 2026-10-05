@@ -23,6 +23,17 @@ import {
   tokenMetadataPolicyFromEnv,
   verifyRpcTokenMetadataEndpoints,
 } from "../../src/token-metadata.mjs";
+import {
+  DEPLOYMENT_TOPOLOGY_VALUES,
+  DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
+  evaluateLocalStoreTerminalIngestOrigin,
+  evaluateLocalStoreTerminalListener,
+  evaluateLocalStoreTerminalProxy,
+  isLoopbackHttpOrigin,
+  isLoopbackBindHost,
+  isPublicHttpsOriginOnly,
+  resolvePublicPolicyOrigin,
+} from "../../src/deployment-topology.mjs";
 
 function parseArgs(argv) {
   const args = new Map();
@@ -59,8 +70,23 @@ function loadEnvFile(envFilePath) {
   return values;
 }
 
+const LOCAL_TOPOLOGY_DISABLED_CONTROLS = Object.freeze([
+  ["ENABLE_PUBLIC_PAYMENT_SIMULATION", "enable_public_payment_simulation"],
+  ["DEMO_CONTROLS_ENABLED", "demo_controls"],
+  ["ALLOW_MANUAL_PAYMENT_INGEST", "manual_payment_ingest"],
+  ["ENABLE_PROVIDER_RAIL_MOCK", "provider_rail_mock"],
+  ["DIAGNOSTIC_MODE_ENABLED", "diagnostic_mode"],
+]);
+
 function boolFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+function approvedRefPresent(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return false;
+  return !["placeholder", "todo", "changeme", "change-me", "example", "sample", "draft"]
+    .some((word) => normalized.toLowerCase().includes(word));
 }
 
 function normalizeAddress(value) {
@@ -149,14 +175,36 @@ async function main() {
     const productionChecks = appEnv === "production"
       || ["pilot", "commercial"].includes(deploymentStage)
       || boolFlag(env.COMMERCIAL_GO_MODE);
-    const publicBaseUrl = String(env.PUBLIC_BASE_URL || env.APP_HOST || env.PAY_BASE_URL || "").trim();
-    const appHost = String(env.APP_HOST || env.PUBLIC_BASE_URL || env.PAY_BASE_URL || (productionChecks ? "" : "http://127.0.0.1:4173")).trim();
-    const payBaseUrl = String(env.PAY_BASE_URL || env.APP_HOST || env.PUBLIC_BASE_URL || appHost).trim();
+    const deploymentTopologyRaw = String(
+      args.get("deployment-topology")
+      || env.DEPLOYMENT_TOPOLOGY
+      || "public_cloud"
+    ).trim().toLowerCase();
+    ensure(DEPLOYMENT_TOPOLOGY_VALUES.includes(deploymentTopologyRaw),
+      "DEPLOYMENT_TOPOLOGY must be public_cloud or local_store_terminal",
+      { actual: deploymentTopologyRaw });
+    const localStoreTerminal = deploymentTopologyRaw === DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL;
+    record("deployment_topology", true, { value: deploymentTopologyRaw });
+    // PUBLIC_POLICY_ORIGIN is the official policy/Site origin key for the
+    // local topology; PUBLIC_BASE_URL stays valid as a compatible fallback.
+    const resolvedLocalPolicyOrigin = localStoreTerminal
+      ? resolvePublicPolicyOrigin(env)?.origin || ""
+      : "";
+    const publicBaseUrl = String((localStoreTerminal
+      ? resolvedLocalPolicyOrigin
+      : env.PUBLIC_BASE_URL || env.APP_HOST || env.PAY_BASE_URL) || "").trim();
+    const appHost = String((localStoreTerminal
+      ? env.APP_HOST
+      : env.APP_HOST || env.PUBLIC_BASE_URL || env.PAY_BASE_URL
+        || (productionChecks ? "" : "http://127.0.0.1:4173")) || "").trim();
+    const payBaseUrl = String((localStoreTerminal
+      ? env.PAY_BASE_URL
+      : env.PAY_BASE_URL || env.APP_HOST || env.PUBLIC_BASE_URL || appHost) || "").trim();
     const dbPath = String(env.DB_PATH || "").trim();
     const workerStateDbPath = String(env.WORKER_STATE_DB_PATH || "").trim();
     const corsOrigins = String(env.CORS_ALLOW_ORIGINS || "")
       .split(",")
-      .map((value) => value.trim().replace(/\/$/, ""))
+      .map((value) => localStoreTerminal ? value.trim() : value.trim().replace(/\/$/, ""))
       .filter(Boolean);
     const chainId = String(env.CHAIN_ID || "137").trim();
     const enabledChainIds = parseEnabledPaymentChainIds(env.ENABLED_PAYMENT_CHAIN_IDS || "1,43114,137");
@@ -194,7 +242,7 @@ async function main() {
       actual: appEnv,
     });
 
-    if (productionChecks && !allowEmpty) {
+    if (productionChecks && !allowEmpty && !localStoreTerminal) {
       ensure(String(env.APP_BIND_HOST || "").trim(), "APP_BIND_HOST must be explicit for production", {});
       record("app_bind_host_explicit", true, { value: String(env.APP_BIND_HOST).trim() });
       ensure(trustProxy && (/^\d+$/.test(trustProxyHops) || trustProxyCidrs.length > 0),
@@ -207,6 +255,111 @@ async function main() {
     } else {
       record("app_bind_host_explicit", true, { skipped: true, reason: "allow-empty" });
       record("trusted_proxy_boundary", true, { skipped: true, reason: "allow-empty" });
+    }
+
+    if (localStoreTerminal) {
+      // Structural local_store_terminal requirements run even with
+      // --allow-empty: they define the exposure boundary of the terminal.
+      const bindHost = String(env.APP_BIND_HOST || "").trim();
+      ensure(isLoopbackBindHost(bindHost),
+        "local_store_terminal requires APP_BIND_HOST to be a loopback address (127.0.0.1, ::1, or localhost)",
+        { value: bindHost || null });
+      record("topology_local_loopback_bind", true, { value: bindHost });
+
+      ensure(isPublicHttpsOriginOnly(publicBaseUrl),
+        "local_store_terminal requires PUBLIC_POLICY_ORIGIN as an origin-only public HTTPS policy/Site origin (PUBLIC_BASE_URL stays accepted as a fallback)",
+        { value: publicBaseUrl || null });
+      record("topology_local_public_policy_origin", true, { value: publicBaseUrl });
+
+      const fallbackPolicyOrigin = String(env.PUBLIC_BASE_URL || "").trim();
+      if (fallbackPolicyOrigin) {
+        ensure(isPublicHttpsOriginOnly(fallbackPolicyOrigin)
+          && new URL(fallbackPolicyOrigin).origin === new URL(publicBaseUrl).origin,
+          "local_store_terminal PUBLIC_BASE_URL must match the resolved PUBLIC_POLICY_ORIGIN", {});
+      }
+
+      // The signed public payment page is structurally absent in this
+      // topology; the flag must be explicitly false (fail closed).
+      const publicPaymentPageEnabledRaw = String(env.PUBLIC_PAYMENT_PAGE_ENABLED ?? "").trim().toLowerCase();
+  ensure(publicPaymentPageEnabledRaw === "false",
+        "local_store_terminal requires PUBLIC_PAYMENT_PAGE_ENABLED=false",
+        { value: publicPaymentPageEnabledRaw || null });
+      record("topology_local_public_payment_page_disabled", true, {});
+
+      for (const [name, raw] of [["APP_HOST", appHost], ["PAY_BASE_URL", payBaseUrl]]) {
+        ensure(isLoopbackHttpOrigin(raw),
+          `local_store_terminal requires ${name} to be an explicit loopback http://127.0.0.1 origin`,
+          { value: raw || null });
+      }
+      const loopbackOrigin = new URL(appHost).origin;
+      ensure(loopbackOrigin === new URL(payBaseUrl).origin,
+        "local_store_terminal requires APP_HOST and PAY_BASE_URL to use the same loopback origin", {});
+      ensure(loopbackOrigin !== new URL(publicBaseUrl).origin,
+        "local_store_terminal requires the loopback app origin to differ from PUBLIC_BASE_URL", {});
+      record("topology_local_no_public_payment_origin", true, { value: loopbackOrigin });
+
+      const listener = evaluateLocalStoreTerminalListener(env);
+      ensure(listener.ok, "local_store_terminal origins must match APP_BIND_HOST and APP_PORT", { blockers: listener.blockers });
+      record("topology_local_listener_origin_match", true, {});
+
+      const localIngest = evaluateLocalStoreTerminalIngestOrigin(env);
+      ensure(localIngest.ok, "local_store_terminal INTERNAL_APP_ORIGIN must be a loopback HTTP origin matching APP_HOST", {
+        blockers: localIngest.blockers,
+      });
+      record("topology_local_internal_app_origin", true, { value: new URL(env.INTERNAL_APP_ORIGIN).origin });
+
+      ensure(evaluateLocalStoreTerminalProxy(env).ok,
+        "local_store_terminal serves the loopback listener directly; TRUST_PROXY/TRUST_PROXY_HOPS/TRUST_PROXY_CIDRS must stay disabled",
+        { trust_proxy: trustProxy, hops: trustProxyHops || null, cidrs: trustProxyCidrs });
+      record("topology_local_direct_loopback_no_trusted_proxy", true, {});
+
+      for (const [envKey, label] of LOCAL_TOPOLOGY_DISABLED_CONTROLS) {
+        ensure(!boolFlag(env[envKey]),
+          `local_store_terminal requires ${envKey}=false`,
+          { flag: envKey, value: boolFlag(env[envKey]) });
+        record(`topology_local_${label}_disabled`, true, {});
+      }
+
+      const walletAdapterType = String(env.WALLET_ADAPTER_TYPE || "mock").trim().toLowerCase();
+      ensure(["wallet_deeplink", "hashport_deeplink"].includes(walletAdapterType),
+        "local_store_terminal requires WALLET_ADAPTER_TYPE=wallet_deeplink or hashport_deeplink",
+        { actual: walletAdapterType });
+
+      const configuredRecipient = normalizeAddress(env.RECIPIENT_ADDRESS);
+      ensure(/^0x[0-9a-f]{40}$/.test(configuredRecipient) && configuredRecipient !== `0x${"0".repeat(40)}`,
+        "local_store_terminal requires an explicitly approved RECIPIENT_ADDRESS", {});
+      record("topology_local_recipient_approval_input", true, { value: configuredRecipient });
+
+      ensure(chainId === "137", "local_store_terminal requires CHAIN_ID=137", { actual: chainId });
+      ensure(enabledChainIds.length === 1 && enabledChainIds.includes("137"),
+        "local_store_terminal requires ENABLED_PAYMENT_CHAIN_IDS to enable only 137",
+        { enabled_chain_ids: enabledChainIds });
+
+      const chainRpcConfigured = String(env.RPC_URLS_137 || env.RPC_URLS || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean).length > 0;
+      ensure(chainRpcConfigured, "local_store_terminal requires RPC_URLS_137 (or RPC_URLS) endpoints", {});
+      record("topology_local_chain_rpc_configured", true, {});
+
+      ensure(String(env.BACKUP_DIR || "").trim(), "local_store_terminal requires BACKUP_DIR for local backup separation", {});
+      record("topology_local_backup_dir", true, { value: String(env.BACKUP_DIR).trim() });
+
+      ensure(workerStateDbPath,
+        "local_store_terminal requires WORKER_STATE_DB_PATH for worker separation", {});
+      if (workerStateDbPath && dbPath) {
+        ensure(path.resolve(process.cwd(), workerStateDbPath) !== path.resolve(process.cwd(), dbPath),
+          "WORKER_STATE_DB_PATH must differ from DB_PATH", {});
+      }
+      record("topology_local_worker_state_db_separation", true, {
+        db_path: dbPath || null,
+        worker_state_db_path: workerStateDbPath || null,
+      });
+
+      const macReadinessRef = String(env.LOCAL_TERMINAL_OPERATOR_READINESS_REF || "").trim();
+      ensure(approvedRefPresent(macReadinessRef),
+        "local_store_terminal requires LOCAL_TERMINAL_OPERATOR_READINESS_REF referencing the completed Mac operational readiness checklist", {});
+      record("topology_local_mac_readiness_reference", true, { reference_configured: true });
     }
 
     if (productionChecks && !allowEmpty) {
@@ -280,7 +433,14 @@ async function main() {
       record("token_contract_fixed", true, { skipped: true, reason: "approved_token_not_configured" });
     }
 
-    if (productionChecks && (!allowEmpty || appHost)) {
+    if (localStoreTerminal) {
+      // Public-origin requirements are replaced by the loopback topology
+      // checks recorded above; the policy origin was already validated.
+      record("app_host_https_fqdn", true, { skipped: true, reason: "local_store_terminal_loopback" });
+      record("public_base_url_https_fqdn", true, { value: publicBaseUrl });
+      record("pay_base_url_https_fqdn", true, { skipped: true, reason: "local_store_terminal_loopback" });
+      record("public_origins_match", true, { skipped: true, reason: "local_store_terminal_separated_origins" });
+    } else if (productionChecks && (!allowEmpty || appHost)) {
       const parsed = new URL(appHost);
       ensure(parsed.protocol === "https:", "APP_HOST must use https", { value: appHost });
       ensure(!/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), "APP_HOST must use a public FQDN", { hostname: parsed.hostname });
@@ -289,25 +449,25 @@ async function main() {
       record("app_host_https_fqdn", true, { skipped: true, reason: "allow-empty" });
     }
 
-    if (productionChecks && (!allowEmpty || publicBaseUrl)) {
+    if (!localStoreTerminal && productionChecks && (!allowEmpty || publicBaseUrl)) {
       const parsed = new URL(publicBaseUrl);
       ensure(parsed.protocol === "https:", "PUBLIC_BASE_URL must use https", { value: publicBaseUrl });
       ensure(!/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), "PUBLIC_BASE_URL must use a public FQDN", { hostname: parsed.hostname });
       record("public_base_url_https_fqdn", true, { value: publicBaseUrl });
-    } else {
+    } else if (!localStoreTerminal) {
       record("public_base_url_https_fqdn", true, { skipped: true, reason: "allow-empty" });
     }
 
-    if (productionChecks && (!allowEmpty || payBaseUrl)) {
+    if (!localStoreTerminal && productionChecks && (!allowEmpty || payBaseUrl)) {
       const parsed = new URL(payBaseUrl);
       ensure(parsed.protocol === "https:", "PAY_BASE_URL must use https", { value: payBaseUrl });
       ensure(!/^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname), "PAY_BASE_URL must use a public FQDN", { hostname: parsed.hostname });
       record("pay_base_url_https_fqdn", true, { value: payBaseUrl });
-    } else {
+    } else if (!localStoreTerminal) {
       record("pay_base_url_https_fqdn", true, { skipped: true, reason: "allow-empty" });
     }
 
-    if (productionChecks && appHost && publicBaseUrl && payBaseUrl) {
+    if (!localStoreTerminal && productionChecks && appHost && publicBaseUrl && payBaseUrl) {
       const normalizedOrigins = [appHost, publicBaseUrl, payBaseUrl].map((value) => new URL(value).toString().replace(/\/$/, ""));
       ensure(new Set(normalizedOrigins).size === 1, "APP_HOST, PUBLIC_BASE_URL, and PAY_BASE_URL must match exactly", {
         app_host: appHost,
@@ -315,11 +475,11 @@ async function main() {
         pay_base_url: payBaseUrl,
       });
       record("public_origins_match", true, { value: normalizedOrigins[0] });
-    } else {
+    } else if (!localStoreTerminal) {
       record("public_origins_match", true, { skipped: true, reason: "allow-empty" });
     }
 
-    if (productionChecks && (!allowEmpty || corsOrigins.length > 0)) {
+    if (localStoreTerminal || (productionChecks && (!allowEmpty || corsOrigins.length > 0))) {
       ensure(corsOrigins.length > 0, "CORS_ALLOW_ORIGINS must not be empty", {});
       ensure(!corsOrigins.some((origin) => origin === "*" || origin.includes("*")), "CORS_ALLOW_ORIGINS wildcard is not allowed", {
         cors_allow_origins: corsOrigins,
@@ -330,7 +490,7 @@ async function main() {
         cors_allow_origins: corsOrigins,
       });
       record("cors_origins_include_app_host", true, { cors_allow_origins: corsOrigins });
-    } else {
+    } else if (!localStoreTerminal) {
       record("cors_origins_include_app_host", true, { skipped: true, reason: "allow-empty" });
     }
 
@@ -348,11 +508,11 @@ async function main() {
       tokenSymbol: "JPYC",
       tokenContract: tokenContract || OFFICIAL_JPYC_CONTRACT_ADDRESS,
       tokenDecimals,
-      receiveAddress: String(env.RECIPIENT_ADDRESS || "0x2222222222222222222222222222222222222222"),
+      receiveAddress: String(env.RECIPIENT_ADDRESS || (localStoreTerminal ? "" : "0x2222222222222222222222222222222222222222")),
       expectedAmountAtomic: oneJpyTokenAtomic.value,
       amountJpy: 1,
       expiresAt: "2099-01-01T00:00:00.000Z",
-      payUrl: publicBaseUrl || "https://pay.miyamibu.xyz/pay?ref=test",
+      payUrl: localStoreTerminal ? appHost : publicBaseUrl || "https://pay.miyamibu.xyz/pay?ref=test",
     });
     ensure(deeplinkPayload.network === paymentChain.network, "wallet payload network must match CHAIN_ID", {
       network: deeplinkPayload.network,
@@ -362,6 +522,34 @@ async function main() {
       payment_uri: deeplinkPayload.payment_uri,
       expected_amount_atomic: oneJpyTokenAtomic.value,
     });
+
+    if (localStoreTerminal) {
+      const paymentUri = String(deeplinkPayload.payment_uri || "");
+      let uriParams = null;
+      try {
+        const match = paymentUri.match(/^ethereum:[^@]+@(\d+)\/transfer\?(.*)$/);
+        if (match) uriParams = { chainId: match[1], searchParams: new URLSearchParams(match[2]) };
+      } catch (_error) {
+        uriParams = null;
+      }
+      ensure(Boolean(uriParams), "local_store_terminal wallet payload must be an EIP-681 ERC-20 transfer URI", {
+        payment_uri_prefix: paymentUri.split("?")[0] || null,
+      });
+      ensure(uriParams.chainId === "137", "local_store_terminal wallet transfer QR must target chain 137", {
+        chain_id: uriParams?.chainId || null,
+      });
+      ensure((uriParams.searchParams.get("address") || "").toLowerCase() === normalizeAddress(env.RECIPIENT_ADDRESS),
+        "local_store_terminal wallet transfer QR must pay the configured approved recipient", {});
+      ensure(uriParams.searchParams.get("uint256") === oneJpyTokenAtomic.value,
+        "local_store_terminal wallet transfer QR must carry the exact invoice amount in atomic units", {
+          expected_amount_atomic: oneJpyTokenAtomic.value,
+        });
+      record("local_topology_wallet_transfer_qr_exactness", true, {
+        chain_id: 137,
+        recipient_configured: true,
+        expected_amount_atomic: oneJpyTokenAtomic.value,
+      });
+    }
 
     if (String(env.WALLET_DEEPLINK_TEMPLATE || env.HASHPORT_WALLET_DEEPLINK_TEMPLATE || "").trim()) {
       ensure(Boolean(deeplinkPayload.wallet_url), "wallet deeplink template must expand to a launch URL");

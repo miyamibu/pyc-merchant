@@ -49,6 +49,7 @@ export function isPublicIp(value) {
       [0xac100000, 0xac1fffff], // RFC1918
       [0xc0000000, 0xc00000ff], // IETF protocol assignments
       [0xc0000200, 0xc00002ff], // TEST-NET-1
+      [0xc0586300, 0xc05863ff], // deprecated 6to4 relay
       [0xc0a80000, 0xc0a8ffff], // RFC1918
       [0xc6120000, 0xc613ffff], // benchmark testing
       [0xc6336400, 0xc63364ff], // TEST-NET-2
@@ -59,6 +60,8 @@ export function isPublicIp(value) {
   if (family !== 6) return false;
   const parsed = parseIpv6(raw);
   if (!parsed) return false;
+  // Only global-unicast space is eligible; unallocated/special IPv6 is closed.
+  if (typeof parsed !== "bigint" || !ipv6InRange(parsed, 3, 0x20000000000000000000000000000000n)) return false;
   // Reject all IPv4-embedded/transition IPv6 forms.  Unwrapping only the
   // familiar ::ffff:d.d.d.d spelling is insufficient because the same
   // address can be represented as ::ffff:0a00:0001, NAT64, 6to4, or Teredo.
@@ -69,16 +72,22 @@ export function isPublicIp(value) {
     [0x00000000000000000000ffff00000000n, 96], // IPv4-mapped
     [0x0064ff9b000000000000000000000000n, 96], // NAT64 well-known prefix
     [0x0064ff9b000100000000000000000000n, 48], // NAT64 local-use prefix
-    [0x20020000000000000000000000000000n, 16], // 6to4
-    [0x20010000000000000000000000000000n, 32], // Teredo
-    [0x00000000000000000000000000000000n, 96], // IPv4-compatible / ::/96
     [0x01000000000000000000000000000000n, 8], // discard-only / special use
-    [0x20010001000000000000000000000000n, 32], // IETF protocol assignments
-    [0x20010002000000000000000000000000n, 48], // benchmarking
+    [0x00000000000000000000000000000000n, 96], // IPv4-compatible / ::/96
+    // RFC 2928 "IETF protocol assignments": the whole 2001::/23 block is
+    // special-purpose (Teredo 2001::/32, benchmarking 2001:2::/48, AMT
+    // 2001:3::/32, AS112-v6 2001:4::/32, IETF assignments 2001:10::/28,
+    // ORCHIDv2 2001:20::/28, ...). Pinning individual sub-blocks here left
+    // 2001:10::/28 (and AMT/AS112-v6) misclassified as public, so the whole
+    // /23 is rejected instead. 2001:db8::/32 (documentation) sits outside the
+    // /23 and stays listed separately.
+    [0x20010000000000000000000000000000n, 23],
+    [0x20020000000000000000000000000000n, 16], // 6to4
+    [0x5f000000000000000000000000000000n, 16], // SRv6 (RFC 9602)
     [0xfc000000000000000000000000000000n, 7], // unique local
     [0xfe800000000000000000000000000000n, 10], // link-local
-    [0x20010020000000000000000000000000n, 28], // ORCHIDv2 / special-use block
     [0x20010db8000000000000000000000000n, 32], // documentation
+    [0x3fff0000000000000000000000000000n, 20], // documentation
     [0xff000000000000000000000000000000n, 8], // multicast
   ].some(([bits, prefix]) => ipv6InRange(parsed, prefix, BigInt(bits)));
 }
@@ -122,8 +131,8 @@ export async function resolvePublicHostAddresses(hostname, { lookup = dns.lookup
 
 export function createPinnedLookup(hostname, addresses) {
   const normalized = normalizePublicHostname(hostname);
-  const pinned = [...new Set((addresses || []).map((address) => String(address || "").trim()).filter(isPublicIp))];
-  if (!normalized || pinned.length === 0) throw new Error("pinned public lookup requires a public hostname and address");
+  const pinned = [...new Set((addresses || []).map((address) => String(address || "").trim()))];
+  if (!normalized || pinned.length === 0 || pinned.some((address) => !isPublicIp(address))) throw new Error("pinned public lookup requires only public addresses");
   return (lookupHostname, options, callback) => {
     if (normalizePublicHostname(lookupHostname) !== normalized) {
       callback(new Error("pinned lookup hostname mismatch"));
@@ -139,7 +148,7 @@ export function createPinnedLookup(hostname, addresses) {
   };
 }
 
-function requestPinnedHttps(url, { addresses, lookup, headers, method, body, timeoutMs }) {
+function requestPinnedHttps(url, { addresses, headers, method, body, timeoutMs, maxResponseBytes }) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const request = https.request(parsed, {
@@ -148,6 +157,10 @@ function requestPinnedHttps(url, { addresses, lookup, headers, method, body, tim
       lookup: createPinnedLookup(parsed.hostname, addresses),
       servername: parsed.hostname,
       rejectUnauthorized: true,
+      // A fresh connection must use this call's DNS verdict, never a pooled
+      // socket or a second system lookup via family autoselection.
+      agent: false,
+      autoSelectFamily: false,
       timeout: timeoutMs,
     }, (response) => {
       response.on("error", reject);
@@ -155,16 +168,19 @@ function requestPinnedHttps(url, { addresses, lookup, headers, method, body, tim
       let bytes = 0;
       response.on("data", (chunk) => {
         bytes += chunk.length;
-        if (bytes <= MAX_RESPONSE_BYTES) chunks.push(chunk);
+        if (bytes <= maxResponseBytes) chunks.push(chunk);
         else response.destroy(new Error("response_too_large"));
       });
       response.on("end", () => resolve({
         status: response.statusCode || 0,
         headers: response.headers,
         body: Buffer.concat(chunks).toString("utf8"),
+        bodyBytes: Buffer.concat(chunks),
         url: parsed.href,
       }));
     });
+    const deadline = setTimeout(() => request.destroy(new Error("request_timeout")), timeoutMs);
+    request.on("close", () => clearTimeout(deadline));
     request.on("timeout", () => request.destroy(new Error("request_timeout")));
     request.on("error", reject);
     if (body != null) request.write(body);
@@ -180,6 +196,7 @@ export async function fetchPinnedPublicHttps(rawUrl, {
   timeoutMs = 10_000,
   expectedHostname = null,
   lookup = dns.lookup,
+  maxResponseBytes = MAX_RESPONSE_BYTES,
 } = {}) {
   let current = String(rawUrl || "");
   let initialHostname = null;
@@ -189,13 +206,21 @@ export async function fetchPinnedPublicHttps(rawUrl, {
     });
     if (!validation.ok) throw new Error(`public endpoint rejected: ${validation.errors.join(",")}`);
     if (!initialHostname) initialHostname = validation.hostname;
-    const addresses = await resolvePublicHostAddresses(validation.hostname, { lookup });
+    let dnsDeadline;
+    let addresses;
+    try {
+      addresses = await Promise.race([
+        resolvePublicHostAddresses(validation.hostname, { lookup }),
+        new Promise((_, reject) => { dnsDeadline = setTimeout(() => reject(new Error("dns_timeout")), timeoutMs); }),
+      ]);
+    } finally { clearTimeout(dnsDeadline); }
     const result = await requestPinnedHttps(validation.url.href, {
       addresses,
       headers: { ...headers, host: validation.hostname },
       method,
       body,
       timeoutMs,
+      maxResponseBytes,
     });
     if (!REDIRECT_STATUSES.has(result.status)) return { ...result, addresses };
     const location = result.headers.location;

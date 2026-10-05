@@ -4,9 +4,11 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   ACCOUNTABLE_SIGNER_ROLES,
+  KNOWN_RELEASE_ENVIRONMENT_IDS,
   MANIFEST_CLOCK_SKEW_MS,
   RELEASE_MANIFEST_MAX_VALIDITY_MS,
   RELEASE_MANIFEST_SCHEMA_VERSION,
+  isKnownReleaseEnvironmentId,
   signedManifestPayload,
   validateReleaseManifestShape,
 } from "../scripts/production-validation/release-identity.mjs";
@@ -96,4 +98,48 @@ test("manifest signing payload excludes signatures but preserves release trust p
   const payload = signedManifestPayload(manifest).toString("utf8");
   assert.doesNotMatch(payload, /must-not-be-signed/);
   assert.match(payload, /release_signer_key_ids/);
+});
+
+test("environment_id stays additive in v1 for local_mac_plus_chatgpt_sites", () => {
+  // v1 keeps environment_id opaque; new environments are recognized by
+  // documentation and tooling without a breaking schema enumeration.
+  assert.deepEqual([...KNOWN_RELEASE_ENVIRONMENT_IDS], ["public_cloud", "local_mac_plus_chatgpt_sites"]);
+  assert.equal(isKnownReleaseEnvironmentId("LOCAL_MAC_PLUS_CHATGPT_SITES"), true);
+  assert.equal(isKnownReleaseEnvironmentId("public_cloud"), true);
+  assert.equal(isKnownReleaseEnvironmentId("datacenter-x"), false);
+
+  const keyIds = (seed) => [`${seed}`.repeat(64).slice(0, 64)];
+  const approvalKeys = Object.fromEntries(
+    ACCOUNTABLE_SIGNER_ROLES.map((role, index) => [role, keyIds(String((index + 1) % 10))])
+  );
+  const manifest = {
+    schema_version: "release_manifest_v1",
+    release_id: "01981234-1234-7123-8123-123456789abc",
+    mode: "limited",
+    commit: "b".repeat(40),
+    source_hash: "1".repeat(64),
+    lockfile_hash: "2".repeat(64),
+    migration_hash: "3".repeat(64),
+    env_hash: "4".repeat(64),
+    db_snapshot_hash: "5".repeat(64),
+    backup_hash: "6".repeat(64),
+    evidence_manifest_hash: "7".repeat(64),
+    approval_manifest_hash: "8".repeat(64),
+    base_image_digest: `sha256:${"9".repeat(64)}`,
+    app_image_digest: `sha256:${"a".repeat(64)}`,
+    nginx_image_digest: `sha256:${"b".repeat(64)}`,
+    runtime: { node: "24.17.0" },
+    audit_root: "artifacts/release/test-audit-root",
+    environment_id: "local_mac_plus_chatgpt_sites",
+    artifact_hashes: [],
+    trust_policy: {
+      release_signer_key_ids: ["c".repeat(64)],
+      evidence_signer_key_ids: ["d".repeat(64)],
+      revoked_key_ids: [],
+      approval_signers: approvalKeys,
+    },
+  };
+  const result = validateReleaseManifestShape(manifest);
+  assert.deepEqual(result.blockers, []);
+  assert.equal(result.ok, true);
 });
