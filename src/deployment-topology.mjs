@@ -45,12 +45,28 @@ function isLoopbackHttpOrigin(rawUrl) {
     const parsed = new URL(String(rawUrl || "").trim());
     return parsed.protocol === "http:"
       && isLoopbackHost(parsed.hostname)
+      && !parsed.username
+      && !parsed.password
       && parsed.pathname === "/"
       && !parsed.search
       && !parsed.hash;
   } catch {
     return false;
   }
+}
+
+// All launchd jobs share this origin. A separate Docker service name or port
+// cannot address the standalone Mac listener; canonical origins must match.
+export function evaluateLocalStoreTerminalIngestOrigin(env = {}) {
+  const blockers = [];
+  const internalOrigin = String(env.INTERNAL_APP_ORIGIN || "").trim();
+  if (!isLoopbackHttpOrigin(internalOrigin)) {
+    blockers.push("topology_local_internal_app_origin_must_be_loopback_http_origin");
+  } else if (isLoopbackHttpOrigin(env.APP_HOST)
+    && new URL(internalOrigin).origin !== new URL(env.APP_HOST).origin) {
+    blockers.push("topology_local_internal_app_origin_must_match_app_host");
+  }
+  return { ok: blockers.length === 0, blockers };
 }
 
 function parseFlag(value, fallback = false) {
@@ -163,6 +179,14 @@ export function evaluateLocalStoreTerminalTopology(env = {}) {
     } catch {
       // Invalid URLs are already reported above.
     }
+  }
+  blockers.push(...evaluateLocalStoreTerminalIngestOrigin(env).blockers);
+  const corsOrigins = String(env.CORS_ALLOW_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
+  if (corsOrigins.some((origin) => origin.includes("*"))) {
+    blockers.push("topology_local_cors_allow_origins_wildcard_not_allowed");
+  }
+  if (isLoopbackHttpOrigin(appHost) && !corsOrigins.includes(new URL(appHost).origin)) {
+    blockers.push("topology_local_cors_allow_origins_must_include_app_host");
   }
   if (appHost && policyOrigin) {
     try {

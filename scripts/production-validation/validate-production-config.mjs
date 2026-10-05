@@ -26,6 +26,7 @@ import {
 import {
   DEPLOYMENT_TOPOLOGY_VALUES,
   DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
+  evaluateLocalStoreTerminalIngestOrigin,
   isLoopbackHost,
   resolvePublicPolicyOrigin,
 } from "../../src/deployment-topology.mjs";
@@ -229,7 +230,7 @@ async function main() {
     const workerStateDbPath = String(env.WORKER_STATE_DB_PATH || "").trim();
     const corsOrigins = String(env.CORS_ALLOW_ORIGINS || "")
       .split(",")
-      .map((value) => value.trim().replace(/\/$/, ""))
+      .map((value) => localStoreTerminal ? value.trim() : value.trim().replace(/\/$/, ""))
       .filter(Boolean);
     const chainId = String(env.CHAIN_ID || "137").trim();
     const enabledChainIds = parseEnabledPaymentChainIds(env.ENABLED_PAYMENT_CHAIN_IDS || "1,43114,137");
@@ -315,6 +316,12 @@ async function main() {
       ensure(loopbackOrigin !== new URL(publicBaseUrl).origin,
         "local_store_terminal requires the loopback app origin to differ from PUBLIC_BASE_URL", {});
       record("topology_local_no_public_payment_origin", true, { value: loopbackOrigin });
+
+      const localIngest = evaluateLocalStoreTerminalIngestOrigin(env);
+      ensure(localIngest.ok, "local_store_terminal INTERNAL_APP_ORIGIN must be a loopback HTTP origin matching APP_HOST", {
+        blockers: localIngest.blockers,
+      });
+      record("topology_local_internal_app_origin", true, { value: new URL(env.INTERNAL_APP_ORIGIN).origin });
 
       ensure(!trustProxy && !trustProxyHops && trustProxyCidrs.length === 0,
         "local_store_terminal serves the loopback listener directly; TRUST_PROXY/TRUST_PROXY_HOPS/TRUST_PROXY_CIDRS must stay disabled",
@@ -487,7 +494,7 @@ async function main() {
       record("public_origins_match", true, { skipped: true, reason: "allow-empty" });
     }
 
-    if (!localStoreTerminal && productionChecks && (!allowEmpty || corsOrigins.length > 0)) {
+    if (localStoreTerminal || (productionChecks && (!allowEmpty || corsOrigins.length > 0))) {
       ensure(corsOrigins.length > 0, "CORS_ALLOW_ORIGINS must not be empty", {});
       ensure(!corsOrigins.some((origin) => origin === "*" || origin.includes("*")), "CORS_ALLOW_ORIGINS wildcard is not allowed", {
         cors_allow_origins: corsOrigins,

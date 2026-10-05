@@ -16,6 +16,8 @@ const fixture = {
   PUBLIC_POLICY_ORIGIN: "https://policies.merchant.jp",
   APP_HOST: "http://127.0.0.1:4173",
   PAY_BASE_URL: "http://127.0.0.1:4173",
+  INTERNAL_APP_ORIGIN: "http://127.0.0.1:4173",
+  CORS_ALLOW_ORIGINS: "http://127.0.0.1:4173",
   TRUST_PROXY: "false",
   PUBLIC_PAYMENT_PAGE_ENABLED: "false",
   WALLET_ADAPTER_TYPE: "wallet_deeplink",
@@ -54,6 +56,7 @@ test("IPv6 URL origins retain their existing bracket handling", () => {
   assert.equal(isLoopbackHost(new URL("http://[::1]:4173").hostname), true);
   const result = evaluateLocalStoreTerminalTopology({
     ...fixture, APP_BIND_HOST: "::1", APP_HOST: "http://[::1]:4173", PAY_BASE_URL: "http://[::1]:4173",
+    INTERNAL_APP_ORIGIN: "http://[::1]:4173", CORS_ALLOW_ORIGINS: "http://[::1]:4173",
   });
   assert.equal(result.ok, true, JSON.stringify(result.blockers));
 });

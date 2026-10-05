@@ -18,6 +18,12 @@
 7. **監査 / バックアップ / ワーカー分離**: `WORKER_STATE_DB_PATH` は `DB_PATH` と別ファイル必須、`BACKUP_DIR` 明示必須。監査証跡はアプリ台帳 DB 内に維持（既存どおり）。
 8. **Mac 運用準備 inputs**: `LOCAL_TERMINAL_OPERATOR_READINESS_REF` に下記チェックリスト完了を示す参照（例: `MAC-READY-2026-08`）を必須。プレースホルド的値は起動失敗。
 
+## Mac listener・worker取り込み先・ブラウザOrigin
+
+同じ `.env.production` を使用する全launchd jobで、`INTERNAL_APP_ORIGIN` を `APP_HOST` と同じloopback HTTP originへ明示設定する。例: `APP_HOST=http://127.0.0.1:4173`、`PAY_BASE_URL=http://127.0.0.1:4173`、`INTERNAL_APP_ORIGIN=http://127.0.0.1:4173`、`CORS_ALLOW_ORIGINS=http://127.0.0.1:4173`。host・portは実際の `APP_BIND_HOST`・`APP_PORT` のlistenerへ到達する値を使う。standalone MacではDocker向けexampleの `http://app:4173` を流用しない。
+
+local topologyでは同一originからの署名付きworker取り込みを許可する。サービス署名・replay・idempotencyの検査は維持する。CORSはブラウザのAPP_HOST originを明示許可し、wildcardを禁止する。公開policy originをCORSのloopback originの代用にしない。`public_cloud` の公開APP_HOSTと内部取り込み先を分離する既存要件は維持する。`--allow-empty` の構造事前点検でもlocal取り込み先とCORSを省略できない。
+
 ## 送金用ウォレット QR（正確性）
 - 店頭スタッフ画面は fixed 入口 QR の代わりに、**当該 invoice 専用**の EIP-681 ERC-20 transfer URI を QR 表示する:
   `ethereum:<official JPYC token>@137/transfer?address=<invoice recipient>&uint256=<exact atomic amount>`

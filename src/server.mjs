@@ -739,7 +739,7 @@ if (PRODUCTION_LIKE_RUNTIME && !INTERNAL_APP_ORIGIN) {
   console.error("FATAL: INTERNAL_APP_ORIGIN is required for production-like worker ingest.");
   process.exit(1);
 }
-if (PRODUCTION_LIKE_RUNTIME && INTERNAL_APP_ORIGIN && INTERNAL_APP_ORIGIN === APP_HOST) {
+if (PRODUCTION_LIKE_RUNTIME && !LOCAL_STORE_TERMINAL_TOPOLOGY && INTERNAL_APP_ORIGIN && INTERNAL_APP_ORIGIN === APP_HOST) {
   console.error("FATAL: INTERNAL_APP_ORIGIN must not equal the public APP_HOST.");
   process.exit(1);
 }
@@ -7044,7 +7044,7 @@ function evaluateDangerousFlagsGate() {
   if (releaseGateRequired && !INTERNAL_APP_ORIGIN) {
     blockers.push("INTERNAL_APP_ORIGIN must be configured for production-like worker ingest");
   }
-  if (releaseGateRequired && INTERNAL_APP_ORIGIN && INTERNAL_APP_ORIGIN === APP_HOST) {
+  if (releaseGateRequired && !LOCAL_STORE_TERMINAL_TOPOLOGY && INTERNAL_APP_ORIGIN && INTERNAL_APP_ORIGIN === APP_HOST) {
     blockers.push("INTERNAL_APP_ORIGIN must not equal the public APP_HOST");
   }
   if (releaseGateRequired && !isEvmAddress(REFUND_TREASURY_ADDRESS)) {
