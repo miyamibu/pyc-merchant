@@ -22,6 +22,7 @@ function loadedEnv(processEnv, file = null) {
   const loader = serverSource.match(/function loadEnv\(\) \{[\s\S]*?\n\}/)[0];
   return vm.runInNewContext(`${defaultsSource};${loader};loadEnv()`, {
     fs: { existsSync: () => file !== null, readFileSync: () => file }, path, CWD: "/synthetic", process: { env: processEnv },
+    CONNECTION_ENV_KEYS: topology.CONNECTION_ENV_KEYS,
   });
 }
 function validator(overrides) {
@@ -56,6 +57,14 @@ test("actual env loader and listener use the same APP_PORT / PORT precedence", a
   const counterexample = { ...fixture, APP_PORT: "", PORT: "5000" };
   assert.equal(topology.evaluateLocalStoreTerminalTopology(counterexample).ok, baseline);
   assert.equal((await validator({ APP_PORT: "", PORT: "5000" })).code === 0, baseline);
+});
+
+test("explicit empty connection values override synthetic dotenv values", async t => {
+  for (const [key, old] of [["APP_PORT", "4999"], ["TRUST_PROXY_HOPS", "1"], ["TRUST_PROXY_CIDRS", "127.0.0.1/8"],
+    ["INTERNAL_APP_ORIGIN", "http://app:4173"], ["CORS_ALLOW_ORIGINS", "https://old.merchant.jp"],
+    ["DEPLOYMENT_STAGE", "commercial"], ["COMMERCIAL_GO_MODE", "true"]]) {
+    await t.test(key, () => assert.equal(loadedEnv({ [key]: "" }, `${key}=${old}\n`)[key], baseline ? old : ""));
+  }
 });
 
 test("local preflight agrees with runtime on credentials and explicit proxy disable", async t => {
@@ -133,6 +142,7 @@ test("worker env loader retains production-like stage and GO flags for ingest sa
       const result = vm.runInNewContext(`${defaults};${loader};const ENV = loadEnv();${gate};PRODUCTION_LIKE`, {
         fs: { existsSync: () => false }, path, CWD: "/synthetic", process: { env: { APP_ENV: "development", ...values } },
         isProductionLikeRuntime: topology.isProductionLikeRuntime,
+        CONNECTION_ENV_KEYS: topology.CONNECTION_ENV_KEYS,
       });
       assert.equal(result, !baseline);
     });

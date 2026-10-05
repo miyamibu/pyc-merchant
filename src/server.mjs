@@ -93,6 +93,7 @@ import {
 import { APPROVED_LEDGER_BASE_UNIT_SCALE, APPROVED_TOKEN_DECIMALS } from "./token-metadata.mjs";
 import {
   DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
+  CONNECTION_ENV_KEYS,
   evaluateLocalStoreTerminalTopology,
   evaluateProxyRequirements,
   resolveListenerPort,
@@ -326,7 +327,7 @@ function loadEnv() {
     }
   }
   for (const [key, value] of Object.entries(process.env)) {
-    if (key in values && typeof value === "string" && value.length > 0) {
+    if (key in values && typeof value === "string" && (value.length > 0 || CONNECTION_ENV_KEYS.has(key))) {
       values[key] = value;
     }
   }

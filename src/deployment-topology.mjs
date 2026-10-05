@@ -24,6 +24,14 @@ export const DEPLOYMENT_TOPOLOGY_VALUES = Object.freeze([
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
 const LOOPBACK_BIND_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 
+// Explicit empty connection settings must clear stale dotenv values, as in
+// preflight and the launchd runner. Other environment semantics stay intact.
+export const CONNECTION_ENV_KEYS = new Set([
+  "APP_PORT", "PORT", "APP_HOST", "PAY_BASE_URL", "INTERNAL_APP_ORIGIN", "APP_BIND_HOST",
+  "CORS_ALLOW_ORIGINS", "TRUST_PROXY", "TRUST_PROXY_HOPS", "TRUST_PROXY_CIDRS",
+  "DEPLOYMENT_STAGE", "COMMERCIAL_GO_MODE",
+]);
+
 export function parseDeploymentTopology(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (!normalized) return DEPLOYMENT_TOPOLOGY_PUBLIC_CLOUD;

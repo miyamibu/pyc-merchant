@@ -14,7 +14,7 @@ import {
 } from "./amounts.mjs";
 import { buildChainRuntimeRegistryRecord } from "./chain-runtime-registry.mjs";
 import { decideMonitoringLifecycle, normalizeChainId } from "./payment-logic.mjs";
-import { isProductionLikeRuntime } from "./deployment-topology.mjs";
+import { CONNECTION_ENV_KEYS, isProductionLikeRuntime } from "./deployment-topology.mjs";
 import {
   OFFICIAL_JPYC_CONTRACT_ADDRESS_LOWER,
   getSupportedPaymentChain,
@@ -98,7 +98,7 @@ function loadEnv() {
     }
   }
   for (const [key, value] of Object.entries(process.env)) {
-    if (key in values && typeof value === "string" && value.length > 0) {
+    if (key in values && typeof value === "string" && (value.length > 0 || CONNECTION_ENV_KEYS.has(key))) {
       values[key] = value;
     }
   }
