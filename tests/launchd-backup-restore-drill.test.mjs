@@ -123,6 +123,8 @@ function createFixtureDb(dbPath) {
       id TEXT PRIMARY KEY,
       store_id TEXT NOT NULL
     );
+    CREATE TABLE invoice_consents (id TEXT PRIMARY KEY, invoice_id TEXT, policy_hash TEXT);
+    INSERT INTO invoice_consents VALUES ('consent-synthetic','inv-drill-fixture-0001','hash-synthetic');
     CREATE TABLE refund_requests (
       id TEXT PRIMARY KEY,
       invoice_id TEXT NOT NULL,
@@ -269,6 +271,7 @@ test("backup then restore drill passes on an isolated mkdtemp SQLite fixture and
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM terminals`).get().count, 1);
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM refund_requests`).get().count, 1);
     assert.equal(restored.prepare(`SELECT COUNT(*) AS count FROM audit_logs`).get().count, 2);
+    assert.deepEqual(restored.prepare(`SELECT * FROM invoice_consents`).get(), {id: "consent-synthetic", invoice_id: "inv-drill-fixture-0001", policy_hash: "hash-synthetic"});
     const sentinelInvoice = restored.prepare(`SELECT id, status, amount_base_units FROM invoices WHERE id = ?`)
       .get("inv-drill-fixture-0001");
     assert.deepEqual(sentinelInvoice, { id: "inv-drill-fixture-0001", status: "issued", amount_base_units: 100_000 });
@@ -307,13 +310,14 @@ test("backup then restore drill passes on an isolated mkdtemp SQLite fixture and
     // (The fixture DB is an isolated mkdtemp test artifact created by this
     // test; the table is renamed rather than dropped so fixture data is
     // preserved while the drill still sees the expected table as missing.)
-    const missingTableDir = path.join(tempRoot, "missing-business-table");
+    for (const missingTable of ["review_cases", "invoice_consents"]) {
+    const missingTableDir = path.join(tempRoot, `missing-${missingTable}`);
     fs.mkdirSync(missingTableDir, { recursive: true });
-    const missingTablePath = path.join(missingTableDir, "missing-review-cases.sqlite3");
+    const missingTablePath = path.join(missingTableDir, `missing-${missingTable}.sqlite3`);
     fs.copyFileSync(backupFile, missingTablePath);
     fs.chmodSync(missingTablePath, 0o600);
     const renameDb = new Database(missingTablePath);
-    renameDb.exec(`ALTER TABLE review_cases RENAME TO review_cases_drill_hidden`);
+    renameDb.exec(`ALTER TABLE ${missingTable} RENAME TO ${missingTable}_drill_hidden`);
     renameDb.close();
     let drillFailed = false;
     let drillStderrText = "";
@@ -328,7 +332,8 @@ test("backup then restore drill passes on an isolated mkdtemp SQLite fixture and
       drillStderrText = String(error.stderr || "");
     }
     assert.equal(drillFailed, true, "restore drill must fail when a core business table is missing");
-    assert.match(drillStderrText, /core business table missing: review_cases/);
+    assert.ok(drillStderrText.includes(`core business table missing: ${missingTable}`));
+    }
   } finally {
     // Remove only the mkdtemp directory this test created.
     fs.rmSync(tempRoot, { recursive: true, force: true });

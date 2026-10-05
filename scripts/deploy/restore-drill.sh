@@ -54,6 +54,7 @@ const CORE_BUSINESS_TABLES = [
   "stores",
   "terminals",
   "invoices",
+  "invoice_consents",
   "payment_events",
   "review_cases",
   "refund_requests",
