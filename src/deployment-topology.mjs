@@ -22,6 +22,7 @@ export const DEPLOYMENT_TOPOLOGY_VALUES = Object.freeze([
 ]);
 
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
+const LOOPBACK_BIND_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 
 export function parseDeploymentTopology(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
@@ -31,6 +32,12 @@ export function parseDeploymentTopology(value) {
 
 export function isLoopbackHost(hostname) {
   return LOOPBACK_HOSTNAMES.has(String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, ""));
+}
+
+// Listener hosts are raw hostnames, not URL authorities. Bracketed IPv6
+// must fail before Node attempts to resolve "[::1]" as a DNS hostname.
+export function isLoopbackBindHost(hostname) {
+  return LOOPBACK_BIND_HOSTNAMES.has(String(hostname || "").trim());
 }
 
 function isLoopbackHttpOrigin(rawUrl) {
@@ -108,8 +115,11 @@ function approvedRefPresent(value) {
 export function evaluateLocalStoreTerminalTopology(env = {}) {
   const blockers = [];
   const bindHost = String(env.APP_BIND_HOST || "").trim();
-  if (!bindHost || !isLoopbackHost(bindHost)) {
+  if (!isLoopbackBindHost(bindHost)) {
     blockers.push("topology_local_requires_loopback_bind_host");
+    if (bindHost.includes("[") || bindHost.includes("]")) {
+      blockers.push("topology_local_bind_host_must_be_unbracketed");
+    }
   }
 
   const policyOrigin = resolvePublicPolicyOrigin(env);
