@@ -40,7 +40,7 @@ export function isLoopbackBindHost(hostname) {
   return LOOPBACK_BIND_HOSTNAMES.has(String(hostname || "").trim());
 }
 
-function isLoopbackHttpOrigin(rawUrl) {
+export function isLoopbackHttpOrigin(rawUrl) {
   try {
     const parsed = new URL(String(rawUrl || "").trim());
     return parsed.protocol === "http:"
@@ -55,6 +55,30 @@ function isLoopbackHttpOrigin(rawUrl) {
   }
 }
 
+export function resolveListenerPort(env = {}) {
+  return Number(env.APP_PORT || env.PORT || "4173");
+}
+
+export function evaluateLocalStoreTerminalProxy(env = {}) {
+  const blockers = [];
+  if (!["false", "0", "no", "off"].includes(String(env.TRUST_PROXY ?? "").trim().toLowerCase())
+    || String(env.TRUST_PROXY_HOPS || "").trim() || String(env.TRUST_PROXY_CIDRS || "").trim()) {
+    blockers.push("topology_local_requires_direct_loopback_no_trusted_proxy");
+  }
+  return { ok: blockers.length === 0, blockers };
+}
+
+export function evaluateProxyRequirements({ localStoreTerminal, appEnv, trustProxy, trustProxyConfigured }) {
+  const blockers = [];
+  if (!localStoreTerminal) {
+    if (!trustProxy) blockers.push("TRUST_PROXY must be enabled");
+    if (appEnv === "production" && !trustProxyConfigured) {
+      blockers.push("production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS");
+    }
+  }
+  return { ok: blockers.length === 0, blockers };
+}
+
 export function evaluateLocalStoreTerminalListener(env = {}) {
   const blockers = [];
   const bindHost = String(env.APP_BIND_HOST || "").trim();
@@ -63,7 +87,7 @@ export function evaluateLocalStoreTerminalListener(env = {}) {
     if (bindHost.includes("[") || bindHost.includes("]")) blockers.push("topology_local_bind_host_must_be_unbracketed");
   }
   // Match the server's default APP_PORT; HTTP URL default ports are 80.
-  const port = Number(env.APP_PORT || "4173");
+  const port = resolveListenerPort(env);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     blockers.push("topology_local_app_port_must_be_valid_listener_port");
   }
@@ -97,6 +121,12 @@ function parseFlag(value, fallback = false) {
   if (["true", "1", "yes", "on"].includes(normalized)) return true;
   if (["false", "0", "no", "off"].includes(normalized)) return false;
   return fallback;
+}
+
+export function isProductionLikeRuntime(env = {}) {
+  return String(env.APP_ENV || "").trim().toLowerCase() === "production"
+    || ["pilot", "commercial"].includes(String(env.DEPLOYMENT_STAGE || "").trim().toLowerCase())
+    || parseFlag(env.COMMERCIAL_GO_MODE, false);
 }
 
 function isEvmAddress(value) {
@@ -214,9 +244,7 @@ export function evaluateLocalStoreTerminalTopology(env = {}) {
     }
   }
 
-  if (parseFlag(env.TRUST_PROXY, true) || String(env.TRUST_PROXY_HOPS || "").trim() || String(env.TRUST_PROXY_CIDRS || "").trim()) {
-    blockers.push("topology_local_requires_direct_loopback_no_trusted_proxy");
-  }
+  blockers.push(...evaluateLocalStoreTerminalProxy(env).blockers);
 
   const disabledControls = [
     ["ENABLE_PUBLIC_PAYMENT_SIMULATION", "enable_public_payment_simulation_disabled"],

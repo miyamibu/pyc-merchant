@@ -28,6 +28,8 @@ import {
   DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
   evaluateLocalStoreTerminalIngestOrigin,
   evaluateLocalStoreTerminalListener,
+  evaluateLocalStoreTerminalProxy,
+  isLoopbackHttpOrigin,
   isLoopbackBindHost,
   isLoopbackHost,
   resolvePublicPolicyOrigin,
@@ -78,19 +80,6 @@ const LOCAL_TOPOLOGY_DISABLED_CONTROLS = Object.freeze([
 
 function boolFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
-}
-
-function isLoopbackHttpOrigin(rawUrl) {
-  try {
-    const parsed = new URL(String(rawUrl || "").trim());
-    return parsed.protocol === "http:"
-      && isLoopbackHost(parsed.hostname)
-      && parsed.pathname === "/"
-      && !parsed.search
-      && !parsed.hash;
-  } catch {
-    return false;
-  }
 }
 
 function isPublicHttpsOriginOnly(rawUrl) {
@@ -336,7 +325,7 @@ async function main() {
       });
       record("topology_local_internal_app_origin", true, { value: new URL(env.INTERNAL_APP_ORIGIN).origin });
 
-      ensure(!trustProxy && !trustProxyHops && trustProxyCidrs.length === 0,
+      ensure(evaluateLocalStoreTerminalProxy(env).ok,
         "local_store_terminal serves the loopback listener directly; TRUST_PROXY/TRUST_PROXY_HOPS/TRUST_PROXY_CIDRS must stay disabled",
         { trust_proxy: trustProxy, hops: trustProxyHops || null, cidrs: trustProxyCidrs });
       record("topology_local_direct_loopback_no_trusted_proxy", true, {});

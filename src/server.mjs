@@ -94,6 +94,9 @@ import { APPROVED_LEDGER_BASE_UNIT_SCALE, APPROVED_TOKEN_DECIMALS } from "./toke
 import {
   DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
   evaluateLocalStoreTerminalTopology,
+  evaluateProxyRequirements,
+  resolveListenerPort,
+  isProductionLikeRuntime as evaluateProductionLikeEnvironment,
   parseDeploymentTopology,
   resolvePublicPolicyOrigin,
 } from "./deployment-topology.mjs";
@@ -116,7 +119,8 @@ const CWD = process.cwd();
 const DEFAULTS = {
   APP_ENV: "development",
   NODE_ENV: "",
-  APP_PORT: "4173",
+  // Resolve the default after explicit APP_PORT / PORT values are loaded.
+  APP_PORT: "",
   PORT: "",
   APP_HOST: "http://localhost:4173",
   APP_BIND_HOST: "",
@@ -336,7 +340,7 @@ const ENV = loadEnv();
 const WALLET_ADAPTER = createWalletAdapter(ENV);
 const APP_ENV = String(ENV.APP_ENV || ENV.NODE_ENV || DEFAULTS.APP_ENV).trim().toLowerCase();
 const IS_PRODUCTION = APP_ENV === "production";
-const PORT = Number(ENV.APP_PORT || ENV.PORT || DEFAULTS.APP_PORT);
+const PORT = resolveListenerPort(ENV);
 const APP_HOST = ENV.APP_HOST || ENV.PAY_BASE_URL || ENV.PUBLIC_BASE_URL || DEFAULTS.APP_HOST;
 const APP_BIND_HOST = String(ENV.APP_BIND_HOST || DEFAULTS.APP_BIND_HOST || "").trim();
 const INTERNAL_APP_ORIGIN = String(ENV.INTERNAL_APP_ORIGIN || DEFAULTS.INTERNAL_APP_ORIGIN || "").trim();
@@ -464,7 +468,7 @@ const COMMERCIAL_GO_MODE = parseFlag(ENV.COMMERCIAL_GO_MODE ?? DEFAULTS.COMMERCI
 const DEPLOYMENT_STAGE = String(
   ENV.DEPLOYMENT_STAGE || DEFAULTS.DEPLOYMENT_STAGE || (IS_PRODUCTION ? "commercial" : "development")
 ).trim().toLowerCase();
-const PRODUCTION_LIKE_RUNTIME = IS_PRODUCTION || ["pilot", "commercial"].includes(DEPLOYMENT_STAGE) || COMMERCIAL_GO_MODE;
+const PRODUCTION_LIKE_RUNTIME = evaluateProductionLikeEnvironment({ APP_ENV, DEPLOYMENT_STAGE, COMMERCIAL_GO_MODE });
 const DEPLOYMENT_TOPOLOGY = parseDeploymentTopology(ENV.DEPLOYMENT_TOPOLOGY ?? DEFAULTS.DEPLOYMENT_TOPOLOGY);
 if (!DEPLOYMENT_TOPOLOGY) {
   console.error("FATAL: DEPLOYMENT_TOPOLOGY must be public_cloud or local_store_terminal.");
@@ -7066,10 +7070,8 @@ function evaluateDangerousFlagsGate() {
   if (INSECURE_SECRETS.has(SERVICE_INGEST_SECRET) || SERVICE_INGEST_SECRET.length < 32) blockers.push("SERVICE_INGEST_SECRET is weak");
   if (INSECURE_SECRETS.has(METRICS_SECRET) || METRICS_SECRET.length < 32) blockers.push("METRICS_SECRET is weak");
   if (CORS_ALLOW_ORIGINS.some((origin) => origin === "*" || origin.includes("*"))) blockers.push("CORS_ALLOW_ORIGINS wildcard is not allowed");
-  if (!TRUST_PROXY) blockers.push("TRUST_PROXY must be enabled");
-  if (APP_ENV === "production" && !TRUST_PROXY_CONFIGURED) {
-    blockers.push("production TRUST_PROXY requires TRUST_PROXY_HOPS or TRUST_PROXY_CIDRS");
-  }
+  blockers.push(...evaluateProxyRequirements({ localStoreTerminal: LOCAL_STORE_TERMINAL_TOPOLOGY,
+    appEnv: APP_ENV, trustProxy: TRUST_PROXY, trustProxyConfigured: TRUST_PROXY_CONFIGURED }).blockers);
   if (!Number.isFinite(SESSION_TTL_SEC) || SESSION_TTL_SEC <= 0) blockers.push("SESSION_TTL_SEC must be positive");
   if (!Number.isFinite(SSE_TOKEN_MAX_TTL_SEC) || SSE_TOKEN_MAX_TTL_SEC < 60 || SSE_TOKEN_MAX_TTL_SEC > 900) {
     blockers.push("SSE_TOKEN_MAX_TTL_SEC must be between 60 and 900");

@@ -27,6 +27,7 @@ import path from "node:path";
 import http from "node:http";
 import process from "node:process";
 import Database from "better-sqlite3";
+import { resolveListenerPort } from "../../../src/deployment-topology.mjs";
 
 const HTTP_TIMEOUT_MS = 5000;
 const OVERALL_TIMEOUT_MS = 15000;
@@ -56,8 +57,8 @@ const bindHostRaw = String(process.env.APP_BIND_HOST ?? "").trim() || "127.0.0.1
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 if (!LOOPBACK_HOSTS.has(bindHostRaw)) fail("bind_host_not_loopback", { bind_host_class: "rejected" });
 
-const port = positiveIntFromEnv("APP_PORT", positiveIntFromEnv("PORT", 4173));
-if (port === null || port < 1 || port > 65535) fail("app_port_invalid");
+const port = resolveListenerPort(process.env);
+if (!Number.isInteger(port) || port < 1 || port > 65535) fail("app_port_invalid");
 
 const chainId = positiveIntFromEnv("CHAIN_ID", 137);
 if (chainId === null) fail("chain_id_invalid");
