@@ -7,20 +7,22 @@ import { POLICY_DOCUMENT_HEADERS, renderPolicyDocument } from '../sites/jpyc-pub
 import { buildEip681PaymentUri } from '../src/wallet-adapter.mjs';
 
 // Same synthetic policy data and attack transformations as the independent
-// review. Its files remain untouched; v2 adds the new positive contract case.
+// review. Contract v3 adds a version-bound positive case.
 const urls = { terms: 'https://policies.merchant.jp/terms', privacy: 'https://policies.merchant.jp/privacy', refund: 'https://policies.merchant.jp/refund-policy' };
 const contents = {
-  terms: JSON.stringify({ title: 'Terms', summary: 'Original summary', sections: [{ title: 'Fees', paragraphs: ['No extra fee.'] }] }),
-  privacy: JSON.stringify({ title: 'Privacy', summary: 'Original summary', sections: [{ title: 'Data', paragraphs: ['No sharing.'] }] }),
-  refund: JSON.stringify({ title: 'Refund', summary: 'Original summary', sections: [{ title: 'Refunds', bullets: ['Ask staff.'] }] }),
+  terms: JSON.stringify({ title: 'Terms', version: '2026-08-26', summary: 'Original summary', sections: [{ title: 'Fees', paragraphs: ['No extra fee.'] }] }),
+  privacy: JSON.stringify({ title: 'Privacy', version: '2026-08-26', summary: 'Original summary', sections: [{ title: 'Data', paragraphs: ['No sharing.'] }] }),
+  refund: JSON.stringify({ title: 'Refund', version: '2026-08-26', summary: 'Original summary', sections: [{ title: 'Refunds', bullets: ['Ask staff.'] }] }),
 };
 const hashes = { terms_hash: hashPolicyContent(contents.terms), privacy_hash: hashPolicyContent(contents.privacy), refund_policy_hash: hashPolicyContent(contents.refund) };
+const expectedVersions = { terms_version: '2026-08-26', privacy_version: '2026-08-26', refund_policy_version: '2026-08-26' };
 const base = Object.fromEntries(Object.entries(contents).map(([key, content]) => [key, renderPolicyDocument(content)]));
 const verify = (terms, headers = POLICY_DOCUMENT_HEADERS) => verifyPublishedPolicyPages(urls, hashes, {
+  expectedVersions,
   fetchImpl: async (url) => new Response(url === urls.terms ? terms : base[Object.keys(urls).find((key) => urls[key] === url)], { headers }),
 });
 
-test('independent F1: contract-v2 baseline succeeds and every visible/hidden addition fails closed', async (t) => {
+test('independent F1: contract-v3 baseline succeeds and every visible/hidden addition fails closed', async (t) => {
   assert.equal((await verify(base.terms)).ok, true);
   assert.equal(extractVisiblePolicyContent(base.terms), contents.terms);
   for (const [name, html] of [
@@ -60,9 +62,9 @@ test('document safety headers and strict content schema are mandatory', async ()
   for (const content of [
     contents.terms + ' ',
     JSON.stringify({ ...JSON.parse(contents.terms), hidden: true }),
-    JSON.stringify({ title: 'Terms', summary: 'Summary', sections: [{ title: 'Fees', html: '<p>Different</p>' }] }),
+    JSON.stringify({ title: 'Terms', version: '2026-08-26', summary: 'Summary', sections: [{ title: 'Fees', html: '<p>Different</p>' }] }),
   ]) assert.throws(() => renderPolicyDocument(content));
-  const escaped = JSON.stringify({ title: '<script>&"', summary: 'Summary', sections: [{ title: 'Fees', paragraphs: ['</script><style>hidden</style>'] }] });
+  const escaped = JSON.stringify({ title: '<script>&"', version: '2026-08-26', summary: 'Summary', sections: [{ title: 'Fees', paragraphs: ['</script><style>hidden</style>'] }] });
   assert.equal(extractVisiblePolicyContent(renderPolicyDocument(escaped)), escaped);
 });
 

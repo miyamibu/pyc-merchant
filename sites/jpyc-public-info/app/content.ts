@@ -12,6 +12,14 @@ export type PublicPage = {
   sections: ContentSection[];
 };
 
+// Matches the existing published document set (1.0). Rendering and snapshot
+// export use the same version source; changing it requires a new approval.
+export const POLICY_PAGE_VERSIONS: Record<string, string> = Object.freeze({
+  terms: '1.0',
+  privacy: '1.0',
+  'refund-policy': '1.0',
+});
+
 export const pages: PublicPage[] = [
   {
     slug: 'payment-guide', eyebrow: 'PAYMENT GUIDE', title: 'JPYC支払い方法',

@@ -3240,6 +3240,10 @@ function summarizeInvoiceForTerminalState(invoice) {
   if (!invoice) return null;
   const review = findLatestReviewCase(invoice.id);
   const fulfillmentDecision = buildAuthoritativeFulfillmentDecision(invoice);
+  const paymentInformation = gateWalletPayloadForConsent({
+    receive_address: invoice.recipient_address,
+    token_amount_atomic: invoice.token_amount_atomic,
+  }, invoice);
   return {
     invoice_id: invoice.id,
     invoice_no: invoice.invoice_no,
@@ -3252,7 +3256,7 @@ function summarizeInvoiceForTerminalState(invoice) {
     amount_scale_version: invoice.amount_scale_version || AMOUNT_SCALE_VERSION,
     token_decimals: invoice.token_decimals ?? TOKEN_DECIMALS,
     ledger_decimals: invoice.ledger_decimals ?? LEDGER_DECIMALS,
-    token_amount_atomic: invoice.token_amount_atomic || null,
+    token_amount_atomic: paymentInformation.token_amount_atomic || null,
     ledger_amount_base: invoice.ledger_amount_base || invoice.amount_jpyc_base || null,
     display_amount: invoice.display_amount || invoice.amount_jpy,
     invoice_version: Number(invoice.invoice_version || invoice.version || 1),
@@ -3270,7 +3274,7 @@ function summarizeInvoiceForTerminalState(invoice) {
           customer_policy_consent: buildLocalConsentSummary(invoice),
         }
       : { payment_url: invoice.payment_url }),
-    recipient_address: invoice.recipient_address,
+    recipient_address: LOCAL_STORE_TERMINAL_TOPOLOGY ? paymentInformation.receive_address || null : invoice.recipient_address,
     review_case_id: review?.id || null,
     state_axes: deriveInvoiceStateAxes(invoice),
   };
@@ -17409,11 +17413,14 @@ app.post("/api/v1/invoices/:invoiceId/policy-consent", requirePermission("invoic
     });
   }
 
-  const publishedPages = await verifyPublishedPolicyPages(policyGate.values, policyGate.hashes);
+  const publishedPages = await verifyPublishedPolicyPages(policyGate.values, policyGate.hashes, {
+    expectedVersions: policyGate.versions,
+  });
   if (!publishedPages.ok) {
     return jsonError(res, 503, "POLICY_SITE_CONTENT_UNVERIFIED", "Published policy pages do not match the invoice policy hashes", {
       mismatch_keys: publishedPages.mismatch_keys,
       unavailable_keys: publishedPages.unavailable_keys,
+      version_mismatch_keys: publishedPages.version_mismatch_keys,
     });
   }
 

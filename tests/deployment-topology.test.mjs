@@ -30,9 +30,9 @@ const CWD = process.cwd();
 const PUBLIC_POLICY_ORIGIN = "https://miyamibu.xyz";
 const OFFICIAL_JPYC_TOKEN = "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29";
 const LOCAL_POLICY_CONTENTS = {
-  terms: JSON.stringify({ title: "Local terminal terms", summary: "Version: 2026-08-26", sections: [{ title: "Terms", paragraphs: ["Pay only from the terminal QR."] }] }),
-  privacy: JSON.stringify({ title: "Local terminal privacy", summary: "Version: 2026-08-26", sections: [{ title: "Privacy", paragraphs: ["No wallet secrets are collected."] }] }),
-  refund: JSON.stringify({ title: "Local terminal refund policy", summary: "Version: 2026-08-26", sections: [{ title: "Refund", bullets: ["Refunds require review."] }] }),
+  terms: JSON.stringify({ title: "Local terminal terms", version: '2026-08-26', summary: "Version: 2026-08-26", sections: [{ title: "Terms", paragraphs: ["Pay only from the terminal QR."] }] }),
+  privacy: JSON.stringify({ title: "Local terminal privacy", version: '2026-08-26', summary: "Version: 2026-08-26", sections: [{ title: "Privacy", paragraphs: ["No wallet secrets are collected."] }] }),
+  refund: JSON.stringify({ title: "Local terminal refund policy", version: '2026-08-26', summary: "Version: 2026-08-26", sections: [{ title: "Refund", bullets: ["Refunds require review."] }] }),
 };
 
 function policySiteFixture(contents = LOCAL_POLICY_CONTENTS) {

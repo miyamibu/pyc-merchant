@@ -32,7 +32,7 @@ test('policy HTTPS rejects non-public/mixed DNS and DNS failure before opening a
 });
 
 test('policy HTTPS pins validated DNS with TLS hostname checks, a fresh socket, size limit and zero redirects', async (t) => {
-  const content = JSON.stringify({ title: 'Terms', summary: 'Original summary', sections: [{ title: 'Fees', paragraphs: ['No extra fee.'] }] });
+  const content = JSON.stringify({ title: 'Terms', version: '2026-08-26', summary: 'Original summary', sections: [{ title: 'Fees', paragraphs: ['No extra fee.'] }] });
   const html = renderPolicyDocument(content);
   let status = 200;
   let body = html;
@@ -80,5 +80,6 @@ test('policy HTTPS pins validated DNS with TLS hostname checks, a fresh socket, 
   body = Buffer.from([0xff]);
   const urls = { terms: 'https://policies.merchant.jp/terms', privacy: 'https://policies.merchant.jp/privacy', refund: 'https://policies.merchant.jp/refund-policy' };
   const hashes = { terms_hash: hashPolicyContent(content), privacy_hash: hashPolicyContent(content), refund_policy_hash: hashPolicyContent(content) };
-  assert.deepEqual((await verifyPublishedPolicyPages(urls, hashes)).unavailable_keys, ['terms', 'privacy', 'refund']);
+  const expectedVersions = { terms_version: '2026-08-26', privacy_version: '2026-08-26', refund_policy_version: '2026-08-26' };
+  assert.deepEqual((await verifyPublishedPolicyPages(urls, hashes, { expectedVersions })).unavailable_keys, ['terms', 'privacy', 'refund']);
 });

@@ -113,6 +113,21 @@ function planFor(root, argv = baseArgs(root)) {
   return resolveRunnerPlan(argv, { execPath: process.execPath, runtimeVersion: PINNED_NODE_VERSION });
 }
 
+test("production example has unique keys and permits every launchd target plan", () => {
+  const raw = fs.readFileSync(path.join(process.cwd(), ".env.production.example"), "utf8");
+  assert.deepEqual(parseEnvFileLines(raw).errors, []);
+  assert.equal(raw.split("\n").filter((line) => line.startsWith("BACKUP_DIR=")).length, 1);
+  const root = makeTempRepo({ envFileBody: raw });
+  try {
+    for (const target of RUNNER_TARGET_FIXTURES) {
+      const result = planFor(root, [...baseArgs(root), "--", target]);
+      assert.equal(result.ok, true, `${target}: ${result.code}`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("resolveRunnerPlan accepts an allowlisted local topology launch", () => {
   const root = makeTempRepo({ envFileBody: "APP_ENV=production\nAPP_PORT=4173\n" });
   try {

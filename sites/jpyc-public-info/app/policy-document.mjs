@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 
-// Contract v2 accepts only this self-contained document, never arbitrary HTML.
+// Contract v3 binds the presented version into this self-contained document.
 // The API regenerates the entire document and compares its UTF-8 bytes.
-export const POLICY_DOCUMENT_CONTRACT = 'jpyc_policy_document_v2';
+export const POLICY_DOCUMENT_CONTRACT = 'jpyc_policy_document_v3';
 const style = 'body{margin:0;background:#fff;color:#172033;font:18px/1.7 system-ui,sans-serif}main{max-width:52rem;margin:auto;padding:2rem 1rem}h1{font-size:2rem}h2{font-size:1.4rem}section{margin:2rem 0}li{margin:.5rem 0}.notice{border:2px solid #172033;padding:1rem}';
 const styleHash = createHash('sha256').update(style, 'utf8').digest('base64');
 export const POLICY_DOCUMENT_CSP = `default-src 'none'; style-src 'sha256-${styleHash}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`;
@@ -24,7 +24,8 @@ export function parsePolicyDocumentContent(content) {
   if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > 64_000) return null;
   try {
     const page = JSON.parse(content);
-    if (!exactKeys(page, ['title', 'summary', 'sections']) || !text(page.title) || !text(page.summary)
+    if (!exactKeys(page, ['title', 'version', 'summary', 'sections']) || !text(page.title)
+      || !isPolicyDocumentVersion(page.version) || !text(page.summary)
       || !Array.isArray(page.sections) || page.sections.length === 0 || page.sections.length > 128) return null;
     const sections = [];
     for (const section of page.sections) {
@@ -37,9 +38,14 @@ export function parsePolicyDocumentContent(content) {
         ...(section.bullets ? { bullets: section.bullets } : {}),
       });
     }
-    const canonical = JSON.stringify({ title: page.title, summary: page.summary, sections });
+    const canonical = JSON.stringify({ title: page.title, version: page.version, summary: page.summary, sections });
     return canonical === content ? page : null;
   } catch { return null; }
+}
+
+export function isPolicyDocumentVersion(version) {
+  return text(version) && version.length <= 128 && version === version.trim()
+    && !/(?:draft|pending|placeholder|example)/i.test(version);
 }
 
 export function renderPolicyDocument(content) {
@@ -55,7 +61,7 @@ export function renderPolicyDocument(content) {
     + `<meta name="policy-contract" content="${POLICY_DOCUMENT_CONTRACT}"><meta http-equiv="Content-Security-Policy" content="${escape(POLICY_DOCUMENT_CSP)}">`
     + `<title>${escape(page.title)}</title><style>${style}</style></head><body><main id="main">`
     + '<p class="notice">このSiteから送金しないでください。支払いは店舗端末に表示されたQRからのみ行います。</p>'
-    + `<header class="document-hero"><h1>${escape(page.title)}</h1><p>${escape(page.summary)}</p></header>`
+    + `<header class="document-hero"><h1>${escape(page.title)}</h1><p data-policy-version="${escape(page.version)}">文書版: ${escape(page.version)}</p><p>${escape(page.summary)}</p></header>`
     + `<article class="document-body" data-policy-sha256="${digest}">${sections}</article></main>`
     + `${dataOpen}${data}</script></body></html>`;
   if (Buffer.byteLength(html, 'utf8') > 256_000) throw new Error('policy document too large');

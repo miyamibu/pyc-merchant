@@ -24,6 +24,14 @@
 
 preflight・app・health watcherは同じport解決を使う。localでは `TRUST_PROXY=false`（0/no/offも互換）を明示し、HOPS/CIDRSは空にする。public_cloudのproxy必須gateは維持し、localのproduction/pilotだけ直接loopbackの境界を使う。CORSはURLのcanonical originを指定する（port80なら `http://127.0.0.1`）。local起動やproxy gateの通過は、別の商用承認・決済GOを意味しない。
 
+### 公開policyの文書版と旧同意の互換性
+
+新規local同意は `jpyc_policy_document_v3` の自己完結文書だけを受け付ける。canonical JSONは `title`・`version`・`summary`・`sections` の順で固定し、versionは本文へ「文書版」として表示する。3ページのrendererと `sites/jpyc-public-info/scripts/policy-snapshot.mjs` は同じ `POLICY_PAGE_VERSIONS` を使う。公開案内の既存文書セットは1.0であり、版情報をhash対象へ結合しても本文の取引条件を変更したことにはしない。
+
+同意APIは公開ページのexact bytes・必須headers・content hashに加え、請求作成時に固定した各文書versionとの一致を確認する。現在の店舗設定で過去請求のsnapshotを置き換えない。v2以前の同意行・監査記録は保持し、新規v3の検証済み証拠へ自動昇格させない。旧同意の請求は送金情報を表示せず、同意再実行も `POLICY_CONSENT_REISSUE_REQUIRED` で拒否する。
+
+コード更新だけで公開Siteや店舗snapshotは変わらない。v3の公開受入と承認済みsnapshotの整合確認が終わるまで新規同意はfail closedとなる。Site公開、店舗snapshot変更、請求再発行の実運用、旧同意移行はこのコード変更に含めず別途承認する。現行のv2確認用HTMLはv3公開artifactとして流用しない。
+
 同じ `.env.production` を使用する全launchd jobで、`INTERNAL_APP_ORIGIN` を `APP_HOST` と同じloopback HTTP originへ明示設定する。例: `APP_HOST=http://127.0.0.1:4173`、`PAY_BASE_URL=http://127.0.0.1:4173`、`INTERNAL_APP_ORIGIN=http://127.0.0.1:4173`、`CORS_ALLOW_ORIGINS=http://127.0.0.1:4173`。host・portは実際の `APP_BIND_HOST`・`APP_PORT` のlistenerへ到達する値を使う。standalone MacではDocker向けexampleの `http://app:4173` を流用しない。
 
 local topologyでは同一originからの署名付きworker取り込みを許可する。サービス署名・replay・idempotencyの検査は維持する。CORSはブラウザのAPP_HOST originを明示許可し、wildcardを禁止する。公開policy originをCORSのloopback originの代用にしない。`public_cloud` の公開APP_HOSTと内部取り込み先を分離する既存要件は維持する。`--allow-empty` の構造事前点検でもlocal取り込み先とCORSを省略できない。

@@ -3,6 +3,8 @@ import { fetchPinnedPublicHttps, validatePublicHttpsUrl } from "./public-endpoin
 import {
   extractPolicyDocumentContent,
   POLICY_DOCUMENT_HEADERS,
+  parsePolicyDocumentContent,
+  isPolicyDocumentVersion,
 } from "../sites/jpyc-public-info/app/policy-document.mjs";
 export { POLICY_DOCUMENT_CONTRACT } from "../sites/jpyc-public-info/app/policy-document.mjs";
 
@@ -90,7 +92,7 @@ export function verifyPolicyContentHashes(contents, hashes) {
   };
 }
 
-// Kept for callers of the previous candidate. Only a complete contract-v2
+// Kept for callers of the previous candidate. Only a complete contract-v3
 // document is accepted; this function no longer parses arbitrary visible HTML.
 export const extractVisiblePolicyContent = extractPolicyDocumentContent;
 
@@ -104,15 +106,18 @@ export async function fetchPublishedPolicyPage(url) {
   return new Response(result.bodyBytes, { status: result.status, headers: result.headers });
 }
 
-export async function verifyPublishedPolicyPages(urls, hashes, { fetchImpl = fetchPublishedPolicyPage } = {}) {
+export async function verifyPublishedPolicyPages(urls, hashes, { expectedVersions, fetchImpl = fetchPublishedPolicyPage } = {}) {
   const mismatchKeys = [];
   const unavailableKeys = [];
+  const versionMismatchKeys = [];
   for (const key of POLICY_URL_KEYS) {
     const url = urls?.[key];
     const expected = String(hashes?.[POLICY_CONTENT_HASH_KEYS[key]] || "").toLowerCase();
+    const expectedVersion = expectedVersions?.[key === "refund" ? "refund_policy_version" : `${key}_version`];
     // The consent caller also requires exact equality with its configured Site
     // origin and paths. Static hostname syntax alone never authorizes a socket.
-    if (!isPublishedPolicyUrl(url) || !validatePublicHttpsUrl(url).ok || !isPublishedPolicyHash(expected)) {
+    if (!isPublishedPolicyUrl(url) || !validatePublicHttpsUrl(url).ok || !isPublishedPolicyHash(expected)
+      || !isPolicyDocumentVersion(expectedVersion)) {
       unavailableKeys.push(key);
       continue;
     }
@@ -140,12 +145,13 @@ export async function verifyPublishedPolicyPages(urls, hashes, { fetchImpl = fet
       const content = extractPolicyDocumentContent(html);
       if (!content) unavailableKeys.push(key);
       else if (hashPolicyContent(content) !== expected) mismatchKeys.push(key);
+      else if (parsePolicyDocumentContent(content).version !== expectedVersion) versionMismatchKeys.push(key);
     } catch {
       unavailableKeys.push(key);
     }
   }
-  return { ok: mismatchKeys.length === 0 && unavailableKeys.length === 0,
-    mismatch_keys: mismatchKeys, unavailable_keys: unavailableKeys };
+  return { ok: mismatchKeys.length === 0 && unavailableKeys.length === 0 && versionMismatchKeys.length === 0,
+    mismatch_keys: mismatchKeys, unavailable_keys: unavailableKeys, version_mismatch_keys: versionMismatchKeys };
 }
 
 export function extractPolicyObjectValues(content, constantName, requiredKeys) {

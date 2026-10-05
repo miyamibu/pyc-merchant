@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { pages } from "../sites/jpyc-public-info/app/content.ts";
+import { pages, POLICY_PAGE_VERSIONS } from "../sites/jpyc-public-info/app/content.ts";
 import { extractVisiblePolicyContent, hashPolicyContent } from "../src/policy-publication.mjs";
 
 const slugs = { terms: "terms", privacy: "privacy", refund: "refund-policy" };
@@ -12,7 +12,7 @@ import { GET as refundGet } from "../sites/jpyc-public-info/app/refund-policy/ro
 const routes = { terms: termsGet, privacy: privacyGet, refund: refundGet };
 import { renderPolicyDocument } from "../sites/jpyc-public-info/app/policy-document.mjs";
 
-test("policy export hashes the same visible title, summary, and sections used by all three Site pages", async () => {
+test("policy export binds the same visible version and body used by all three Site pages", async () => {
   const exported = JSON.parse(execFileSync(process.execPath, ["sites/jpyc-public-info/scripts/policy-snapshot.mjs"], {
     cwd: process.cwd(),
     encoding: "utf8",
@@ -20,12 +20,15 @@ test("policy export hashes the same visible title, summary, and sections used by
   for (const [key, slug] of Object.entries(slugs)) {
     const page = pages.find((candidate) => candidate.slug === slug);
     assert.ok(page);
-    const expected = JSON.stringify({ title: page.title, summary: page.summary, sections: page.sections });
+    const version = POLICY_PAGE_VERSIONS[slug];
+    const expected = JSON.stringify({ title: page.title, version, summary: page.summary, sections: page.sections });
     const hashKey = key === "refund" ? "refund_policy_hash" : `${key}_hash`;
     assert.equal(exported.contents[key], expected);
     assert.equal(exported[hashKey], hashPolicyContent(expected));
+    assert.equal(exported[key === "refund" ? "refund_policy_version" : `${key}_version`], version);
     const visiblePage = await routes[key]().text();
     assert.equal(visiblePage, renderPolicyDocument(expected));
+    assert.ok(visiblePage.includes(`data-policy-version="${version}">文書版: ${version}`));
     assert.equal(extractVisiblePolicyContent(visiblePage), expected);
 
     const firstVisibleText = page.sections[0].paragraphs?.[0] || page.sections[0].bullets?.[0];

@@ -110,9 +110,9 @@ test("published policy page verification fails closed for changed, missing, or u
     refund: "https://policies.merchant.jp/refund-policy",
   };
   const contents = {
-    terms: JSON.stringify({ title: "Terms", summary: "Terms summary", sections: [{ title: "Terms section", paragraphs: ["Original visible terms"] }] }),
-    privacy: JSON.stringify({ title: "Privacy", summary: "Privacy summary", sections: [{ title: "Privacy section", paragraphs: ["Visible privacy"] }] }),
-    refund: JSON.stringify({ title: "Refund", summary: "Refund summary", sections: [{ title: "Refund section", bullets: ["Visible refund"] }] }),
+    terms: JSON.stringify({ title: "Terms", version: '2026-07-15', summary: "Terms summary", sections: [{ title: "Terms section", paragraphs: ["Original visible terms"] }] }),
+    privacy: JSON.stringify({ title: "Privacy", version: '2026-07-15', summary: "Privacy summary", sections: [{ title: "Privacy section", paragraphs: ["Visible privacy"] }] }),
+    refund: JSON.stringify({ title: "Refund", version: '2026-07-15', summary: "Refund summary", sections: [{ title: "Refund section", bullets: ["Visible refund"] }] }),
   };
   const hashes = {
     terms_hash: hashPolicyContent(contents.terms),
@@ -133,7 +133,7 @@ test("published policy page verification fails closed for changed, missing, or u
     if (url === urls.privacy) return page(contents.privacy);
     return new Response("not found", { status: 404 });
   };
-  const result = await verifyPublishedPolicyPages(urls, hashes, { fetchImpl });
+  const result = await verifyPublishedPolicyPages(urls, hashes, { expectedVersions: PUBLISHED_VERSIONS, fetchImpl });
   assert.equal(result.ok, false);
   assert.deepEqual(result.mismatch_keys, ["terms"]);
   assert.deepEqual(result.unavailable_keys, ["refund"]);
@@ -141,6 +141,7 @@ test("published policy page verification fails closed for changed, missing, or u
   assert.ok(requests.every((request) => request.redirect === "error"));
 
   const missingMarker = await verifyPublishedPolicyPages(urls, hashes, {
+    expectedVersions: PUBLISHED_VERSIONS,
     fetchImpl: async () => new Response("<article>old deployment</article>", {
       status: 200,
       headers: { "content-type": "text/html" },
