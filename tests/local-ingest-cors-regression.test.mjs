@@ -76,7 +76,8 @@ test("local validator requires the browser origin and rejects wildcard CORS even
 test("valid local loopback origins pass structural preflight including IPv6", async (t) => {
   for (const origin of ["http://127.0.0.1:4173", "http://localhost:4173", "http://[::1]:4173"]) {
     await t.test(origin, async () => {
-      const result = await validate({ APP_HOST: origin, PAY_BASE_URL: origin, INTERNAL_APP_ORIGIN: `${origin}/`, CORS_ALLOW_ORIGINS: origin });
+      const APP_BIND_HOST = new URL(origin).hostname.replace(/^\[|\]$/g, "");
+      const result = await validate({ APP_BIND_HOST, APP_HOST: origin, PAY_BASE_URL: origin, INTERNAL_APP_ORIGIN: `${origin}/`, CORS_ALLOW_ORIGINS: origin });
       assert.equal(result.code, 0, JSON.stringify(result.payload));
       assert.ok(result.payload.checks.some((check) => check.name === "cors_origins_include_app_host" && check.ok));
     });

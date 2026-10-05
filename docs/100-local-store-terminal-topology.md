@@ -20,6 +20,8 @@
 
 ## Mac listener・worker取り込み先・ブラウザOrigin
 
+3つのアプリoriginは `APP_BIND_HOST` と同じhost表記・`APP_PORT` と同じportを使用する。bindはraw `127.0.0.1` / `::1` / `localhost`、IPv6 URLだけは `[::1]` とする。IPv4・IPv6・localhost間の別名到達を推測しない。`APP_PORT` 省略時の既定は4173、HTTP URLのport省略は80であり、両者を混同しない。portは1〜65535の整数。`PUBLIC_POLICY_ORIGIN` と互換 `PUBLIC_BASE_URL` を両方指定する場合は同じpublic HTTPS originに揃える。
+
 同じ `.env.production` を使用する全launchd jobで、`INTERNAL_APP_ORIGIN` を `APP_HOST` と同じloopback HTTP originへ明示設定する。例: `APP_HOST=http://127.0.0.1:4173`、`PAY_BASE_URL=http://127.0.0.1:4173`、`INTERNAL_APP_ORIGIN=http://127.0.0.1:4173`、`CORS_ALLOW_ORIGINS=http://127.0.0.1:4173`。host・portは実際の `APP_BIND_HOST`・`APP_PORT` のlistenerへ到達する値を使う。standalone MacではDocker向けexampleの `http://app:4173` を流用しない。
 
 local topologyでは同一originからの署名付きworker取り込みを許可する。サービス署名・replay・idempotencyの検査は維持する。CORSはブラウザのAPP_HOST originを明示許可し、wildcardを禁止する。公開policy originをCORSのloopback originの代用にしない。`public_cloud` の公開APP_HOSTと内部取り込み先を分離する既存要件は維持する。`--allow-empty` の構造事前点検でもlocal取り込み先とCORSを省略できない。

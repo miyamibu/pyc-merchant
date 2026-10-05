@@ -27,6 +27,8 @@ import {
   DEPLOYMENT_TOPOLOGY_VALUES,
   DEPLOYMENT_TOPOLOGY_LOCAL_STORE_TERMINAL,
   evaluateLocalStoreTerminalIngestOrigin,
+  evaluateLocalStoreTerminalListener,
+  isLoopbackBindHost,
   isLoopbackHost,
   resolvePublicPolicyOrigin,
 } from "../../src/deployment-topology.mjs";
@@ -287,7 +289,7 @@ async function main() {
       // Structural local_store_terminal requirements run even with
       // --allow-empty: they define the exposure boundary of the terminal.
       const bindHost = String(env.APP_BIND_HOST || "").trim();
-      ensure(bindHost && isLoopbackHost(bindHost),
+      ensure(isLoopbackBindHost(bindHost),
         "local_store_terminal requires APP_BIND_HOST to be a loopback address (127.0.0.1, ::1, or localhost)",
         { value: bindHost || null });
       record("topology_local_loopback_bind", true, { value: bindHost });
@@ -296,6 +298,13 @@ async function main() {
         "local_store_terminal requires PUBLIC_POLICY_ORIGIN as an origin-only public HTTPS policy/Site origin (PUBLIC_BASE_URL stays accepted as a fallback)",
         { value: publicBaseUrl || null });
       record("topology_local_public_policy_origin", true, { value: publicBaseUrl });
+
+      const fallbackPolicyOrigin = String(env.PUBLIC_BASE_URL || "").trim();
+      if (fallbackPolicyOrigin) {
+        ensure(isPublicHttpsOriginOnly(fallbackPolicyOrigin)
+          && new URL(fallbackPolicyOrigin).origin === new URL(publicBaseUrl).origin,
+          "local_store_terminal PUBLIC_BASE_URL must match the resolved PUBLIC_POLICY_ORIGIN", {});
+      }
 
       // The signed public payment page is structurally absent in this
       // topology; the flag must be explicitly false (fail closed).
@@ -316,6 +325,10 @@ async function main() {
       ensure(loopbackOrigin !== new URL(publicBaseUrl).origin,
         "local_store_terminal requires the loopback app origin to differ from PUBLIC_BASE_URL", {});
       record("topology_local_no_public_payment_origin", true, { value: loopbackOrigin });
+
+      const listener = evaluateLocalStoreTerminalListener(env);
+      ensure(listener.ok, "local_store_terminal origins must match APP_BIND_HOST and APP_PORT", { blockers: listener.blockers });
+      record("topology_local_listener_origin_match", true, {});
 
       const localIngest = evaluateLocalStoreTerminalIngestOrigin(env);
       ensure(localIngest.ok, "local_store_terminal INTERNAL_APP_ORIGIN must be a loopback HTTP origin matching APP_HOST", {

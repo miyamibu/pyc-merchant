@@ -33,7 +33,9 @@ const fixture = {
 test("bind validation accepts only raw loopback hosts", () => {
   for (const APP_BIND_HOST of ["127.0.0.1", "::1", "localhost"]) {
     assert.equal(isLoopbackBindHost(APP_BIND_HOST), true);
-    assert.deepEqual(evaluateLocalStoreTerminalTopology({ ...fixture, APP_BIND_HOST }).blockers, []);
+    const origin = `http://${APP_BIND_HOST === "::1" ? "[::1]" : APP_BIND_HOST}:4173`;
+    assert.deepEqual(evaluateLocalStoreTerminalTopology({ ...fixture, APP_BIND_HOST,
+      APP_HOST: origin, PAY_BASE_URL: origin, INTERNAL_APP_ORIGIN: origin, CORS_ALLOW_ORIGINS: origin }).blockers, []);
   }
 });
 

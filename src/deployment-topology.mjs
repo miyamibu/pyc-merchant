@@ -55,6 +55,28 @@ function isLoopbackHttpOrigin(rawUrl) {
   }
 }
 
+export function evaluateLocalStoreTerminalListener(env = {}) {
+  const blockers = [];
+  const bindHost = String(env.APP_BIND_HOST || "").trim();
+  if (!isLoopbackBindHost(bindHost)) {
+    blockers.push("topology_local_requires_loopback_bind_host");
+    if (bindHost.includes("[") || bindHost.includes("]")) blockers.push("topology_local_bind_host_must_be_unbracketed");
+  }
+  // Match the server's default APP_PORT; HTTP URL default ports are 80.
+  const port = Number(env.APP_PORT || "4173");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    blockers.push("topology_local_app_port_must_be_valid_listener_port");
+  }
+  for (const key of ["APP_HOST", "PAY_BASE_URL", "INTERNAL_APP_ORIGIN"]) {
+    if (!isLoopbackHttpOrigin(env[key])) continue; // Existing origin gates report format errors.
+    const origin = new URL(env[key]);
+    const hostname = origin.hostname.replace(/^\[|\]$/g, "");
+    if (hostname !== bindHost) blockers.push(`topology_local_${key.toLowerCase()}_must_match_bind_host`);
+    if (Number(origin.port || "80") !== port) blockers.push(`topology_local_${key.toLowerCase()}_must_match_app_port`);
+  }
+  return { ok: blockers.length === 0, blockers };
+}
+
 // All launchd jobs share this origin. A separate Docker service name or port
 // cannot address the standalone Mac listener; canonical origins must match.
 export function evaluateLocalStoreTerminalIngestOrigin(env = {}) {
@@ -130,13 +152,7 @@ function approvedRefPresent(value) {
 // Returns blocker codes so callers decide how to fail closed.
 export function evaluateLocalStoreTerminalTopology(env = {}) {
   const blockers = [];
-  const bindHost = String(env.APP_BIND_HOST || "").trim();
-  if (!isLoopbackBindHost(bindHost)) {
-    blockers.push("topology_local_requires_loopback_bind_host");
-    if (bindHost.includes("[") || bindHost.includes("]")) {
-      blockers.push("topology_local_bind_host_must_be_unbracketed");
-    }
-  }
+  blockers.push(...evaluateLocalStoreTerminalListener(env).blockers);
 
   const policyOrigin = resolvePublicPolicyOrigin(env);
   if (!policyOrigin) {
