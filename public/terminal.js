@@ -354,6 +354,8 @@ const state = {
   refundPayerAddressVerified: false,
   refundPayerAddressReviewId: "",
   autoResetTimer: null,
+  localPaymentQrExpiryTimer: null,
+  consentRecordingRequest: null,
   autoResetInvoiceId: "",
   logoutInFlight: false,
   logoutRetryToken: "",
@@ -1172,6 +1174,7 @@ function failClosedFulfillmentObservation() {
 }
 
 function refreshFulfillmentObservationAfterResume() {
+  if (state.deploymentTopology === "local_store_terminal") renderCustomerFacingQr();
   if (!state.token || !state.invoiceId || document.visibilityState === "hidden") return;
   // iPad/Safari may suspend timers and EventSource while backgrounded. Keep
   // the last green decision hidden until a fresh server response is accepted.
@@ -2906,6 +2909,7 @@ function clearQrCanvas(canvas, { showEmptyLabel = false } = {}) {
 }
 
 function clearQr() {
+  stopLocalPaymentQrExpiryTimer();
   clearQrCanvas(el.qrCanvas, { showEmptyLabel: true });
   if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
 }
@@ -2957,7 +2961,27 @@ function providerBadgeClass(operatorStateCode) {
   return "s-blue";
 }
 
+function stopLocalPaymentQrExpiryTimer() {
+  if (state.localPaymentQrExpiryTimer != null) clearTimeout(state.localPaymentQrExpiryTimer);
+  state.localPaymentQrExpiryTimer = null;
+}
+
+function hideLocalPaymentQr() {
+  if (state.deploymentTopology === "local_store_terminal") clearQr();
+}
+
+function scheduleLocalPaymentQrExpiry(invoice) {
+  const delayMs = Math.min(Math.max(Date.parse(invoice.expires_at) - Date.now(), 1), 2_147_483_647);
+  const timer = window.setTimeout(() => {
+    if (state.localPaymentQrExpiryTimer !== timer) return;
+    state.localPaymentQrExpiryTimer = null;
+    renderCustomerFacingQr();
+  }, delayMs);
+  state.localPaymentQrExpiryTimer = timer;
+}
+
 function renderCustomerFacingDisplay(invoice) {
+  stopLocalPaymentQrExpiryTimer();
   const providerSummary = invoice?.provider_summary || null;
   const tapOnly = PROVIDER_RAIL_ENABLED && providerSummary?.qr_available === false;
   el.qrCanvas.classList.toggle("hidden", tapOnly);
@@ -2973,9 +2997,11 @@ function renderCustomerFacingDisplay(invoice) {
       const consentRecorded = consent?.recorded === true;
       const walletUri = String(invoice?.payment_uri || "").trim();
       const invoiceActive = Boolean(invoice && walletUri) && consentRecorded
-        && invoice.status === "issued" && Date.parse(invoice.expires_at || "") > Date.now();
+        && invoice.status === "issued" && Date.parse(invoice.expires_at || "") > Date.now()
+        && document.visibilityState !== "hidden";
       if (invoiceActive) {
         drawQr(walletUri);
+        scheduleLocalPaymentQrExpiry(invoice);
         if (typeof requestScreenWakeLock === "function") void requestScreenWakeLock();
         el.fixedQrUrlLink.textContent = "送金用QR（この会計専用）";
         el.fixedQrUrlLink.removeAttribute("href");
@@ -3148,6 +3174,9 @@ function syncConsentControls() {
     !checked
     || !ready
     || requiresReissue
+    || state.currentInvoice?.customer_policy_consent?.recorded === true
+    || state.currentInvoice?.status !== "issued"
+    || !(Date.parse(state.currentInvoice?.expires_at || "") > Date.now())
     || state.consentRecordingInFlight
     || !state.invoiceId;
 }
@@ -3156,7 +3185,13 @@ async function handleRecordInvoiceConsent() {
   if (!requireUiPermission("invoice.create", "規約同意の記録")) return;
   const invoiceId = String(state.invoiceId || "").trim();
   const consent = state.currentInvoice?.customer_policy_consent;
-  if (!invoiceId || !consent?.versions || state.consentRecordingInFlight) return;
+  syncConsentControls();
+  if (state.deploymentTopology !== "local_store_terminal"
+    || el.recordConsentBtn?.disabled !== false
+    || String(state.currentInvoice?.invoice_id || "") !== invoiceId
+    || !invoiceId || !consent?.versions || state.consentRecordingInFlight) return;
+  const recordingRequest = {};
+  state.consentRecordingRequest = recordingRequest;
   state.consentRecordingInFlight = true;
   syncConsentControls();
   try {
@@ -3169,15 +3204,20 @@ async function handleRecordInvoiceConsent() {
         refund_policy_version: consent.versions.refund_policy_version,
       }),
     });
+    if (state.consentRecordingRequest !== recordingRequest || state.invoiceId !== invoiceId) return;
     showToast("規約同意を記録しました。監査ログにも残っています");
     await loadInvoice(invoiceId);
   } catch (error) {
-    if (isIgnoredRequestError(error)) return;
+    if (isIgnoredRequestError(error)
+      || state.consentRecordingRequest !== recordingRequest || state.invoiceId !== invoiceId) return;
     showToast(`規約同意を記録できませんでした: ${String(error.message || error)}`, true);
     await loadInvoice(invoiceId, { silent: true });
   } finally {
-    state.consentRecordingInFlight = false;
-    renderInvoiceConsent();
+    if (state.consentRecordingRequest === recordingRequest) {
+      state.consentRecordingRequest = null;
+      state.consentRecordingInFlight = false;
+      renderInvoiceConsent();
+    }
   }
 }
 
@@ -3358,6 +3398,9 @@ function scheduleCompletedInvoiceAutoReset(invoice = state.currentInvoice) {
 function renderInvoice(invoice) {
   const previousInvoiceId = state.invoiceId;
   const nextInvoiceId = String(invoice?.invoice_id || "");
+  if (String(previousInvoiceId || "") !== nextInvoiceId && el.invoiceConsentCheckbox) {
+    el.invoiceConsentCheckbox.checked = false;
+  }
   if (previousInvoiceId && previousInvoiceId !== nextInvoiceId) state.pendingDangerAction = "";
   state.currentInvoice = invoice;
   state.invoiceDiagnostics = invoice.diagnostics || null;
@@ -3417,6 +3460,7 @@ function clearInvoiceView() {
   state.invoiceDiagnostics = null;
   state.invoiceConsent = null;
   state.consentRecordingInFlight = false;
+  state.consentRecordingRequest = null;
   state.selectedReviewId = "";
   state.selectedReviewDetail = null;
   state.sseToken = "";
@@ -5792,12 +5836,14 @@ function bindEvents() {
   el.saveSettingsBtn.addEventListener("click", saveTerminalSettings);
 
   window.addEventListener("beforeunload", () => {
+    hideLocalPaymentQr();
     closeSse();
     stopFallbackPolling();
     stopOpsAutoRefresh();
     stopSessionExpiryTimer();
     if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
   });
+  window.addEventListener("pagehide", hideLocalPaymentQr);
   window.addEventListener("pageshow", refreshFulfillmentObservationAfterResume);
   window.addEventListener("online", refreshFulfillmentObservationAfterResume);
   document.addEventListener("visibilitychange", () => {
@@ -5813,6 +5859,7 @@ function bindEvents() {
         void requestScreenWakeLock();
       }
     } else {
+      hideLocalPaymentQr();
       if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
     }
   });

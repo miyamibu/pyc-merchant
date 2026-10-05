@@ -12,6 +12,8 @@
 // public Site origin configured via PUBLIC_POLICY_ORIGIN (official key;
 // PUBLIC_BASE_URL remains accepted as a compatible fallback).
 
+import { validatePublicHttpsUrl } from "./public-endpoint-security.mjs";
+
 export const PUBLIC_PAYMENT_PAGE_ENABLED_DEFAULT = "true";
 
 export const DEPLOYMENT_TOPOLOGY_PUBLIC_CLOUD = "public_cloud";
@@ -141,7 +143,7 @@ function isEvmAddress(value) {
   return /^0x[0-9a-fA-F]{40}$/.test(String(value || "").trim());
 }
 
-function isPublicHttpsOriginOnly(rawUrl) {
+export function isPublicHttpsOriginOnly(rawUrl) {
   try {
     const parsed = new URL(String(rawUrl || "").trim());
     return parsed.protocol === "https:"
@@ -151,7 +153,7 @@ function isPublicHttpsOriginOnly(rawUrl) {
       && parsed.pathname === "/"
       && !parsed.search
       && !parsed.hash
-      && !isLoopbackHost(parsed.hostname);
+      && validatePublicHttpsUrl(parsed.href).ok;
   } catch {
     return false;
   }

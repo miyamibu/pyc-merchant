@@ -31,7 +31,7 @@ import {
   evaluateLocalStoreTerminalProxy,
   isLoopbackHttpOrigin,
   isLoopbackBindHost,
-  isLoopbackHost,
+  isPublicHttpsOriginOnly,
   resolvePublicPolicyOrigin,
 } from "../../src/deployment-topology.mjs";
 
@@ -80,23 +80,6 @@ const LOCAL_TOPOLOGY_DISABLED_CONTROLS = Object.freeze([
 
 function boolFlag(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
-}
-
-function isPublicHttpsOriginOnly(rawUrl) {
-  try {
-    const parsed = new URL(String(rawUrl || "").trim());
-    return parsed.protocol === "https:"
-      && !parsed.username
-      && !parsed.password
-      && parsed.port === ""
-      && parsed.hostname.includes(".")
-      && !isLoopbackHost(parsed.hostname)
-      && parsed.pathname === "/"
-      && !parsed.search
-      && !parsed.hash;
-  } catch {
-    return false;
-  }
 }
 
 function approvedRefPresent(value) {
