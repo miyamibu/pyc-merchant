@@ -360,6 +360,8 @@ const el = {
   staffName: document.getElementById("staffName"),
   staffPin: document.getElementById("staffPin"),
   loginFormPanel: document.getElementById("loginFormPanel"),
+  terminalSessionCard: document.getElementById("terminalSessionCard"),
+  terminalCheckoutCard: document.getElementById("terminalCheckoutCard"),
   loginError: document.getElementById("loginError"),
   loginBtn: document.getElementById("loginBtn"),
   logoutBtn: document.getElementById("logoutBtn"),
@@ -397,6 +399,9 @@ const el = {
   expireInvoiceBtn: document.getElementById("expireInvoiceBtn"),
   invoiceDangerActions: document.getElementById("invoiceDangerActions"),
   invoiceStatusPill: document.getElementById("invoiceStatusPill"),
+  checkoutFlow: document.getElementById("checkoutFlow"),
+  checkoutNextAction: document.getElementById("checkoutNextAction"),
+  checkoutFlowHint: document.getElementById("checkoutFlowHint"),
   invoiceIdText: document.getElementById("invoiceIdText"),
   fixedQrUrlLink: document.getElementById("fixedQrUrlLink"),
   paymentUrlLink: document.getElementById("paymentUrlLink"),
@@ -664,6 +669,14 @@ function refreshDynamicElementRefs() {
   el.permissionNodes = Array.from(document.querySelectorAll("[data-permission], [data-permission-any]"));
 }
 
+function initializeBusinessDateInputs() {
+  if (!el.businessTimezoneText || !el.businessDateInput || !el.businessMonthInput) return;
+  el.businessTimezoneText.textContent = state.storeTimezone;
+  const businessDate = nowIsoDate();
+  el.businessDateInput.value = businessDate;
+  el.businessMonthInput.value = businessDate.slice(0, 7);
+}
+
 let screenWakeLock = null;
 
 async function releaseScreenWakeLock() {
@@ -807,6 +820,27 @@ function mountAdminOperations() {
     refreshDynamicElementRefs();
     bindAdminEvents();
   }
+}
+
+function handleManagementNavigation(event) {
+  const link = event.target.closest("a[data-management-target]");
+  if (!link || !el.adminOperationsMount?.contains(link)) return;
+  event.preventDefault();
+  if (!state.token || !state.permissionsKnown) return;
+  const permissions = String(link.dataset.permissionAny || "").trim().split(/\s+/).filter(Boolean);
+  if (permissions.length > 0 && !hasAnyPermission(permissions)) return;
+  const target = document.getElementById(link.dataset.managementTarget);
+  if (!target || target.closest(".hidden")) return;
+  for (let ancestor = target; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor.tagName === "DETAILS") ancestor.open = true;
+  }
+  for (const item of el.adminOperationsMount.querySelectorAll("a[data-management-target]")) {
+    if (item === link) item.setAttribute("aria-current", "location");
+    else item.removeAttribute("aria-current");
+  }
+  target.setAttribute("tabindex", "-1");
+  target.focus({ preventScroll: true });
+  target.scrollIntoView({ block: "start", behavior: "auto" });
 }
 
 function requireUiPermission(permission, actionLabel) {
@@ -1132,14 +1166,103 @@ function resolveFulfillmentDecisionModel(invoice) {
   };
 }
 
+function readableFulfillmentBody(invoice, model) {
+  if (model.decision === "allow") return "支払いとお渡し許可を確認しました。";
+  if (hasIntegrityHold(invoice)) return "記録を確認中です。追加送金せず、店長へ。";
+  if (!invoice?.invoice_id) return state.token ? "金額を入力して、会計を始めます。" : "ログインして、会計を始めます。";
+  if (!hasFreshFulfillmentObservation()) return "最新状態を確認できません。再取得してください。";
+  const status = effectiveOperatorStatus(invoice);
+  if (["paid", "settled"].includes(status)) return "支払いは確認済みですが、お渡しは保留中です。店長へ確認してください。";
+  if (status === "review_required") return "追加送金せず、店長へ引き継いでください。";
+  if (status === "expired") return "期限切れです。送金済みの場合は店長へ。";
+  if (status === "cancelled") return "無効な会計です。送金済みの場合は店長へ。";
+  if (["issued", "payment_detected", "confirming"].includes(status)) return "サーバーの支払い確認を待っています。";
+  return "最新の判定を確認できません。状態を再取得してください。";
+}
+
 function renderFulfillmentDecisionBanner(invoice = state.currentInvoice) {
   if (!el.fulfillmentDecisionBanner) return;
   const model = resolveFulfillmentDecisionModel(invoice);
   el.fulfillmentDecisionBanner.dataset.decision = model.decision;
-  el.fulfillmentDecisionBadge.textContent = model.badge;
+  const badge = model.decision === "allow" ? "お渡し可" : "お渡し不可";
+  if (el.fulfillmentDecisionBadge.textContent !== badge) el.fulfillmentDecisionBadge.textContent = badge;
   el.fulfillmentDecisionBadge.className = `status-pill ${model.badgeClass}`;
-  el.fulfillmentDecisionTitle.textContent = model.title;
-  el.fulfillmentDecisionBody.textContent = model.body;
+  const title = model.decision === "allow" ? "商品をお渡しできます" : "商品はまだ渡さない";
+  const body = readableFulfillmentBody(invoice, model);
+  if (el.fulfillmentDecisionTitle.textContent !== title) el.fulfillmentDecisionTitle.textContent = title;
+  if (el.fulfillmentDecisionBody.textContent !== body) el.fulfillmentDecisionBody.textContent = body;
+  const details = document.getElementById("fulfillmentDecisionDetails");
+  const reason = `${model.title}\n${model.body}`;
+  if (details && details.textContent !== reason) details.textContent = reason;
+}
+
+function resolveCheckoutFlow(invoice = state.currentInvoice) {
+  const holdHint = "商品はまだ渡さないでください。";
+  if (!state.token) return { step: 1, action: "ログインして会計を始めます", hint: holdHint, primary: "none" };
+  if (!invoice?.invoice_id) {
+    if (!hasPermission("invoice.create")) return { step: 1, action: "会計の作成は担当スタッフへ", hint: "現在の権限で確認できる内容を表示します。", primary: "none" };
+    return paymentIssuanceAllowed()
+      ? { step: 1, action: "金額を入力し、請求を作成", hint: "送金はお客様のウォレットで行います。", primary: "create" }
+      : { step: 1, action: "新規決済を受け付けられません", hint: "店舗の停止状態を確認してください。", primary: "none" };
+  }
+  const status = effectiveOperatorStatus(invoice);
+  const fulfillment = resolveFulfillmentDecisionModel(invoice);
+  if (status === "integrity_hold") {
+    return { step: 3, action: "記録の確認が必要です。店長へ引き継ぐ", hint: "商品を渡さず、追加送金も案内しないでください。", primary: "none" };
+  }
+  if (fulfillment.decision === "allow") {
+    return { step: 4, action: "商品をお渡しできます", hint: "サーバーの引渡し許可を確認済みです。日次締めは別の記録です。", primary: "none" };
+  }
+  if (isFulfillmentObservationUnavailable(invoice)) {
+    return { step: 3, action: "最新の状態を確認", hint: "商品は渡さず、状態の再取得を待ってください。", primary: "refresh" };
+  }
+  if (status === "review_required") {
+    return { step: 3, action: "店長へ引き継ぐ", hint: "確認待ち一覧で理由を確認します。追加送金は案内しないでください。", primary: "none" };
+  }
+  if (["paid", "settled"].includes(status)) {
+    return { step: 3, action: "支払い確認済み・引渡しは保留", hint: "商品は渡さず、保留理由を店長と確認してください。", primary: "refresh" };
+  }
+  if (["payment_detected", "confirming"].includes(status)) {
+    return { step: 3, action: "支払いの自動確認を待つ", hint: "商品はまだ渡さないでください。二重送金も案内しないでください。", primary: "none" };
+  }
+  if (status === "issued") {
+    const tapOnly = PROVIDER_RAIL_ENABLED && invoice.provider_summary?.qr_available === false;
+    return {
+      step: 2,
+      action: tapOnly ? "店頭端末の案内に沿ってお待ちください" : "QRをお客様に見せる",
+      hint: "商品はまだ渡さないでください。送金後は自動で確認します。",
+      primary: "none",
+    };
+  }
+  if (status === "expired") {
+    if (!hasPermission("invoice.create")) return { step: 2, action: "期限切れです。担当スタッフに再発行を依頼", hint: "送金済みの場合は店長へ確認してください。", primary: "none" };
+    return { step: 2, action: "期限切れです。会計を確認して再発行", hint: "送金済みの申告がある場合は、確認待ち一覧へ引き継いでください。", primary: "reissue" };
+  }
+  if (status === "cancelled") {
+    if (!hasPermission("invoice.create")) return { step: 1, action: "必要なら担当スタッフに新しい会計を依頼", hint: "無効な会計へは送金しないでください。", primary: "none" };
+    return { step: 1, action: "必要なら新しい請求を作成", hint: "無効な会計は使えません。送金済みの場合は店長へ確認してください。", primary: "create" };
+  }
+  return { step: 3, action: "状態を再取得して確認", hint: holdHint, primary: "refresh" };
+}
+
+function renderCheckoutFlow(invoice = state.currentInvoice) {
+  if (!el.checkoutFlow || !el.checkoutNextAction || !el.checkoutFlowHint) return;
+  const model = resolveCheckoutFlow(invoice);
+  el.checkoutFlow.dataset.step = String(model.step);
+  for (const node of el.checkoutFlow.querySelectorAll("[data-checkout-step]")) {
+    const step = Number(node.dataset.checkoutStep);
+    node.dataset.state = step === model.step ? "current" : step < model.step ? "complete" : "upcoming";
+    if (step === model.step) node.setAttribute("aria-current", "step");
+    else node.removeAttribute("aria-current");
+  }
+  if (el.checkoutNextAction.textContent !== model.action) el.checkoutNextAction.textContent = model.action;
+  if (el.checkoutFlowHint.textContent !== model.hint) el.checkoutFlowHint.textContent = model.hint;
+  for (const [kind, button] of [["create", el.createInvoiceBtn], ["refresh", el.refreshBtn], ["reissue", el.reissueInvoiceBtn], ["tap", el.presentTapBtn]]) {
+    if (!button) continue;
+    const primary = kind === model.primary;
+    button.classList.toggle("btn-primary", primary);
+    button.classList.toggle("btn-secondary", !primary);
+  }
 }
 
 function stopFulfillmentFreshnessTimer() {
@@ -1743,6 +1866,7 @@ function renderOperatorGuide() {
     el.operatorGuideList.appendChild(li);
   }
   renderFulfillmentDecisionBanner(invoice);
+  renderCheckoutFlow(invoice);
 }
 
 function computeReviewSuggestion(review) {
@@ -2022,7 +2146,7 @@ async function loadOpsSnapshot() {
         : "取得失敗";
     el.opsSnapshotState.textContent =
       reviewsAvailable && (!canReadSettlement || settlementAvailable)
-        ? "サーバーが返した実効権限の範囲で review / settlement / monitor を集約しています。"
+        ? "許可された範囲の確認待ち・締め・監視状態を表示しています。"
         : "レビュー件数または日次締め状態を確認できていません。日次締めは安全のため停止しています。";
     setChecklist(el.opsSnapshotChecklist, checklist);
     return { status: reviewsAvailable && (!canReadSettlement || settlementAvailable) ? "ok" : "close_preflight_failed" };
@@ -2053,6 +2177,7 @@ async function loadOpsSnapshot() {
 function startOpsAutoRefresh() {
   if (state.autoRefreshTimer !== null) return;
   state.autoRefreshTimer = setInterval(() => {
+    if (document.visibilityState === "hidden") return;
     if (hasAnyPermission(["review.read", "settlement.close", "monitor.read"])) void loadOpsSnapshot();
   }, OPS_AUTO_REFRESH_INTERVAL_MS);
 }
@@ -2061,6 +2186,11 @@ function stopOpsAutoRefresh() {
   if (state.autoRefreshTimer === null) return;
   clearInterval(state.autoRefreshTimer);
   state.autoRefreshTimer = null;
+}
+
+function refreshOpsSnapshotAfterResume() {
+  if (document.visibilityState === "hidden" || !state.token || state.autoRefreshTimer === null) return;
+  if (hasAnyPermission(["review.read", "settlement.close", "monitor.read"])) void loadOpsSnapshot();
 }
 
 function setSseStatus(status, reason = "") {
@@ -2243,6 +2373,8 @@ function loginErrorMessage(error) {
 }
 
 function setLoggedInUi(loggedIn) {
+  el.terminalSessionCard?.classList.toggle("is-authenticated", loggedIn);
+  document.body.classList.toggle("terminal-authenticated", loggedIn);
   if (el.loginFormPanel) el.loginFormPanel.classList.toggle("collapsed-after-login", loggedIn);
   if (el.logoutBtn) {
     el.logoutBtn.classList.toggle("hidden", !loggedIn);
@@ -2275,12 +2407,22 @@ function updateRefundStepState(statusText = "") {
       : index === currentStepIndex
         ? "current"
         : "future";
+    const previousStepState = panel.dataset.stepState;
     panel.dataset.stepState = stepState;
+    if (stepState === "current" && previousStepState !== "current" && panel.tagName === "DETAILS") panel.open = true;
     panel.classList.toggle("current", stepState === "current");
     panel.classList.toggle("completed", stepState === "completed");
     if (stepState === "current") panel.setAttribute("aria-current", "step");
     else panel.removeAttribute("aria-current");
   });
+  const flowTrack = document.getElementById("refundFlowTrack");
+  for (const item of flowTrack?.querySelectorAll("[data-refund-step]") || []) {
+    const index = Number(item.dataset.refundStep);
+    const stepState = panels[index]?.dataset.stepState || "future";
+    item.dataset.state = stepState;
+    if (stepState === "current") item.setAttribute("aria-current", "step");
+    else item.removeAttribute("aria-current");
+  }
   if (el.refundStepRequestBadge) el.refundStepRequestBadge.textContent = hasRefundId ? "作成済み" : "入力";
   if (el.refundStepApproveBadge) {
     el.refundStepApproveBadge.textContent = approvedStatuses.has(refundStatus) ? "承認済み" : hasRefundId ? "承認待ち" : "返金ID待ち";
@@ -2864,7 +3006,12 @@ function setInvoiceStatusPill(statusRaw) {
   el.invoiceStatusPill.className = `status-pill ${klass}`;
 }
 
+const qrRenderCache = { value: "", model: null, renderKey: "" };
+
 function clearQr() {
+  qrRenderCache.value = "";
+  qrRenderCache.model = null;
+  qrRenderCache.renderKey = "";
   const rect = el.qrCanvas.getBoundingClientRect?.();
   const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || 420, rect?.height || 420)));
   const dpr = Math.min(Math.max(Number(window.devicePixelRatio) || 1, 1), 3);
@@ -2886,18 +3033,25 @@ function drawQr(value) {
     clearQr();
     return;
   }
-  const qr = qrcode(0, "M");
-  qr.addData(value);
-  qr.make();
-
-  const moduleCount = qr.getModuleCount();
-  const quietZoneModules = 4;
-  const totalModules = moduleCount + quietZoneModules * 2;
   const rect = el.qrCanvas.getBoundingClientRect?.();
   const cssSize = Math.max(1, Math.floor(Math.min(rect?.width || 420, rect?.height || 420)));
   const dpr = Math.min(Math.max(Number(window.devicePixelRatio) || 1, 1), 3);
-  el.qrCanvas.width = Math.round(cssSize * dpr);
-  el.qrCanvas.height = Math.round(cssSize * dpr);
+  const pixelSize = Math.round(cssSize * dpr);
+  const renderKey = JSON.stringify([value, cssSize, dpr]);
+  if (qrRenderCache.renderKey === renderKey && el.qrCanvas.width === pixelSize && el.qrCanvas.height === pixelSize) return;
+  if (qrRenderCache.value !== value || !qrRenderCache.model) {
+    const model = qrcode(0, "M");
+    model.addData(value);
+    model.make();
+    qrRenderCache.value = value;
+    qrRenderCache.model = model;
+  }
+  const qr = qrRenderCache.model;
+  const moduleCount = qr.getModuleCount();
+  const quietZoneModules = 4;
+  const totalModules = moduleCount + quietZoneModules * 2;
+  el.qrCanvas.width = pixelSize;
+  el.qrCanvas.height = pixelSize;
   const ctx = el.qrCanvas.getContext("2d");
   const tile = Math.max(1, Math.floor(cssSize / totalModules));
   const renderedSize = tile * totalModules;
@@ -2918,6 +3072,7 @@ function drawQr(value) {
       }
     }
   }
+  qrRenderCache.renderKey = renderKey;
 }
 
 function providerBadgeClass(operatorStateCode) {
@@ -2944,7 +3099,7 @@ function renderCustomerFacingDisplay(invoice) {
       clearQr();
     }
     el.customerDisplayHint.textContent =
-      "このQRは端末ごとの固定入口です。お客様画面は、その時点の current invoice に一度だけ解決されます。";
+      "端末ごとの固定QRです。店舗・金額を確認して、その会計に進みます。";
     return;
   }
 
@@ -3692,20 +3847,20 @@ function renderReviewDetail(detail = null) {
     el.reviewDetailBadge.textContent = "未選択";
     el.reviewDetailBadge.className = "status-pill s-gray";
     el.reviewDetailSummary.textContent =
-      "一覧から確認待ち支払いを選ぶと、原因・対象請求・直近イベント・返金候補をここで確認できます。";
+      "一覧から選んで、理由と支払い証跡を確認してください。";
     el.reviewDetailId.textContent = "-";
     el.reviewDetailInvoice.textContent = "-";
     el.reviewDetailAmount.textContent = "-";
     el.reviewDetailTxHash.textContent = "-";
-    el.reviewDetailAction.textContent = "ここには、そのレビューでまず何を確認するかと、推奨ステータスを表示します。";
+    el.reviewDetailAction.textContent = "選択後に、次の対応を表示します。";
     el.reviewDetailRefundHint.textContent =
-      "返金が必要そうな場合は、候補額をここに表示し、下の返金記録フォームにも下書きします。";
-    el.reviewDetailEvents.textContent = "レビューを選ぶと、その支払いに紐づく直近イベントをここへ表示します。";
-    el.reviewRelatedInvoices.textContent = "レビューを選ぶと、同じ会計で再発行された関連請求をここへ表示します。";
+      "返金候補がある場合は、申請欄にも下書きします。";
+    el.reviewDetailEvents.textContent = "レビューを選ぶと、直近イベントを表示します。";
+    el.reviewRelatedInvoices.textContent = "同じ会計の関連請求を表示します。";
     el.reviewAdjustmentInvoiceId.value = "";
     el.accountingAdjustmentStatus.textContent = "レビューを選択すると対象請求を表示します。";
     el.refundDraftHint.textContent =
-      "レビューを選択すると、返金候補額・支払い元アドレス・チェーンIDを返金フォームへ下書きします。";
+      "選択したレビューから、返金額・支払い元・チェーンを下書きします。";
     el.refundEligibleHint.textContent = "レビューを選択すると、サーバーが返した返金可能額を表示します。";
     state.refundPayerAddressVerified = false;
     state.refundPayerAddressReviewId = "";
@@ -3831,11 +3986,11 @@ function createReviewRow(row) {
   tr.dataset.reviewId = row.id;
   tr.tabIndex = 0;
   tr.setAttribute("aria-selected", "false");
-  tr.setAttribute("aria-label", `レビュー ${shortId(row.id)}、${reviewReasonLabel(row.reason_type)}、${reviewStatusLabel(row.status)}。Enter または Space で詳細を表示`);
+  tr.setAttribute("aria-label", `レビュー ${row.id}、${reviewReasonLabel(row.reason_type)}、${reviewStatusLabel(row.status)}。Enter または Space で詳細を表示`);
   const priority = reviewPriorityMeta(row);
 
   const cells = [
-    { className: "mono", text: row.id },
+    { className: "mono", text: shortId(row.id), title: row.id },
     { badge: priority },
     { className: "mono", text: row.invoice_no || row.invoice_id || "-" },
     { text: reviewReasonLabel(row.reason_type) },
@@ -3845,6 +4000,7 @@ function createReviewRow(row) {
   for (const cell of cells) {
     const td = document.createElement("td");
     if (cell.className) td.className = cell.className;
+    if (cell.title) td.title = cell.title;
     if (cell.badge) {
       const badge = document.createElement("span");
       badge.className = `status-pill ${cell.badge.className}`;
@@ -3870,6 +4026,7 @@ function createReviewRow(row) {
 }
 
 async function handleLogin() {
+  if (el.loginBtn.disabled) return;
   if (state.logoutRetryToken) {
     showToast("ログアウト完了を確認するまで、新しい担当者ではログインできません", true);
     return;
@@ -3942,15 +4099,11 @@ async function handleLogin() {
     el.sessionPermissionText.textContent = state.permissionsKnown
       ? `実効権限 ${state.effectivePermissions.size}件（許可された操作のみ表示）`
       : "実効権限を確認できないため、管理・返金・締め・監査・監視操作を非表示にしています。";
-    if (el.businessTimezoneText) {
-      el.businessTimezoneText.textContent = state.storeTimezone;
-      el.businessDateInput.value = nowIsoDate();
-      el.businessMonthInput.value = nowIsoDate().slice(0, 7);
-    }
     startSessionExpiryTimer();
     setNetworkStatus("認証済み");
     renderCustomerFacingQr();
     applyPermissionVisibility();
+    initializeBusinessDateInputs();
     renderDiagnostics();
     renderOperatorGuide();
     if (hasAnyPermission(["invoice.create", "invoice.read"])) {
@@ -3983,6 +4136,7 @@ async function handleLogin() {
     }
     else renderOpsWarningsList(["監視状態は現在の実効権限の対象外です"]);
     showToast("ログインしました");
+    if (!state.invoiceId) el.amountInput?.focus();
   } catch (error) {
     if (isIgnoredRequestError(error)) return;
     showLoginError(loginErrorMessage(error), error?.code === "VALIDATION_ERROR" ? el.staffPin : el.loginError);
@@ -4009,7 +4163,7 @@ function renderPaymentChains(chains = []) {
   el.paymentChainSelect.disabled = state.paymentChains.length === 0 || !hasPermission("invoice.create");
   const selected = state.paymentChains.find((chain) => String(chain.chain_id) === nextValue);
   el.paymentChainHint.textContent = selected
-    ? `${selected.network} / 公式JPYC ${selected.token_contract_display || selected.token_contract}`
+    ? `${selected.network} / 公式JPYC。契約情報は会計の詳細へ。`
     : "利用可能な支払いチェーンを取得できません。請求作成を停止しています。";
   syncInvoiceOperationControls();
 }
@@ -4322,9 +4476,9 @@ async function loadReviews() {
         ? `${rows.length} 件のレビュー。最優先: ${reviewReasonLabel(topReview.reason_type)}（${shortId(topReview.id)}）`
         : `${rows.length} 件のレビューがあります。`
     );
-    for (const row of rows) {
-      el.reviewsTableBody.appendChild(createReviewRow(row));
-    }
+    const reviewFragment = document.createDocumentFragment();
+    for (const row of rows) reviewFragment.appendChild(createReviewRow(row));
+    el.reviewsTableBody.appendChild(reviewFragment);
     const nextSelection = rows.some((row) => row.id === state.selectedReviewId) ? state.selectedReviewId : rows[0]?.id;
     if (nextSelection) {
       await selectReview(nextSelection);
@@ -4552,7 +4706,7 @@ async function handleUpdateReview() {
   if (destructiveDisposition && state.pendingReviewUpdate !== updateSignature) {
     state.pendingReviewUpdate = updateSignature;
     el.updateReviewBtn.textContent = "対象請求を無効にしてレビューを更新";
-    el.reviewUpdateImpact.textContent = `レビュー ${shortId(reviewId)} の更新により対象請求が無効になります。対象・状態・処分を再確認し、同じボタンをもう一度押してください。`;
+    el.reviewUpdateImpact.textContent = `レビュー ${shortId(reviewId)} の更新により対象請求が無効になります。対象・状態・対応方針を再確認し、同じボタンをもう一度押してください。`;
     showToast("この更新は対象請求を無効にします。確認後、同じボタンをもう一度押してください", true);
     return;
   }
@@ -5527,7 +5681,14 @@ function bindAdminEvents() {
 }
 
 function bindEvents() {
+  el.adminOperationsMount?.addEventListener("click", handleManagementNavigation);
   el.loginBtn.addEventListener("click", () => void handleLogin());
+  el.loginFormPanel?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.isComposing) return;
+    if (![el.terminalCode, el.staffName, el.staffPin].includes(event.target)) return;
+    event.preventDefault();
+    void handleLogin();
+  });
   el.logoutBtn.addEventListener("click", () => void handleLogout());
   el.amountPresetList.addEventListener("click", (event) => {
     const actionButton = event.target.closest("[data-preset-action]");
@@ -5585,10 +5746,12 @@ function bindEvents() {
     if (typeof releaseScreenWakeLock === "function") void releaseScreenWakeLock();
   });
   window.addEventListener("pageshow", refreshFulfillmentObservationAfterResume);
+  window.addEventListener("pageshow", refreshOpsSnapshotAfterResume);
   window.addEventListener("online", refreshFulfillmentObservationAfterResume);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       refreshFulfillmentObservationAfterResume();
+      refreshOpsSnapshotAfterResume();
       if (state.fixedQrUrl && !el.qrCanvas.classList.contains("hidden") && typeof requestScreenWakeLock === "function") {
         void requestScreenWakeLock();
       }
@@ -5614,7 +5777,7 @@ function init() {
   setReviewListState("empty", "ログイン後に確認待ち一覧を読み込めます。");
   renderReviewDetail(null);
   if (el.opsSnapshotState) {
-    el.opsSnapshotState.textContent = "ログイン後に review / settlement / monitor を集約し、優先確認項目を表示します。";
+    el.opsSnapshotState.textContent = "ログイン後、確認待ち・締め・監視状態を表示します。";
     el.opsOpenReviewCount.textContent = "-";
     el.opsDeadLetterCount.textContent = "-";
     el.opsSettlementStatus.textContent = "-";

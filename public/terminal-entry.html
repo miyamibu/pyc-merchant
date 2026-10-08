@@ -6,12 +6,12 @@
   <title>JPYCお支払い案内</title>
   <link rel="stylesheet" href="/app.css" />
 </head>
-<body>
+<body class="entry-surface">
   <div class="wrap wrap-narrow">
     <header class="section-header">
       <div class="stack">
-        <h1 class="title">JPYCお支払い案内</h1>
-        <p class="small">会計状態に応じて、確認内容と次の操作をご案内します。</p>
+        <h1 class="title">会計確認</h1>
+        <p class="small">店舗と金額をご確認ください。</p>
       </div>
       <span class="badge">お客様向け</span>
     </header>
@@ -20,43 +20,43 @@
 
     <section class="card stack mt-16" aria-labelledby="entryStateTitle">
       <div class="section-header">
-        <h2 id="entryStateTitle" class="title title-lg">会計状態</h2>
+        <h2 id="entryStateTitle" class="title title-lg">この会計</h2>
         <span id="entryBadge" class="status-pill s-blue" role="status" aria-live="polite" aria-atomic="true">確認中</span>
       </div>
       <div class="info-list">
         <div class="info-item">
           <span class="info-label">店舗</span>
-          <p id="storeText" class="info-value">-</p>
+          <p id="storeText" class="info-value customer-store-name">-</p>
         </div>
         <div class="info-item">
           <span class="info-label">状態</span>
           <p id="headlineText" class="info-value">会計を確認しています。</p>
-          <p id="bodyText" class="helper-text">この端末入口QRは会計準備画面です。会計準備が完了したら、店舗・金額・会計番号を確認して進みます。</p>
+          <p id="bodyText" class="helper-text">会計の準備後に、内容を確認して進みます。</p>
         </div>
       </div>
-      <div id="entryReadyPanel" class="panel panel-warm stack hidden" aria-labelledby="entryReadyTitle">
+      <div id="entryReadyPanel" class="panel panel-warm stack entry-confirm-panel hidden" aria-labelledby="entryReadyTitle">
         <h3 id="entryReadyTitle" class="title title-md">この会計でよろしいですか</h3>
         <div class="info-list">
           <div class="info-item">
             <span class="info-label">金額</span>
-            <p id="entryAmountText" class="info-value">-</p>
+            <p id="entryAmountText" class="amount-primary entry-amount">-</p>
           </div>
           <div class="info-item">
             <span class="info-label">会計番号</span>
-            <p id="entryInvoiceText" class="info-value mono">-</p>
+            <p id="entryInvoiceText" class="info-value mono entry-reference">-</p>
           </div>
         </div>
         <button id="openInvoiceBtn" class="btn btn-primary btn-full" type="button">この会計を確認して進む</button>
-        <p class="helper-text">最初の確認で表示中の会計を短時間だけ確保し、次の確認で支払い画面を発行します。内容が変わった場合は自動で移動しません。</p>
+        <p class="helper-text entry-confirm-note">1回の操作で最新内容を照合し、支払い画面を開きます。内容が変わった場合は移動を止め、再確認をお願いします。</p>
       </div>
       <button id="refreshEntryBtn" class="btn btn-secondary btn-full" type="button">会計状態を更新</button>
     </section>
 
     <section class="card stack mt-16" aria-labelledby="entryHelpTitle">
-      <h2 id="entryHelpTitle" class="title title-lg">ご案内</h2>
+      <h2 id="entryHelpTitle" class="title title-md">ご案内</h2>
       <ul id="helpList" class="warning-list compact-list">
         <li>会計が表示されたら、店舗・金額・会計番号を確認してください。</li>
-        <li>表示後の請求内容は、その時点の会計に固定されます。</li>
+        <li>開いた支払い画面は、確認した会計に固定されます。</li>
         <li>長く進まない場合は、店舗スタッフへお声がけください。</li>
       </ul>
     </section>

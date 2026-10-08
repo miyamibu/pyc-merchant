@@ -321,12 +321,12 @@ function renderWaiting(entry) {
   clearReadyState();
   setBadge("会計準備中", "s-blue");
   el.storeText.textContent = entry.store_name || "-";
-  el.headlineText.textContent = "店舗側で会計を準備しています。";
-  el.bodyText.textContent = "準備ができたら、この画面に会計内容と確認ボタンを表示します。";
+  el.headlineText.textContent = "会計を準備中です";
+  el.bodyText.textContent = "準備ができたら、金額と確認ボタンを表示します。";
   setHelp([
-    "会計内容が表示されるまで、この画面のままお待ちください。",
-    "会計がまだ立っていないため、支払い先や金額は表示されていません。",
-    "長く進まない場合は、会計状態を更新するか店舗スタッフへお声がけください。",
+    "会計が表示されるまでお待ちください。",
+    "まだ送金しないでください。",
+    "長く進まない場合は更新するか、店舗スタッフへお声がけください。",
   ]);
   announce("会計準備中です。");
 }
@@ -335,7 +335,7 @@ function renderBlocked(entry) {
   clearReadyState();
   setBadge("要スタッフ確認", "s-yellow");
   el.storeText.textContent = entry.store_name || "-";
-  el.headlineText.textContent = "店舗スタッフによる会計確認が必要です。";
+  el.headlineText.textContent = "店舗スタッフへお声がけください";
   el.bodyText.textContent = "この端末で複数の会計が検出されたため、請求を自動で選択していません。";
   setHelp([
     "店舗スタッフが会計状態を確認するまでお待ちください。",
@@ -381,10 +381,10 @@ function renderReady(entry, { changed = false, requireReconfirmation = changed }
   if (!state.presentedFingerprint && !mustReconfirm) state.presentedFingerprint = fingerprint;
   setBadge(contentChanged ? "内容更新" : "会計準備完了", contentChanged ? "s-yellow" : "s-green");
   el.storeText.textContent = entry.store_name || "-";
-  el.headlineText.textContent = contentChanged ? "会計内容が更新されました。" : "お支払いに進めます。";
+  el.headlineText.textContent = contentChanged ? "会計内容が変わりました" : "店舗・金額をご確認ください";
   el.bodyText.textContent = contentChanged
-    ? "安全のため移動を止めました。店舗・金額・会計番号をもう一度確認してください。"
-    : "店舗・金額・会計番号を確認し、内容が正しければ確認ボタンを押してください。";
+    ? "移動を止めました。店舗・金額・会計番号を再確認してください。"
+    : "ご自身の会計なら、確認ボタンで進みます。";
   const amount = Number(invoice.amount_jpy);
   el.entryAmountText.textContent = Number.isFinite(amount) ? `¥${amount.toLocaleString("ja-JP")}` : "-";
   el.entryInvoiceText.textContent = shortInvoiceReference(invoice);
@@ -392,9 +392,9 @@ function renderReady(entry, { changed = false, requireReconfirmation = changed }
   el.openInvoiceBtn.disabled = !entry.pay_url || state.opening;
   el.openInvoiceBtn.textContent = mustReconfirm ? "変更内容を確認して進む" : "この会計を確認して進む";
   setHelp([
-    "表示された店舗・金額・会計番号がご自身の会計か確認してください。",
-    "確認ボタンを押す直前にも最新状態を照合します。",
-    "内容に心当たりがない場合は進まず、店舗スタッフへお声がけください。",
+    "店舗・金額・会計番号をご確認ください。",
+    "ボタンを押すと最新内容を照合して開きます。",
+    "ご自身の会計でなければ進まず、スタッフへお声がけください。",
   ]);
   announce(contentChanged ? "会計内容が更新されました。もう一度確認してください。" : "会計の準備ができました。内容を確認してください。");
 }

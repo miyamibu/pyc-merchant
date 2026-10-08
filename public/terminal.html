@@ -5,14 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>JPYC Merchant Ops 端末</title>
   <link rel="stylesheet" href="/app.css" />
-  <script src="/vendor/qrcode.min.js"></script>
+  <script src="/vendor/qrcode.min.js" defer></script>
 </head>
 <body class="terminal-surface" data-provider-rail-enabled="false">
   <div class="wrap">
     <header class="section-header">
       <div class="stack">
         <h1 class="title">JPYC Merchant Ops 端末</h1>
-        <p class="small">スタッフが暗号資産を知らなくても、請求作成・支払い確認・確認待ち対応・返金証跡・日次締めまで回せる店舗運用画面です。</p>
+        <p class="small">会計から確認・返金記録・日次締めまで。</p>
       </div>
       <a class="btn btn-secondary btn-compact dev-only-link" href="/prototype.html">アニメーションを見る</a>
     </header>
@@ -31,6 +31,10 @@
         <div class="stack gap-tight">
           <h2 id="fulfillmentDecisionTitle" class="title title-md">会計状態を確認中です</h2>
           <p id="fulfillmentDecisionBody" class="helper-text">サーバーの判定を確認できるまで、商品引渡しと追加送金の案内を止めてください。</p>
+          <details class="details fulfillment-details">
+            <summary>判定の詳細</summary>
+            <p id="fulfillmentDecisionDetails" class="details-content small mono">判定を確認中です。</p>
+          </details>
         </div>
       </section>
       <div id="storePaymentsMount" class="sticky-stack-slot"></div>
@@ -46,13 +50,13 @@
       >
         <div class="stack gap-tight">
           <div class="row row-between">
-            <h2 id="storePaymentsControlTitle" class="title title-md">店舗決済コントロール</h2>
+            <h2 id="storePaymentsControlTitle" class="title title-md">店舗の決済</h2>
             <span id="storePaymentsStatusBadge" class="status-pill s-gray">状態未確認</span>
           </div>
           <p id="storePaymentsStatusText" class="helper-text" role="status" aria-live="polite" aria-atomic="true">
             状態が不明なときも、店舗の新規決済停止は実行できます。
           </p>
-          <p class="small">この操作は現在の店舗だけが対象で、全体停止の解除や変更はできません。操作は監査ログに記録されます。</p>
+          <p class="small">この店舗だけが対象です。全体停止の解除や変更はできません。操作は監査ログに記録されます。</p>
         </div>
         <div class="store-payments-control-actions">
           <button id="storePaymentsRefreshBtn" class="btn btn-secondary btn-compact" type="button">状態を再確認</button>
@@ -67,12 +71,14 @@
     </template>
 
     <main class="grid-main mt-16">
-      <section class="card stack col-4 terminal-session-card" aria-labelledby="sessionSectionTitle">
+      <section id="terminalSessionCard" class="card stack col-4 terminal-session-card" aria-labelledby="sessionSectionTitle">
         <div class="section-header">
-          <h2 id="sessionSectionTitle" class="title title-lg">端末セッション</h2>
+          <h2 id="sessionSectionTitle" class="title title-lg">担当者</h2>
           <span id="sessionRolePill" class="role-pill role-staff">未ログイン</span>
         </div>
         <div id="loginFormPanel" class="stack">
+          <p class="helper-text">この端末で使うスタッフ情報を入力してください。</p>
+          <div class="login-fields">
           <label for="terminalCode">
             端末コード
             <input id="terminalCode" value="TERM-001" autocomplete="off" required aria-describedby="loginError" />
@@ -86,26 +92,26 @@
             <input id="staffPin" type="password" autocomplete="current-password" inputmode="numeric" pattern="[0-9]{4,8}" minlength="4" maxlength="8" required aria-describedby="loginError" />
           </label>
           <p id="loginError" class="error-state login-inline-error hidden" role="alert" tabindex="-1"></p>
+          </div>
           <button class="btn btn-primary" id="loginBtn" type="button">ログイン</button>
         </div>
-        <div class="panel stack gap-tight">
+        <div class="session-compact-row">
           <p class="small">担当者: <span id="sessionIdentityText" class="mono">未ログイン</span></p>
-          <p class="small">権限ロール: <span id="sessionRoleText" class="mono">-</span></p>
-          <p class="small">セッションID: <span id="sessionText" class="mono">未接続</span></p>
-          <p class="small">接続状態: <span id="networkText" class="mono">オンライン</span></p>
+          <p class="small">権限: <span id="sessionRoleText" class="mono">-</span></p>
+          <button id="logoutBtn" class="btn btn-secondary btn-compact hidden" type="button">担当者を交代 / ログアウト</button>
+        </div>
+        <details class="details session-details">
+          <summary>接続・端末設定</summary>
+          <div class="details-content">
           <div id="connectionStatusPanel" class="connection-status status-idle" role="status" aria-live="polite" aria-atomic="true">
             <span id="connectionStatusDot" class="status-dot"></span>
             <span id="connectionStatusText">リアルタイム更新: 未接続</span>
             <button id="connectionRefreshBtn" class="btn btn-secondary btn-compact" type="button">最新の状態に更新</button>
           </div>
+          <p class="small">接続状態: <span id="networkText" class="mono">オンライン</span></p>
+          <p class="small">セッションID: <span id="sessionText" class="mono">未接続</span></p>
           <p class="small">セッション期限: <span id="sessionExpiryText" class="mono">-</span></p>
           <p id="sessionPermissionText" class="helper-text">ログイン後、サーバーが返した実効権限に応じて操作を表示します。</p>
-          <button id="logoutBtn" class="btn btn-secondary hidden" type="button">担当者を交代 / ログアウト</button>
-        </div>
-
-        <details class="details">
-          <summary>端末設定</summary>
-          <div class="details-content">
           <label>
             音量
             <input id="volumeInput" type="range" min="0" max="1" step="0.1" value="0.8" />
@@ -118,7 +124,7 @@
           </div>
         </details>
 
-        <div class="panel panel-warm stack">
+        <div class="panel panel-warm stack session-warnings">
           <p class="small"><strong>運用警告</strong></p>
           <ul id="opsWarnings" class="small ops-list">
             <li>監視状態を確認中...</li>
@@ -126,29 +132,42 @@
         </div>
       </section>
 
-      <section class="card stack col-8 terminal-invoice-card" aria-labelledby="invoiceCreateTitle">
+      <section id="terminalCheckoutCard" class="card stack col-8 terminal-invoice-card" aria-labelledby="invoiceCreateTitle">
         <div class="section-header">
-          <h2 id="invoiceCreateTitle" class="title title-lg">請求作成（運用起点）</h2>
+          <h2 id="invoiceCreateTitle" class="title title-lg">会計</h2>
           <span id="invoiceStatusPill" class="status-pill s-gray" role="status" aria-live="polite" aria-atomic="true">未発行</span>
         </div>
+        <ol id="checkoutFlow" class="checkout-flow" aria-label="会計の流れ">
+          <li class="checkout-flow-step" data-checkout-step="1" data-state="current" aria-current="step"><span class="checkout-step-number">1</span><span class="checkout-step-label">金額</span></li>
+          <li class="checkout-flow-step" data-checkout-step="2" data-state="upcoming"><span class="checkout-step-number">2</span><span class="checkout-step-label">QR</span></li>
+          <li class="checkout-flow-step" data-checkout-step="3" data-state="upcoming"><span class="checkout-step-number">3</span><span class="checkout-step-label">確認</span></li>
+          <li class="checkout-flow-step" data-checkout-step="4" data-state="upcoming"><span class="checkout-step-number">4</span><span class="checkout-step-label">お渡し</span></li>
+        </ol>
+        <div class="checkout-next-action" role="status" aria-live="polite" aria-atomic="true">
+          <p id="checkoutNextAction" class="title title-md">ログインして会計を始めます</p>
+          <p id="checkoutFlowHint" class="helper-text">商品はまだ渡さないでください。</p>
+        </div>
+        <div class="checkout-layout">
+        <section class="panel stack checkout-amount-panel" aria-labelledby="checkoutAmountTitle">
+        <h3 id="checkoutAmountTitle" class="title title-md">金額を入力</h3>
         <div class="row invoice-action-row">
           <label class="field-w-180" for="amountInput">
-            請求金額（円）
+            金額（円）
             <input id="amountInput" type="number" min="1" step="1" value="1000" aria-describedby="amountInputError" />
           </label>
           <label class="field-w-180" for="paymentChainSelect">
-            支払いチェーン
+            ネットワーク
             <select id="paymentChainSelect" aria-describedby="paymentChainHint" disabled>
               <option value="">ログイン後に取得</option>
             </select>
           </label>
           <button id="createInvoiceBtn" class="btn btn-primary btn-main-action" data-permission="invoice.create">請求を作成</button>
         </div>
-        <p id="paymentChainHint" class="helper-text">店舗で有効化された公式JPYCチェーンだけを表示します。</p>
+        <p id="paymentChainHint" class="helper-text">店舗で有効な公式JPYCのみ。</p>
         <details id="invoiceDangerActions" class="details danger-actions" data-permission="invoice.create">
           <summary>会計をやり直す</summary>
           <div class="details-content">
-            <p class="helper-text">現在の請求を無効化または期限切れにする副操作です。送金済みの申告がある場合は確認待ち一覧へ引き継いでください。</p>
+            <p class="helper-text">送金済みの申告がある場合は、確認待ち一覧へ引き継いでください。</p>
             <div class="inline-action-group">
               <button id="cancelInvoiceBtn" class="btn btn-ghost btn-compact" data-permission="invoice.create">請求を無効化</button>
               <button id="expireInvoiceBtn" class="btn btn-ghost btn-compact" data-permission="invoice.create">期限切れ処理</button>
@@ -174,16 +193,21 @@
           </div>
         </details>
         <p id="amountInputError" class="small live-region" role="status" aria-live="polite" aria-atomic="true"></p>
-
-        <div class="split-layout">
-          <section class="panel stack">
-            <h3 class="title title-md">現在の請求 / 端末入口QR / 運用状態</h3>
-            <p class="small">請求ID: <span id="invoiceIdText" class="mono">-</span></p>
-            <p class="small">端末入口QR URL: <a id="fixedQrUrlLink" class="mono" target="_blank" rel="noopener noreferrer">-</a></p>
-            <p class="small">この会計の支払いURL: <a id="paymentUrlLink" class="mono" target="_blank" rel="noopener noreferrer">-</a></p>
-            <p class="small">支払いチェーン: <span id="paymentChainText">-</span></p>
-            <p class="small">JPYCコントラクト: <span id="paymentContractText" class="mono address-text">-</span></p>
-            <p class="small">有効期限: <span id="expiresAtText" class="mono nowrap">-</span></p>
+        </section>
+          <section class="panel stack checkout-qr-panel">
+            <h3 class="title title-md">QRを提示</h3>
+            <canvas id="qrCanvas" width="420" height="420" aria-label="決済QR"></canvas>
+            <p id="qrAccessibleText" class="visually-hidden">請求IDと金額は現在の請求欄に表示されます。</p>
+            <div id="tapModePanel" class="panel stack hidden" data-provider-rail aria-live="polite" aria-atomic="true">
+              <span id="tapModeBadge" class="status-pill s-blue">タッチ案内</span>
+              <p id="tapModeTitle" class="title title-md">カード・スマホをかざしてください</p>
+              <p id="tapModeBody" class="helper-text">店頭端末でタッチ決済をご案内しています。</p>
+              <p id="tapModeAmount" class="amount-primary">-</p>
+            </div>
+            <p id="customerDisplayHint" class="helper-text">QRを読み取り、店舗・金額を確認してください。</p>
+          </section>
+          <section class="panel stack checkout-summary-panel">
+            <h3 class="title title-md">現在の会計</h3>
             <div id="amountComparePanel" class="amount-compare" aria-label="請求額と受取額">
               <div>
                 <span class="info-label">請求額</span>
@@ -195,8 +219,8 @@
               </div>
               <p id="amountCompareDelta" class="amount-delta">差額 -</p>
             </div>
-            <p class="small">請求額: <span id="amountText" class="mono nowrap">-</span></p>
-            <p class="small">受取額: <span id="paidText" class="mono nowrap">-</span></p>
+            <p class="small">会計ID: <span id="invoiceIdText" class="mono">-</span></p>
+            <p class="small">期限: <span id="expiresAtText" class="mono nowrap">-</span></p>
             <p class="small">状態理由: <span id="reasonText" class="mono">-</span></p>
             <p class="small" data-provider-rail>店頭案内状態: <span id="providerOperatorStateText" class="mono">-</span></p>
             <p class="small" data-provider-rail>店頭端末連携状態: <span id="providerStatusText" class="mono">-</span></p>
@@ -207,25 +231,24 @@
               <button id="resumeQrBtn" class="btn btn-secondary" type="button" data-provider-rail data-permission="invoice.create">QR案内へ戻す</button>
             </div>
             <p id="providerControlHint" class="helper-text" data-provider-rail>QR とタッチ案内は同じ会計で同時に開きません。タッチ案内中は端末入口QRからのウォレット導線を止めます。</p>
-          </section>
-
-          <section class="panel stack">
-            <h3 class="title title-md">お客様提示（端末入口QR）</h3>
-            <canvas id="qrCanvas" width="420" height="420" aria-label="決済QR"></canvas>
-            <p id="qrAccessibleText" class="visually-hidden">請求IDと金額は現在の請求欄に表示されます。</p>
-            <div id="tapModePanel" class="panel stack hidden" data-provider-rail aria-live="polite" aria-atomic="true">
-              <span id="tapModeBadge" class="status-pill s-blue">タッチ案内</span>
-              <p id="tapModeTitle" class="title title-md">カード・スマホをかざしてください</p>
-              <p id="tapModeBody" class="helper-text">店頭端末でタッチ決済をご案内しています。</p>
-              <p id="tapModeAmount" class="amount-primary">-</p>
-            </div>
-            <p id="customerDisplayHint" class="helper-text">このQRは端末ごとの入口です。お客様画面は、その時点の会計に一度だけ紐づきます。</p>
+            <details class="details">
+              <summary>会計の詳細</summary>
+              <div class="details-content">
+                <p class="small">請求額: <span id="amountText" class="mono nowrap">-</span></p>
+                <p class="small">受取額: <span id="paidText" class="mono nowrap">-</span></p>
+                <p class="small">ネットワーク: <span id="paymentChainText">-</span></p>
+                <p class="small">JPYCコントラクト: <span id="paymentContractText" class="mono address-text">-</span></p>
+                <p class="small">端末入口QR: <a id="fixedQrUrlLink" class="mono" target="_blank" rel="noopener noreferrer">-</a></p>
+                <p class="small">支払い画面: <a id="paymentUrlLink" class="mono" target="_blank" rel="noopener noreferrer">-</a></p>
+              </div>
+            </details>
           </section>
         </div>
 
-        <section id="operatorGuideCard" class="panel stack" aria-labelledby="operatorGuideSectionTitle">
+        <details id="operatorGuideCard" class="details" aria-labelledby="operatorGuideSectionTitle">
+          <summary id="operatorGuideSectionTitle">運用ガイド・ウォレット案内</summary>
+          <div class="details-content">
           <div class="section-header">
-            <h3 id="operatorGuideSectionTitle" class="title title-md">現場で迷わない運用ガイド</h3>
             <span id="operatorGuideBadge" class="badge">Merchant Ops</span>
           </div>
           <p id="operatorGuideHeadline" class="title title-md">商品を渡してよいか、次に何をするかをこのカードで確認します</p>
@@ -258,13 +281,14 @@
               <p id="operatorGuideAction" class="info-value">QR発行</p>
             </div>
           </div>
-        </section>
+          </div>
+        </details>
 
-        <section id="diagnosticsCard" class="panel stack hidden" aria-labelledby="diagnosticsTitle">
+        <section id="diagnosticsCard" class="panel stack hidden management-section" aria-labelledby="diagnosticsTitle" tabindex="-1">
           <div class="section-header">
             <div class="stack">
               <h3 id="diagnosticsTitle" class="title title-md">診断モード</h3>
-              <p class="small">read-only で運用状態を確認する検証用パネルです。通常運用では常時表示しません。</p>
+              <p class="small">読み取り専用。取引を変更せず、運用状態を確認します。</p>
             </div>
             <span class="badge">Read-only</span>
           </div>
@@ -272,24 +296,35 @@
             <span id="diagnosticsStatusBadge" class="badge">無効</span>
             <span class="small">最終更新: <span id="diagnosticsUpdatedText" class="mono">-</span></span>
           </div>
-          <pre id="diagnosticsDumpText" class="diagnostics-dump mono">診断モードは無効です。</pre>
+          <details class="details management-details">
+            <summary>診断の詳細</summary>
+            <div class="details-content"><pre id="diagnosticsDumpText" class="diagnostics-dump mono">診断モードは無効です。</pre></div>
+          </details>
         </section>
       </section>
 
       <template id="adminOperationsTemplate">
-      <section class="card stack col-12" data-admin-only="true" data-permission-any="review.read settlement.close monitor.read" aria-labelledby="opsSnapshotTitle">
+      <nav id="managementNavigation" class="management-navigation col-12" data-admin-only="true" data-permission-any="review.read review.update accounting.adjustment.read accounting.adjustment.create accounting.adjustment.approve refund.request refund.view refund.approve refund.execute settlement.close settlement.export audit.read audit.export monitor.read" aria-label="店舗運用">
+        <a href="#terminalCheckoutCard" data-management-target="terminalCheckoutCard">会計</a>
+        <a href="#opsSnapshotSection" data-management-target="opsSnapshotSection" data-permission-any="review.read settlement.close monitor.read">概要</a>
+        <a href="#reviewOperations" data-management-target="reviewOperations" data-permission-any="review.read review.update">確認待ち</a>
+        <a href="#refundOperations" data-management-target="refundOperations" data-permission-any="refund.request refund.view refund.approve refund.execute">返金記録</a>
+        <a href="#settlementOperations" data-management-target="settlementOperations" data-permission-any="settlement.close settlement.export">日次締め</a>
+        <a href="#auditOperations" data-management-target="auditOperations" data-permission-any="audit.read audit.export">監査履歴</a>
+      </nav>
+      <section id="opsSnapshotSection" class="card stack col-12 management-section" data-admin-only="true" data-permission-any="review.read settlement.close monitor.read" aria-labelledby="opsSnapshotTitle" tabindex="-1">
         <div class="section-header">
           <h2 id="opsSnapshotTitle" class="title title-lg">本日の運用サマリー</h2>
           <button id="refreshOpsSnapshotBtn" class="btn btn-secondary btn-compact" data-permission-any="review.read settlement.close monitor.read" type="button">サマリーを更新</button>
         </div>
-        <p id="opsSnapshotState" class="helper-text">ログイン後に review / settlement / monitor を集約し、現場で止まりやすい項目を先に表示します。</p>
+        <p id="opsSnapshotState" class="helper-text">確認待ち・返金候補・本日の締めを確認します。</p>
         <div class="metrics-grid">
           <div class="mini-metric">
             <span class="info-label">未解決レビュー</span>
             <p id="opsOpenReviewCount" class="info-value">-</p>
           </div>
           <div class="mini-metric">
-            <span class="info-label">dead-letter</span>
+            <span class="info-label">処理を終えられない記録</span>
             <p id="opsDeadLetterCount" class="info-value">-</p>
           </div>
           <div class="mini-metric">
@@ -297,7 +332,7 @@
             <p id="opsSettlementStatus" class="info-value">-</p>
           </div>
           <div class="mini-metric">
-            <span class="info-label">推奨アクション</span>
+            <span class="info-label">次にすること</span>
             <p id="opsRecommendedAction" class="info-value">-</p>
           </div>
           <div class="mini-metric">
@@ -325,11 +360,18 @@
         </div>
       </section>
 
-      <section class="card stack col-6" data-admin-only="true" data-permission-any="review.read review.update" aria-labelledby="reviewSectionTitle">
+      <section id="reviewOperations" class="card stack col-12 management-section" data-admin-only="true" data-permission-any="review.read review.update" aria-labelledby="reviewSectionTitle" tabindex="-1">
         <div class="section-header">
           <h2 id="reviewSectionTitle" class="title title-lg">確認待ち支払い</h2>
           <span class="role-pill role-admin">管理者操作</span>
         </div>
+        <ol class="management-flow" aria-label="確認待ちの対応順序">
+          <li class="management-flow-item">1 一覧から選ぶ</li>
+          <li class="management-flow-item">2 理由・証跡を確認</li>
+          <li class="management-flow-item">3 対応を記録</li>
+        </ol>
+        <div class="review-layout">
+        <div class="review-queue stack">
         <div class="row">
           <button id="loadReviewsBtn" class="btn btn-secondary" data-permission="review.read">一覧を更新</button>
           <label class="field-w-180" for="reviewStatusFilter">
@@ -347,19 +389,21 @@
         <p id="reviewListState" class="loading-state" role="status" aria-live="polite" aria-atomic="true">読み込み中です...</p>
         <div class="table-wrap">
           <table id="reviewsTable">
-            <caption>確認待ち支払いを優先度順に表示します。行を選ぶと詳細と更新フォームに反映されます。</caption>
+            <caption>優先度順。行を選ぶと詳細と対応欄に反映します。</caption>
             <thead>
               <tr><th>レビューID</th><th>優先度</th><th>請求番号</th><th>確認理由</th><th>状態</th></tr>
             </thead>
             <tbody></tbody>
           </table>
         </div>
+        </div>
+        <div class="review-selection stack">
         <div id="reviewDetailCard" class="panel stack" aria-labelledby="reviewDetailTitle">
           <div class="section-header">
             <h3 id="reviewDetailTitle" class="title title-md">選択中のレビュー</h3>
             <span id="reviewDetailBadge" class="status-pill s-gray">未選択</span>
           </div>
-          <p id="reviewDetailSummary" class="helper-text">一覧からレビューを選ぶと、必要な ID と直近イベントを確認できます。</p>
+          <p id="reviewDetailSummary" class="helper-text">一覧から選んで理由と証跡を確認してください。</p>
           <div class="metrics-grid metrics-grid-compact">
             <div class="mini-metric">
               <span class="info-label">レビューID</span>
@@ -379,22 +423,23 @@
             </div>
           </div>
           <div class="panel stack gap-tight">
-            <p class="small"><strong>推奨アクション</strong></p>
+            <p class="small"><strong>次にすること</strong></p>
             <p id="reviewDetailAction" class="helper-text">レビューを選択すると、この理由に応じた対応方針を表示します。</p>
             <p id="reviewDetailRefundHint" class="helper-text">返金候補額がある場合はここに表示します。</p>
           </div>
-          <div class="panel panel-muted stack gap-tight">
-            <p class="small"><strong>直近イベント</strong></p>
-            <pre id="reviewDetailEvents" class="log mono">レビューを選択してください。</pre>
-          </div>
-          <div class="panel panel-muted stack gap-tight">
-            <p class="small"><strong>同じ会計の関連請求</strong></p>
-            <pre id="reviewRelatedInvoices" class="log mono">レビューを選択してください。</pre>
-          </div>
+          <details class="details management-details">
+            <summary>イベント・関連請求</summary>
+            <div class="details-content">
+              <p class="small"><strong>直近イベント</strong></p>
+              <pre id="reviewDetailEvents" class="log mono">レビューを選択してください。</pre>
+              <p class="small"><strong>同じ会計の関連請求</strong></p>
+              <pre id="reviewRelatedInvoices" class="log mono">レビューを選択してください。</pre>
+            </div>
+          </details>
         </div>
-        <div class="panel stack">
-          <h3 class="title title-md">レビュー対応更新</h3>
-          <p class="helper-text">ここは請求そのものの金額変更ではなく、確認待ち支払いの対応状況とメモを更新する欄です。</p>
+        <div class="panel stack review-response">
+          <h3 class="title title-md">対応を記録</h3>
+          <p class="helper-text">選択したレビューの状況とメモを更新します。</p>
           <div class="row">
             <label class="field-flex-1" for="reviewIdInput">
               レビューID
@@ -412,7 +457,7 @@
           </div>
           <div class="row">
             <label class="field-flex-1" for="reviewDisposition">
-              処分
+              対応方針
               <select id="reviewDisposition">
                 <option value="">サーバー推奨に任せる</option>
                 <option value="accounting_adjustment">会計調整済み（承認済みIDが必要）</option>
@@ -420,7 +465,7 @@
               </select>
             </label>
             <label class="field-flex-1" for="reviewIncidentId">
-              対象incident ID（任意）
+              関連事案ID（任意）
               <input id="reviewIncidentId" autocomplete="off" />
             </label>
           </div>
@@ -428,26 +473,28 @@
             対応メモ
             <textarea id="reviewNote"></textarea>
           </label>
-          <div class="row">
-            <label class="field-flex-1" for="reviewStepUpPin">
-              会計調整のstep-up PIN（作成/承認時）
-              <input id="reviewStepUpPin" type="password" inputmode="numeric" autocomplete="one-time-code" />
-            </label>
-          </div>
-          <p class="helper-text">レビュー更新は処分によって請求へ波及します。「売上にしない」を選ぶと対象請求は無効になります。この端末では解決済みまたは却下と同時にだけ実行できます。会計調整は請求の支払い状態を変更しません。</p>
-          <p id="reviewUpdateImpact" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">対象レビュー・更新後の状態・処分を確認してください。レビューを切り替えた場合、編集中の下書きはレビューIDごとにこの画面内で保持します。</p>
+          <p class="ops-note danger">「売上にしない」は対象請求を無効にします。解決済み・却下と同時にだけ実行できます。会計調整は支払い状態を変更しません。</p>
+          <p id="reviewUpdateImpact" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">対象・状態・対応方針を確認してください。下書きはレビューごとに保持します。</p>
           <button id="updateReviewBtn" class="btn btn-primary" data-permission="review.update">レビューを更新</button>
         </div>
-        <div class="panel stack" data-permission-any="accounting.adjustment.read accounting.adjustment.create accounting.adjustment.approve">
-          <h3 class="title title-md">会計調整（支払い状態は変更しない）</h3>
-          <p class="helper-text">manual_acceptance / loss_accepted / goodwill / write_off は、請求の <code>status</code> と <code>paid_tx_hash</code> を変更せず、二者step-upと証拠参照を会計台帳へ記録します。</p>
+        </div>
+        </div>
+        <details class="details management-details accounting-adjustment-details" data-permission-any="accounting.adjustment.read accounting.adjustment.create accounting.adjustment.approve">
+          <summary>会計調整（支払い状態は変更しない）</summary>
+          <div class="details-content">
+          <ol class="management-flow" aria-label="会計調整の手順"><li class="management-flow-item">1 作成</li><li class="management-flow-item">2 別スタッフが承認</li><li class="management-flow-item">3 承認済みIDをレビューへ</li></ol>
+          <p class="helper-text">請求の <code>status</code> と <code>paid_tx_hash</code> は変更しません。2人の追加PIN確認と証拠参照を台帳に残します。</p>
+          <label for="reviewStepUpPin">
+            追加確認PIN（作成・承認時）
+            <input id="reviewStepUpPin" type="password" inputmode="numeric" autocomplete="one-time-code" />
+          </label>
           <div class="row">
             <label class="field-flex-1" for="reviewAdjustmentInvoiceId">
               対象請求ID
               <input id="reviewAdjustmentInvoiceId" class="mono" readonly />
             </label>
             <label class="field-flex-1" for="reviewAdjustmentId">
-              会計調整ID（承認後にレビューへ指定）
+              会計調整ID（承認後に指定）
               <input id="reviewAdjustmentId" class="mono" autocomplete="off" />
             </label>
           </div>
@@ -455,10 +502,10 @@
             <label class="field-flex-1" for="reviewAdjustmentType">
               調整種別
               <select id="reviewAdjustmentType">
-                <option value="manual_acceptance">manual_acceptance（人手受入）</option>
-                <option value="loss_accepted">loss_accepted（損失受入）</option>
-                <option value="goodwill">goodwill（顧客配慮）</option>
-                <option value="write_off">write_off（償却）</option>
+                <option value="manual_acceptance">人手受入</option>
+                <option value="loss_accepted">損失受入</option>
+                <option value="goodwill">顧客配慮</option>
+                <option value="write_off">償却</option>
               </select>
             </label>
             <label class="field-flex-1" for="reviewAdjustmentAmount">
@@ -474,6 +521,7 @@
             証拠参照（チケット/保管先/証跡ID）
             <input id="reviewAdjustmentEvidenceRef" autocomplete="off" placeholder="例: ops-case-2026-001" />
           </label>
+          <p class="ops-note danger">支払い確認や引渡し許可を変更する操作ではありません。作成者とは別のスタッフが承認します。</p>
           <div class="inline-action-group">
             <button id="createAccountingAdjustmentBtn" class="btn btn-primary" data-permission="accounting.adjustment.create" type="button">会計調整を作成</button>
             <button id="loadPendingAdjustmentsBtn" class="btn btn-secondary" data-permission="accounting.adjustment.read" type="button">確認待ちを更新</button>
@@ -487,25 +535,32 @@
             </select>
           </label>
           <p id="accountingAdjustmentStatus" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">レビューを選択すると対象請求を表示します。</p>
-        </div>
+          </div>
+        </details>
       </section>
 
-      <section class="card stack col-6" data-admin-only="true" data-permission-any="refund.request refund.view refund.approve refund.execute" aria-labelledby="refundSectionTitle">
+      <section id="refundOperations" class="card stack col-12 management-section" data-admin-only="true" data-permission-any="refund.request refund.view refund.approve refund.execute" aria-labelledby="refundSectionTitle" tabindex="-1">
         <div class="section-header">
           <h2 id="refundSectionTitle" class="title title-lg">返金記録</h2>
           <span class="role-pill role-admin">管理者操作</span>
         </div>
-        <p class="helper-text">お店側が外部ウォレットなどで返金したときに、申請・承認・返金Tx・検証結果を証跡として残す欄です。</p>
+        <p class="helper-text">申請 → 別スタッフの承認 → 外部返金の記録・検証。</p>
         <div class="ops-note danger">
           このシステムは返金送金を実行しません。外部ウォレットで実行した返金を記録・検証します。秘密鍵・シードフレーズは入力しないでください。
         </div>
-        <p id="refundDraftHint" class="helper-text">レビューを選択すると、返金候補額やチェーンIDをフォームへ下書きします。</p>
-        <div class="step-flow" aria-label="返金記録ステップ">
-          <section id="refundStepRequestPanel" class="step-panel current" aria-labelledby="refundStepRequestTitle" aria-current="step" data-step-state="current">
-            <div class="section-header">
-              <h3 id="refundStepRequestTitle" class="title title-md">1. 返金申請を作る</h3>
+        <p id="refundDraftHint" class="helper-text">レビューから返金候補額・チェーンを下書きします。</p>
+        <ol id="refundFlowTrack" class="management-flow" aria-label="返金記録の流れ">
+          <li class="management-flow-item" data-refund-step="0" data-state="current" aria-current="step">1 申請</li>
+          <li class="management-flow-item" data-refund-step="1" data-state="future">2 別スタッフが承認</li>
+          <li class="management-flow-item" data-refund-step="2" data-state="future">3 外部返金を記録・検証</li>
+        </ol>
+        <div class="step-flow refund-record-flow" aria-label="返金記録ステップ">
+          <details id="refundStepRequestPanel" class="step-panel details current" aria-labelledby="refundStepRequestTitle" aria-current="step" data-step-state="current" open>
+            <summary class="section-header">
+              <span id="refundStepRequestTitle" class="title title-md">1. 返金申請</span>
               <span id="refundStepRequestBadge" class="badge">入力</span>
-            </div>
+            </summary>
+            <div class="details-content">
             <div class="row">
               <label class="field-flex-1" for="refundReviewCaseId">
                 レビューID
@@ -516,7 +571,7 @@
                 <input id="refundAmount" type="number" min="1" step="1" inputmode="decimal" aria-describedby="refundEligibleHint" />
               </label>
             </div>
-            <p id="refundEligibleHint" class="helper-text">レビューを選択すると、サーバーが返した返金可能額を表示します。</p>
+            <p id="refundEligibleHint" class="helper-text">返金可能額はサーバーの確認結果です。</p>
             <div class="row">
               <label class="field-flex-1" for="refundAddress">
                 返金先（選択レビューの支払い元）
@@ -527,27 +582,32 @@
                 <input id="refundChainId" placeholder="通常は 137" />
               </label>
             </div>
-            <p id="refundAddressPolicyHint" class="helper-text">返金先は、選択レビューで一意に確認できた支払い元アドレスに固定します。代替返金先はこの端末では受け付けません。</p>
+            <p id="refundAddressPolicyHint" class="helper-text">返金先は確認済みの支払い元に固定します。別の返金先は指定できません。</p>
             <button id="requestRefundBtn" class="btn btn-primary" data-permission="refund.request">返金申請を作成</button>
-          </section>
-
-          <section id="refundStepApprovePanel" class="step-panel" aria-labelledby="refundStepApproveTitle" data-step-state="future">
-            <div class="section-header">
-              <h3 id="refundStepApproveTitle" class="title title-md">2. 申請を承認する</h3>
-              <span id="refundStepApproveBadge" class="badge">返金ID待ち</span>
             </div>
+          </details>
+
+          <details id="refundStepApprovePanel" class="step-panel details" aria-labelledby="refundStepApproveTitle" data-step-state="future">
+            <summary class="section-header">
+              <span id="refundStepApproveTitle" class="title title-md">2. 別スタッフが承認</span>
+              <span id="refundStepApproveBadge" class="badge">返金ID待ち</span>
+            </summary>
+            <div class="details-content">
+            <p class="helper-text">申請内容を確認して、作成者とは別のスタッフが承認します。</p>
             <label for="refundIdInput">
               返金ID
               <input id="refundIdInput" placeholder="返金ID" />
             </label>
             <button id="approveRefundBtn" class="btn btn-secondary" data-permission="refund.approve">返金申請を承認</button>
-          </section>
-
-          <section id="refundStepEvidencePanel" class="step-panel" aria-labelledby="refundStepEvidenceTitle" data-step-state="future">
-            <div class="section-header">
-              <h3 id="refundStepEvidenceTitle" class="title title-md">3. 外部実行を記録・検証する</h3>
-              <span id="refundStepEvidenceBadge" class="badge">証跡</span>
             </div>
+          </details>
+
+          <details id="refundStepEvidencePanel" class="step-panel details" aria-labelledby="refundStepEvidenceTitle" data-step-state="future">
+            <summary class="section-header">
+              <span id="refundStepEvidenceTitle" class="title title-md">3. 外部返金を記録・検証</span>
+              <span id="refundStepEvidenceBadge" class="badge">証跡</span>
+            </summary>
+            <div class="details-content">
             <label for="refundTxHashInput">
               返金取引番号
               <input id="refundTxHashInput" class="mono" placeholder="0x + 64桁hex" />
@@ -557,44 +617,44 @@
               <input id="refundExecutedWalletInput" class="mono" placeholder="0x..." />
             </label>
             <label for="refundEvidenceNotePathInput">
-              証跡メモ/スクリーンショット保管先
+              証跡の保管先
               <input id="refundEvidenceNotePathInput" placeholder="例: docs/production/evidence/.../refund-note.md" />
             </label>
             <label for="refundCustomerNoteInput">
               お客様向けメモ
               <textarea id="refundCustomerNoteInput" placeholder="例: 過入金差額の返金証跡です。"></textarea>
             </label>
-            <p class="helper-text">返金取引番号: 外部ウォレットで返金した取引の識別番号です。</p>
+            <p class="ops-note danger">ここでは送金しません。外部ウォレットで返金した取引番号・証跡を保存します。</p>
             <div class="inline-action-group">
               <button id="executeRefundBtn" class="btn btn-danger" data-permission="refund.execute">返金記録を保存</button>
               <button id="verifyRefundBtn" class="btn btn-secondary" data-permission="refund.execute">返金を検証</button>
             </div>
-          </section>
+            </div>
+          </details>
         </div>
         <p id="executeRefundHint" class="helper-text live-region hidden" role="status" aria-live="polite" aria-atomic="true"></p>
       </section>
 
-      <section class="card stack col-12" data-admin-only="true" data-permission-any="settlement.close settlement.export audit.read audit.export" aria-labelledby="settlementSectionTitle">
+      <section id="settlementOperations" class="card stack col-12 management-section settlement-workflow" data-admin-only="true" data-permission-any="settlement.close settlement.export audit.read audit.export" aria-labelledby="settlementSectionTitle" tabindex="-1">
         <div class="section-header">
-          <h2 id="settlementSectionTitle" class="title title-lg">日次締め / CSV出力</h2>
+          <h2 id="settlementSectionTitle" class="title title-lg">日次締め・正式出力</h2>
           <span class="role-pill role-admin">管理者操作</span>
         </div>
+        <ol class="management-flow" aria-label="日次締めの手順"><li class="management-flow-item">1 締め前確認</li><li class="management-flow-item">2 日付・件数・金額を確認</li><li class="management-flow-item">3 締めを確定</li><li class="management-flow-item">4 正式CSV・JSON</li></ol>
         <div class="row">
           <label class="field-w-180" for="businessDateInput">
             対象営業日
             <input id="businessDateInput" type="date" aria-describedby="businessDateHint" />
           </label>
-          <button id="loadSettlementPreviewBtn" class="btn btn-secondary" type="button" data-permission="settlement.close">締め前確認を読み込む</button>
-          <button id="closeSettlementBtn" class="btn btn-success" type="button" data-permission="settlement.close" disabled>確認内容で日次締めを確定</button>
-          <button id="exportAuditCsvBtn" class="btn btn-secondary" data-permission="audit.export">監査CSVを出力</button>
+          <button id="loadSettlementPreviewBtn" class="btn btn-primary" type="button" data-permission="settlement.close">締め前確認を読み込む</button>
         </div>
-        <p id="businessDateHint" class="small">形式: YYYY-MM-DD / タイムゾーン: <span id="businessTimezoneText" class="mono">Asia/Tokyo</span></p>
+        <p id="businessDateHint" class="small">営業日のタイムゾーン: <span id="businessTimezoneText" class="mono">Asia/Tokyo</span></p>
         <div id="settlementConfirmPanel" class="panel stack hidden" role="region" aria-labelledby="settlementPreviewTitle">
           <div class="section-header">
-            <h3 id="settlementPreviewTitle" class="title title-md">日次締めpreview</h3>
+            <h3 id="settlementPreviewTitle" class="title title-md">締め前確認</h3>
             <span id="settlementPreviewBadge" class="status-pill s-gray">未取得</span>
           </div>
-          <p id="settlementPreviewState" class="helper-text">対象日・件数・金額・blockerをサーバーから取得します。</p>
+          <p id="settlementPreviewState" class="helper-text">対象日・件数・金額と、未解決項目をサーバーで確認します。</p>
           <dl id="settlementPreviewTotals" class="definition-grid compact-definition-grid">
             <div><dt>対象営業日</dt><dd id="settlementPreviewBusinessDate">-</dd></div>
             <div><dt>対象請求</dt><dd id="settlementPreviewInvoiceCount">-</dd></div>
@@ -605,13 +665,17 @@
           </dl>
           <div class="ops-note danger">
             <strong>締めを止めている項目</strong>
-            <ul id="settlementPreviewBlockers" class="warning-list compact-list"><li>preview未取得</li></ul>
+            <ul id="settlementPreviewBlockers" class="warning-list compact-list"><li>締め前確認は未取得です</li></ul>
           </div>
           <div class="row consent-checkbox-row">
             <input id="settlementPreviewConfirm" type="checkbox" disabled aria-describedby="settlementPreviewConfirmLabel" />
-            <label id="settlementPreviewConfirmLabel" for="settlementPreviewConfirm" class="consent-checkbox-label">対象日・件数・金額・blockerを確認しました</label>
+            <label id="settlementPreviewConfirmLabel" for="settlementPreviewConfirm" class="consent-checkbox-label">対象日・件数・金額・未解決項目を確認しました</label>
           </div>
+          <button id="closeSettlementBtn" class="btn btn-success" type="button" data-permission="settlement.close" disabled>確認内容で日次締めを確定</button>
         </div>
+        <details class="details management-details" data-permission="settlement.export">
+        <summary>月次CSV（運用用）</summary>
+        <div class="details-content">
         <div class="row">
           <label class="field-w-180" for="businessMonthInput">
             対象月
@@ -619,35 +683,43 @@
           </label>
           <button id="exportMonthlyCsvBtn" class="btn btn-secondary" data-permission="settlement.export">月次CSV（運用用）を出力</button>
         </div>
-        <p id="businessMonthHint" class="small">月次CSVは運用用で、正式なimmutable snapshotではありません。正式記録には、日次締めで発行されたSettlement Export Contractのsnapshotを使用してください。</p>
+        <p id="businessMonthHint" class="small">月次CSVは運用用です。正式記録には日次締めのSettlement Exportを使用してください。</p>
+        </div>
+        </details>
         <p id="closeSettlementHint" class="helper-text live-region hidden" role="status" aria-live="polite" aria-atomic="true"></p>
         <section id="settlementExportPanel" class="panel stack hidden" aria-labelledby="settlementExportTitle">
           <div class="section-header">
-            <h3 id="settlementExportTitle" class="title title-md">正式Settlement Export snapshot</h3>
+            <h3 id="settlementExportTitle" class="title title-md">正式Settlement Export</h3>
             <span id="settlementExportStatus" class="status-pill s-green">取得済み</span>
           </div>
-          <dl class="definition-grid compact-definition-grid">
+          <details class="details management-details">
+          <summary>正式記録のID・契約版・ハッシュ</summary>
+          <div class="details-content"><dl class="definition-grid compact-definition-grid">
             <div><dt>Export ID</dt><dd id="settlementExportId" class="mono contract-address-text">-</dd></div>
             <div><dt>Run ID</dt><dd id="settlementExportRunId" class="mono contract-address-text">-</dd></div>
             <div><dt>Contract</dt><dd id="settlementExportVersion" class="mono">-</dd></div>
             <div><dt>Content SHA-256</dt><dd id="settlementExportHash" class="mono contract-address-text">-</dd></div>
-          </dl>
+          </dl></div>
+          </details>
           <div class="inline-action-group">
-            <button id="downloadSettlementCsvBtn" class="btn btn-secondary" type="button" data-permission="settlement.export">正式CSVをダウンロード</button>
-            <button id="downloadSettlementJsonBtn" class="btn btn-secondary" type="button" data-permission="settlement.export">正式JSONをダウンロード</button>
-            <button id="reloadSettlementExportBtn" class="btn btn-secondary" type="button" data-permission="settlement.export">正式snapshot履歴を再取得</button>
+            <button id="downloadSettlementCsvBtn" class="btn btn-primary" type="button" data-permission="settlement.export">正式CSV</button>
+            <button id="downloadSettlementJsonBtn" class="btn btn-secondary" type="button" data-permission="settlement.export">正式JSON</button>
+            <button id="reloadSettlementExportBtn" class="btn btn-secondary" type="button" data-permission="settlement.export">正式記録を再取得</button>
           </div>
-          <p id="settlementExportHint" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">ID・版・hashを確認してから保存してください。</p>
+          <p id="settlementExportHint" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">ID・契約版・ハッシュを確認し、正式データを保存します。</p>
         </section>
-        <div class="panel stack">
-          <h3 class="title title-md">操作履歴</h3>
-          <p class="small">監査ログはCSV出力して会計処理に利用します。エラー時は再試行してください。</p>
-          <button id="openAuditLogBtn" class="btn btn-secondary btn-full" data-permission="audit.read" type="button">認証して操作履歴を表示</button>
+        <section id="auditOperations" class="panel stack management-section audit-operations" data-permission-any="audit.read audit.export" aria-labelledby="auditOperationsTitle" tabindex="-1">
+          <h3 id="auditOperationsTitle" class="title title-md">監査履歴</h3>
+          <p class="small">認証された操作履歴と参照IDを確認し、CSVへ出力できます。</p>
+          <div class="inline-action-group">
+            <button id="openAuditLogBtn" class="btn btn-primary" data-permission="audit.read" type="button">操作履歴を表示</button>
+            <button id="exportAuditCsvBtn" class="btn btn-secondary" data-permission="audit.export">監査CSVを出力</button>
+          </div>
           <div id="auditLogPanel" class="panel panel-muted stack hidden" aria-live="polite">
             <p class="small"><strong>直近の操作履歴</strong></p>
             <ul id="auditLogList" class="small ops-list"><li>未取得</li></ul>
           </div>
-        </div>
+        </section>
       </section>
       </template>
       <div id="adminOperationsMount" class="admin-operations-mount"></div>

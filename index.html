@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>JPYC Merchant Ops プロトタイプ</title>
+  <title>JPYC Merchant Ops 操作練習</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="./public/app.css" />
 </head>
-<body>
+<body class="training-surface">
   <div class="wrap">
     <header class="section-header">
       <div class="stack">
-        <h1 class="title">JPYC Merchant Ops プロトタイプ</h1>
-        <p class="small">小規模店舗・イベント・実証現場で、支払い後の運用まで迷わず回せるかを確認する画面です。</p>
+        <h1 class="title"><span class="training-brand">JPYC Merchant Ops</span> <span class="training-title">操作練習</span></h1>
+        <p class="small">会計・確認・返金記録・日次締めを、サンプルで確認します。</p>
       </div>
       <span id="demoModeBadge" class="demo-badge hidden" aria-live="polite" aria-atomic="true">デモモード</span>
     </header>
@@ -21,15 +21,32 @@
       <section class="card motion-showcase col-12" aria-labelledby="motionShowcaseTitle">
         <div class="section-header">
           <div class="stack gap-tight">
-            <p class="motion-kicker">Animated Walkthrough</p>
-            <h2 id="motionShowcaseTitle" class="title title-lg">取引・UI・運用が流れる Merchant Ops アニメーション</h2>
-            <p id="motionSceneSummary" class="small">請求作成から review / refund / settlement まで、自動再生で全体像を確認できます。</p>
+            <p class="motion-kicker">練習用の表示・実決済なし</p>
+            <h2 id="motionShowcaseTitle" class="title title-lg">操作の流れ</h2>
+            <p id="motionSceneSummary" class="small">場面と段階を選んで確認できます。</p>
           </div>
-          <div class="stack gap-tight motion-header-actions">
+          <div class="row motion-header-actions training-control-row">
             <span id="motionScenarioBadge" class="status-pill s-blue">通常会計</span>
-            <button id="motionPauseBtn" class="btn btn-secondary btn-compact" type="button">一時停止</button>
+            <button id="motionPauseBtn" class="btn btn-primary btn-compact" type="button">一時停止</button>
           </div>
         </div>
+
+        <div class="motion-scene-list training-scene-tabs" role="group" aria-label="練習する場面">
+          <button class="motion-scene-btn is-active" type="button" data-motion-scene-trigger="success"><strong>通常会計</strong><span>請求 → 確認 → 締め</span></button>
+          <button class="motion-scene-btn" type="button" data-motion-scene-trigger="review"><strong>過入金レビュー</strong><span>差分 → 要確認 → 返金記録</span></button>
+          <button class="motion-scene-btn" type="button" data-motion-scene-trigger="late"><strong>期限後着金</strong><span>期限切れ → 要確認 → 再発行</span></button>
+          <button class="motion-scene-btn" type="button" data-motion-scene-trigger="settlement"><strong>日次締め</strong><span>集計 → 確定 → 出力</span></button>
+        </div>
+
+        <div class="panel stack training-current-step">
+          <div class="section-header">
+            <h3 id="motionCurrentPhaseText" class="title title-md">請求作成</h3>
+            <span id="motionActiveStepPill" class="badge">1 / 4</span>
+          </div>
+          <p class="helper-text training-example-note">表示はすべてサンプルです。実際の商品引渡しは、店頭端末が最新のサーバー判定で「渡してOK」と表示してから行います。</p>
+        </div>
+
+        <div id="motionPhaseTrack" class="motion-phase-track" aria-label="場面の段階"></div>
 
         <div class="motion-layout mt-16">
           <div class="motion-stage stack">
@@ -44,7 +61,7 @@
                   <div class="section-header">
                     <div class="stack gap-tight">
                       <p class="motion-device-kicker">店舗運用端末</p>
-                      <h3 class="title title-md">請求・review・settlement</h3>
+                      <h3 class="title title-md">会計と支払い後の運用</h3>
                     </div>
                     <span id="motionTerminalStatus" class="status-pill s-blue">支払い待ち</span>
                   </div>
@@ -57,7 +74,7 @@
 
                   <div class="motion-mini-metrics">
                     <div class="mini-metric">
-                      <span class="info-label">invoice</span>
+                      <span class="info-label">会計番号</span>
                       <p id="motionTerminalInvoice" class="info-value mono">INV-20260422-001</p>
                     </div>
                     <div class="mini-metric">
@@ -65,7 +82,7 @@
                       <p id="motionTerminalAction" class="info-value">QR提示</p>
                     </div>
                     <div class="mini-metric">
-                      <span class="info-label">trace</span>
+                      <span class="info-label">証跡</span>
                       <p id="motionTerminalTrace" class="info-value mono">export_reference 待ち</p>
                     </div>
                   </div>
@@ -108,7 +125,7 @@
 
                   <div class="motion-mobile-cta-wrap">
                     <div id="motionMobileCta" class="motion-mobile-cta">ウォレットで支払う</div>
-                    <div class="motion-mobile-subtext">non-custodial / 秘密鍵入力なし</div>
+                    <div class="motion-mobile-subtext">秘密鍵入力なし・表示のみ</div>
                   </div>
 
                   <ul id="motionMobileList" class="warning-list compact-list motion-mobile-list">
@@ -118,21 +135,19 @@
               </article>
             </div>
 
-            <div id="motionPhaseTrack" class="motion-phase-track" aria-label="シナリオ進行"></div>
-
             <div class="motion-ops-grid">
               <article id="motionReviewCard" class="motion-ops-card" data-tone="idle">
-                <p class="motion-ops-label">review queue</p>
+                <p class="motion-ops-label">確認待ち</p>
                 <strong id="motionReviewTitle">例外なし</strong>
                 <p id="motionReviewBody" class="helper-text">通常会計では自動完了し、要確認時のみ review に分岐します。</p>
               </article>
               <article id="motionRefundCard" class="motion-ops-card" data-tone="idle">
-                <p class="motion-ops-label">refund evidence</p>
+                <p class="motion-ops-label">返金証跡</p>
                 <strong id="motionRefundTitle">返金なし</strong>
                 <p id="motionRefundBody" class="helper-text">返金が必要なときだけ証跡を残し、送金署名は外部で実行します。</p>
               </article>
               <article id="motionSettlementCard" class="motion-ops-card" data-tone="active">
-                <p class="motion-ops-label">settlement export</p>
+                <p class="motion-ops-label">日次締め・出力</p>
                 <strong id="motionSettlementTitle">締め待ち</strong>
                 <p id="motionSettlementBody" class="helper-text">paid 後に日次締めへ集約され、export_reference で追跡されます。</p>
               </article>
@@ -141,64 +156,46 @@
 
           <aside class="motion-sidebar stack">
             <div class="panel stack">
-              <p class="feature-kicker">Scene</p>
+              <p class="feature-kicker">選択中の場面</p>
               <h3 id="motionSceneTitle" class="title title-lg">通常会計</h3>
               <p id="motionSceneBody" class="helper-text">QR 発行から支払い確認、締め候補化までを自動再生します。</p>
             </div>
 
-            <div class="motion-scene-list" role="group" aria-label="再生シーン">
-              <button class="motion-scene-btn is-active" type="button" data-motion-scene-trigger="success">
-                <strong>通常会計</strong>
-                <span>QR → paid → settled</span>
-              </button>
-              <button class="motion-scene-btn" type="button" data-motion-scene-trigger="review">
-                <strong>過入金レビュー</strong>
-                <span>review queue → refund evidence</span>
-              </button>
-              <button class="motion-scene-btn" type="button" data-motion-scene-trigger="late">
-                <strong>期限後着金</strong>
-                <span>expired → manual review → 再発行</span>
-              </button>
-              <button class="motion-scene-btn" type="button" data-motion-scene-trigger="settlement">
-                <strong>日次締め</strong>
-                <span>daily close → export_reference</span>
-              </button>
-            </div>
-
-            <div class="panel stack">
-              <div class="section-header">
-                <h3 class="title title-md">この瞬間の意味</h3>
-                <span id="motionActiveStepPill" class="badge">phase 1 / 4</span>
+            <details class="details training-reference-details">
+              <summary>この段階の確認ポイント</summary>
+              <div class="details-content">
+                <ul id="motionNarrativeList" class="warning-list compact-list">
+                  <li>請求作成から支払い後運用まで、同じ台帳の証跡を維持します。</li>
+                </ul>
               </div>
-              <ul id="motionNarrativeList" class="warning-list compact-list">
-                <li>請求作成から支払い後運用まで、同じ台帳の trace を維持します。</li>
-              </ul>
-            </div>
+            </details>
 
-            <div class="panel panel-muted stack">
-              <p class="small"><strong>追える証跡</strong></p>
-              <div class="chip-group">
-                <span class="chip">invoice</span>
-                <span class="chip">payment evidence</span>
-                <span class="chip">review</span>
-                <span class="chip">refund</span>
-                <span class="chip">export_reference</span>
+            <details class="details training-reference-details">
+              <summary>追える証跡</summary>
+              <div class="details-content stack">
+                <div class="chip-group">
+                  <span class="chip">請求</span>
+                  <span class="chip">入金証跡</span>
+                  <span class="chip">レビュー</span>
+                  <span class="chip">返金</span>
+                  <span class="chip">export_reference</span>
+                </div>
+                <p id="motionAuditText" class="helper-text">export_referenceから請求・レビュー・返金・日次締めを追跡します。</p>
               </div>
-              <p id="motionAuditText" class="helper-text">export_reference と review / refund / settlement を分離せず、同じ運用文脈で追跡します。</p>
-            </div>
+            </details>
           </aside>
         </div>
 
         <p id="motionLive" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
       </section>
 
-      <section class="card stack col-8" aria-labelledby="prototypeTitle">
+      <section class="card stack col-8 training-keypad-card" aria-labelledby="prototypeTitle">
         <div class="section-header">
-          <h2 id="prototypeTitle" class="title title-lg">現場運用を止めない請求導線</h2>
+          <h2 id="prototypeTitle" class="title title-lg">金額入力の練習</h2>
           <span id="prototypeStatus" class="status-pill s-gray" role="status" aria-live="polite" aria-atomic="true">未発行</span>
         </div>
         <div class="ops-note info">
-          このデモは「JPYCで払える」だけでなく、「払われた後に店舗が困らない」運用レイヤーを確認する構成です。
+          表示だけの練習です。実際の請求作成・送金は行いません。
         </div>
 
         <div class="panel stack">
@@ -208,7 +205,7 @@
         </div>
 
         <div class="quick-preset-group" aria-label="デモ用のよく使う金額">
-          <span class="small">おすすめシナリオ</span>
+          <span class="small">よく使う金額</span>
           <button class="btn btn-ghost btn-compact" type="button" data-prototype-preset="500">屋台 ¥500</button>
           <button class="btn btn-ghost btn-compact" type="button" data-prototype-preset="1000">会計 ¥1,000</button>
           <button class="btn btn-ghost btn-compact" type="button" data-prototype-preset="3000">イベント ¥3,000</button>
@@ -232,48 +229,48 @@
 
         <div class="inline-action-group">
           <button id="clearAmountBtn" class="btn btn-secondary" type="button">クリア</button>
-          <button id="createQrBtn" class="btn btn-primary" type="button">QRを作成</button>
+          <button id="createQrBtn" class="btn btn-primary" type="button">請求を試す</button>
         </div>
 
         <div class="panel stack">
           <p class="small">現在状態</p>
           <p id="prototypeStateLabel" class="title title-md">金額を入力してください</p>
-          <p id="prototypeStateDetail" class="helper-text">QR作成後は支払い待ちになり、完了・要確認を運用導線で追跡します。</p>
+          <p id="prototypeStateDetail" class="helper-text">金額を設定して、支払い待ちの表示を試します。</p>
         </div>
       </section>
 
       <section class="card stack col-4" aria-labelledby="opsLinksTitle">
-        <h2 id="opsLinksTitle" class="title title-lg">小規模向け Merchant Opsで勝つ理由</h2>
-        <p class="small">大手と同じ土俵の加盟店網競争ではなく、現場運用の速い改善を価値にします。</p>
+        <h2 id="opsLinksTitle" class="title title-lg">このアプリの強み</h2>
+        <p class="small">支払い後も、請求ごとの記録を追えます。</p>
         <div class="feature-stack">
           <article class="feature-card">
-            <p class="feature-kicker">1. Non-custodial</p>
+            <p class="feature-kicker">1. 資産を預からない</p>
             <p class="feature-title">秘密鍵を預からない</p>
             <p class="helper-text">送金は常にお客様ウォレットから実行され、店舗側は受取と運用に集中できます。</p>
           </article>
           <article class="feature-card">
-            <p class="feature-kicker">2. Invoice-first</p>
+            <p class="feature-kicker">2. 請求から追える</p>
             <p class="feature-title">過不足や重複を請求単位で追跡</p>
             <p class="helper-text">小規模店舗やイベントでも、例外を review queue でさばける設計です。</p>
           </article>
           <article class="feature-card">
-            <p class="feature-kicker">3. Audit-ready</p>
+            <p class="feature-kicker">3. 監査に備える</p>
             <p class="feature-title">返金証跡と日次締めまで含む</p>
             <p class="helper-text">単なる支払い受付だけでなく、実証リリースに必要な運用導線まで確認できます。</p>
           </article>
         </div>
-        <p class="small">実運用 UI は以下で確認できます。</p>
+        <p class="small">店舗画面ではログイン後に実際の操作ができます。</p>
         <a class="btn btn-primary btn-full" href="/terminal.html">店舗運用端末を開く</a>
-        <a class="btn btn-secondary btn-full" href="/mobile.html">お客様支払い画面を開く</a>
+        <a class="btn btn-secondary btn-full" href="/mobile.html">お客様画面の例（支払い不可）</a>
         <div class="ops-note info">
-          このプロトタイプは non-custodial 前提です。秘密鍵・シードフレーズ入力はありません。小規模チームが現場ごとの例外処理を素早く改善できる情報設計を意識しています。
+          秘密鍵・シードフレーズは入力しません。練習表示を実際の支払い確認には使わないでください。
         </div>
       </section>
 
       <section class="card stack col-12" aria-labelledby="pilotFitTitle">
         <div class="section-header">
-          <h2 id="pilotFitTitle" class="title title-lg">この Merchant Ops UI が向いている現場</h2>
-          <span class="badge">Pilot-ready</span>
+          <h2 id="pilotFitTitle" class="title title-lg">活用する現場</h2>
+          <span class="badge">運用例</span>
         </div>
         <div class="step-grid">
           <article class="step-card">

@@ -10,8 +10,8 @@
   <div class="wrap wrap-narrow">
     <header class="section-header">
       <div class="stack">
-        <h1 class="title">JPYCお支払い案内</h1>
-        <p class="small">請求金額・ネットワーク・送金先を確認し、送金後は二重送金せず確認完了までお待ちください。</p>
+        <h1 class="title">JPYC お支払い</h1>
+        <p class="small">送金後は、追加送金せず確認をお待ちください。</p>
       </div>
       <span class="badge">お客様向け</span>
     </header>
@@ -25,11 +25,12 @@
 
     <section class="card stack mt-16 mobile-summary-card" aria-labelledby="invoiceSummaryTitle">
       <div class="section-header">
-        <h2 id="invoiceSummaryTitle" class="title title-lg">ご請求内容</h2>
+        <h2 id="invoiceSummaryTitle" class="title title-lg">お支払い内容</h2>
         <span id="statusPill" class="status-pill s-gray" role="status" aria-live="polite" aria-atomic="true">読み込み中</span>
       </div>
+      <p id="storeText" class="customer-store-name">店舗を確認中</p>
       <div class="trust-row" aria-label="請求の発行元">
-        <span id="merchantTrustBadge" class="badge">サーバー発行済み</span>
+        <span id="merchantTrustBadge" class="badge">発行元を確認中</span>
         <span class="small">発行時刻: <span id="issuedAtText" class="mono">-</span></span>
       </div>
       <div class="amount-hero" aria-label="お支払い金額">
@@ -39,13 +40,13 @@
       </div>
       <div class="state-box">
         <strong id="uxStateLabel">状況を確認中</strong>
-        <p id="uxStateDetail" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">請求情報と店舗側の確認状態を読み込み中です。</p>
+        <p id="uxStateDetail" class="helper-text live-region" role="status" aria-live="polite" aria-atomic="true">請求の最新状態を読み込み中です。</p>
       </div>
       <div class="primary-action-stack" aria-label="支払い操作">
         <button id="walletPayBtn" class="btn btn-primary btn-xl" aria-label="ウォレットで支払う" aria-describedby="paymentGateHint" disabled>ウォレットで支払う</button>
-        <p class="helper-text payment-safety-note">送金は1回のみ有効です。金額・ネットワーク・送金先を確認してから進んでください。</p>
+        <p class="helper-text payment-safety-note">二重送金しないでください。金額・ネットワーク・送金先を確認し、送金は1回だけ行います。</p>
         <p id="paymentGateHint" class="helper-text" role="status" aria-live="polite" aria-atomic="true">最新の請求状態を確認しています。</p>
-        <button id="goToConsentBtn" type="button" class="btn btn-secondary btn-compact hidden">確認・同意へ</button>
+        <button id="goToConsentBtn" type="button" class="btn btn-primary btn-xl hidden">確認・同意へ</button>
         <div id="secondaryPaymentActions" class="secondary-action-row">
           <button id="copyInfoBtn" class="btn btn-ghost btn-compact" disabled>支払い情報をコピー</button>
           <button id="showMethodsBtn" class="btn btn-ghost btn-compact" disabled>手動送金を表示</button>
@@ -53,14 +54,20 @@
       </div>
       <div class="info-list info-list-compact">
         <div class="info-item">
-          <span class="info-label">店舗</span>
-          <p id="storeText" class="info-value">-</p>
-        </div>
-        <div class="info-item">
           <span class="info-label">お支払い期限</span>
           <p id="expiresText" class="info-value">-</p>
           <p id="remainingText" class="helper-text">残り時間を計算中です。</p>
         </div>
+      </div>
+      <div class="customer-flow-panel" aria-labelledby="customerFlowTitle">
+        <h3 id="customerFlowTitle" class="title title-md">お支払いの流れ</h3>
+        <ol class="customer-flow checkout-flow" aria-label="お支払いの進み具合">
+          <li id="customerFlowStep0" class="customer-flow-step" data-state="current" aria-current="step"><span class="flow-step-index" aria-hidden="true">1</span><span class="flow-step-label">内容確認・同意</span></li>
+          <li id="customerFlowStep1" class="customer-flow-step" data-state="upcoming"><span class="flow-step-index" aria-hidden="true">2</span><span id="customerFlowPaymentLabel" class="flow-step-label">ウォレットで送金</span></li>
+          <li id="customerFlowStep2" class="customer-flow-step" data-state="upcoming"><span class="flow-step-index" aria-hidden="true">3</span><span class="flow-step-label">確認を待つ</span></li>
+          <li id="customerFlowStep3" class="customer-flow-step" data-state="upcoming"><span class="flow-step-index" aria-hidden="true">4</span><span class="flow-step-label">支払い確認済み</span></li>
+        </ol>
+        <p id="customerFlowHint" class="helper-text">最新状態を確認しています。</p>
       </div>
     </section>
 
@@ -103,8 +110,8 @@
     </section>
 
     <section class="card stack mt-16" aria-labelledby="paymentActionTitle">
-      <h2 id="paymentActionTitle" class="title title-lg">迷わないお支払い手順</h2>
-      <details class="details payment-guide-details" open>
+      <h2 id="paymentActionTitle" class="title title-lg">確認・ヘルプ</h2>
+      <details class="details payment-guide-details">
         <summary>はじめての方へ</summary>
         <section class="details-content" aria-labelledby="paymentGuideTitle">
         <div class="section-header">
@@ -115,7 +122,7 @@
           <article class="step-card">
             <span class="step-index">1</span>
             <strong>ウォレットを開く</strong>
-            <p class="helper-text">まずはメインボタンからウォレットを開きます。ウォレットが自動で開かない場合は支払い情報をコピーしてください。</p>
+            <p class="helper-text">支払いボタンから開きます。開かない場合は支払い情報をコピーしてください。</p>
           </article>
           <article class="step-card">
             <span class="step-index">2</span>
@@ -125,7 +132,7 @@
           <article class="step-card">
             <span class="step-index">3</span>
             <strong>送金後はこの画面で確認</strong>
-            <p class="helper-text">送金後は、この画面が「支払い確認済み」になるまでお待ちください。二重送金しないでください。</p>
+            <p class="helper-text">「支払い確認済み」までお待ちください。二重送金しないでください。</p>
           </article>
         </div>
         </section>
@@ -147,13 +154,13 @@
           <a id="consentPrivacyLink" class="btn btn-secondary btn-compact" target="_blank" rel="noopener noreferrer" aria-label="プライバシーポリシー（新しいタブで開く）">プライバシーポリシー</a>
           <a id="consentRefundLink" class="btn btn-secondary btn-compact" target="_blank" rel="noopener noreferrer" aria-label="返金ポリシー（新しいタブで開く）">返金ポリシー</a>
         </div>
-        <p id="consentRequirementHint" class="helper-text">チェック後に、最新の請求状態を再確認して支払い操作を有効にします。</p>
+        <p id="consentRequirementHint" class="helper-text">同意の保存と最新状態の確認後に支払えます。</p>
         <div class="row consent-checkbox-row">
           <input type="checkbox" id="consentCheckbox" aria-describedby="consentRequirementHint" />
           <label for="consentCheckbox" id="consentCheckboxLabel" class="consent-checkbox-label">上記の内容と利用規約・プライバシーポリシー・返金ポリシーを確認しました</label>
         </div>
         <div id="consentRecordError" class="error-state mobile-inline-error hidden" role="alert"></div>
-        <button id="retryConsentBtn" type="button" class="btn btn-secondary btn-compact hidden">同意記録を再送する</button>
+        <button id="retryConsentBtn" type="button" class="btn btn-primary hidden">同意記録を再送する</button>
         <div id="consentLiveStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
       </section>
       <section id="paymentVerifyCard" class="panel stack hidden" aria-labelledby="paymentVerifyTitle">
@@ -161,7 +168,7 @@
           <h3 id="paymentVerifyTitle" class="title title-md">送金前の4点照合</h3>
           <span class="badge">必ず確認</span>
         </div>
-        <p class="helper-text">ウォレットで送信する前に、以下の4つがこの画面と完全に一致していることを確認してください。</p>
+        <p class="helper-text">送信前に、ウォレットと以下の4点を照合してください。</p>
         <div class="verify-grid">
           <div class="verify-item">
             <span class="info-label">ネットワーク</span>
@@ -190,16 +197,17 @@
         </div>
         <p id="methodPanelText" class="helper-text" role="status" aria-live="polite" aria-atomic="true">支払い方法を読み込み中です。</p>
       </dialog>
-      <section id="customerActionCard" class="panel stack" aria-labelledby="customerActionTitleHeading">
-        <div class="section-header">
-          <h3 id="customerActionTitleHeading" class="title title-md">いまの状況と次の行動</h3>
-          <span id="customerActionBadge" class="status-pill s-gray">確認中</span>
-        </div>
+      <section id="customerActionCard" class="stack" aria-labelledby="customerActionTitleHeading">
+        <details class="details">
+          <summary id="customerActionTitleHeading">詳しい状況 <span id="customerActionBadge" class="status-pill s-gray">確認中</span></summary>
+          <div class="details-content">
         <p id="customerActionTitle" class="title title-md">請求内容を読み込み中です</p>
-        <p id="customerActionBody" class="helper-text">この画面は、お客様のウォレット送金と店舗側の確認導線を合わせて案内します。</p>
+        <p id="customerActionBody" class="helper-text">最新状態に合わせてご案内します。</p>
         <ul id="customerActionList" class="warning-list compact-list">
           <li>ウォレットを開く準備ができるまでお待ちください。</li>
         </ul>
+          </div>
+        </details>
         <details id="paymentRecoveryDetails" class="details">
           <summary>送金済み取引を確認する</summary>
           <div class="details-content stack">
@@ -217,7 +225,7 @@
               <option value="wrong_token">誤トークンかもしれない</option>
             </select>
             <p id="recoveryHint" class="helper-text">取引番号はウォレットの送金履歴からコピーしてください。シードフレーズや秘密鍵は入力しないでください。</p>
-            <button id="submitRecoveryBtn" type="button" class="btn btn-secondary btn-compact" disabled>送金済み取引を確認依頼する</button>
+            <button id="submitRecoveryBtn" type="button" class="btn btn-secondary btn-compact" disabled>取引の確認を依頼</button>
             <p id="recoveryStatus" class="helper-text" role="status" aria-live="polite" aria-atomic="true"></p>
           </div>
         </details>
@@ -248,7 +256,7 @@
         </ul>
       </section>
       <details class="details" id="technicalDetails">
-        <summary>詳細情報を表示する</summary>
+        <summary>支払い情報</summary>
         <div class="details-content">
           <div class="info-item">
             <span class="info-label">支払いネットワーク</span>

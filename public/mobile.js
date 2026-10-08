@@ -102,6 +102,9 @@ const el = {
   issuedAtText: document.getElementById("issuedAtText"),
   amountText: document.getElementById("amountText"),
   amountSubText: document.getElementById("amountSubText"),
+  customerFlowSteps: [0, 1, 2, 3].map((index) => document.getElementById(`customerFlowStep${index}`)),
+  customerFlowHint: document.getElementById("customerFlowHint"),
+  customerFlowPaymentLabel: document.getElementById("customerFlowPaymentLabel"),
   expiresText: document.getElementById("expiresText"),
   remainingText: document.getElementById("remainingText"),
   uxStateLabel: document.getElementById("uxStateLabel"),
@@ -721,6 +724,13 @@ function evaluatePaymentActionGate(invoice = state.invoice) {
 function applyPaymentActionGate(invoice = state.invoice) {
   const gate = evaluatePaymentActionGate(invoice);
   const walletAllowed = gate.allowed && state.consented;
+  const refreshing = gate.code === "refresh_in_progress";
+  const consentRecovery = gate.code === "consent_record_required";
+  if (!refreshing) {
+    el.walletPayBtn?.classList?.toggle("hidden", !gate.allowed && gate.code !== "launch_in_progress");
+    el.secondaryPaymentActions?.classList?.toggle("hidden", !walletAllowed);
+  }
+  el.walletPayBtn?.setAttribute?.("aria-busy", String(refreshing));
   for (const control of [el.walletPayBtn, el.showMethodsBtn, el.copyInfoBtn]) {
     if (control) control.disabled = !walletAllowed;
   }
@@ -732,16 +742,19 @@ function applyPaymentActionGate(invoice = state.invoice) {
     el.paymentGateHint.textContent = gate.message;
   }
   if (el.goToConsentBtn) {
-    el.goToConsentBtn.classList.toggle("hidden", gate.code !== "consent_required");
+    if (!refreshing) el.goToConsentBtn.classList.toggle("hidden", gate.code !== "consent_required" && !consentRecovery);
+    el.goToConsentBtn.disabled = refreshing;
   }
-  setPaymentSurfacesBlocked(Boolean(gate.blockingMessage));
+  if (!refreshing) setPaymentSurfacesBlocked(Boolean(gate.blockingMessage), consentRecovery);
+  if (el.retryConsentBtn) el.retryConsentBtn.disabled = refreshing || state.consentRecordStatus === "pending" || !state.consented || !el.consentCheckbox?.checked;
   if (!gate.allowed && gate.code !== "launch_in_progress") setMethodPanel(false, "");
-  setBlockingWarning(gate.blockingMessage);
+  if (!refreshing) setBlockingWarning(gate.blockingMessage);
   if (gate.blockingMessage) applyBlockingCustomerCopy(gate);
+  renderCustomerFlow(invoice, gate);
   return gate;
 }
 
-function setPaymentSurfacesBlocked(blocked) {
+function setPaymentSurfacesBlocked(blocked, consentRecovery = false) {
   for (const surface of [
     el.secondaryPaymentActions,
     el.paymentRecoveryDetails,
@@ -749,10 +762,10 @@ function setPaymentSurfacesBlocked(blocked) {
     el.paymentConditionsCard,
     el.paymentVerifyCard,
     el.technicalDetails,
-    el.consentGateSection,
   ]) {
     surface?.classList.toggle("payment-surface-blocked", Boolean(blocked));
   }
+  el.consentGateSection?.classList.toggle("payment-surface-blocked", Boolean(blocked) && !consentRecovery);
 }
 
 function setCustomerActionBadge(label, tone = "s-gray") {
@@ -763,6 +776,14 @@ function setCustomerActionBadge(label, tone = "s-gray") {
 
 function applyBlockingCustomerCopy(gate) {
   if (!gate?.blockingMessage || !el.customerActionBadge) return;
+  if (gate.code === "refresh_in_progress") {
+    el.statusPill.textContent = "確認中";
+    el.statusPill.className = "status-pill s-gray";
+    el.uxStateLabel.textContent = "最新状態を確認中";
+    el.uxStateDetail.textContent = gate.message;
+    setCustomerActionBadge("再確認中", "s-gray");
+    return;
+  }
   el.statusPill.textContent = "支払い停止";
   el.statusPill.className = "status-pill s-red";
   el.uxStateLabel.textContent = "現在は支払いできません";
@@ -781,6 +802,52 @@ function applyBlockingCustomerCopy(gate) {
     el.customerActionList.appendChild(li);
   }
   state.manualActionHint = gate.blockingMessage;
+}
+
+function resolveCustomerFlow(invoice, gate) {
+  const status = canonicalInvoiceStatus(invoice?.status);
+  const afterTransfer = ["payment_detected", "confirming", "paid", "settled", "review_required"].includes(status);
+  const recoveryStatus = String(invoice?.payment_recovery?.status || "");
+  const recoveryHold = ["verified_wrong_chain", "verified_wrong_token", "customer_reported_wrong_chain", "customer_reported_wrong_token", "unverified_report"].includes(recoveryStatus);
+  const mode = invoice?.customer_payment_mode?.mode;
+  const storeGuidance = Boolean(mode && mode !== "wallet_qr");
+  const paymentLabel = storeGuidance ? "店頭で支払い" : "ウォレットで送金";
+  if (!invoice) return { step: 0, hold: true, paymentLabel, hint: gate.message };
+  if (gate.code === "refresh_in_progress" && PAYMENT_ACTION_STATUSES.has(status) && state.consented && state.consentRecordStatus === "recorded") {
+    return { step: 1, hold: true, paymentLabel, hint: gate.message };
+  }
+  if (gate.blockingMessage || recoveryHold || ["review_required", "expired", "cancelled"].includes(status)) {
+    return { step: afterTransfer || recoveryHold ? 2 : 0, hold: true, paymentLabel,
+      hint: recoveryHold || status === "review_required"
+        ? "追加送金せず、店舗スタッフへお声がけください。"
+        : "状態を確認するまで送金しないでください。" };
+  }
+  if (["paid", "settled"].includes(status)) {
+    return getReceiptEvidence(invoice).complete
+      ? { step: 3, hold: false, paymentLabel, hint: "サーバーの支払い確認情報を表示しています。再送金は不要です。" }
+      : { step: 2, hold: true, paymentLabel, hint: "確認情報を準備中です。追加送金せずお待ちください。" };
+  }
+  if (["payment_detected", "confirming"].includes(status)) {
+    return { step: 2, hold: false, paymentLabel, hint: "送金を確認中です。追加送金せずお待ちください。" };
+  }
+  if (storeGuidance) return { step: 2, hold: ["tap_review", "tap_retry"].includes(mode), paymentLabel, hint: invoice.customer_payment_mode.body || "店頭スタッフの案内に従ってください。" };
+  if (gate.allowed || gate.code === "launch_in_progress") {
+    return { step: 1, hold: false, paymentLabel, hint: "ウォレットで内容を確認し、送金は1回だけ行います。" };
+  }
+  return { step: 0, hold: false, paymentLabel, hint: gate.message };
+}
+
+function renderCustomerFlow(invoice, gate) {
+  if (!el.customerFlowSteps?.every(Boolean)) return;
+  const model = resolveCustomerFlow(invoice, gate);
+  el.customerFlowSteps.forEach((node, index) => {
+    const displayState = index === model.step ? (model.hold ? "hold" : "current") : index < model.step ? "complete" : "upcoming";
+    if (node.dataset.state !== displayState) node.dataset.state = displayState;
+    if (index === model.step) node.setAttribute("aria-current", "step");
+    else node.removeAttribute("aria-current");
+  });
+  if (el.customerFlowHint.textContent !== model.hint) el.customerFlowHint.textContent = model.hint;
+  if (el.customerFlowPaymentLabel.textContent !== model.paymentLabel) el.customerFlowPaymentLabel.textContent = model.paymentLabel;
 }
 
 function startPolling(status) {
@@ -1197,7 +1264,7 @@ function renderPaymentRecovery(invoice) {
       || state.recoveryChains.length === 0;
     el.submitRecoveryBtn.textContent = state.recoverySubmitting
       ? "確認依頼を送信中"
-      : "送金済み取引を確認依頼する";
+      : "取引の確認を依頼";
   }
 }
 

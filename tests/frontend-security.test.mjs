@@ -77,11 +77,11 @@ test("index prototype demo controls are guarded and delete key has aria-label", 
   assert.match(indexHtml, /data-key="back"[^>]*aria-label="削除"/);
   assert.match(indexHtml, /id="demoControlsSection"/);
   assert.match(indexHtml, /id="demoModeBadge"/);
-  assert.match(indexHtml, /JPYC Merchant Ops プロトタイプ/);
-  assert.match(indexHtml, /Merchant Opsで勝つ理由/);
-  assert.match(indexHtml, /払われた後に店舗が困らない/);
+  assert.match(indexHtml, /JPYC Merchant Ops 操作練習/);
+  assert.match(indexHtml, /このアプリの強み/);
+  assert.match(indexHtml, /支払い後も、請求ごとの記録を追えます/);
   assert.match(indexHtml, /data-prototype-preset="1000"/);
-  assert.match(indexHtml, /Pilot-ready/);
+  assert.match(indexHtml, /運用例/);
 
   assert.match(indexJs, /query\.get\("demo"\)\s*===\s*"1"/);
   assert.match(indexJs, /config\.app_env\s*!==\s*"production"/);
@@ -98,8 +98,8 @@ test("mobile customer-first UX keeps technical fields in details and includes wa
   const mobileHtml = read("public/mobile.html");
   const mobileJs = read("public/mobile.js");
   assert.match(mobileHtml, /JPYCお支払い案内/);
-  assert.match(mobileHtml, /迷わないお支払い手順/);
-  assert.match(mobileHtml, /二重送金せず確認完了まで/);
+  assert.match(mobileHtml, /id="paymentActionTitle"[^>]*>確認・ヘルプ/);
+  assert.match(mobileHtml, /二重送金しないでください/);
   assert.match(mobileHtml, /店舗/);
   assert.match(mobileHtml, /お支払い金額/);
   assert.match(mobileHtml, /お支払い期限/);
@@ -125,11 +125,11 @@ test("terminal staff/admin IA and review empty/loading/error placeholders are pr
   const server = read("src/server.mjs");
   assert.match(terminalHtml, /viewport-fit=cover/);
   assert.match(terminalHtml, /JPYC Merchant Ops 端末/);
-  assert.match(terminalHtml, /端末セッション/);
-  assert.match(terminalHtml, /請求作成（運用起点）/);
-  assert.match(terminalHtml, /端末入口QR URL/);
-  assert.match(terminalHtml, /この会計の支払いURL/);
-  assert.match(terminalHtml, /お客様提示（端末入口QR）/);
+  assert.match(terminalHtml, /id="sessionSectionTitle"[^>]*>担当者/);
+  assert.match(terminalHtml, /id="invoiceCreateTitle"[^>]*>会計/);
+  assert.match(terminalHtml, /id="fixedQrUrlLink"/);
+  assert.match(terminalHtml, /id="paymentUrlLink"/);
+  assert.match(terminalHtml, /QRを提示/);
   assert.match(terminalHtml, /data-provider-rail-enabled="false"/);
   assert.match(terminalHtml, /id="presentTapBtn"/);
   assert.match(terminalHtml, /id="resumeQrBtn"/);
@@ -154,7 +154,7 @@ test("terminal staff/admin IA and review empty/loading/error placeholders are pr
   assert.match(terminalHtml, /id="refundEvidenceNotePathInput"/);
   assert.match(terminalHtml, /id="refundCustomerNoteInput"/);
   assert.match(terminalHtml, /id="refundDraftHint"/);
-  assert.match(terminalHtml, /日次締め \/ CSV出力/);
+  assert.match(terminalHtml, /id="settlementSectionTitle"[^>]*>日次締め・正式出力/);
   assert.match(terminalHtml, /id="reviewListState"/);
   assert.match(terminalHtml, /外部ウォレットで実行した返金を記録・検証します/);
   assert.match(terminalJs, /diagnostic_mode_enabled/);
@@ -178,7 +178,7 @@ test("terminal staff/admin IA and review empty/loading/error placeholders are pr
   assert.match(terminalJs, /DEFAULT_AMOUNT_PRESETS/);
   assert.match(terminalEntryHtml, /JPYCお支払い案内/);
   assert.match(terminalEntryJs, /public\/terminal-entry/);
-  assert.match(terminalEntryJs, /会計がまだ立っていない/);
+  assert.match(terminalEntryJs, /会計を準備中です/);
   assert.match(terminalEntryJs, /店頭端末でお支払いをご案内しています/);
   assert.match(terminalEntryHtml, /id="openInvoiceBtn"[^>]*>この会計を確認して進む</);
   assert.match(terminalEntryJs, /async function handleOpenInvoice/);

@@ -14,6 +14,7 @@ const motionState = {
   phaseIndex: 0,
   timer: null,
   playing: !motionMediaQuery.matches,
+  pausedByUser: false,
 };
 
 const el = {
@@ -72,6 +73,7 @@ const el = {
   motionSettlementBody: document.getElementById("motionSettlementBody"),
   motionSceneButtons: Array.from(document.querySelectorAll("[data-motion-scene-trigger]")),
   motionActiveStepPill: document.getElementById("motionActiveStepPill"),
+  motionCurrentPhaseText: document.getElementById("motionCurrentPhaseText"),
   motionNarrativeList: document.getElementById("motionNarrativeList"),
   motionAuditText: document.getElementById("motionAuditText"),
   motionLive: document.getElementById("motionLive"),
@@ -99,8 +101,8 @@ const MOTION_SCENES = [
     id: "success",
     label: "通常会計",
     badgeClass: "s-green",
-    summary: "請求作成から支払い確認、日次締め候補化までの基本フローです。",
-    body: "JPYC で払えた後に店舗が困らないよう、端末 UI・顧客 UI・settlement export が同じ流れでつながります。",
+    summary: "請求 → 送金確認 → 日次締めの基本例です。",
+    body: "店舗とお客様の案内を、同じ請求と証跡で追います。",
     phases: [
       {
         label: "請求作成",
@@ -151,7 +153,7 @@ const MOTION_SCENES = [
       },
       {
         label: "送金検知",
-        hint: "payment detected から confirming へ",
+        hint: "入金を検知し、確認中へ",
         canvasTone: "default",
         flowActive: true,
         terminalStatus: ["確認中", "s-blue"],
@@ -198,7 +200,7 @@ const MOTION_SCENES = [
       },
       {
         label: "支払い確認",
-        hint: "paid になり次会計へ戻る",
+        hint: "支払い確認後、次の会計へ",
         canvasTone: "default",
         flowActive: false,
         terminalStatus: ["支払い完了", "s-green"],
@@ -245,7 +247,7 @@ const MOTION_SCENES = [
       },
       {
         label: "日次締め",
-        hint: "export_reference 付きで確定",
+        hint: "締めの参照ID付きで記録",
         canvasTone: "settled",
         flowActive: false,
         terminalStatus: ["確定済み", "s-green"],
@@ -296,8 +298,8 @@ const MOTION_SCENES = [
     id: "review",
     label: "過入金レビュー",
     badgeClass: "s-yellow",
-    summary: "過入金を review queue に分岐し、返金証跡まで追えるフローです。",
-    body: "例外を決済後に処理できることが、このプロダクトの実運用価値です。review / refund evidence を UI で迷わず扱えます。",
+    summary: "過入金の検知 → 理由確認 → 返金記録の例です。",
+    body: "差額と証跡を確認し、返金申請・別担当者の承認・外部送金の証跡を残します。アプリは送金しません。",
     phases: [
       {
         label: "請求作成",
@@ -394,7 +396,7 @@ const MOTION_SCENES = [
         audit: "reason code 候補と差分金額を evidence と一緒に残します。",
       },
       {
-        label: "review queue",
+        label: "要確認",
         hint: "要確認として管理者へ",
         canvasTone: "alert",
         flowActive: false,
@@ -442,7 +444,7 @@ const MOTION_SCENES = [
       },
       {
         label: "返金証跡",
-        hint: "refund evidence を記録",
+        hint: "外部返金の証跡を記録",
         canvasTone: "alert",
         flowActive: false,
         terminalStatus: ["確認が必要", "s-yellow"],
@@ -493,12 +495,12 @@ const MOTION_SCENES = [
     id: "late",
     label: "期限後着金",
     badgeClass: "s-red",
-    summary: "期限切れ後の着金を旧請求レビューに残しつつ、新しい QR を再発行するフローです。",
-    body: "小規模店舗で起こりやすい late payment を、その場の案内と audit trace の両方を崩さず処理できます。",
+    summary: "期限切れ → 期限後着金の確認 → 再発行の例です。",
+    body: "旧請求の入金証跡を残し、新しい請求と分けて確認します。",
     phases: [
       {
         label: "請求作成",
-        hint: "短い TTL で発行",
+        hint: "短い期限で発行",
         canvasTone: "default",
         flowActive: false,
         terminalStatus: ["支払い待ち", "s-blue"],
@@ -545,7 +547,7 @@ const MOTION_SCENES = [
       },
       {
         label: "期限切れ",
-        hint: "old invoice は expired",
+        hint: "元の会計は期限切れ",
         canvasTone: "alert",
         flowActive: false,
         terminalStatus: ["期限切れ", "s-red"],
@@ -592,7 +594,7 @@ const MOTION_SCENES = [
       },
       {
         label: "期限後着金",
-        hint: "late payment を review へ",
+        hint: "期限後着金は確認待ちへ",
         canvasTone: "alert",
         flowActive: true,
         terminalStatus: ["確認が必要", "s-yellow"],
@@ -639,7 +641,7 @@ const MOTION_SCENES = [
       },
       {
         label: "QR再発行",
-        hint: "new invoice で会計再開",
+        hint: "新しい請求で会計を再開",
         canvasTone: "default",
         flowActive: false,
         terminalStatus: ["支払い待ち", "s-blue"],
@@ -690,12 +692,12 @@ const MOTION_SCENES = [
     id: "settlement",
     label: "日次締め",
     badgeClass: "s-green",
-    summary: "paid 済み取引を export_reference 付きで日次締めへまとめるフローです。",
-    body: "Generic CSV / JSON を source of truth にして downstream adapter へ渡す、accounting trace の中心部分を見せています。",
+    summary: "対象集計 → 内容確認 → 締め確定 → CSV・JSONの例です。",
+    body: "サーバー台帳を正として、export_referenceで請求・返金・監査へたどれる出力を作ります。",
     phases: [
       {
         label: "締め準備",
-        hint: "paid 済み取引を集計",
+        hint: "支払い確認済みを集計",
         canvasTone: "default",
         flowActive: false,
         terminalStatus: ["支払い完了", "s-green"],
@@ -742,7 +744,7 @@ const MOTION_SCENES = [
       },
       {
         label: "保留確認",
-        hint: "unresolved review を判定",
+        hint: "未解決の確認待ちを判定",
         canvasTone: "alert",
         flowActive: false,
         terminalStatus: ["確認中", "s-blue"],
@@ -789,7 +791,7 @@ const MOTION_SCENES = [
       },
       {
         label: "export 生成",
-        hint: "CSV / JSON contract v1",
+        hint: "正式なCSV・JSONを出力",
         canvasTone: "settled",
         flowActive: false,
         terminalStatus: ["確定済み", "s-green"],
@@ -835,8 +837,8 @@ const MOTION_SCENES = [
         audit: "export_reference を軸に internal ledger semantics を固定します。",
       },
       {
-        label: "adapter 連携",
-        hint: "下流 sync へ handoff",
+        label: "別途アダプター連携",
+        hint: "正式データから外部用に変換",
         canvasTone: "settled",
         flowActive: false,
         terminalStatus: ["確定済み", "s-green"],
@@ -1102,7 +1104,8 @@ function renderMotionScene(announceScene = false) {
 
   renderMotionPhaseTrack(scene, motionState.phaseIndex);
   syncMotionButtons(scene.id);
-  setText(el.motionActiveStepPill, `phase ${motionState.phaseIndex + 1} / ${scene.phases.length}`);
+  setText(el.motionActiveStepPill, `${motionState.phaseIndex + 1} / ${scene.phases.length}`);
+  setText(el.motionCurrentPhaseText, `${phase.label}：${phase.terminalAction}`);
   renderList(el.motionNarrativeList, phase.narrative);
   setText(el.motionAuditText, phase.audit);
   syncMotionPauseButton();
@@ -1120,8 +1123,10 @@ function stopMotionTimer() {
 
 function scheduleMotionAdvance() {
   stopMotionTimer();
-  if (!motionState.playing || !el.motionCanvas) return;
+  if (!motionState.playing || !el.motionCanvas || document.visibilityState === "hidden") return;
   motionState.timer = setTimeout(() => {
+    motionState.timer = null;
+    if (!motionState.playing || document.visibilityState === "hidden") return;
     if (el.motionPhaseTrack?.contains(document.activeElement)) {
       scheduleMotionAdvance();
       return;
@@ -1158,6 +1163,7 @@ function jumpToMotionPhase(index) {
 
 function toggleMotionPlayback() {
   motionState.playing = !motionState.playing;
+  motionState.pausedByUser = !motionState.playing;
   syncMotionPauseButton();
   if (motionState.playing) {
     announceMotion("アニメーションの自動再生を再開しました");
@@ -1171,6 +1177,12 @@ function toggleMotionPlayback() {
 function bindMotionEvents() {
   if (!el.motionCanvas) return;
 
+  document.addEventListener("visibilitychange", scheduleMotionAdvance);
+  motionMediaQuery.addEventListener("change", () => {
+    motionState.playing = !motionMediaQuery.matches && !motionState.pausedByUser;
+    syncMotionPauseButton();
+    scheduleMotionAdvance();
+  });
   el.motionPauseBtn.addEventListener("click", toggleMotionPlayback);
   for (const button of el.motionSceneButtons) {
     button.addEventListener("click", () => jumpToMotionScene(String(button.dataset.motionSceneTrigger || "")));

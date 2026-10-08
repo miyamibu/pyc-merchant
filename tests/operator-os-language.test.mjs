@@ -102,7 +102,7 @@ test("staff terminal and customer page expose operation-first safety copy", () =
   const mobileJs = read("public/mobile.js");
 
   assert.match(terminalHtml, /商品を渡してよいか/);
-  assert.match(terminalHtml, /端末入口QR URL/);
+  assert.match(terminalHtml, /端末入口QR: <a id="fixedQrUrlLink"/);
   assert.doesNotMatch(terminalHtml, /固定QR URL/);
   assert.doesNotMatch(visibleText(terminalHtml), /worker/i);
   assert.match(terminalJs, /商品引渡し: まだ渡さない/);
@@ -110,7 +110,7 @@ test("staff terminal and customer page expose operation-first safety copy", () =
   assert.match(terminalJs, /状態更新が停止しています。新しいJPYC決済を受け付けないでください/);
   assert.match(terminalJs, /受取アドレス残数が少なくなっています/);
   assert.match(mobileHtml, /この画面に表示された内容以外には送金しないでください/);
-  assert.match(mobileHtml, /ウォレットが自動で開かない場合/);
+  assert.match(mobileHtml, /開かない場合は支払い情報をコピー/);
   assert.match(mobileJs, /お支払い内容の確認が必要です。追加で送金せず/);
   assert.doesNotMatch(mobileJs, /送金額\(atomic\)/);
 });

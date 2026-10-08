@@ -2193,6 +2193,458 @@ tbody tr:last-child td {
   }
 }
 
+.terminal-surface .sticky-stack,
+.terminal-surface .fulfillment-banner {
+  position: static;
+}
+
+.fulfillment-details {
+  background: var(--color-surface);
+  max-width: 100%;
+}
+
+.store-payments-control[data-state="active"] #storePaymentsToggleBtn {
+  color: var(--color-danger);
+  background: var(--color-surface);
+  border-color: var(--color-danger);
+}
+
+.terminal-authenticated .terminal-session-card,
+.terminal-authenticated .terminal-invoice-card {
+  grid-column: 1 / -1;
+}
+
+.terminal-session-card.is-authenticated {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+  gap: var(--space-2);
+}
+
+.terminal-session-card.is-authenticated > .section-header {
+  display: none;
+}
+
+.terminal-session-card.is-authenticated .session-warnings {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+}
+
+.terminal-session-card.is-authenticated .session-warnings .ops-list {
+  margin: 0;
+}
+
+.session-compact-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.session-compact-row > * {
+  min-width: 0;
+}
+
+.checkout-flow,
+.customer-flow {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.checkout-flow {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.customer-flow.checkout-flow {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.customer-flow-panel {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.checkout-flow-step,
+.customer-flow-step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-soft);
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.checkout-step-number,
+.flow-step-index {
+  display: grid;
+  place-items: center;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--color-border);
+  color: var(--color-text-subtle);
+}
+
+.checkout-flow-step[data-state="current"],
+.customer-flow-step[data-state="current"] {
+  background: var(--color-primary-soft);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.checkout-flow-step[data-state="current"] .checkout-step-number,
+.customer-flow-step[data-state="current"] .flow-step-index {
+  background: var(--color-primary);
+  color: var(--color-surface);
+}
+
+.checkout-flow-step[data-state="complete"],
+.customer-flow-step[data-state="complete"] {
+  color: var(--color-success);
+  background: var(--color-success-soft);
+}
+
+.checkout-flow-step[data-state="hold"],
+.customer-flow-step[data-state="hold"] {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+  background: var(--color-danger-soft);
+}
+
+.checkout-flow[data-step="3"] .checkout-flow-step[aria-current="step"],
+.customer-flow-step:nth-child(3)[data-state="current"] {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+  background: var(--color-warning-soft);
+}
+
+.checkout-flow[data-step="3"] .checkout-flow-step[aria-current="step"] .checkout-step-number,
+.customer-flow-step:nth-child(3)[data-state="current"] .flow-step-index {
+  background: var(--color-warning);
+  color: var(--color-surface);
+}
+
+.checkout-flow[data-step="4"] .checkout-flow-step[aria-current="step"],
+.customer-flow-step:last-child[data-state="current"] {
+  color: var(--color-success);
+  border-color: var(--color-success);
+  background: var(--color-success-soft);
+}
+
+.checkout-flow[data-step="4"] .checkout-flow-step[aria-current="step"] .checkout-step-number,
+.customer-flow-step:last-child[data-state="current"] .flow-step-index {
+  background: var(--color-success);
+  color: var(--color-surface);
+}
+
+.management-flow-item[data-state="current"] {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.checkout-step-label,
+.flow-step-label {
+  overflow-wrap: anywhere;
+}
+
+.checkout-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 0.9fr) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-3);
+}
+
+.checkout-layout > * {
+  min-width: 0;
+}
+
+.checkout-amount-panel #amountInput {
+  min-height: calc(var(--control-height) + var(--space-6));
+  font-size: var(--font-size-amount);
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.checkout-amount-panel .invoice-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.checkout-amount-panel .field-w-180 {
+  width: auto;
+}
+
+.checkout-qr-panel {
+  text-align: center;
+}
+
+.checkout-qr-panel #qrCanvas {
+  width: min(100%, 360px);
+  justify-self: center;
+}
+
+.checkout-summary-panel .amount-compare {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.checkout-summary-panel .amount-primary {
+  font-size: clamp(28px, 3vw, 40px);
+}
+
+.checkout-next-action {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-soft);
+}
+
+.customer-store-name {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: 800;
+  text-align: center;
+}
+
+.mobile-surface .wrap-narrow,
+.entry-surface .wrap-narrow {
+  max-width: 560px;
+}
+
+.mobile-summary-card .amount-hero {
+  text-align: center;
+}
+
+.mobile-summary-card #uxStateDetail {
+  min-height: 3em;
+}
+
+.entry-confirm-panel,
+.entry-amount,
+.entry-reference {
+  text-align: center;
+}
+
+.entry-confirm-note {
+  font-size: var(--font-size-sm);
+  color: var(--color-warning);
+}
+
+.management-navigation {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.management-navigation a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap-target-min);
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-soft);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.management-navigation a[aria-current="location"] {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+}
+
+.management-section,
+.audit-operations {
+  scroll-margin-top: var(--space-6);
+}
+
+.management-flow {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.management-flow-item {
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-soft);
+  color: var(--color-text-subtle);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.review-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  align-items: start;
+  gap: var(--space-4);
+}
+
+.settlement-workflow .definition-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.settlement-workflow .definition-grid > div {
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.settlement-workflow .definition-grid dt {
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+}
+
+.settlement-workflow .definition-grid dd {
+  margin: var(--space-2) 0 0;
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.settlement-workflow .definition-grid dd.mono {
+  font-size: var(--font-size-sm);
+}
+
+.review-queue,
+.review-selection,
+.review-response,
+.login-fields {
+  min-width: 0;
+}
+
+.login-fields {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.training-surface .motion-showcase {
+  background: var(--color-surface);
+}
+
+.training-scene-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.training-current-step {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+}
+
+.training-brand {
+  display: block;
+  margin-bottom: var(--space-2);
+  color: var(--color-muted);
+  font-size: var(--font-size-md);
+  font-weight: 700;
+}
+
+.training-title {
+  display: block;
+}
+
+.training-control-row {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.training-example-note {
+  color: var(--color-text-subtle);
+}
+
+.training-surface .motion-canvas {
+  background: var(--color-surface-soft);
+}
+
+.training-surface .motion-device-screen {
+  background: var(--color-surface);
+}
+
+.training-surface .motion-phase-track {
+  margin-top: var(--space-3);
+}
+
+@media (max-width: 899px) {
+  .training-surface .motion-phase-track {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .training-surface .motion-phase {
+    min-height: var(--tap-target-min);
+    padding: var(--space-2);
+  }
+  .settlement-workflow .definition-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .review-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .training-scene-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .management-flow-item {
+    padding: var(--space-2);
+    font-size: var(--font-size-xs);
+  }
+
+  .terminal-session-card.is-authenticated {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .checkout-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .checkout-flow-step {
+    flex-direction: column;
+    text-align: center;
+    padding: var(--space-2) var(--space-1);
+    font-size: var(--font-size-xs);
+  }
+
+  .session-compact-row > * {
+    flex: 0 1 auto;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
